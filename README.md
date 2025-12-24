@@ -18,6 +18,11 @@ This fork keeps the original behavior while adding practical improvements for da
 - Optional timing/debug logs via `~/.config/jls/logging.properties`.
 - Unused import warnings in diagnostics.
 
+
+## IMPORTANT
+I may often introduce **breaking changes** until i'm satisfied with a stable version so prepare your horses for a wild ride
+
+
 ## First-run checklist
 
 - Install a compatible JDK and verify `java -version`.
