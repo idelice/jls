@@ -81,7 +81,7 @@ lspconfig.jls.setup({})
 The language server will provide autocomplete and other features using:
 * .java files anywhere in your workspace
 * Java platform classes
-* External dependencies specified using `pom.xml`, Bazel, or [settings](#Settings)
+* External dependencies specified using `pom.xml` or [settings](#Settings)
 
 ## Settings
 
