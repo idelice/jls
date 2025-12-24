@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+# Activates git_hooks directory
+git config core.hooksPath git_hooks
