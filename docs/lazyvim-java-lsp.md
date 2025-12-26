@@ -53,3 +53,13 @@ Notes:
 - It uses the current working directory as the workspace root when selecting a JDK.
 - Auto-detection checks `.java-version`, `.tool-versions`, `pom.xml`, `build.gradle`, `build.gradle.kts`.
 - If no runtime matches, it falls back to the bundled runtime (or `JAVA_LSP_HOST_JAVA`/`JAVA_HOME` when Lombok is used).
+
+## Linux (env-based Lombok)
+
+```sh
+export lombokPath=/path/to/lombok.jar
+```
+
+```sh
+-Dorg.javacs.lombokPath=$lombokPath
+```
