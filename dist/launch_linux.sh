@@ -1,4 +1,9 @@
 #!/bin/sh
+# export LOMBOK_PATH=/path/to/lombok.jar for lombok support
+if [ "x$LOMBOK_PATH" != "x" ]
+then 
+    LOMBOK_SUPPORT="-Dorg.javacs.lombokPath=$LOMBOK_PATH"
+fi
 JLINK_VM_OPTIONS="\
 --add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED \
@@ -124,4 +129,4 @@ elif [ -n "$HOST_JAVA_HOME" ] && [ -x "$HOST_JAVA_HOME/bin/java" ]; then
   JAVA_EXECUTABLE="$HOST_JAVA_HOME/bin/java"
 fi
 
-exec "$JAVA_EXECUTABLE" $JLINK_VM_OPTIONS $CLASSPATH_OPTIONS "$@"
+exec "$JAVA_EXECUTABLE" $JLINK_VM_OPTIONS $CLASSPATH_OPTIONS $LOMBOK_SUPPORT "$@"
