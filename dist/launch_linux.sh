@@ -9,7 +9,11 @@ JLINK_VM_OPTIONS="\
 --add-exports jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED \
 --add-opens jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED"
 DIR=`dirname $0`
-CLASSPATH_OPTIONS="-classpath $DIR/classpath/*"
+for f in $DIR/classpath/*.jar
+do
+    JARS="$JARS:$f"
+done
+CLASSPATH_OPTIONS="-classpath $JARS"
 JAVA_EXECUTABLE="java"
 HOST_JAVA_HOME="${JAVA_LSP_HOST_JAVA:-${JAVA_HOME:-}}"
 WORKSPACE_ROOT="${JAVA_LSP_WORKSPACE_ROOT:-${PWD}}"
