@@ -42,8 +42,8 @@ RUNTIMES_FILE="${JAVA_LSP_RUNTIMES_FILE:-${HOME}/.config/jls/runtimes.json}"
 RUNTIME_JAVA=""
 for arg in "$@"; do
   case "$arg" in
-    -Dorg.javacs.lombokPath=*)
-      LOMBOK_PATH="${arg#-Dorg.javacs.lombokPath=}"
+    -DlombokPath=*)
+      LOMBOK_PATH="${arg#-DlombokPath=}"
       JAVA_ARGS+=("$arg")
       ;;
     -D*|-X*|-javaagent:*|-Xbootclasspath*|-J*)

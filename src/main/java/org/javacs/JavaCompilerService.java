@@ -24,7 +24,7 @@ class JavaCompilerService implements CompilerProvider {
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports) {
         var cp = new LinkedHashSet<Path>();
-        var lombokPath = System.getProperty("org.javacs.lombokPath");
+        var lombokPath = LombokSupport.lombokPath();
         if (lombokPath != null) {
             cp.add(Paths.get(lombokPath));
         }

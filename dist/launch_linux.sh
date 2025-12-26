@@ -19,6 +19,16 @@ HOST_JAVA_HOME="${JAVA_LSP_HOST_JAVA:-${JAVA_HOME:-}}"
 WORKSPACE_ROOT="${JAVA_LSP_WORKSPACE_ROOT:-${PWD}}"
 RUNTIMES_FILE="${JAVA_LSP_RUNTIMES_FILE:-${HOME}/.config/jls/runtimes.json}"
 RUNTIME_JAVA=""
+LOMBOK_PATH=""
+JAVA_AGENT=""
+
+for arg in "$@"; do
+  case "$arg" in
+    -DlombokPath=*)
+      LOMBOK_PATH="${arg#-DlombokPath=}"
+      ;;
+  esac
+done
 
 if [ -n "$WORKSPACE_ROOT" ] && [ -r "$RUNTIMES_FILE" ] && command -v python3 >/dev/null 2>&1; then
   RUNTIME_JAVA="$(
@@ -124,4 +134,16 @@ elif [ -n "$HOST_JAVA_HOME" ] && [ -x "$HOST_JAVA_HOME/bin/java" ]; then
   JAVA_EXECUTABLE="$HOST_JAVA_HOME/bin/java"
 fi
 
-exec "$JAVA_EXECUTABLE" $JLINK_VM_OPTIONS $CLASSPATH_OPTIONS "$@"
+if [ -n "$LOMBOK_PATH" ]; then
+  if [ -r "$LOMBOK_PATH" ]; then
+    JAVA_AGENT="-javaagent:$LOMBOK_PATH"
+  else
+    echo "Warning: ignoring lombok jar (unreadable): $LOMBOK_PATH" >&2
+  fi
+fi
+
+if [ -n "$JAVA_AGENT" ]; then
+  exec "$JAVA_EXECUTABLE" $JLINK_VM_OPTIONS $JAVA_AGENT $CLASSPATH_OPTIONS "$@"
+else
+  exec "$JAVA_EXECUTABLE" $JLINK_VM_OPTIONS $CLASSPATH_OPTIONS "$@"
+fi

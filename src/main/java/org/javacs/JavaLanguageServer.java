@@ -200,7 +200,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private Optional<Path> lombokDocSources() {
-        var lombokPath = System.getProperty("org.javacs.lombokPath");
+        var lombokPath = LombokSupport.lombokPath();
         if (lombokPath == null || lombokPath.isBlank()) return Optional.empty();
         var jar = Paths.get(lombokPath);
         var parent = jar.getParent();

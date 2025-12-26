@@ -29,7 +29,7 @@ local lspconfig = require("lspconfig")
 local configs = require("lspconfig.configs")
 
 local JAVA_LSP_LAUNCHER = "/Users/youruser/projects/jls/dist/lang_server_mac.sh"
-local LOMBOK_JAR_PATH_ARG = "-Dorg.javacs.lombokPath=/Users/youruser/downloads/lombok.jar"
+local LOMBOK_JAR_PATH_ARG = "-DlombokPath=/Users/youruser/downloads/lombok.jar"
 
 local cmd = {
   JAVA_LSP_LAUNCHER,

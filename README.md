@@ -48,7 +48,7 @@ if not configs.jls then
     default_config = {
       cmd = {
         "/path/to/jls/dist/lang_server_{linux|mac|windows}.sh",
-        "-Dorg.javacs.lombokPath=/path/to/lombok.jar",
+        "-DlombokPath=/path/to/lombok.jar",
       },
       filetypes = { "java" },
       root_dir = lspconfig.util.root_pattern("pom.xml", "build.gradle", "build.gradle.kts", ".java-version", ".git"),

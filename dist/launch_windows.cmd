@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableDelayedExpansion
 set JLINK_VM_OPTIONS=^
 --add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED ^
 --add-exports jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED ^
@@ -10,6 +11,15 @@ set JLINK_VM_OPTIONS=^
 --add-opens jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED
 set CLASSPATH_OPTIONS=-classpath %~dp0classpath\*
 set "JAVA_EXECUTABLE=java"
+set "LOMBOK_PATH="
+set "JAVA_AGENT="
+
+for %%A in (%*) do (
+  set "ARG=%%~A"
+  if /I "!ARG:~0,13!"=="-DlombokPath=" (
+    set "LOMBOK_PATH=!ARG:~13!"
+  )
+)
 
 where python3 >nul 2>nul
 if %errorlevel%==0 if defined JAVA_LSP_RUNTIMES_FILE if defined JAVA_LSP_WORKSPACE_ROOT (
@@ -81,4 +91,16 @@ sys.exit(0)"') do set "JAVA_EXECUTABLE=%%i"
 if not "%JAVA_LSP_HOST_JAVA%"=="" if exist "%JAVA_LSP_HOST_JAVA%\\bin\\java.exe" set "JAVA_EXECUTABLE=%JAVA_LSP_HOST_JAVA%\\bin\\java.exe"
 if not "%JAVA_HOME%"=="" if exist "%JAVA_HOME%\\bin\\java.exe" set "JAVA_EXECUTABLE=%JAVA_HOME%\\bin\\java.exe"
 
-%JAVA_EXECUTABLE% %JLINK_VM_OPTIONS% %CLASSPATH_OPTIONS% %*
+if defined LOMBOK_PATH (
+  if exist "!LOMBOK_PATH!" (
+    set "JAVA_AGENT=-javaagent:!LOMBOK_PATH!"
+  ) else (
+    echo Warning: ignoring lombok jar (unreadable): !LOMBOK_PATH! 1>&2
+  )
+)
+
+if defined JAVA_AGENT (
+  %JAVA_EXECUTABLE% %JLINK_VM_OPTIONS% %JAVA_AGENT% %CLASSPATH_OPTIONS% %*
+) else (
+  %JAVA_EXECUTABLE% %JLINK_VM_OPTIONS% %CLASSPATH_OPTIONS% %*
+)
