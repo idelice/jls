@@ -75,14 +75,11 @@ lspconfig.jls.setup({})
 ```
 
 ### Linux (env-based Lombok)
-
+For including lombok support execute
 ```sh
-export lombokPath=/path/to/lombok.jar
+export LOMBOK_PATH=/path/to/lombok.jar
 ```
-
-```sh
--Dorg.javacs.lombokPath=$lombokPath
-```
+before using language server
 
 ## [Issues](https://github.com/idelice/jls/issues)
 
