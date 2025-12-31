@@ -287,6 +287,11 @@ class JavaCompilerService implements CompilerProvider {
             var found =
                     docs.fileManager.getJavaFileForInput(
                             StandardLocation.SOURCE_PATH, className, JavaFileObject.Kind.SOURCE);
+            if (found == null) {
+                LOG.fine(String.format("DocPath lookup miss for %s", className));
+            } else {
+                LOG.fine(String.format("DocPath lookup hit for %s -> %s", className, found.toUri()));
+            }
             return Optional.ofNullable(found);
         } catch (IOException e) {
             throw new RuntimeException(e);

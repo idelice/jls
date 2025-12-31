@@ -34,14 +34,17 @@ public class HoverProvider {
             var position = task.root(file).getLineMap().getPosition(line, column);
             var element = new FindHoverElement(task.task).scan(task.root(file), position);
             if (element == null) return NOT_SUPPORTED;
-            var list = new ArrayList<MarkedString>();
-            var code = printType(element);
-            list.add(new MarkedString("java", code));
             var docs = docs(task, element);
+            var code =
+                    (element instanceof TypeElement)
+                            ? hoverTypeDeclaration((TypeElement) element)
+                            : printType(element);
+            var combined = new StringBuilder();
+            combined.append("```java\n").append(code).append("\n```\n");
             if (!docs.isEmpty()) {
-                list.add(new MarkedString(docs));
+                combined.append("\n").append(docs);
             }
-            return list;
+            return List.of(new MarkedString(combined.toString()));
         }
     }
 
@@ -131,8 +134,17 @@ public class HoverProvider {
     private String docs(ParseTask task, Tree tree) {
         var path = Trees.instance(task.task).getPath(task.root, tree);
         var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
-        if (docTree == null) return "";
-        return MarkdownHelper.asMarkdown(docTree);
+        if (docTree == null) {
+            LOG.fine(String.format("No DocTree found for %s", tree.getKind()));
+            return "";
+        }
+        var markdown = MarkdownHelper.asMarkdown(docTree);
+        if (markdown.isBlank()) {
+            LOG.fine(String.format("DocTree empty for %s", tree.getKind()));
+        } else {
+            LOG.fine(String.format("DocTree size=%d for %s", markdown.length(), tree.getKind()));
+        }
+        return markdown;
     }
 
     // TODO this should be merged with logic in CompletionProvider

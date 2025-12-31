@@ -133,19 +133,24 @@ class InferConfig {
                 }
                 result.add(found);
             }
+            LOG.fine("Doc path (external deps) size=" + result.size());
             return result;
         }
 
         // Maven
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:resolve", mavenSettings, "-Dclassifier=sources");
+            var deps = mvnDependencies(pomXml, "dependency:resolve", mavenSettings, "-Dclassifier=sources");
+            LOG.fine("Doc path (maven sources) size=" + deps.size());
+            return deps;
         }
 
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
         if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
-            return bazelSourcepath(bazelWorkspaceRoot);
+            var deps = bazelSourcepath(bazelWorkspaceRoot);
+            LOG.fine("Doc path (bazel) size=" + deps.size());
+            return deps;
         }
 
         return Collections.emptySet();
@@ -219,7 +224,22 @@ class InferConfig {
             if (Files.exists(cacheFile)) {
                 try (var reader = new InputStreamReader(Files.newInputStream(cacheFile), StandardCharsets.UTF_8)) {
                     Set<String> paths = GSON.fromJson(reader, new TypeToken<Set<String>>() {}.getType());
-                    return paths.stream().map(Paths::get).collect(Collectors.toSet());
+                    var cached = paths.stream().map(Paths::get).collect(Collectors.toSet());
+                    var missing = cached.stream().filter(p -> !Files.exists(p)).collect(Collectors.toSet());
+                    boolean wantsSources = Arrays.asList(extraArgs).contains("-Dclassifier=sources");
+                    if (!missing.isEmpty()) {
+                        LOG.warning("Cached Maven paths missing on disk, re-running Maven: " + missing.size());
+                    } else if (cached.isEmpty() && wantsSources) {
+                        LOG.warning("Cached Maven sources are empty, re-running Maven to pick up newly downloaded sources");
+                    } else {
+                        LOG.fine(
+                                "Using cached Maven dependencies: size="
+                                        + cached.size()
+                                        + " goal="
+                                        + goal
+                                        + (wantsSources ? " classifier=sources" : ""));
+                        return cached;
+                    }
                 } catch (IOException e) {
                     LOG.warning("Failed to read Maven cache: " + e.getMessage());
                 }
@@ -270,6 +290,13 @@ class InferConfig {
                     dependencies.add(jar);
                 }
             }
+            boolean wantsSources = Arrays.asList(extraArgs).contains("-Dclassifier=sources");
+            LOG.fine(
+                    "Maven dependencies resolved: size="
+                            + dependencies.size()
+                            + " goal="
+                            + goal
+                            + (wantsSources ? " classifier=sources" : ""));
             
             // Save to cache
             if (!hash.isEmpty()) {
