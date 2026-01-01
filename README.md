@@ -17,6 +17,8 @@ This fork keeps the original behavior while adding practical improvements for da
 - Completion prioritizes already-imported types.
 - Optional timing/debug logs via `~/.config/jls/logging.properties`.
 - Unused import warnings in diagnostics.
+- Inlay hints for parameter names (configurable).
+- Configurable cache directory via init options.
 
 
 ## IMPORTANT
@@ -92,7 +94,7 @@ The language server will provide autocomplete and other features using:
 
 ## Settings
 
-If the language server doesn't detect your external dependencies automatically, you can specify them in your LSP client settings (the JSON examples map directly to `settings.java.*` in most clients):
+If the language server doesn't detect your external dependencies automatically, you can specify them in your LSP client settings (the JSON examples map directly to `settings.java.*` in most clients). This fork also accepts `settings.jls.*`:
 
 ```json
 {
@@ -100,6 +102,35 @@ If the language server doesn't detect your external dependencies automatically, 
         "junit:junit:jar:4.12:test", // Maven format
         "junit:junit:4.12" // Gradle-style format is also allowed
     ]
+}
+```
+
+### JLS-specific settings (this fork)
+
+```json
+{
+  "jls.diagnostics": {
+    "enable": true,
+    "unusedImports": "warning"
+  },
+  "jls.features": {
+    "inlayHints": true,
+    "semanticTokens": true
+  }
+}
+```
+
+Notes:
+- `unusedImports` supports `"warning"`, `"error"`, or `"off"`.
+- `semanticTokens` is advertised but currently returns empty tokens.
+
+### Init options (this fork)
+
+```json
+{
+  "jls.cache": {
+    "dir": "/path/to/jls-cache"
+  }
 }
 ```
 
