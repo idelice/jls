@@ -64,6 +64,14 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public Optional<java.util.List<InlayHint>> inlayHint(InlayHintParams params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
+    public Optional<SemanticTokens> semanticTokensFull(SemanticTokensParams params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
     public Optional<List<Location>> gotoDefinition(TextDocumentPositionParams params) {
         throw new RuntimeException("Unimplemented");
     }

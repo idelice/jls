@@ -377,6 +377,20 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
+                    case "textDocument/inlayHint":
+                        {
+                            var params = gson.fromJson(r.params, InlayHintParams.class);
+                            var response = server.inlayHint(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/semanticTokens/full":
+                        {
+                            var params = gson.fromJson(r.params, SemanticTokensParams.class);
+                            var response = server.semanticTokensFull(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
                     case "textDocument/definition":
                         {
                             var params = gson.fromJson(r.params, TextDocumentPositionParams.class);

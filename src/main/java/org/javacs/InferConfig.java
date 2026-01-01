@@ -24,15 +24,10 @@ import java.util.stream.Stream;
 
 class InferConfig {
     private static final Logger LOG = Logger.getLogger("main");
-    private static final Path CACHE_DIR = Paths.get(System.getProperty("java.io.tmpdir"), "jls-cache");
     private static final Gson GSON = new Gson();
 
-    static {
-        try {
-            Files.createDirectories(CACHE_DIR);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+    private static Path cacheDir() {
+        return CacheConfig.cacheDir();
     }
 
     /** Root of the workspace that is currently open in VSCode */
@@ -219,7 +214,7 @@ class InferConfig {
             mavenSettings.ifPresent(p -> sb.append(p.toString()));
             for (var arg : extraArgs) sb.append(arg);
             hash = md5(sb.toString());
-            var cacheFile = CACHE_DIR.resolve("mvn-" + hash + ".json");
+            var cacheFile = cacheDir().resolve("mvn-" + hash + ".json");
             
             if (Files.exists(cacheFile)) {
                 try (var reader = new InputStreamReader(Files.newInputStream(cacheFile), StandardCharsets.UTF_8)) {
@@ -300,7 +295,7 @@ class InferConfig {
             
             // Save to cache
             if (!hash.isEmpty()) {
-                var cacheFile = CACHE_DIR.resolve("mvn-" + hash + ".json");
+                var cacheFile = cacheDir().resolve("mvn-" + hash + ".json");
                 try (var writer = new OutputStreamWriter(Files.newOutputStream(cacheFile), StandardCharsets.UTF_8)) {
                     var paths = dependencies.stream().map(Path::toString).collect(Collectors.toSet());
                     GSON.toJson(paths, writer);

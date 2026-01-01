@@ -16,9 +16,11 @@ import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
+    final Integer unusedImportsSeverity;
 
-    public ErrorProvider(CompileTask task) {
+    public ErrorProvider(CompileTask task, Integer unusedImportsSeverity) {
         this.task = task;
+        this.unusedImportsSeverity = unusedImportsSeverity;
     }
 
     public PublishDiagnosticsParams[] errors() {
@@ -94,12 +96,14 @@ public class ErrorProvider {
         for (var unusedEl : warnUnused.notUsed()) {
             result.add(warnUnused(unusedEl));
         }
-        for (var importPath : warnUnused.unusedImports()) {
-            var leaf = importPath.getLeaf();
-            if (!(leaf instanceof ImportTree)) continue;
-            var warn = warnUnusedImport(root, (ImportTree) leaf);
-            if (warn != null) {
-                result.add(warn);
+        if (unusedImportsSeverity != null) {
+            for (var importPath : warnUnused.unusedImports()) {
+                var leaf = importPath.getLeaf();
+                if (!(leaf instanceof ImportTree)) continue;
+                var warn = warnUnusedImport(root, (ImportTree) leaf);
+                if (warn != null) {
+                    result.add(warn);
+                }
             }
         }
         return result;
@@ -129,7 +133,7 @@ public class ErrorProvider {
         }
         var qualified = tree.getQualifiedIdentifier().toString();
         var d = new org.javacs.lsp.Diagnostic();
-        d.severity = DiagnosticSeverity.Warning;
+        d.severity = unusedImportsSeverity;
         d.code = "unused_import";
         d.message = String.format("Import '%s' is not used", qualified);
         d.tags = List.of(DiagnosticTag.Unnecessary);

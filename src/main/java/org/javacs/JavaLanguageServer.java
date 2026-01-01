@@ -24,6 +24,7 @@ import org.javacs.hover.HoverProvider;
 import org.javacs.imports.AutoImportProvider;
 import org.javacs.imports.AutoImportProviderFactory;
 import org.javacs.imports.SimpleAutoImportProvider;
+import org.javacs.inlay.InlayHintProvider;
 import org.javacs.index.SymbolProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
@@ -42,6 +43,8 @@ class JavaLanguageServer extends LanguageServer {
     private JsonObject settings = new JsonObject();
     private boolean modifiedBuild = true;
     private AutoImportProvider autoImportProvider = SimpleAutoImportProvider.INSTANCE;
+    private DiagnosticsConfig diagnosticsConfig = DiagnosticsConfig.defaults();
+    private FeaturesConfig featuresConfig = FeaturesConfig.defaults();
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -70,8 +73,15 @@ class JavaLanguageServer extends LanguageServer {
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
             var compiled = Instant.now();
             LOG.info("...compiled in " + Duration.between(started, compiled).toMillis() + " ms");
-            for (var errs : new ErrorProvider(task).errors()) {
-                client.publishDiagnostics(errs);
+            if (diagnosticsConfig.enabled) {
+                for (var errs : new ErrorProvider(task, diagnosticsConfig.unusedImportsSeverity).errors()) {
+                    client.publishDiagnostics(errs);
+                }
+            } else {
+                for (var root : task.roots) {
+                    client.publishDiagnostics(
+                            new PublishDiagnosticsParams(root.getSourceFile().toUri(), List.of()));
+                }
             }
             for (var colors : new ColorProvider(task).colors()) {
                 client.customNotification("java/colors", GSON.toJsonTree(colors));
@@ -233,6 +243,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public InitializeResult initialize(InitializeParams params) {
+        applyInitOptions(params.initializationOptions);
         if (params.rootUri != null) {
             this.workspaceRoot = Paths.get(params.rootUri);
         } else if (params.rootPath != null) {
@@ -271,6 +282,12 @@ class JavaLanguageServer extends LanguageServer {
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
         c.add("renameProvider", renameOptions);
+        if (featuresConfig.inlayHints) {
+            c.addProperty("inlayHintProvider", true);
+        }
+        if (featuresConfig.semanticTokens) {
+            c.add("semanticTokensProvider", semanticTokensProvider());
+        }
 
         return new InitializeResult(c);
     }
@@ -312,9 +329,11 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didChangeConfiguration(DidChangeConfigurationParams change) {
-        var java = change.settings.getAsJsonObject().get("java");
-        LOG.info("Received java settings " + java);
-        settings = java.getAsJsonObject();
+        var next = normalizeSettings(change.settings);
+        LOG.info("Received settings " + next);
+        settings = next;
+        diagnosticsConfig = DiagnosticsConfig.from(settings);
+        featuresConfig = FeaturesConfig.from(settings);
         updateAutoImportProvider();
     }
 
@@ -394,6 +413,28 @@ class JavaLanguageServer extends LanguageServer {
         var help = new SignatureProvider(compiler()).signatureHelp(file, line, column);
         if (help == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(help);
+    }
+
+    @Override
+    public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
+        if (!featuresConfig.inlayHints) return Optional.of(List.of());
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
+        var file = Paths.get(params.textDocument.uri);
+        try (var task = compiler().compile(file)) {
+            var range = params != null ? params.range : null;
+            var root = task.root(file);
+            return Optional.of(new InlayHintProvider(task, root, range).hints());
+        } catch (RuntimeException e) {
+            LOG.log(Level.SEVERE, "Inlay hints failed", e);
+            return Optional.of(List.of());
+        }
+    }
+
+    @Override
+    public Optional<SemanticTokens> semanticTokensFull(SemanticTokensParams params) {
+        if (!featuresConfig.semanticTokens) return Optional.of(new SemanticTokens());
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(new SemanticTokens());
+        return Optional.of(new SemanticTokens());
     }
 
     @Override
@@ -660,6 +701,141 @@ class JavaLanguageServer extends LanguageServer {
         if (uncheckedChanges && FileStore.activeDocuments().contains(lastEdited)) {
             lint(List.of(lastEdited));
             uncheckedChanges = false;
+        }
+    }
+
+    private static JsonObject normalizeSettings(JsonElement settings) {
+        if (settings == null || settings.isJsonNull()) {
+            return new JsonObject();
+        }
+        if (!settings.isJsonObject()) {
+            return new JsonObject();
+        }
+        var obj = settings.getAsJsonObject();
+        if (obj.has("jls") && obj.get("jls").isJsonObject()) {
+            return obj.getAsJsonObject("jls");
+        }
+        if (obj.has("java") && obj.get("java").isJsonObject()) {
+            return obj.getAsJsonObject("java");
+        }
+        return obj;
+    }
+
+    private void applyInitOptions(JsonElement initOptions) {
+        if (initOptions == null || initOptions.isJsonNull() || !initOptions.isJsonObject()) {
+            return;
+        }
+        var obj = normalizeSettings(initOptions);
+        if (obj.has("cache") && obj.get("cache").isJsonObject()) {
+            var cache = obj.getAsJsonObject("cache");
+            if (cache.has("dir")) {
+                var dir = cache.getAsJsonPrimitive("dir").getAsString();
+                if (dir != null && !dir.isBlank()) {
+                    CacheConfig.setCacheDir(Paths.get(dir));
+                }
+            }
+        }
+        if (obj.has("features") && obj.get("features").isJsonObject()) {
+            featuresConfig = FeaturesConfig.from(obj);
+        }
+    }
+
+    private JsonObject semanticTokensProvider() {
+        var provider = new JsonObject();
+        var legend = new JsonObject();
+        var tokenTypes = new JsonArray();
+        tokenTypes.add("class");
+        tokenTypes.add("method");
+        tokenTypes.add("variable");
+        var tokenModifiers = new JsonArray();
+        tokenModifiers.add("declaration");
+        tokenModifiers.add("static");
+        legend.add("tokenTypes", tokenTypes);
+        legend.add("tokenModifiers", tokenModifiers);
+        provider.add("legend", legend);
+        provider.addProperty("full", true);
+        return provider;
+    }
+
+    private static class DiagnosticsConfig {
+        final boolean enabled;
+        final Integer unusedImportsSeverity;
+
+        private DiagnosticsConfig(boolean enabled, Integer unusedImportsSeverity) {
+            this.enabled = enabled;
+            this.unusedImportsSeverity = unusedImportsSeverity;
+        }
+
+        static DiagnosticsConfig defaults() {
+            return new DiagnosticsConfig(true, DiagnosticSeverity.Warning);
+        }
+
+        static DiagnosticsConfig from(JsonObject settings) {
+            var diagnostics =
+                    settings.has("diagnostics") && settings.get("diagnostics").isJsonObject()
+                            ? settings.getAsJsonObject("diagnostics")
+                            : new JsonObject();
+            var enabled = getBoolean(diagnostics, "enable", true);
+            var unusedImports = getString(diagnostics, "unusedImports", "warning");
+            var severity = parseSeverity(unusedImports);
+            return new DiagnosticsConfig(enabled, severity);
+        }
+    }
+
+    private static class FeaturesConfig {
+        final boolean inlayHints;
+        final boolean semanticTokens;
+
+        private FeaturesConfig(boolean inlayHints, boolean semanticTokens) {
+            this.inlayHints = inlayHints;
+            this.semanticTokens = semanticTokens;
+        }
+
+        static FeaturesConfig defaults() {
+            return new FeaturesConfig(true, true);
+        }
+
+        static FeaturesConfig from(JsonObject settings) {
+            var features =
+                    settings.has("features") && settings.get("features").isJsonObject()
+                            ? settings.getAsJsonObject("features")
+                            : new JsonObject();
+            var inlayHints = getBoolean(features, "inlayHints", false);
+            var semanticTokens = getBoolean(features, "semanticTokens", false);
+            return new FeaturesConfig(inlayHints, semanticTokens);
+        }
+    }
+
+    private static boolean getBoolean(JsonObject obj, String key, boolean fallback) {
+        if (obj == null || !obj.has(key) || obj.get(key).isJsonNull()) return fallback;
+        try {
+            return obj.getAsJsonPrimitive(key).getAsBoolean();
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private static String getString(JsonObject obj, String key, String fallback) {
+        if (obj == null || !obj.has(key) || obj.get(key).isJsonNull()) return fallback;
+        try {
+            return obj.getAsJsonPrimitive(key).getAsString();
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private static Integer parseSeverity(String value) {
+        if (value == null) return DiagnosticSeverity.Warning;
+        switch (value.toLowerCase(Locale.ROOT)) {
+            case "off":
+            case "none":
+            case "false":
+                return null;
+            case "error":
+                return DiagnosticSeverity.Error;
+            case "warning":
+            default:
+                return DiagnosticSeverity.Warning;
         }
     }
 

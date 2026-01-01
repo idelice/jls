@@ -23,15 +23,10 @@ import java.util.logging.Logger;
 import org.javacs.guava.ClassPath;
 
 class ScanClassPath {
-    private static final Path CACHE_DIR = Paths.get(System.getProperty("java.io.tmpdir"), "jls-cache");
     private static final Gson GSON = new Gson();
 
-    static {
-        try {
-            Files.createDirectories(CACHE_DIR);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+    private static Path cacheDir() {
+        return CacheConfig.cacheDir();
     }
 
     // TODO delete this and implement findPublicTypeDeclarationInJdk some other way
@@ -130,7 +125,7 @@ class ScanClassPath {
     };
 
     static Set<String> jdkTopLevelClasses() {
-        var cacheFile = CACHE_DIR.resolve("jdk-classes.json");
+        var cacheFile = cacheDir().resolve("jdk-classes.json");
         if (Files.exists(cacheFile)) {
             try (var reader = new InputStreamReader(Files.newInputStream(cacheFile), StandardCharsets.UTF_8)) {
                 return GSON.fromJson(reader, new TypeToken<Set<String>>() {}.getType());
@@ -178,7 +173,7 @@ class ScanClassPath {
             sb.append(p.toString()).append(File.pathSeparator);
         }
         var hash = md5(sb.toString());
-        var cacheFile = CACHE_DIR.resolve("classpath-" + hash + ".json");
+        var cacheFile = cacheDir().resolve("classpath-" + hash + ".json");
         if (Files.exists(cacheFile)) {
             try (var reader = new InputStreamReader(Files.newInputStream(cacheFile), StandardCharsets.UTF_8)) {
                 return GSON.fromJson(reader, new TypeToken<Set<String>>() {}.getType());
