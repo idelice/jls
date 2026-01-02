@@ -36,6 +36,8 @@ public class FileStore {
 
     private static final ScheduledExecutorService CACHE_WRITER =
             Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "jls-cache-writer"));
+    private static final ScheduledExecutorService BACKGROUND_INDEXER =
+            Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "jls-indexer"));
     private static final int CACHE_WRITE_DELAY_MS = 1000;
     private static boolean cacheWriteScheduled = false;
     private static Path cacheFile = null;
@@ -79,11 +81,13 @@ public class FileStore {
         CompletableFuture.runAsync(() -> {
             var started = Instant.now();
             var count = new AtomicInteger();
+            var allFiles = new ArrayList<Path>();
             for (var root : toAdd) {
-                addFiles(root, count);
+                addFiles(root, count, allFiles);
             }
             var elapsed = java.time.Duration.between(started, Instant.now()).toMillis();
             LOG.fine(String.format("Scanned %,d java files in %,d ms", count.get(), elapsed));
+            scheduleBackgroundIndex(allFiles);
             scheduleCacheSave();
         });
     }
@@ -96,14 +100,16 @@ public class FileStore {
         return normalize;
     }
 
-    private static void addFiles(Path root, AtomicInteger count) {
+    private static void addFiles(Path root, AtomicInteger count, List<Path> out) {
         var files = new ArrayList<Path>();
         try {
             Files.walkFileTree(root, new FindJavaSources(files, count));
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        indexFilesInParallel(files);
+        if (!files.isEmpty()) {
+            out.addAll(files);
+        }
     }
 
     static class FindJavaSources extends SimpleFileVisitor<Path> {
@@ -604,6 +610,11 @@ public class FileStore {
             LOG.warning("Failed to write java sources cache: " + e.getMessage());
         }
         WorkspaceIndex.saveCache();
+    }
+
+    private static void scheduleBackgroundIndex(List<Path> files) {
+        if (files == null || files.isEmpty()) return;
+        BACKGROUND_INDEXER.execute(() -> indexFilesInParallel(files));
     }
 
     private static void indexFilesInParallel(List<Path> files) {
