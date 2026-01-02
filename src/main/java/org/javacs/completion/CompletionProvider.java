@@ -42,6 +42,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.CompletionDocumentation;
 import org.javacs.FileStore;
+import org.javacs.FindHelper;
 import org.javacs.JsonHelper;
 import org.javacs.ParseTask;
 import org.javacs.SourceFileObject;
@@ -179,6 +180,10 @@ public class CompletionProvider {
         try (var task = compiler.compile(List.of(source))) {
             LOG.info("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
             var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
+            if (path == null) return NOT_SUPPORTED;
+            if (isAnnotationContext(contents, (int) cursor)) {
+                return completeAnnotation(task, path, partial);
+            }
             switch (path.getLeaf().getKind()) {
                 case IDENTIFIER:
                     return completeIdentifier(task, path, partial, endsWithParen);
@@ -252,6 +257,18 @@ public class CompletionProvider {
         return contents.substring(start, end);
     }
 
+    private boolean isAnnotationContext(CharSequence contents, int cursor) {
+        var i = cursor - 1;
+        while (i >= 0) {
+            char c = contents.charAt(i);
+            if (!Character.isWhitespace(c)) {
+                return c == '@';
+            }
+            i--;
+        }
+        return false;
+    }
+
     private boolean endsWithParen(String contents, int cursor) {
         for (var i = cursor; i < contents.length(); i++) {
             if (!Character.isJavaIdentifierPart(contents.charAt(i))) {
@@ -280,6 +297,17 @@ public class CompletionProvider {
         addStaticImports(task, path.getCompilationUnit(), partial, endsWithParen, list);
         if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
             addClassNames(path.getCompilationUnit(), Trees.instance(task.task).getSourcePositions(), partial, list);
+        }
+        addKeywords(path, partial, list);
+        return list;
+    }
+
+    private CompletionList completeAnnotation(CompileTask task, TreePath path, String partial) {
+        LOG.info("...complete annotations");
+        var list = new CompletionList();
+        addAnnotationImports(task, path.getCompilationUnit(), Trees.instance(task.task).getSourcePositions(), partial, list);
+        if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
+            addAnnotationNames(task, path.getCompilationUnit(), Trees.instance(task.task).getSourcePositions(), partial, list);
         }
         addKeywords(path, partial, list);
         return list;
@@ -408,6 +436,73 @@ public class CompletionProvider {
             list.items.add(item);
         }
         LOG.info("...found " + (list.items.size() - previousSize) + " class names");
+    }
+
+    private void addAnnotationImports(
+            CompileTask task, CompilationUnitTree root, SourcePositions sourcePositions, String partial, CompletionList list) {
+        var previousSize = list.items.size();
+        var added = new HashSet<String>();
+        var annotationCache = new HashMap<String, Boolean>();
+
+        for (var i : root.getImports()) {
+            if (i.isStatic()) continue;
+            var qualified = i.getQualifiedIdentifier().toString();
+            if (qualified.endsWith(".*")) continue;
+            if (!StringSearch.matchesPartialName(simpleName(qualified), partial)) continue;
+            if (!isAnnotationType(task, qualified, annotationCache)) continue;
+            var item = classItem(qualified);
+            item.additionalTextEdits = autoImportProvider.addImport(qualified, root, sourcePositions);
+            list.items.add(item);
+            added.add(qualified);
+        }
+
+        LOG.info("...found " + (list.items.size() - previousSize) + " annotation imports");
+    }
+
+    private void addAnnotationNames(
+            CompileTask task, CompilationUnitTree root, SourcePositions sourcePositions, String partial, CompletionList list) {
+        var previousSize = list.items.size();
+        var added = new HashSet<String>();
+        var annotationCache = new HashMap<String, Boolean>();
+
+        for (var className : compiler.publicTopLevelTypes()) {
+            if (added.contains(className)) continue;
+            if (!StringSearch.matchesPartialName(simpleName(className), partial)) continue;
+            if (!isAnnotationType(task, className, annotationCache)) continue;
+            if (list.items.size() > MAX_COMPLETION_ITEMS) {
+                list.isIncomplete = true;
+                break;
+            }
+            var item = classItem(className);
+            item.additionalTextEdits = autoImportProvider.addImport(className, root, sourcePositions);
+            list.items.add(item);
+        }
+
+        LOG.info("...found " + (list.items.size() - previousSize) + " annotation names");
+    }
+
+    private boolean isAnnotationType(CompileTask task, String className, Map<String, Boolean> cache) {
+        var cached = cache.get(className);
+        if (cached != null) return cached;
+        try {
+            var source = compiler.findAnywhere(className);
+            if (source.isEmpty()) {
+                cache.put(className, false);
+                return false;
+            }
+            var parse = compiler.parse(source.get());
+            var tree = FindHelper.findType(parse, className);
+            if (tree instanceof ClassTree) {
+                var kind = ((ClassTree) tree).getKind();
+                var isAnnotation = kind == Tree.Kind.ANNOTATION_TYPE;
+                cache.put(className, isAnnotation);
+                return isAnnotation;
+            }
+        } catch (RuntimeException e) {
+            // ignore parse failures
+        }
+        cache.put(className, false);
+        return false;
     }
 
     private CompletionList completeMemberSelect(

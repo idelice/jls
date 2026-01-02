@@ -691,8 +691,19 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
-            // Re-lint all active documents
-            lint(FileStore.activeDocuments());
+            var file = Paths.get(params.textDocument.uri);
+            var targets = new HashSet<>(FileStore.activeDocuments());
+            targets.add(file);
+            try {
+                var className = compiler().fileManager.getClassName(file);
+                for (var ref : compiler().findTypeReferences(className)) {
+                    targets.add(ref);
+                }
+            } catch (RuntimeException e) {
+                LOG.log(Level.WARNING, "Failed to compute dependent files for " + file, e);
+            }
+            // Re-lint active + dependent documents
+            lint(targets);
         }
     }
 
