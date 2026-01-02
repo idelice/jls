@@ -145,12 +145,46 @@ public class StringSearch {
         return nextWord(text.getBytes());
     }
 
+    int nextWord(String text, int startingAfter) {
+        return nextWord(ByteBuffer.wrap(text.getBytes()), startingAfter);
+    }
+
+    int countWords(String text) {
+        return countWords(text, Integer.MAX_VALUE);
+    }
+
+    int countWords(String text, int limit) {
+        if (limit <= 0) return 0;
+        var buffer = ByteBuffer.wrap(text.getBytes());
+        int count = 0;
+        int i = 0;
+        while (true) {
+            i = next(buffer, i);
+            if (i == -1) return count;
+            if (isWord(buffer, i)) {
+                count++;
+                if (count > limit) return count;
+            }
+            i++;
+        }
+    }
+
     private int nextWord(byte[] text) {
         return nextWord(ByteBuffer.wrap(text));
     }
 
     private int nextWord(ByteBuffer text) {
         var i = 0;
+        while (true) {
+            i = next(text, i);
+            if (i == -1) return -1;
+            if (isWord(text, i)) return i;
+            i++;
+        }
+    }
+
+    private int nextWord(ByteBuffer text, int startingAfter) {
+        var i = startingAfter;
         while (true) {
             i = next(text, i);
             if (i == -1) return -1;

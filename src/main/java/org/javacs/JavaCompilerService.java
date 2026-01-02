@@ -116,7 +116,12 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
         var uniqueSources = deduplicateSources(sources);
-        if (needsCompile(uniqueSources)) {
+        if (cachedCompile == null) {
+            if (uniqueSources.isEmpty()) {
+                throw new RuntimeException("empty sources");
+            }
+            loadCompile(uniqueSources);
+        } else if (needsCompile(uniqueSources)) {
             loadCompile(uniqueSources);
         } else {
             LOG.info("...using cached compile");

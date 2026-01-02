@@ -2,11 +2,13 @@ package org.javacs.lens;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
+import com.google.gson.JsonObject;
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import javax.tools.Diagnostic;
 import org.javacs.FileStore;
 import org.javacs.lsp.CodeLens;
 import org.javacs.lsp.Command;
@@ -33,6 +35,7 @@ class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
     @Override
     public Void visitClass(ClassTree t, List<CodeLens> list) {
         qualifiedName.add(t.getSimpleName());
+        referencesLens(t, t.getSimpleName().toString()).ifPresent(list::add);
         if (isTestClass(t)) {
             list.add(runAllTests(t));
         }
@@ -43,6 +46,7 @@ class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
 
     @Override
     public Void visitMethod(MethodTree t, List<CodeLens> list) {
+        referencesLens(t, t.getName().toString()).ifPresent(list::add);
         if (isTestMethod(t)) {
             list.add(runTest(t));
             list.add(debugTest(t));
@@ -120,5 +124,54 @@ class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
         var endLine = (int) lines.getLineNumber(end);
         var endColumn = (int) lines.getColumnNumber(end);
         return new Range(new Position(startLine - 1, startColumn - 1), new Position(endLine - 1, endColumn - 1));
+    }
+
+    private java.util.Optional<CodeLens> referencesLens(Tree t, String name) {
+        if (root == null || name == null || name.isBlank()) return java.util.Optional.empty();
+        var pos = namePosition(t, name);
+        if (pos == null) return java.util.Optional.empty();
+        var data = new JsonObject();
+        data.addProperty("uri", root.getSourceFile().toUri().toString());
+        data.addProperty("line", pos.line);
+        data.addProperty("column", pos.character);
+        data.addProperty("name", name);
+        var posRange = new Range(new Position(pos.line, pos.character), new Position(pos.line, pos.character));
+        return java.util.Optional.of(new CodeLens(posRange, null, data));
+    }
+
+    private Position namePosition(Tree t, String name) {
+        try {
+            var source = root.getSourceFile().getCharContent(true);
+            var positions = Trees.instance(task).getSourcePositions();
+            var start = positions.getStartPosition(root, t);
+            var end = positions.getEndPosition(root, t);
+            if (start == Diagnostic.NOPOS || end == Diagnostic.NOPOS || end <= start) {
+                return null;
+            }
+            var windowEnd = Math.min((int) end, (int) start + 300);
+            var snippet = source.subSequence((int) start, windowEnd).toString();
+            var idx = findIdentifier(snippet, name);
+            if (idx < 0) return null;
+            var offset = (int) start + idx;
+            var lines = root.getLineMap();
+            var line = (int) lines.getLineNumber(offset) - 1;
+            var column = (int) lines.getColumnNumber(offset) - 1;
+            return new Position(line, column);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private int findIdentifier(String text, String name) {
+        var idx = text.indexOf(name);
+        while (idx >= 0) {
+            var beforeOk = idx == 0 || !Character.isJavaIdentifierPart(text.charAt(idx - 1));
+            var afterIdx = idx + name.length();
+            var afterOk = afterIdx >= text.length()
+                    || !Character.isJavaIdentifierPart(text.charAt(afterIdx));
+            if (beforeOk && afterOk) return idx;
+            idx = text.indexOf(name, idx + 1);
+        }
+        return -1;
     }
 }

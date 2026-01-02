@@ -7,6 +7,7 @@ import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.Trees;
 import com.sun.tools.javac.tree.JCTree;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -602,12 +603,54 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
         var task = compiler().parse(file);
-        return CodeLensProvider.find(task);
+        var lenses = CodeLensProvider.find(task);
+        var resolved = new ArrayList<CodeLens>(lenses.size());
+        for (var lens : lenses) {
+            resolved.add(resolveCodeLens(lens));
+        }
+        return resolved;
     }
 
     @Override
     public CodeLens resolveCodeLens(CodeLens unresolved) {
-        return null;
+        if (unresolved == null || unresolved.data == null || !unresolved.data.isJsonObject()) {
+            return unresolved;
+        }
+        var obj = unresolved.data.getAsJsonObject();
+        if (!obj.has("uri") || !obj.has("line") || !obj.has("column") || !obj.has("name")) {
+            return unresolved;
+        }
+        try {
+            var name = obj.get("name").getAsString();
+            if (name == null || name.isBlank()) return unresolved;
+            var count = fastReferenceCount(name);
+            var title = count == 1 ? "1 reference" : count + " references";
+            if (count > 20) {
+                title = "20+ references";
+            }
+            unresolved.command = new Command(title, "jls.showReferences", null);
+            return unresolved;
+        } catch (RuntimeException e) {
+            LOG.log(Level.WARNING, "CodeLens resolve failed", e);
+            return unresolved;
+        }
+    }
+
+    private int fastReferenceCount(String name) {
+        var files = org.javacs.index.WorkspaceIndex.filesContaining(name);
+        if (files.isEmpty()) return 0;
+        int count = 0;
+        final int limit = 20;
+        var search = new StringSearch(name);
+        for (var file : files) {
+            var text = FileStore.contents(file);
+            int remaining = limit - count;
+            if (remaining <= 0) return limit + 1;
+            var found = search.countWords(text, remaining);
+            if (found > remaining) return limit + 1;
+            count += found;
+        }
+        return count;
     }
 
     @Override
