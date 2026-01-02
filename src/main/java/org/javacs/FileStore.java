@@ -532,6 +532,7 @@ public class FileStore {
         cacheFile = dir.resolve("java-sources.json");
         indexCacheFile = dir.resolve("workspace-index.json");
         WorkspaceIndex.setCacheFile(indexCacheFile);
+        CacheConfig.setCacheDirIfUnset(dir);
         LOG.info("Workspace cache file: " + cacheFile);
         LOG.info("Workspace index cache file: " + indexCacheFile);
     }
