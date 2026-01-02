@@ -91,6 +91,7 @@ The language server will provide autocomplete and other features using:
 * .java files anywhere in your workspace
 * Java platform classes
 * External dependencies specified using `pom.xml` or [settings](#Settings)
+* CodeLens for tests and reference counts (classes and methods)
 
 ## Settings
 
@@ -123,6 +124,7 @@ If the language server doesn't detect your external dependencies automatically, 
 Notes:
 - `unusedImports` supports `"warning"`, `"error"`, or `"off"`.
 - `semanticTokens` is advertised but currently returns empty tokens.
+- CodeLens reference counts are capped at `20+` for speed.
 
 ### Init options (this fork)
 
