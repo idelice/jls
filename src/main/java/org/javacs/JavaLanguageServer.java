@@ -6,9 +6,14 @@ import com.google.gson.*;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.Trees;
 import com.sun.tools.javac.tree.JCTree;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
@@ -129,6 +134,26 @@ class JavaLanguageServer extends LanguageServer {
         }
         // Otherwise, combine inference with user-specified external dependencies
         else {
+            var fingerprint = inferenceFingerprint(externalDependencies, mavenSettings());
+            var cached = loadInferenceCache(fingerprint);
+            if (cached != null) {
+                javaReportProgress(new JavaReportProgressParams("Using cached classpath"));
+                javaEndProgress();
+                var cachedClassPath = new HashSet<Path>();
+                for (var p : cached.classPath) {
+                    cachedClassPath.add(Paths.get(p));
+                }
+                var cachedDocPath = new HashSet<Path>();
+                for (var p : cached.docPath) {
+                    cachedDocPath.add(Paths.get(p));
+                }
+                var service = new JavaCompilerService(cachedClassPath, cachedDocPath, addExports);
+                LOG.fine(
+                        String.format(
+                                "Compiler configured from cache in %,d ms",
+                                Duration.between(started, Instant.now()).toMillis()));
+                return service;
+            }
             var infer = new InferConfig(workspaceRoot, externalDependencies, mavenSettings().orElse(null));
 
             javaReportProgress(new JavaReportProgressParams("Inferring class path"));
@@ -153,6 +178,7 @@ class JavaLanguageServer extends LanguageServer {
                             Duration.between(docStarted, Instant.now()).toMillis()));
 
             javaEndProgress();
+            saveInferenceCache(fingerprint, classPath, docPath);
             var service = new JavaCompilerService(classPath, docPath, addExports);
             LOG.fine(
                     String.format(
@@ -207,6 +233,107 @@ class JavaLanguageServer extends LanguageServer {
         var value = settings.get("mavenSettings");
         if (value == null || value.isJsonNull()) return Optional.empty();
         return Optional.of(Paths.get(value.getAsString()).toAbsolutePath());
+    }
+
+    private static class InferenceCache {
+        String fingerprint;
+        Set<String> classPath = Set.of();
+        Set<String> docPath = Set.of();
+    }
+
+    private String inferenceFingerprint(Set<String> externalDependencies, Optional<Path> mavenSettings) {
+        var sb = new StringBuilder();
+        sb.append("root=").append(workspaceRoot.toAbsolutePath().normalize());
+        var deps = new ArrayList<>(externalDependencies);
+        Collections.sort(deps);
+        sb.append("|deps=").append(String.join(";", deps));
+        if (mavenSettings.isPresent()) {
+            sb.append("|maven=").append(fileFingerprint(mavenSettings.get()));
+        } else {
+            sb.append("|maven=none");
+        }
+        for (var name : buildFileNames()) {
+            var path = workspaceRoot.resolve(name);
+            if (Files.exists(path)) {
+                sb.append("|").append(fileFingerprint(path));
+            }
+        }
+        return md5(sb.toString());
+    }
+
+    private static List<String> buildFileNames() {
+        return List.of(
+                "pom.xml",
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradle.properties",
+                "BUILD",
+                "WORKSPACE",
+                "javaconfig.json");
+    }
+
+    private static String fileFingerprint(Path path) {
+        try {
+            var stat = Files.readAttributes(path, BasicFileAttributes.class);
+            return path.toAbsolutePath().normalize()
+                    + ":"
+                    + stat.size()
+                    + ":"
+                    + stat.lastModifiedTime().toMillis();
+        } catch (IOException e) {
+            return path.toAbsolutePath().normalize() + ":missing";
+        }
+    }
+
+    private static String md5(String input) {
+        try {
+            var md = MessageDigest.getInstance("MD5");
+            var bytes = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            var sb = new StringBuilder();
+            for (var b : bytes) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private InferenceCache loadInferenceCache(String fingerprint) {
+        var cacheFile = CacheConfig.cacheDir().resolve("inferred-classpath.json");
+        if (!Files.exists(cacheFile)) return null;
+        try (var reader = Files.newBufferedReader(cacheFile)) {
+            var cache = GSON.fromJson(reader, InferenceCache.class);
+            if (cache == null || cache.fingerprint == null) return null;
+            if (!fingerprint.equals(cache.fingerprint)) return null;
+            return cache;
+        } catch (IOException e) {
+            LOG.warning("Failed to read inference cache: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void saveInferenceCache(String fingerprint, Set<Path> classPath, Set<Path> docPath) {
+        var cacheFile = CacheConfig.cacheDir().resolve("inferred-classpath.json");
+        var cache = new InferenceCache();
+        cache.fingerprint = fingerprint;
+        var classPathStrings = new HashSet<String>();
+        for (var p : classPath) {
+            classPathStrings.add(p.toAbsolutePath().normalize().toString());
+        }
+        cache.classPath = classPathStrings;
+        var docPathStrings = new HashSet<String>();
+        for (var p : docPath) {
+            docPathStrings.add(p.toAbsolutePath().normalize().toString());
+        }
+        cache.docPath = docPathStrings;
+        try (var writer = Files.newBufferedWriter(cacheFile)) {
+            GSON.toJson(cache, writer);
+        } catch (IOException e) {
+            LOG.warning("Failed to write inference cache: " + e.getMessage());
+        }
     }
 
     private Optional<Path> lombokDocSources() {
