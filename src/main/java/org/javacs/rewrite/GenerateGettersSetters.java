@@ -137,11 +137,9 @@ public class GenerateGettersSetters implements Rewrite {
             if (member.getKind() == Tree.Kind.METHOD) {
                 var method = (MethodTree) member;
                 if (method.getReturnType() == null) continue;
-                LOG.info("...insert getters/setters before " + method.getName());
                 return EditHelper.insertBefore(task.task, root, method);
             }
         }
-        LOG.info("...insert getters/setters at end of class");
         return EditHelper.insertAtEndOfClass(task.task, root, typeTree);
     }
 
