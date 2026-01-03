@@ -22,6 +22,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
+import org.javacs.action.CodeActionConfig;
 import org.javacs.action.CodeActionProvider;
 import org.javacs.completion.CompletionProvider;
 import org.javacs.completion.SignatureProvider;
@@ -51,6 +52,7 @@ class JavaLanguageServer extends LanguageServer {
     private AutoImportProvider autoImportProvider = SimpleAutoImportProvider.INSTANCE;
     private DiagnosticsConfig diagnosticsConfig = DiagnosticsConfig.defaults();
     private FeaturesConfig featuresConfig = FeaturesConfig.defaults();
+    private CodeActionConfig codeActionConfig = CodeActionConfig.defaults();
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -462,6 +464,7 @@ class JavaLanguageServer extends LanguageServer {
         settings = next;
         diagnosticsConfig = DiagnosticsConfig.from(settings);
         featuresConfig = FeaturesConfig.from(settings);
+        codeActionConfig = CodeActionConfig.from(settings);
         updateAutoImportProvider();
     }
 
@@ -850,7 +853,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<CodeAction> codeAction(CodeActionParams params) {
-        var provider = new CodeActionProvider(compiler(), autoImportProvider);
+        var provider = new CodeActionProvider(compiler(), autoImportProvider, codeActionConfig);
         if (params.context.diagnostics.isEmpty()) {
             return provider.codeActionsForCursor(params);
         } else {

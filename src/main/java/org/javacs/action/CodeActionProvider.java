@@ -20,10 +20,13 @@ import org.javacs.rewrite.*;
 public class CodeActionProvider {
     private final CompilerProvider compiler;
     private final AutoImportProvider autoImportProvider;
+    private final CodeActionConfig config;
 
-    public CodeActionProvider(CompilerProvider compiler, AutoImportProvider autoImportProvider) {
+    public CodeActionProvider(
+            CompilerProvider compiler, AutoImportProvider autoImportProvider, CodeActionConfig config) {
         this.compiler = compiler;
         this.autoImportProvider = autoImportProvider;
+        this.config = config == null ? CodeActionConfig.defaults() : config;
     }
 
     public List<CodeAction> codeActionsForCursor(CodeActionParams params) {
@@ -40,9 +43,11 @@ public class CodeActionProvider {
         try (var task = compiler.compile(file)) {
             var elapsed = Duration.between(started, Instant.now()).toMillis();
             LOG.info(String.format("...compiled in %d ms", elapsed));
-            var lines = task.root().getLineMap();
+            var root = task.root(file);
+            var lines = root.getLineMap();
             var cursor = lines.getPosition(params.range.start.line + 1, params.range.start.character + 1);
-            rewrites.putAll(overrideInheritedMethods(task, file, cursor));
+            rewrites.putAll(overrideInheritedMethods(task, root, file, cursor));
+            rewrites.putAll(generateConstructor(task, root, file, cursor));
         }
         var actions = new ArrayList<CodeAction>();
         for (var title : rewrites.keySet()) {
@@ -54,16 +59,17 @@ public class CodeActionProvider {
         return actions;
     }
 
-    private Map<String, Rewrite> overrideInheritedMethods(CompileTask task, Path file, long cursor) {
-        if (!isBlankLine(task.root(), cursor)) return Map.of();
-        if (isInMethod(task, cursor)) return Map.of();
-        var methodTree = new FindMethodDeclarationAt(task.task).scan(task.root(), cursor);
+    private Map<String, Rewrite> overrideInheritedMethods(
+            CompileTask task, CompilationUnitTree root, Path file, long cursor) {
+        if (!isBlankLine(root, cursor)) return Map.of();
+        if (isInMethod(task, root, cursor)) return Map.of();
+        var methodTree = new FindMethodDeclarationAt(task.task).scan(root, cursor);
         if (methodTree != null) return Map.of();
         var actions = new TreeMap<String, Rewrite>();
         var trees = Trees.instance(task.task);
-        var classTree = new FindTypeDeclarationAt(task.task).scan(task.root(), cursor);
+        var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
         if (classTree == null) return Map.of();
-        var classPath = trees.getPath(task.root(), classTree);
+        var classPath = trees.getPath(root, classTree);
         var elements = task.task.getElements();
         var classElement = (TypeElement) trees.getElement(classPath);
         for (var member : elements.getAllMembers(classElement)) {
@@ -83,8 +89,49 @@ public class CodeActionProvider {
         return actions;
     }
 
-    private boolean isInMethod(CompileTask task, long cursor) {
-        var method = new FindMethodDeclarationAt(task.task).scan(task.root(), cursor);
+    private Map<String, Rewrite> generateConstructor(
+            CompileTask task, CompilationUnitTree root, Path file, long cursor) {
+        var trees = Trees.instance(task.task);
+        var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
+        if (classTree == null) {
+            classTree = firstClass(root);
+        }
+        if (classTree == null) return Map.of();
+        var classPath = trees.getPath(root, classTree);
+        var classElement = (TypeElement) trees.getElement(classPath);
+        var className = classElement == null
+                ? qualifiedName(root, classTree)
+                : classElement.getQualifiedName().toString();
+        if (className == null || className.isBlank()) return Map.of();
+        return Map.of(
+                "Generate constructor",
+                new GenerateConstructor(className, config.constructor.include));
+    }
+
+    private ClassTree firstClass(CompilationUnitTree root) {
+        return new TreeScanner<ClassTree, Void>() {
+            @Override
+            public ClassTree visitClass(ClassTree t, Void v) {
+                return t;
+            }
+
+            @Override
+            public ClassTree reduce(ClassTree a, ClassTree b) {
+                if (a != null) return a;
+                return b;
+            }
+        }.scan(root, null);
+    }
+
+    private String qualifiedName(CompilationUnitTree root, ClassTree classTree) {
+        var pkg = Objects.toString(root.getPackageName(), "");
+        var name = classTree.getSimpleName().toString();
+        if (pkg == null || pkg.isBlank()) return name;
+        return pkg + "." + name;
+    }
+
+    private boolean isInMethod(CompileTask task, CompilationUnitTree root, long cursor) {
+        var method = new FindMethodDeclarationAt(task.task).scan(root, cursor);
         return method != null;
     }
 
@@ -111,9 +158,10 @@ public class CodeActionProvider {
         var started = Instant.now();
         var file = Paths.get(params.textDocument.uri);
         try (var task = compiler.compile(file)) {
+            var root = task.root(file);
             var actions = new ArrayList<CodeAction>();
             for (var d : params.context.diagnostics) {
-                var newActions = codeActionForDiagnostic(task, file, d);
+                var newActions = codeActionForDiagnostic(task, root, file, d);
                 actions.addAll(newActions);
             }
             var elapsed = Duration.between(started, Instant.now()).toMillis();
@@ -122,28 +170,29 @@ public class CodeActionProvider {
         }
     }
 
-    private List<CodeAction> codeActionForDiagnostic(CompileTask task, Path file, Diagnostic d) {
+    private List<CodeAction> codeActionForDiagnostic(
+            CompileTask task, CompilationUnitTree root, Path file, Diagnostic d) {
         // TODO this should be done asynchronously using executeCommand
         switch (d.code) {
             case "unused_local":
-                var toStatement = new ConvertVariableToStatement(file, findPosition(task, d.range.start));
+                var toStatement = new ConvertVariableToStatement(file, findPosition(root, d.range.start));
                 return createQuickFix("Convert to statement", toStatement);
             case "unused_field":
-                var toBlock = new ConvertFieldToBlock(file, findPosition(task, d.range.start));
+                var toBlock = new ConvertFieldToBlock(file, findPosition(root, d.range.start));
                 return createQuickFix("Convert to block", toBlock);
             case "unused_class":
-                var removeClass = new RemoveClass(file, findPosition(task, d.range.start));
+                var removeClass = new RemoveClass(file, findPosition(root, d.range.start));
                 return createQuickFix("Remove class", removeClass);
             case "unused_method":
-                var unusedMethod = findMethod(task, d.range);
+                var unusedMethod = findMethod(task, root, d.range);
                 var removeMethod =
                         new RemoveMethod(
                                 unusedMethod.className, unusedMethod.methodName, unusedMethod.erasedParameterTypes);
                 return createQuickFix("Remove method", removeMethod);
             case "unused_throws":
-                var shortExceptionName = extractRange(task, d.range);
+                var shortExceptionName = extractRange(root, d.range);
                 var notThrown = extractNotThrownExceptionName(d.message);
-                var methodWithExtraThrow = findMethod(task, d.range);
+                var methodWithExtraThrow = findMethod(task, root, d.range);
                 var removeThrow =
                         new RemoveException(
                                 methodWithExtraThrow.className,
@@ -152,13 +201,13 @@ public class CodeActionProvider {
                                 notThrown);
                 return createQuickFix("Remove '" + shortExceptionName + "'", removeThrow);
             case "compiler.warn.unchecked.call.mbr.of.raw.type":
-                var warnedMethod = findMethod(task, d.range);
+                var warnedMethod = findMethod(task, root, d.range);
                 var suppressWarning =
                         new AddSuppressWarningAnnotation(
                                 warnedMethod.className, warnedMethod.methodName, warnedMethod.erasedParameterTypes);
                 return createQuickFix("Suppress 'unchecked' warning", suppressWarning);
             case "compiler.err.unreported.exception.need.to.catch.or.throw":
-                var needsThrow = findMethod(task, d.range);
+                var needsThrow = findMethod(task, root, d.range);
                 var exceptionName = extractExceptionName(d.message);
                 var addThrows =
                         new AddException(
@@ -169,7 +218,7 @@ public class CodeActionProvider {
                 return createQuickFix("Add 'throws'", addThrows);
             case "compiler.err.cant.resolve":
             case "compiler.err.cant.resolve.location":
-                var simpleName = extractRange(task, d.range);
+                var simpleName = extractRange(root, d.range);
                 var allImports = new ArrayList<CodeAction>();
                 for (var qualifiedName : compiler.publicTopLevelTypes()) {
                     if (qualifiedName.endsWith("." + simpleName)) {
@@ -180,56 +229,56 @@ public class CodeActionProvider {
                 }
                 return allImports;
             case "compiler.err.var.not.initialized.in.default.constructor":
-                var needsConstructor = findClassNeedingConstructor(task, d.range);
+                var needsConstructor = findClassNeedingConstructor(task, root, d.range);
                 if (needsConstructor == null) return List.of();
                 var generateConstructor = new GenerateRecordConstructor(needsConstructor);
                 return createQuickFix("Generate constructor", generateConstructor);
             case "compiler.err.does.not.override.abstract":
-                var missingAbstracts = findClass(task, d.range);
+                var missingAbstracts = findClass(task, root, d.range);
                 var implementAbstracts = new ImplementAbstractMethods(missingAbstracts);
                 return createQuickFix("Implement abstract methods", implementAbstracts);
             case "compiler.err.cant.resolve.location.args":
-                var missingMethod = new CreateMissingMethod(file, findPosition(task, d.range.start));
+                var missingMethod = new CreateMissingMethod(file, findPosition(root, d.range.start));
                 return createQuickFix("Create missing method", missingMethod);
             default:
                 return List.of();
         }
     }
 
-    private int findPosition(CompileTask task, Position position) {
-        var lines = task.root().getLineMap();
+    private int findPosition(CompilationUnitTree root, Position position) {
+        var lines = root.getLineMap();
         return (int) lines.getPosition(position.line + 1, position.character + 1);
     }
 
-    private String findClassNeedingConstructor(CompileTask task, Range range) {
-        var type = findClassTree(task, range);
-        if (type == null || hasConstructor(task, type)) return null;
-        return qualifiedName(task, type);
+    private String findClassNeedingConstructor(CompileTask task, CompilationUnitTree root, Range range) {
+        var type = findClassTree(task, root, range);
+        if (type == null || hasConstructor(task, root, type)) return null;
+        return qualifiedName(task, root, type);
     }
 
-    private String findClass(CompileTask task, Range range) {
-        var type = findClassTree(task, range);
+    private String findClass(CompileTask task, CompilationUnitTree root, Range range) {
+        var type = findClassTree(task, root, range);
         if (type == null) return null;
-        return qualifiedName(task, type);
+        return qualifiedName(task, root, type);
     }
 
-    private ClassTree findClassTree(CompileTask task, Range range) {
-        var position = task.root().getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
-        return new FindTypeDeclarationAt(task.task).scan(task.root(), position);
+    private ClassTree findClassTree(CompileTask task, CompilationUnitTree root, Range range) {
+        var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
+        return new FindTypeDeclarationAt(task.task).scan(root, position);
     }
 
-    private String qualifiedName(CompileTask task, ClassTree tree) {
+    private String qualifiedName(CompileTask task, CompilationUnitTree root, ClassTree tree) {
         var trees = Trees.instance(task.task);
-        var path = trees.getPath(task.root(), tree);
+        var path = trees.getPath(root, tree);
         var type = (TypeElement) trees.getElement(path);
         return type.getQualifiedName().toString();
     }
 
-    private boolean hasConstructor(CompileTask task, ClassTree type) {
+    private boolean hasConstructor(CompileTask task, CompilationUnitTree root, ClassTree type) {
         for (var member : type.getMembers()) {
             if (member instanceof MethodTree) {
                 var method = (MethodTree) member;
-                if (isConstructor(task, method)) {
+                if (isConstructor(task, root, method)) {
                     return true;
                 }
             }
@@ -237,19 +286,19 @@ public class CodeActionProvider {
         return false;
     }
 
-    private boolean isConstructor(CompileTask task, MethodTree method) {
-        return method.getName().contentEquals("<init>") && !synthentic(task, method);
+    private boolean isConstructor(CompileTask task, CompilationUnitTree root, MethodTree method) {
+        return method.getName().contentEquals("<init>") && !synthentic(task, root, method);
     }
 
-    private boolean synthentic(CompileTask task, MethodTree method) {
-        return Trees.instance(task.task).getSourcePositions().getStartPosition(task.root(), method) != -1;
+    private boolean synthentic(CompileTask task, CompilationUnitTree root, MethodTree method) {
+        return Trees.instance(task.task).getSourcePositions().getStartPosition(root, method) != -1;
     }
 
-    private MethodPtr findMethod(CompileTask task, Range range) {
+    private MethodPtr findMethod(CompileTask task, CompilationUnitTree root, Range range) {
         var trees = Trees.instance(task.task);
-        var position = task.root().getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
-        var tree = new FindMethodDeclarationAt(task.task).scan(task.root(), position);
-        var path = trees.getPath(task.root(), tree);
+        var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
+        var tree = new FindMethodDeclarationAt(task.task).scan(root, position);
+        var path = trees.getPath(root, tree);
         var method = (ExecutableElement) trees.getElement(path);
         return new MethodPtr(task.task, method);
     }
@@ -295,15 +344,15 @@ public class CodeActionProvider {
         return matcher.group(1);
     }
 
-    private CharSequence extractRange(CompileTask task, Range range) {
+    private CharSequence extractRange(CompilationUnitTree root, Range range) {
         CharSequence contents;
         try {
-            contents = task.root().getSourceFile().getCharContent(true);
+            contents = root.getSourceFile().getCharContent(true);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        var start = (int) task.root().getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
-        var end = (int) task.root().getLineMap().getPosition(range.end.line + 1, range.end.character + 1);
+        var start = (int) root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
+        var end = (int) root.getLineMap().getPosition(range.end.line + 1, range.end.character + 1);
         return contents.subSequence(start, end);
     }
 
