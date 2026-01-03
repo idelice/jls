@@ -103,9 +103,10 @@ public class CodeActionProvider {
                 ? qualifiedName(root, classTree)
                 : classElement.getQualifiedName().toString();
         if (className == null || className.isBlank()) return Map.of();
-        return Map.of(
-                "Generate constructor",
-                new GenerateConstructor(className, config.constructor.include));
+        var actions = new TreeMap<String, Rewrite>();
+        actions.put("Generate constructor", new GenerateConstructor(className, config.constructor.include));
+        actions.put("Generate toString", new GenerateToString(className));
+        return actions;
     }
 
     private ClassTree firstClass(CompilationUnitTree root) {
