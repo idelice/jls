@@ -106,6 +106,7 @@ public class CodeActionProvider {
         var actions = new TreeMap<String, Rewrite>();
         actions.put("Generate constructor", new GenerateConstructor(className, config.constructor.include));
         actions.put("Generate toString", new GenerateToString(className));
+        actions.put("Generate equals/hashCode", new GenerateEqualsHashCode(className));
         return actions;
     }
 
