@@ -107,6 +107,7 @@ public class CodeActionProvider {
         actions.put("Generate constructor", new GenerateConstructor(className, config.constructor.include));
         actions.put("Generate toString", new GenerateToString(className));
         actions.put("Generate equals/hashCode", new GenerateEqualsHashCode(className));
+        actions.put("Generate getters/setters", new GenerateGettersSetters(className));
         return actions;
     }
 
@@ -163,6 +164,9 @@ public class CodeActionProvider {
             var root = task.root(file);
             var actions = new ArrayList<CodeAction>();
             for (var d : params.context.diagnostics) {
+                if (d == null || d.range == null || d.range.start == null) {
+                    continue;
+                }
                 var newActions = codeActionForDiagnostic(task, root, file, d);
                 actions.addAll(newActions);
             }
@@ -175,6 +179,9 @@ public class CodeActionProvider {
     private List<CodeAction> codeActionForDiagnostic(
             CompileTask task, CompilationUnitTree root, Path file, Diagnostic d) {
         // TODO this should be done asynchronously using executeCommand
+        if (d == null || d.range == null || d.range.start == null) {
+            return List.of();
+        }
         switch (d.code) {
             case "unused_local":
                 var toStatement = new ConvertVariableToStatement(file, findPosition(root, d.range.start));

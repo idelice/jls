@@ -854,11 +854,12 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<CodeAction> codeAction(CodeActionParams params) {
         var provider = new CodeActionProvider(compiler(), autoImportProvider, codeActionConfig);
-        if (params.context.diagnostics.isEmpty()) {
-            return provider.codeActionsForCursor(params);
-        } else {
-            return provider.codeActionForDiagnostics(params);
+        var actions = new ArrayList<CodeAction>();
+        actions.addAll(provider.codeActionsForCursor(params));
+        if (!params.context.diagnostics.isEmpty()) {
+            actions.addAll(provider.codeActionForDiagnostics(params));
         }
+        return actions;
     }
 
     @Override
