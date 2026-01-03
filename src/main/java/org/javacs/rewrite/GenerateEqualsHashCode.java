@@ -83,7 +83,7 @@ public class GenerateEqualsHashCode implements Rewrite {
             var string = buf.toString();
             var indent = EditHelper.indent(task.task, root, typeTree) + 4;
             string = string.replaceAll("\n", "\n" + " ".repeat(indent));
-            string = string + "\n\n";
+            string = string + "\n";
             var insert = insertPoint(task, root, typeTree);
             TextEdit[] edits = {new TextEdit(new Range(insert, insert), string)};
             return Map.of(file, edits);
@@ -121,14 +121,13 @@ public class GenerateEqualsHashCode implements Rewrite {
 
     private Position insertPoint(CompileTask task, CompilationUnitTree root, ClassTree typeTree) {
         for (var member : typeTree.getMembers()) {
-            if (member.getKind() == Tree.Kind.METHOD) {
-                var method = (MethodTree) member;
-                if (method.getReturnType() == null) continue;
-                LOG.info("...insert equals/hashCode before " + method.getName());
+            if (member.getKind() != Tree.Kind.METHOD) continue;
+            var method = (MethodTree) member;
+            if (method.getReturnType() == null) continue;
+            if (method.getName().contentEquals("toString")) {
                 return EditHelper.insertBefore(task.task, root, method);
             }
         }
-        LOG.info("...insert equals/hashCode at end of class");
         return EditHelper.insertAtEndOfClass(task.task, root, typeTree);
     }
 

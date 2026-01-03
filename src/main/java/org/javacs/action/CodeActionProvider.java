@@ -1,5 +1,8 @@
 package org.javacs.action;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import java.io.IOException;
@@ -36,10 +39,8 @@ public class CodeActionProvider {
                         params.textDocument.uri.getPath(), params.range.start.line + 1));
         var started = Instant.now();
         var file = Paths.get(params.textDocument.uri);
-        // TODO this get-map / convert-to-CodeAction split is an ugly workaround of the fact that we need a new compile
-        // task to generate the code actions
-        // If we switch to resolving code actions asynchronously using Command, that will fix this problem.
         var rewrites = new TreeMap<String, Rewrite>();
+        var deferred = new ArrayList<CodeAction>();
         try (var task = compiler.compile(file)) {
             var elapsed = Duration.between(started, Instant.now()).toMillis();
             LOG.info(String.format("...compiled in %d ms", elapsed));
@@ -47,13 +48,14 @@ public class CodeActionProvider {
             var lines = root.getLineMap();
             var cursor = lines.getPosition(params.range.start.line + 1, params.range.start.character + 1);
             rewrites.putAll(overrideInheritedMethods(task, root, file, cursor));
-            rewrites.putAll(generateConstructor(task, root, file, cursor));
+            deferred.addAll(generateDeferredActions(task, root, cursor));
         }
         var actions = new ArrayList<CodeAction>();
         for (var title : rewrites.keySet()) {
             // TODO are these all quick fixes?
             actions.addAll(createQuickFix(title, rewrites.get(title)));
         }
+        actions.addAll(deferred);
         var elapsed = Duration.between(started, Instant.now()).toMillis();
         LOG.info(String.format("...created %d actions in %d ms", actions.size(), elapsed));
         return actions;
@@ -89,26 +91,70 @@ public class CodeActionProvider {
         return actions;
     }
 
-    private Map<String, Rewrite> generateConstructor(
-            CompileTask task, CompilationUnitTree root, Path file, long cursor) {
+    private List<CodeAction> generateDeferredActions(CompileTask task, CompilationUnitTree root, long cursor) {
         var trees = Trees.instance(task.task);
         var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
         if (classTree == null) {
             classTree = firstClass(root);
         }
-        if (classTree == null) return Map.of();
+        if (classTree == null) return List.of();
         var classPath = trees.getPath(root, classTree);
         var classElement = (TypeElement) trees.getElement(classPath);
         var className = classElement == null
                 ? qualifiedName(root, classTree)
                 : classElement.getQualifiedName().toString();
-        if (className == null || className.isBlank()) return Map.of();
-        var actions = new TreeMap<String, Rewrite>();
-        actions.put("Generate constructor", new GenerateConstructor(className, config.constructor.include));
-        actions.put("Generate toString", new GenerateToString(className));
-        actions.put("Generate equals/hashCode", new GenerateEqualsHashCode(className));
-        actions.put("Generate getters/setters", new GenerateGettersSetters(className));
+        if (className == null || className.isBlank()) return List.of();
+        var actions = new ArrayList<CodeAction>();
+        var includePatterns = new ArrayList<String>();
+        for (var p : config.constructor.include) {
+            includePatterns.add(p.pattern());
+        }
+        actions.add(lazyAction("Generate constructor", "constructor", className, includePatterns));
+        if (!hasLombok(classTree, LOMBOK_DATA_LIKE, LOMBOK_DATA_PATTERN)) {
+            actions.add(lazyAction("Generate toString", "toString", className, null));
+            actions.add(lazyAction("Generate equals/hashCode", "equalsHashCode", className, null));
+        }
+        if (!hasLombok(classTree, LOMBOK_ACCESSORS, LOMBOK_ACCESSOR_PATTERN)) {
+            actions.add(lazyAction("Generate getters/setters", "gettersSetters", className, null));
+        }
         return actions;
+    }
+
+    private boolean hasLombok(ClassTree classTree, Set<String> suffixes, Pattern suffixPattern) {
+        if (classTree == null || classTree.getModifiers() == null) return false;
+        var anns = classTree.getModifiers().getAnnotations();
+        if (anns == null || anns.isEmpty()) return false;
+        for (var ann : anns) {
+            var name = ann.getAnnotationType().toString();
+            var shortName = name.substring(name.lastIndexOf('.') + 1);
+            if (suffixPattern.matcher(shortName).find() || suffixPattern.matcher(name).find()) return true;
+        }
+        return false;
+    }
+
+    private static final Set<String> LOMBOK_ACCESSORS =
+            Set.of("Data", "Getter", "Setter", "Value");
+    private static final Set<String> LOMBOK_DATA_LIKE =
+            Set.of("Data", "Value", "ToString", "EqualsAndHashCode");
+    private static final Pattern LOMBOK_ACCESSOR_PATTERN =
+            Pattern.compile("(Data|Getter|Setter|Value)$");
+    private static final Pattern LOMBOK_DATA_PATTERN =
+            Pattern.compile("(Data|Value|ToString|EqualsAndHashCode)$");
+
+    private CodeAction lazyAction(String title, String type, String className, List<String> includePatterns) {
+        var action = new CodeAction();
+        action.title = title;
+        action.kind = CodeActionKind.Refactor;
+        var data = new JsonObject();
+        data.addProperty("type", type);
+        if (className != null) data.addProperty("class", className);
+        if (includePatterns != null && !includePatterns.isEmpty()) {
+            var arr = new JsonArray();
+            includePatterns.forEach(arr::add);
+            data.add("include", arr);
+        }
+        action.data = data;
+        return action;
     }
 
     private ClassTree firstClass(CompilationUnitTree root) {
@@ -380,5 +426,58 @@ public class CodeActionProvider {
         return List.of(a);
     }
 
+    public CodeAction resolve(CodeAction action) {
+        if (action == null) return null;
+        if (action.edit != null) return action; // already resolved
+        var data = GSON.toJsonTree(action.data);
+        if (data == null || !data.isJsonObject()) return action;
+        var obj = data.getAsJsonObject();
+        var type = getString(obj, "type");
+        var className = getString(obj, "class");
+        List<Pattern> include = config.constructor.include;
+        if (obj.has("include") && obj.get("include").isJsonArray()) {
+            include = new ArrayList<>();
+            for (var el : obj.getAsJsonArray("include")) {
+                try {
+                    include.add(Pattern.compile(el.getAsString()));
+                } catch (Exception e) {
+                    // ignore bad pattern
+                }
+            }
+        }
+        Rewrite rewrite = null;
+        switch (type) {
+            case "constructor":
+                rewrite = new GenerateConstructor(className, include);
+                break;
+            case "toString":
+                rewrite = new GenerateToString(className);
+                break;
+            case "equalsHashCode":
+                rewrite = new GenerateEqualsHashCode(className);
+                break;
+            case "gettersSetters":
+                rewrite = new GenerateGettersSetters(className);
+                break;
+            default:
+                return action;
+        }
+        var edits = rewrite.rewrite(compiler);
+        if (edits == Rewrite.CANCELLED) return action;
+        var ws = new WorkspaceEdit();
+        for (var file : edits.keySet()) {
+            ws.changes.put(file.toUri(), List.of(edits.get(file)));
+        }
+        action.edit = ws;
+        if (action.kind == null) action.kind = CodeActionKind.Refactor;
+        return action;
+    }
+
+    private String getString(JsonObject obj, String key) {
+        if (obj == null || !obj.has(key) || obj.get(key).isJsonNull()) return null;
+        return obj.get(key).getAsString();
+    }
+
+    private static final Gson GSON = new Gson();
     private static final Logger LOG = Logger.getLogger("main");
 }

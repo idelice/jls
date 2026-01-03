@@ -7,5 +7,6 @@ public class CodeAction {
     public List<Diagnostic> diagnostics;
     public WorkspaceEdit edit;
     public Command command;
+    public Object data;
     public static CodeAction NONE;
 }
