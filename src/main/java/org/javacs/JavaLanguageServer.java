@@ -53,6 +53,8 @@ class JavaLanguageServer extends LanguageServer {
     private DiagnosticsConfig diagnosticsConfig = DiagnosticsConfig.defaults();
     private FeaturesConfig featuresConfig = FeaturesConfig.defaults();
     private CodeActionConfig codeActionConfig = CodeActionConfig.defaults();
+    private final Object progressToken = "jls-startup";
+    private String progressTitle = "";
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -104,15 +106,42 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void javaStartProgress(JavaStartProgressParams params) {
+        // legacy custom notification
         client.customNotification("java/startProgress", GSON.toJsonTree(params));
+        progressTitle = params.getMessage();
+        // standard workDoneProgress
+        client.workDoneProgressCreate(progressToken);
+        var p = new ProgressParams();
+        p.token = progressToken;
+        p.value = new ProgressParams.ProgressValue();
+        p.value.kind = "begin";
+        p.value.title = progressTitle;
+        p.value.percentage = 0;
+        client.workDoneProgressNotify(p);
     }
 
-    private void javaReportProgress(JavaReportProgressParams params) {
+    private void javaReportProgress(JavaReportProgressParams params, Integer percentage) {
         client.customNotification("java/reportProgress", GSON.toJsonTree(params));
+        var p = new ProgressParams();
+        p.token = progressToken;
+        p.value = new ProgressParams.ProgressValue();
+        p.value.kind = "report";
+        p.value.title = progressTitle;
+        p.value.message = params.getMessage();
+        p.value.percentage = percentage;
+        client.workDoneProgressNotify(p);
     }
 
     private void javaEndProgress() {
         client.customNotification("java/endProgress", JsonNull.INSTANCE);
+        var p = new ProgressParams();
+        p.token = progressToken;
+        p.value = new ProgressParams.ProgressValue();
+        p.value.kind = "end";
+        p.value.title = "Ready";
+        p.value.message = "Ready";
+        p.value.percentage = 100;
+        client.workDoneProgressNotify(p);
     }
 
     private JavaCompilerService createCompiler() {
@@ -120,13 +149,14 @@ class JavaLanguageServer extends LanguageServer {
 
         var started = Instant.now();
         javaStartProgress(new JavaStartProgressParams("Configure javac"));
-        javaReportProgress(new JavaReportProgressParams("Finding source roots"));
+        javaReportProgress(new JavaReportProgressParams("Finding source roots"), 10);
 
         var externalDependencies = externalDependencies();
         var classPath = classPath();
         var addExports = addExports();
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
+            javaReportProgress(new JavaReportProgressParams("Using explicit classpath"), 90);
             javaEndProgress();
             var service = new JavaCompilerService(classPath, docPath(), addExports);
             LOG.fine(
@@ -140,7 +170,7 @@ class JavaLanguageServer extends LanguageServer {
             var fingerprint = inferenceFingerprint(externalDependencies, mavenSettings());
             var cached = loadInferenceCache(fingerprint);
             if (cached != null) {
-                javaReportProgress(new JavaReportProgressParams("Using cached classpath"));
+                javaReportProgress(new JavaReportProgressParams("Using cached classpath"), 80);
                 javaEndProgress();
                 var cachedClassPath = new HashSet<Path>();
                 for (var p : cached.classPath) {
@@ -159,7 +189,7 @@ class JavaLanguageServer extends LanguageServer {
             }
             var infer = new InferConfig(workspaceRoot, externalDependencies, mavenSettings().orElse(null));
 
-            javaReportProgress(new JavaReportProgressParams("Inferring class path"));
+            javaReportProgress(new JavaReportProgressParams("Inferring class path"), 40);
             var cpStarted = Instant.now();
             classPath = infer.classPath();
             LOG.fine(
@@ -167,7 +197,7 @@ class JavaLanguageServer extends LanguageServer {
                             "Inferred classpath in %,d ms",
                             Duration.between(cpStarted, Instant.now()).toMillis()));
 
-            javaReportProgress(new JavaReportProgressParams("Inferring doc path"));
+            javaReportProgress(new JavaReportProgressParams("Inferring doc path"), 70);
             var docStarted = Instant.now();
             var docPath = infer.buildDocPath();
             lombokDocSources().ifPresent(source -> {
@@ -414,6 +444,9 @@ class JavaLanguageServer extends LanguageServer {
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
         c.add("renameProvider", renameOptions);
+        var window = new JsonObject();
+        window.addProperty("workDoneProgress", true);
+        c.add("window", window);
         if (featuresConfig.inlayHints) {
             c.addProperty("inlayHintProvider", true);
         }

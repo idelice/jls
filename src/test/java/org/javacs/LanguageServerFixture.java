@@ -45,6 +45,12 @@ public class LanguageServerFixture {
 
                     @Override
                     public void customNotification(String method, JsonElement params) {}
+
+                    @Override
+                    public void workDoneProgressCreate(Object token) {}
+
+                    @Override
+                    public void workDoneProgressNotify(ProgressParams params) {}
                 });
     }
 

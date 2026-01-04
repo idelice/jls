@@ -129,4 +129,8 @@ public class LanguageServer {
     }
 
     public void doAsyncWork() {}
+
+    public void windowWorkDoneCreate(Object token) {
+        throw new RuntimeException("Unimplemented");
+    }
 }

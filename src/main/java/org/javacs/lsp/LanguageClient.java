@@ -10,4 +10,8 @@ public interface LanguageClient {
     void registerCapability(String method, JsonElement options);
 
     void customNotification(String method, JsonElement params);
+
+    void workDoneProgressCreate(Object token);
+
+    void workDoneProgressNotify(ProgressParams params);
 }

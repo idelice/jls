@@ -12,6 +12,7 @@ import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.PublishDiagnosticsParams;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.ShowMessageParams;
+import org.javacs.lsp.ProgressParams;
 import org.javacs.markup.SemanticColors;
 import org.junit.Test;
 
@@ -49,6 +50,12 @@ public class SemanticColorsTest {
                                 colors = JsonHelper.GSON.fromJson(params, SemanticColors.class);
                             }
                         }
+
+                        @Override
+                        public void workDoneProgressCreate(Object token) {}
+
+                        @Override
+                        public void workDoneProgressNotify(ProgressParams params) {}
                     });
 
     protected List<String> colors(String file) {

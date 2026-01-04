@@ -171,6 +171,25 @@ public class LSP {
         public void customNotification(String method, JsonElement params) {
             notifyClient(send, method, params);
         }
+
+        @Override
+        public void workDoneProgressCreate(Object token) {
+            var params = new WorkDoneProgressCreateParams();
+            params.token = token;
+            var jsonText = toJson(params);
+            var method = "window/workDoneProgress/create";
+            var id = new Random().nextInt();
+            var messageText =
+                    String.format(
+                            "{\"jsonrpc\":\"2.0\",\"id\":\"%d\",\"method\":\"%s\",\"params\":%s}",
+                            id, method, jsonText);
+            writeClient(send, messageText);
+        }
+
+        @Override
+        public void workDoneProgressNotify(ProgressParams params) {
+            notifyClient(send, "$/progress", params);
+        }
     }
 
     public static void connect(
