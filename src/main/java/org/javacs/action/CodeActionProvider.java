@@ -33,6 +33,9 @@ public class CodeActionProvider {
     }
 
     public List<CodeAction> codeActionsForCursor(CodeActionParams params) {
+        if (params.range == null || params.range.start == null) {
+            return List.of();
+        }
         LOG.info(
                 String.format(
                         "Find code actions at %s(%d)...",
