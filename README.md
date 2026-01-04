@@ -36,7 +36,17 @@ I may often introduce **breaking changes** until i'm satisfied with a stable ver
 
 JLS does not bundle a runtime. Install a compatible JDK and either add it to PATH, set `JAVA_HOME`, or configure `~/.config/jls/runtimes.json`.
 
-### Neovim (with nvim-lspconfig)
+### Neovim (recommended)
+
+Use the companion plugin **nvim-jls** which auto-wires the launcher, Lombok, root detection, and cache handling:
+
+```
+https://github.com/idelice/nvim-jls
+```
+
+Drop it into your plugin manager and set `jls_dir = "/path/to/jls"` (the folder containing `dist/`). No manual `lspconfig` setup is needed.
+
+### Neovim (manual / nvim-lspconfig)
 
 See `docs/lazyvim-java-lsp.md` for a complete LazyVim example. For a minimal `nvim-lspconfig` setup:
 Ensure a compatible JDK is installed and available on PATH (or set `JAVA_HOME`).
