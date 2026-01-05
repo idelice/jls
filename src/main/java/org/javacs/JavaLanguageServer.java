@@ -882,6 +882,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = normalizePath(params.textDocument.uri);
         pendingLintTargets.add(file);
         dirtyVisualDocuments.add(file);
+        FileStore.invalidateCache(file);
         lastChangeAt = Instant.now();
         uncheckedChanges = true;
     }
@@ -940,6 +941,7 @@ class JavaLanguageServer extends LanguageServer {
                 buildInProgress = false;
             }
             refreshVisualDecorations();
+            FileStore.updateCacheAsync(file);
         }
     }
 

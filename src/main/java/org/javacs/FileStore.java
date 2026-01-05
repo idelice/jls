@@ -42,6 +42,7 @@ public class FileStore {
     private static boolean cacheWriteScheduled = false;
     private static Path cacheFile = null;
     private static Path indexCacheFile = null;
+    private static CacheManager cacheManager = null;
 
     private static long workspaceVersion = 0;
 
@@ -63,6 +64,10 @@ public class FileStore {
         synchronized (FileStore.class) {
             workspaceRoots.clear();
             workspaceRoots.addAll(newRoots);
+        }
+        cacheManager = createCacheManager(newRoots);
+        if (cacheManager != null) {
+            cacheManager.load();
         }
         initCache(newRoots);
         var cacheLoaded = loadCache();
@@ -153,6 +158,7 @@ public class FileStore {
         workspaceRoots.clear();
         javaSources.clear();
         WorkspaceIndex.clear();
+        cacheManager = null;
         workspaceVersion++;
     }
 
@@ -611,6 +617,9 @@ public class FileStore {
             LOG.warning("Failed to write java sources cache: " + e.getMessage());
         }
         WorkspaceIndex.saveCache();
+        if (cacheManager != null) {
+            cacheManager.saveAsync();
+        }
     }
 
     private static void scheduleBackgroundIndex(List<Path> files) {
@@ -638,10 +647,28 @@ public class FileStore {
                 info = javaSources.get(file);
             }
             var infoCached = info != null && info.modified.toEpochMilli() == modifiedMillis;
-            if (infoCached && WorkspaceIndex.isCached(file, modifiedMillis)) {
-                return;
+            byte[] bytes = null;
+            String hash = null;
+            if (cacheManager != null) {
+                bytes = Files.readAllBytes(file);
+                hash = CacheManager.hash(bytes);
+                var cached = cacheManager.validate(file, hash, modifiedMillis);
+                if (cached.isPresent()) {
+                    var entry = cached.get();
+                    if (!infoCached) {
+                        synchronized (FileStore.class) {
+                            javaSources.put(file, new Info(modified, entry.packageName()));
+                            workspaceVersion++;
+                        }
+                    }
+                    if (entry.tokens() != null && !entry.tokens().isEmpty()) {
+                        WorkspaceIndex.updateFileTokens(file, entry.tokens(), modifiedMillis);
+                        return;
+                    }
+                }
             }
-            var contents = Files.readString(file);
+            var contents =
+                    bytes != null ? new String(bytes, java.nio.charset.StandardCharsets.UTF_8) : Files.readString(file);
             var packageName = infoCached ? info.packageName : StringSearch.packageName(contents);
             var tokens = WorkspaceIndex.tokenizeContents(contents);
             if (!infoCached) {
@@ -651,6 +678,9 @@ public class FileStore {
                 }
             }
             WorkspaceIndex.updateFileTokens(file, tokens, modifiedMillis);
+            if (cacheManager != null) {
+                cacheManager.recordAsync(file, contents, modifiedMillis);
+            }
         } catch (NoSuchFileException | CharacterCodingException e) {
             LOG.warning(e.getMessage());
             synchronized (FileStore.class) {
@@ -660,6 +690,39 @@ public class FileStore {
             WorkspaceIndex.removeFile(file);
         } catch (IOException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private static CacheManager createCacheManager(Set<Path> roots) {
+        if (roots == null || roots.isEmpty()) return null;
+        try {
+            var primary = roots.iterator().next();
+            var cachePath = primary.resolve(".jls_cache");
+            return new CacheManager(cachePath, roots);
+        } catch (RuntimeException e) {
+            LOG.warning("Failed to create cache manager: " + e.getMessage());
+            return null;
+        }
+    }
+
+    static CacheManager cache() {
+        return cacheManager;
+    }
+
+    public static void invalidateCache(Path file) {
+        if (cacheManager != null) {
+            cacheManager.invalidate(file);
+        }
+    }
+
+    public static void updateCacheAsync(Path file) {
+        if (cacheManager == null) return;
+        try {
+            var modified = Files.getLastModifiedTime(file).toInstant().toEpochMilli();
+            var contents = contents(file);
+            cacheManager.recordAsync(file, contents, modified);
+        } catch (IOException e) {
+            LOG.fine("Skipped cache update for " + file + ": " + e.getMessage());
         }
     }
 
