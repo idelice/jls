@@ -116,27 +116,33 @@ class ReusableCompiler {
         if (checkedOut) {
             throw new RuntimeException("Compiler is already in-use!");
         }
-        checkedOut = true;
         List<String> opts =
                 StreamSupport.stream(options.spliterator(), false).collect(Collectors.toCollection(ArrayList::new));
-        if (disableReuse || !opts.equals(currentOptions)) {
-            if (!disableReuse) {
-                LOG.warning(String.format("Options changed from %s to %s, creating new compiler", currentOptions, opts));
+        try {
+            checkedOut = true;
+            if (disableReuse || !opts.equals(currentOptions)) {
+                if (!disableReuse) {
+                    LOG.warning(
+                            String.format("Options changed from %s to %s, creating new compiler", currentOptions, opts));
+                }
+                currentOptions = opts;
+                currentContext = new ReusableContext(opts);
+            } else if (currentContext == null) {
+                currentOptions = opts;
+                currentContext = new ReusableContext(opts);
             }
-            currentOptions = opts;
-            currentContext = new ReusableContext(opts);
-        } else if (currentContext == null) {
-            currentOptions = opts;
-            currentContext = new ReusableContext(opts);
+            JavacTaskImpl task =
+                    (JavacTaskImpl)
+                            systemProvider.getTask(
+                                    null, fileManager, diagnosticListener, opts, classes, compilationUnits, currentContext);
+
+            task.addTaskListener(currentContext);
+
+            return new Borrow(task, currentContext);
+        } catch (RuntimeException e) {
+            checkedOut = false; // reset so future compiles aren't blocked
+            throw e;
         }
-        JavacTaskImpl task =
-                (JavacTaskImpl)
-                        systemProvider.getTask(
-                                null, fileManager, diagnosticListener, opts, classes, compilationUnits, currentContext);
-
-        task.addTaskListener(currentContext);
-
-        return new Borrow(task, currentContext);
     }
 
     public void removeClass(JCTree.JCCompilationUnit root, String className) {

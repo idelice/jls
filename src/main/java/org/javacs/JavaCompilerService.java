@@ -137,6 +137,10 @@ public class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
         var uniqueSources = deduplicateSources(sources);
+        // If the cached batch was already closed by a prior caller, it is no longer usable.
+        if (cachedCompile != null && cachedCompile.closed) {
+            cachedCompile = null;
+        }
         if (cachedCompile == null) {
             if (uniqueSources.isEmpty()) {
                 throw new RuntimeException("empty sources");
@@ -426,14 +430,18 @@ public class JavaCompilerService implements CompilerProvider {
 
     @Override
     public ParseTask parse(Path file) {
-        var parser = Parser.parseFile(file);
-        return new ParseTask(parser.task, parser.root);
+        synchronized (taskLock) {
+            var parser = Parser.parseFile(file);
+            return new ParseTask(parser.task, parser.root);
+        }
     }
 
     @Override
     public ParseTask parse(JavaFileObject file) {
-        var parser = Parser.parseJavaFileObject(file);
-        return new ParseTask(parser.task, parser.root);
+        synchronized (taskLock) {
+            var parser = Parser.parseJavaFileObject(file);
+            return new ParseTask(parser.task, parser.root);
+        }
     }
 
     @Override
@@ -451,34 +459,36 @@ public class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
-        if (COMPLETION_MODE.get()) {
-            var batch = doCompile(sources);
-            return new CompileTask(batch.task, batch.roots, diags, batch::close);
-        }
-        var activeRoots = selectActiveSourceRoots(sources);
-        var started = System.nanoTime();
-        if (!activeRoots.isEmpty()) {
-            FileStore.setActiveSourceRoots(activeRoots);
-        }
-        try {
-            var expanded = maybeExpandSourcesForLombok(sources);
-            if (expanded.size() > sources.size()) {
-                LOG.fine(
-                        String.format(
-                                "compile: expanded sources for Lombok from %d to %d (completionMode=%s)",
-                                sources.size(), expanded.size(), COMPLETION_MODE.get()));
+        synchronized (taskLock) {
+            if (COMPLETION_MODE.get()) {
+                var batch = doCompile(sources);
+                return new CompileTask(batch.task, batch.roots, diags, batch::close);
             }
-            var compile = compileBatch(expanded);
-            return new CompileTask(compile.task, compile.roots, diags, compile::close);
-        } finally {
-            FileStore.clearActiveSourceRoots();
+            var activeRoots = selectActiveSourceRoots(sources);
+            var started = System.nanoTime();
             if (!activeRoots.isEmpty()) {
-                LOG.fine(
-                        String.format(
-                                "Compile source roots: active=%d total=%d in %d ms",
-                                activeRoots.size(),
-                                FileStore.sourceRoots().size(),
-                                (System.nanoTime() - started) / 1_000_000));
+                FileStore.setActiveSourceRoots(activeRoots);
+            }
+            try {
+                var expanded = maybeExpandSourcesForLombok(sources);
+                if (expanded.size() > sources.size()) {
+                    LOG.fine(
+                            String.format(
+                                    "compile: expanded sources for Lombok from %d to %d (completionMode=%s)",
+                                    sources.size(), expanded.size(), COMPLETION_MODE.get()));
+                }
+                var compile = compileBatch(expanded);
+                return new CompileTask(compile.task, compile.roots, diags, compile::close);
+            } finally {
+                FileStore.clearActiveSourceRoots();
+                if (!activeRoots.isEmpty()) {
+                    LOG.fine(
+                            String.format(
+                                    "Compile source roots: active=%d total=%d in %d ms",
+                                    activeRoots.size(),
+                                    FileStore.sourceRoots().size(),
+                                    (System.nanoTime() - started) / 1_000_000));
+                }
             }
         }
     }

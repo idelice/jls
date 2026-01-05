@@ -969,11 +969,13 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
-        var file = normalizePath(params.textDocument.uri);
-        dirtyVisualDocuments.remove(file);
-        pendingLintTargets.remove(file);
-        var targets = new HashSet<>(FileStore.activeDocuments());
-        targets.add(file);
+            // Saving is a good indicator that the user paused typing; allow diagnostics to run immediately.
+            typingInProgress = false;
+            var file = normalizePath(params.textDocument.uri);
+            dirtyVisualDocuments.remove(file);
+            pendingLintTargets.remove(file);
+            var targets = new HashSet<>(FileStore.activeDocuments());
+            targets.add(file);
             try {
                 var className = compiler().fileManager.getClassName(file);
                 for (var ref : compiler().findTypeReferences(className)) {
@@ -1018,6 +1020,8 @@ class JavaLanguageServer extends LanguageServer {
             uncheckedChanges = !pendingLintTargets.isEmpty();
             return;
         }
+        // We are past the debounce window, so consider typing paused and permit diagnostics.
+        typingInProgress = false;
         diagnosticsExecutor.submit(
                 () -> {
                     buildInProgress = true;
