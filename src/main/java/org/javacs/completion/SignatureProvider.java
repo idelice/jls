@@ -186,20 +186,25 @@ public class SignatureProvider {
     }
 
     private void addSourceInfo(CompileTask task, ExecutableElement method, SignatureInformation info) {
-        var type = (TypeElement) method.getEnclosingElement();
-        var className = type.getQualifiedName().toString();
-        var methodName = method.getSimpleName().toString();
-        var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
-        var file = compiler.findAnywhere(className);
-        if (file.isEmpty()) return;
-        var parse = compiler.parse(file.get());
-        var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-        var path = Trees.instance(task.task).getPath(parse.root, source);
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
-        if (docTree != null) {
-            info.documentation = MarkdownHelper.asMarkupContent(docTree);
+        try {
+            var type = (TypeElement) method.getEnclosingElement();
+            var className = type.getQualifiedName().toString();
+            var methodName = method.getSimpleName().toString();
+            var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
+            var file = compiler.findAnywhere(className);
+            if (file.isEmpty()) return;
+            var parse = compiler.parse(file.get());
+            var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
+            var path = Trees.instance(task.task).getPath(parse.root, source);
+            var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+            if (docTree != null) {
+                info.documentation = MarkdownHelper.asMarkupContent(docTree);
+            }
+            info.parameters = parametersFromSource(source);
+        } catch (RuntimeException e) {
+            // If we can't find source (e.g., synthetic/Lombok), still return the basic signature.
+            LOG.fine("Signature source lookup failed: " + e.getMessage());
         }
-        info.parameters = parametersFromSource(source);
     }
 
     private void addFancyLabel(SignatureInformation info) {
