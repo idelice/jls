@@ -5,12 +5,18 @@ import com.google.gson.JsonElement;
 import java.io.*;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -213,9 +219,28 @@ public class LSP {
 
     public static void connect(
             Function<LanguageClient, LanguageServer> serverFactory, InputStream receive, OutputStream send) {
-        var server = serverFactory.apply(new RealClient(send));
-        var pending = new ArrayBlockingQueue<Message>(10);
-        var endOfStream = new Message();
+        final var server = serverFactory.apply(new RealClient(send));
+        final var pending = new ArrayBlockingQueue<Message>(10);
+        final var endOfStream = new Message();
+        final var requestExecutor =
+                Executors.newFixedThreadPool(
+                        Math.max(2, Runtime.getRuntime().availableProcessors()),
+                        r -> {
+                            var t = new Thread(r, "jls-requests");
+                            t.setDaemon(true);
+                            return t;
+                        });
+        final Map<Object, CompletableFuture<?>> inFlight = new ConcurrentHashMap<>();
+
+        java.util.function.Function<Object, Boolean> cancelInFlight =
+                requestId -> {
+                    if (requestId == null) return false;
+                    var f = inFlight.remove(requestId);
+                    if (f != null) {
+                        return f.cancel(true);
+                    }
+                    return false;
+                };
 
         // Read messages and process cancellations on a separate thread
         class MessageReader implements Runnable {
@@ -223,8 +248,12 @@ public class LSP {
                 if ("$/cancelRequest".equals(message.method)) {
                     var params = gson.fromJson(message.params, CancelParams.class);
                     var removed = pending.removeIf(r -> r.id != null && r.id.equals(params.id));
-                    if (removed) LOG.info(String.format("Cancelled request %d, which had not yet started", params.id));
-                    else LOG.info(String.format("Cannot cancel request %d because it has already started", params.id));
+                    var cancelledRunning = cancelInFlight.apply(params.id);
+                    if (removed || cancelledRunning) {
+                        LOG.info(String.format("Cancelled request %s", params.id));
+                    } else {
+                        LOG.info(String.format("Cannot cancel request %s because it has already started", params.id));
+                    }
                 }
             }
 
@@ -260,6 +289,37 @@ public class LSP {
         Thread reader = new Thread(new MessageReader(), "reader");
         reader.setDaemon(true);
         reader.start();
+
+        java.util.function.BiConsumer<Message, Supplier<Object>> respondAsync =
+                (message, supplier) -> {
+                    var future =
+                            CompletableFuture.supplyAsync(
+                                    supplier,
+                                    requestExecutor); // Already daemon; heavy work off main loop.
+                    if (message.id != null) {
+                        inFlight.put(message.id, future);
+                    }
+                    future.whenComplete(
+                            (result, throwable) -> {
+                                if (message.id != null) {
+                                    inFlight.remove(message.id);
+                                }
+                                if (throwable instanceof java.util.concurrent.CancellationException) {
+                                    return;
+                                }
+                                if (throwable != null) {
+                                    var msg = throwable.getMessage() == null ? throwable.toString() : throwable.getMessage();
+                                    if (message.id != null) {
+                                        error(send, message.id, new ResponseError(ErrorCodes.InternalError, msg, null));
+                                    }
+                                    LOG.log(Level.SEVERE, msg, throwable);
+                                    return;
+                                }
+                                if (message.id != null) {
+                                    respond(send, message.id, result);
+                                }
+                            });
+                };
 
         // Process messages on main thread
         LOG.info("Reading messages from queue...");
@@ -339,8 +399,7 @@ public class LSP {
                     case "workspace/symbol":
                         {
                             var params = gson.fromJson(r.params, WorkspaceSymbolParams.class);
-                            var response = server.workspaceSymbols(params);
-                            respond(send, r.id, response);
+                            respondAsync.accept(r, () -> server.workspaceSymbols(params));
                             break;
                         }
                     case "textDocument/documentLink":
@@ -390,8 +449,7 @@ public class LSP {
                     case "textDocument/completion":
                         {
                             var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.completion(params);
-                            respond(send, r.id, response);
+                            respondAsync.accept(r, () -> server.completion(params));
                             break;
                         }
                     case "completionItem/resolve":
@@ -432,22 +490,19 @@ public class LSP {
                     case "textDocument/definition":
                         {
                             var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.gotoDefinition(params);
-                            respond(send, r.id, response);
+                            respondAsync.accept(r, () -> server.gotoDefinition(params));
                             break;
                         }
                     case "textDocument/references":
                         {
                             var params = gson.fromJson(r.params, ReferenceParams.class);
-                            var response = server.findReferences(params);
-                            respond(send, r.id, response);
+                            respondAsync.accept(r, () -> server.findReferences(params));
                             break;
                         }
                     case "textDocument/documentSymbol":
                         {
                             var params = gson.fromJson(r.params, DocumentSymbolParams.class);
-                            var response = server.documentSymbol(params);
-                            respond(send, r.id, response);
+                            respondAsync.accept(r, () -> server.documentSymbol(params));
                             break;
                         }
                     case "textDocument/codeAction":

@@ -19,6 +19,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
@@ -54,6 +58,11 @@ class JavaLanguageServer extends LanguageServer {
     private CodeActionConfig codeActionConfig = CodeActionConfig.defaults();
     private final Object progressToken = "jls-startup";
     private String progressTitle = "";
+    private static final int CPU = Math.max(2, Runtime.getRuntime().availableProcessors());
+    private final ExecutorService diagnosticsExecutor =
+            Executors.newFixedThreadPool(
+                    Math.max(2, CPU - 1), newNamedThreadFactory("jls-diagnostics"));
+    private static final AtomicInteger THREAD_COUNTER = new AtomicInteger();
     private static final Duration LINT_DEBOUNCE = Duration.ofMillis(750);
     private final Set<Path> pendingLintTargets = new LinkedHashSet<>();
     private final Set<Path> dirtyVisualDocuments = new HashSet<>();
@@ -496,6 +505,14 @@ class JavaLanguageServer extends LanguageServer {
         updateAutoImportProvider();
     }
 
+    private ThreadFactory newNamedThreadFactory(String prefix) {
+        return r -> {
+            var t = new Thread(r, prefix + "-" + THREAD_COUNTER.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        };
+    }
+
     @Override
     public List<SymbolInformation> workspaceSymbols(WorkspaceSymbolParams params) {
         return new SymbolProvider(compiler()).findSymbols(params.query, 50);
@@ -920,11 +937,11 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
-            var file = normalizePath(params.textDocument.uri);
-            dirtyVisualDocuments.remove(file);
-            pendingLintTargets.remove(file);
-            var targets = new HashSet<>(FileStore.activeDocuments());
-            targets.add(file);
+        var file = normalizePath(params.textDocument.uri);
+        dirtyVisualDocuments.remove(file);
+        pendingLintTargets.remove(file);
+        var targets = new HashSet<>(FileStore.activeDocuments());
+        targets.add(file);
             try {
                 var className = compiler().fileManager.getClassName(file);
                 for (var ref : compiler().findTypeReferences(className)) {
@@ -934,12 +951,15 @@ class JavaLanguageServer extends LanguageServer {
                 LOG.log(Level.WARNING, "Failed to compute dependent files for " + file, e);
             }
             // Re-lint active + dependent documents
-            buildInProgress = true;
-            try {
-                lint(targets);
-            } finally {
-                buildInProgress = false;
-            }
+            diagnosticsExecutor.submit(
+                    () -> {
+                        buildInProgress = true;
+                        try {
+                            lint(targets);
+                        } finally {
+                            buildInProgress = false;
+                        }
+                    });
             refreshVisualDecorations();
             FileStore.updateCacheAsync(file);
         }
@@ -963,12 +983,15 @@ class JavaLanguageServer extends LanguageServer {
             uncheckedChanges = !pendingLintTargets.isEmpty();
             return;
         }
-        buildInProgress = true;
-        try {
-            lint(List.of(target));
-        } finally {
-            buildInProgress = false;
-        }
+        diagnosticsExecutor.submit(
+                () -> {
+                    buildInProgress = true;
+                    try {
+                        lint(List.of(target));
+                    } finally {
+                        buildInProgress = false;
+                    }
+                });
         pendingLintTargets.remove(target);
         uncheckedChanges = !pendingLintTargets.isEmpty();
     }

@@ -38,6 +38,12 @@ public class FileStore {
             Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "jls-cache-writer"));
     private static final ScheduledExecutorService BACKGROUND_INDEXER =
             Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "jls-indexer"));
+    private static final java.util.concurrent.ForkJoinPool INDEX_POOL =
+            new java.util.concurrent.ForkJoinPool(
+                    Math.max(2, Runtime.getRuntime().availableProcessors()),
+                    java.util.concurrent.ForkJoinPool.defaultForkJoinWorkerThreadFactory,
+                    null,
+                    false);
     private static final int CACHE_WRITE_DELAY_MS = 1000;
     private static boolean cacheWriteScheduled = false;
     private static Path cacheFile = null;
@@ -630,7 +636,7 @@ public class FileStore {
     private static void indexFilesInParallel(List<Path> files) {
         if (files == null || files.isEmpty()) return;
         var started = System.nanoTime();
-        files.parallelStream().forEach(FileStore::indexFileFromDisk);
+        INDEX_POOL.submit(() -> files.parallelStream().forEach(FileStore::indexFileFromDisk)).join();
         LOG.fine(
                 String.format(
                         "Indexed %,d java files in %,d ms",
