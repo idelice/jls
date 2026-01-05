@@ -18,6 +18,10 @@ class JavaCompilerService implements CompilerProvider {
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
     final ReusableCompiler compiler = new ReusableCompiler(LombokSupport.isEnabled());
+    // Lightweight compiler reused for completion (-proc:none) to avoid per-request init overhead.
+    // reuse enabled because completion options are stable (-proc:none).
+    private final ReusableCompiler completionCompiler = new ReusableCompiler(false /*disableReuse*/);
+    private final Object completionLock = new Object();
     final Docs docs;
     final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
     // Diagnostics from the last compilation task
@@ -40,6 +44,22 @@ class JavaCompilerService implements CompilerProvider {
         this.docs = new Docs(docPath);
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
         this.fileManager = new SourceFileManager();
+        this.completionFileManager =
+                ThreadLocal.withInitial(() -> {
+                    var fm = new SourceFileManager();
+                    try {
+                        fm.setLocationFromPaths(StandardLocation.CLASS_PATH, this.classPath);
+                        var sourceRoots = FileStore.sourceRoots();
+                        if (!sourceRoots.isEmpty()) {
+                            fm.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourceRoots);
+                        }
+                        var classOutput = Files.createTempDirectory("jls-classes-completion-");
+                        fm.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(classOutput));
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                    return fm;
+                });
         try {
             fileManager.setLocationFromPaths(StandardLocation.CLASS_PATH, cp);
             if (LombokSupport.isEnabled()) {
@@ -59,35 +79,39 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public CompileTask compileForCompletion(Collection<? extends JavaFileObject> sources) {
         if (sources == null || sources.isEmpty()) throw new RuntimeException("empty sources");
-        // Use a fresh, non-reused compiler instance so completion requests cannot contend with the main compiler.
-        var tempCompiler = new ReusableCompiler(true /*disableReuse*/);
-        var fm = newFileManager();
-        diags.clear();
-        var options = completionOptions(classPath, addExports);
-        LOG.fine(() -> String.format("completion compile: proc.none=%s, cpEntries=%d, sourceRoots=%d",
-                options.contains("-proc:none"),
-                classPath.size(),
-                FileStore.sourceRoots().size()));
-        var borrow = tempCompiler.getTask(fm, diags::add, options, List.of(), sources);
-        boolean success = false;
-        try {
-            var task = (JavacTask) borrow.task;
-            var roots = new ArrayList<CompilationUnitTree>();
-            for (var t : task.parse()) {
-                roots.add(t);
-            }
-            task.analyze();
-            success = true;
-            return new CompileTask(task, roots, diags, borrow::close);
-        } catch (IOException e) {
-            borrow.close();
-            throw new RuntimeException(e);
-        } finally {
-            if (!success) {
+        // Serialize lightweight compiles to avoid ReusableCompiler contention while still reusing context.
+        synchronized (completionLock) {
+            var fm = completionFileManager.get();
+            diags.clear();
+            var options = completionOptions(classPath, addExports);
+            LOG.fine(
+                    () ->
+                            String.format(
+                                    "completion compile: proc.none=%s, cpEntries=%d, sourceRoots=%d",
+                                    options.contains("-proc:none"), classPath.size(), FileStore.sourceRoots().size()));
+            var borrow = completionCompiler.getTask(fm, diags::add, options, List.of(), sources);
+            boolean success = false;
+            try {
+                var task = (JavacTask) borrow.task;
+                var roots = new ArrayList<CompilationUnitTree>();
+                for (var t : task.parse()) {
+                    roots.add(t);
+                }
+                task.analyze();
+                success = true;
+                return new CompileTask(task, roots, diags, borrow::close);
+            } catch (IOException e) {
                 borrow.close();
+                throw new RuntimeException(e);
+            } finally {
+                if (!success) {
+                    borrow.close();
+                }
             }
         }
     }
+
+    private final ThreadLocal<SourceFileManager> completionFileManager;
 
     private SourceFileManager newFileManager() {
         var fm = new SourceFileManager();

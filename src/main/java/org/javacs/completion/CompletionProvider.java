@@ -59,6 +59,7 @@ public class CompletionProvider {
     private final CompilerProvider compiler;
     private final AutoImportProvider autoImportProvider;
     private final CompletionDocumentation documentationHelper;
+    private volatile CompletionCacheEntry lastCache;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
@@ -183,6 +184,14 @@ public class CompletionProvider {
         var source = new SourceFileObject(file, contents, completionModified(file, endOfLine));
         var partial = partialIdentifier(contents, (int) cursor);
         var endsWithParen = endsWithParen(contents, (int) cursor);
+        var cacheKey = cacheKey(file, completionModifiedMillis(file, endOfLine), cursor);
+        if (lightweight) {
+            var cached = lastCache;
+            if (cached != null && cached.matches(cacheKey)) {
+                LOG.fine("completion cache hit");
+                return cached.copy();
+            }
+        }
         CompletionList result;
         String fallbackReason = null;
         try (var task = lightweight ? compiler.compileForCompletion(List.of(source)) : compiler.compile(List.of(source))) {
@@ -253,6 +262,9 @@ public class CompletionProvider {
                             "Lightweight completion fallback: reason=%s items=%d partial='%s' sample=%s",
                             fallbackReason, result.items.size(), partial, sampleLabels(result)));
             return compileAndComplete(file, contents, cursor, endOfLine, false, false);
+        }
+        if (lightweight) {
+            lastCache = new CompletionCacheEntry(cacheKey, result);
         }
         return result;
     }
@@ -336,6 +348,29 @@ public class CompletionProvider {
         return false;
     }
 
+    private static long cacheKey(Path file, long token, long cursor) {
+        return file.hashCode() * 31L + token * 7L + cursor;
+    }
+
+    private static final class CompletionCacheEntry {
+        final long key;
+        final CompletionList list;
+
+        CompletionCacheEntry(long key, CompletionList list) {
+            this.key = key;
+            this.list = list;
+        }
+
+        boolean matches(long otherKey) {
+            return this.key == otherKey;
+        }
+
+        CompletionList copy() {
+            var copy = new CompletionList(list.isIncomplete, new ArrayList<>(list.items));
+            return copy;
+        }
+    }
+
     private boolean isLikelyLombokFile(Path file) {
         try {
             var text = FileStore.contents(file);
@@ -414,6 +449,10 @@ public class CompletionProvider {
             return Instant.ofEpochMilli(token);
         }
         return Instant.EPOCH;
+    }
+
+    private long completionModifiedMillis(Path file, int endOfLine) {
+        return completionModified(file, endOfLine).toEpochMilli();
     }
 
     private void addTopLevelSnippets(ParseTask task, CompletionList list) {
