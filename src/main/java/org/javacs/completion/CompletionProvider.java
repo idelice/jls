@@ -250,9 +250,10 @@ public class CompletionProvider {
         }
 
         // If lightweight compile produced nothing (or was unsupported), retry once with full compile to pick up
-        // Lombok-generated members and other processor outputs.
+        // Lombok-generated members and other processor outputs, but throttle repeats at the same position.
         if (lightweight && allowFallback && (result == NOT_SUPPORTED || result.items.isEmpty())) {
             LOG.fine("Lightweight completion produced no items; retrying with full compile");
+            recordFallback(cacheKey);
             return compileAndComplete(file, contents, cursor, endOfLine, false, false);
         }
 
@@ -261,11 +262,15 @@ public class CompletionProvider {
                     String.format(
                             "Lightweight completion fallback: reason=%s items=%d partial='%s' sample=%s",
                             fallbackReason, result.items.size(), partial, sampleLabels(result)));
-            return compileAndComplete(file, contents, cursor, endOfLine, false, false);
+            if (!shouldCooldown(cacheKey)) {
+                recordFallback(cacheKey);
+                return compileAndComplete(file, contents, cursor, endOfLine, false, false);
+            } else {
+                LOG.fine("Skipping fallback due to cooldown");
+            }
         }
-        if (lightweight) {
-            lastCache = new CompletionCacheEntry(cacheKey, result);
-        }
+        // Cache both lightweight and fallback results to avoid recomputation at the same spot.
+        lastCache = new CompletionCacheEntry(cacheKey, result);
         return result;
     }
 
@@ -369,6 +374,20 @@ public class CompletionProvider {
             var copy = new CompletionList(list.isIncomplete, new ArrayList<>(list.items));
             return copy;
         }
+    }
+
+    private static final long FALLBACK_COOLDOWN_MS = 1500;
+    private long lastFallbackKey = Long.MIN_VALUE;
+    private long lastFallbackTime = 0;
+
+    private boolean shouldCooldown(long key) {
+        var now = System.currentTimeMillis();
+        return key == lastFallbackKey && (now - lastFallbackTime) < FALLBACK_COOLDOWN_MS;
+    }
+
+    private void recordFallback(long key) {
+        lastFallbackKey = key;
+        lastFallbackTime = System.currentTimeMillis();
     }
 
     private boolean isLikelyLombokFile(Path file) {
