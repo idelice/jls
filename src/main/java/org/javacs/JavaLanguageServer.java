@@ -861,6 +861,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private boolean uncheckedChanges = false;
     private Path lastEdited = Paths.get("");
+    private static final long LINT_IDLE_DEBOUNCE_MS = 0; // lint only on save
 
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
@@ -925,10 +926,9 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void doAsyncWork() {
-        if (uncheckedChanges && FileStore.activeDocuments().contains(lastEdited)) {
-            lint(List.of(lastEdited));
-            uncheckedChanges = false;
-        }
+        // Previously we linted on every change via this async hook. To keep typing fast,
+        // we now lint only on save (see didSaveTextDocument). Just clear the flag.
+        uncheckedChanges = false;
     }
 
     private static JsonObject normalizeSettings(JsonElement settings) {

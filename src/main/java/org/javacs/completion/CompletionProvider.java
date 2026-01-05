@@ -184,7 +184,9 @@ public class CompletionProvider {
         var source = new SourceFileObject(file, contents, completionModified(file, endOfLine));
         var partial = partialIdentifier(contents, (int) cursor);
         var endsWithParen = endsWithParen(contents, (int) cursor);
-        var cacheKey = cacheKey(file, completionModifiedMillis(file, endOfLine), cursor);
+        var modMillis = completionModifiedMillis(file, endOfLine);
+        var cacheKey = cacheKey(file, modMillis, cursor);
+        var fallbackKey = fallbackKey(file, modMillis);
         if (lightweight) {
             var cached = lastCache;
             if (cached != null && cached.matches(cacheKey)) {
@@ -253,7 +255,7 @@ public class CompletionProvider {
         // Lombok-generated members and other processor outputs, but throttle repeats at the same position.
         if (lightweight && allowFallback && (result == NOT_SUPPORTED || result.items.isEmpty())) {
             LOG.fine("Lightweight completion produced no items; retrying with full compile");
-            recordFallback(cacheKey);
+            recordFallback(fallbackKey);
             return compileAndComplete(file, contents, cursor, endOfLine, false, false);
         }
 
@@ -262,8 +264,8 @@ public class CompletionProvider {
                     String.format(
                             "Lightweight completion fallback: reason=%s items=%d partial='%s' sample=%s",
                             fallbackReason, result.items.size(), partial, sampleLabels(result)));
-            if (!shouldCooldown(cacheKey)) {
-                recordFallback(cacheKey);
+            if (!shouldCooldown(fallbackKey)) {
+                recordFallback(fallbackKey);
                 return compileAndComplete(file, contents, cursor, endOfLine, false, false);
             } else {
                 LOG.fine("Skipping fallback due to cooldown");
@@ -355,6 +357,10 @@ public class CompletionProvider {
 
     private static long cacheKey(Path file, long token, long cursor) {
         return file.hashCode() * 31L + token * 7L + cursor;
+    }
+
+    private static long fallbackKey(Path file, long token) {
+        return file.hashCode() * 31L + token * 7L;
     }
 
     private static final class CompletionCacheEntry {
