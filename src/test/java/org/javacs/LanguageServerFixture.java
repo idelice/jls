@@ -51,6 +51,12 @@ public class LanguageServerFixture {
 
                     @Override
                     public void workDoneProgressNotify(ProgressParams params) {}
+
+                    @Override
+                    public void refreshCodeLens() {}
+
+                    @Override
+                    public void refreshInlayHints() {}
                 });
     }
 

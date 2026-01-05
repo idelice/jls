@@ -21,4 +21,10 @@ class FakeProgressClient implements LanguageClient {
 
     @Override
     public void workDoneProgressNotify(ProgressParams params) {}
+
+    @Override
+    public void refreshCodeLens() {}
+
+    @Override
+    public void refreshInlayHints() {}
 }

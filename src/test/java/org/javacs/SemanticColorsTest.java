@@ -21,12 +21,7 @@ public class SemanticColorsTest {
     @Test
     public void colorType() {
         var found = colors("org/javacs/color/ColorExample.java");
-        assertThat("colors field declaration", found, hasItem("virtualField:4:field"));
-        assertThat("colors field reference", found, hasItem("virtualField:7:field"));
-        assertThat("ignores method parameter declaration", found, not(hasItem("methodParameter:10:field")));
-        assertThat("ignores method parameter reference", found, not(hasItem("methodParameter:11:field")));
-        assertThat("colors static field declaration", found, hasItem("staticField:14:field"));
-        assertThat("colors static field reference", found, hasItem("staticField:17:field"));
+        assertThat("java/colors notifications are disabled", found.isEmpty(), is(true));
     }
 
     private SemanticColors colors;
@@ -56,6 +51,12 @@ public class SemanticColorsTest {
 
                         @Override
                         public void workDoneProgressNotify(ProgressParams params) {}
+
+                        @Override
+                        public void refreshCodeLens() {}
+
+                        @Override
+                        public void refreshInlayHints() {}
                     });
 
     protected List<String> colors(String file) {
@@ -64,6 +65,9 @@ public class SemanticColorsTest {
         server.lint(Arrays.asList(path));
         var contents = FileStore.contents(path);
         var list = new ArrayList<String>();
+        if (colors == null) {
+            return list;
+        }
         for (var range : colors.statics) {
             list.add(String.format("%s:%d:static", substring(contents, range), range.start.line + 1));
         }

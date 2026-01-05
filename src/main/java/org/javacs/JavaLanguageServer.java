@@ -35,7 +35,6 @@ import org.javacs.inlay.InlayHintProvider;
 import org.javacs.index.SymbolProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
-import org.javacs.markup.ColorProvider;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.navigation.DefinitionProvider;
 import org.javacs.navigation.ReferenceProvider;
@@ -55,6 +54,11 @@ class JavaLanguageServer extends LanguageServer {
     private CodeActionConfig codeActionConfig = CodeActionConfig.defaults();
     private final Object progressToken = "jls-startup";
     private String progressTitle = "";
+    private static final Duration LINT_DEBOUNCE = Duration.ofMillis(750);
+    private final Set<Path> pendingLintTargets = new LinkedHashSet<>();
+    private final Set<Path> dirtyVisualDocuments = new HashSet<>();
+    private Instant lastChangeAt = Instant.EPOCH;
+    private volatile boolean buildInProgress = false;
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -63,6 +67,14 @@ class JavaLanguageServer extends LanguageServer {
             modifiedBuild = false;
         }
         return cacheCompiler;
+    }
+
+    synchronized JavaCompilerService completionCompiler() {
+        if (cacheCompiler != null && (modifiedBuild || buildInProgress)) {
+            LOG.fine("Using cached compiler for completion while build tasks are pending");
+            return cacheCompiler;
+        }
+        return compiler();
     }
 
     private boolean needsCompiler() {
@@ -92,9 +104,6 @@ class JavaLanguageServer extends LanguageServer {
                     client.publishDiagnostics(
                             new PublishDiagnosticsParams(root.getSourceFile().toUri(), List.of()));
                 }
-            }
-            for (var colors : new ColorProvider(task).colors()) {
-                client.customNotification("java/colors", GSON.toJsonTree(colors));
             }
             var published = Instant.now();
             LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
@@ -536,7 +545,7 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         try {
             var file = Paths.get(params.textDocument.uri);
-            var provider = new CompletionProvider(compiler(), autoImportProvider);
+            var provider = new CompletionProvider(completionCompiler(), autoImportProvider);
             var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
             if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
             return Optional.of(list);
@@ -585,7 +594,8 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
         if (!featuresConfig.inlayHints) return Optional.of(List.of());
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
-        var file = Paths.get(params.textDocument.uri);
+        var file = normalizePath(params.textDocument.uri);
+        if (dirtyVisualDocuments.contains(file)) return Optional.of(List.of());
         try (var task = compiler().compile(file)) {
             var range = params != null ? params.range : null;
             var root = task.root(file);
@@ -639,7 +649,8 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
-        var file = Paths.get(params.textDocument.uri);
+        var file = normalizePath(params.textDocument.uri);
+        if (dirtyVisualDocuments.contains(file)) return List.of();
         var task = compiler().parse(file);
         var lenses = CodeLensProvider.find(task);
         var resolved = new ArrayList<CodeLens>(lenses.size());
@@ -661,7 +672,12 @@ class JavaLanguageServer extends LanguageServer {
         try {
             var name = obj.get("name").getAsString();
             if (name == null || name.isBlank()) return unresolved;
-            var count = fastReferenceCount(name);
+            var uri = obj.get("uri").getAsString();
+            var file = normalizePath(uri);
+            if (dirtyVisualDocuments.contains(file)) {
+                return unresolved;
+            }
+            var count = fastReferenceCount(file, name);
             var title = count == 1 ? "1 reference" : count + " references";
             if (count > 20) {
                 title = "20+ references";
@@ -674,21 +690,12 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
-    private int fastReferenceCount(String name) {
-        var files = org.javacs.index.WorkspaceIndex.filesContaining(name);
-        if (files.isEmpty()) return 0;
-        int count = 0;
+    private int fastReferenceCount(Path file, String name) {
         final int limit = 20;
         var search = new StringSearch(name);
-        for (var file : files) {
-            var text = FileStore.contents(file);
-            int remaining = limit - count;
-            if (remaining <= 0) return limit + 1;
-            var found = search.countWords(text, remaining);
-            if (found > remaining) return limit + 1;
-            count += found;
-        }
-        return count;
+        var text = FileStore.contents(file);
+        var count = search.countWords(text, limit + 1);
+        return Math.min(count, limit + 1);
     }
 
     @Override
@@ -859,20 +866,23 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private boolean uncheckedChanges = false;
-    private Path lastEdited = Paths.get("");
 
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isJavaFile(params.textDocument.uri)) return;
-        lastEdited = Paths.get(params.textDocument.uri);
+        pendingLintTargets.add(normalizePath(params.textDocument.uri));
+        lastChangeAt = Instant.now();
         uncheckedChanges = true;
     }
 
     @Override
     public void didChangeTextDocument(DidChangeTextDocumentParams params) {
         FileStore.change(params);
-        lastEdited = Paths.get(params.textDocument.uri);
+        var file = normalizePath(params.textDocument.uri);
+        pendingLintTargets.add(file);
+        dirtyVisualDocuments.add(file);
+        lastChangeAt = Instant.now();
         uncheckedChanges = true;
     }
 
@@ -881,6 +891,9 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.close(params);
 
         if (FileStore.isJavaFile(params.textDocument.uri)) {
+            var file = normalizePath(params.textDocument.uri);
+            dirtyVisualDocuments.remove(file);
+            pendingLintTargets.remove(file);
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }
@@ -906,7 +919,9 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
-            var file = Paths.get(params.textDocument.uri);
+            var file = normalizePath(params.textDocument.uri);
+            dirtyVisualDocuments.remove(file);
+            pendingLintTargets.remove(file);
             var targets = new HashSet<>(FileStore.activeDocuments());
             targets.add(file);
             try {
@@ -918,15 +933,62 @@ class JavaLanguageServer extends LanguageServer {
                 LOG.log(Level.WARNING, "Failed to compute dependent files for " + file, e);
             }
             // Re-lint active + dependent documents
-            lint(targets);
+            buildInProgress = true;
+            try {
+                lint(targets);
+            } finally {
+                buildInProgress = false;
+            }
+            refreshVisualDecorations();
         }
     }
 
     @Override
     public void doAsyncWork() {
-        if (uncheckedChanges && FileStore.activeDocuments().contains(lastEdited)) {
-            lint(List.of(lastEdited));
+        if (!uncheckedChanges) {
+            return;
+        }
+        if (pendingLintTargets.isEmpty()) {
             uncheckedChanges = false;
+            return;
+        }
+        if (Duration.between(lastChangeAt, Instant.now()).compareTo(LINT_DEBOUNCE) < 0) {
+            return;
+        }
+        var target = pendingLintTargets.iterator().next();
+        if (!FileStore.activeDocuments().contains(target)) {
+            pendingLintTargets.remove(target);
+            uncheckedChanges = !pendingLintTargets.isEmpty();
+            return;
+        }
+        buildInProgress = true;
+        try {
+            lint(List.of(target));
+        } finally {
+            buildInProgress = false;
+        }
+        pendingLintTargets.remove(target);
+        uncheckedChanges = !pendingLintTargets.isEmpty();
+    }
+
+    private Path normalizePath(URI uri) {
+        if (uri == null) {
+            return Paths.get(".").toAbsolutePath().normalize();
+        }
+        return Paths.get(uri).toAbsolutePath().normalize();
+    }
+
+    private Path normalizePath(String uri) {
+        if (uri == null) {
+            return Paths.get(".").toAbsolutePath().normalize();
+        }
+        return normalizePath(URI.create(uri));
+    }
+
+    private void refreshVisualDecorations() {
+        client.refreshCodeLens();
+        if (featuresConfig.inlayHints) {
+            client.refreshInlayHints();
         }
     }
 

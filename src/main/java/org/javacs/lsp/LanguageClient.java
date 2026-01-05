@@ -14,4 +14,8 @@ public interface LanguageClient {
     void workDoneProgressCreate(Object token);
 
     void workDoneProgressNotify(ProgressParams params);
+
+    void refreshCodeLens();
+
+    void refreshInlayHints();
 }

@@ -190,6 +190,25 @@ public class LSP {
         public void workDoneProgressNotify(ProgressParams params) {
             notifyClient(send, "$/progress", params);
         }
+
+        @Override
+        public void refreshCodeLens() {
+            requestClient("workspace/codeLens/refresh");
+        }
+
+        @Override
+        public void refreshInlayHints() {
+            requestClient("workspace/inlayHint/refresh");
+        }
+
+        private void requestClient(String method) {
+            var id = new Random().nextInt();
+            var messageText =
+                    String.format(
+                            "{\"jsonrpc\":\"2.0\",\"id\":\"%d\",\"method\":\"%s\",\"params\":null}",
+                            id, method);
+            writeClient(send, messageText);
+        }
     }
 
     public static void connect(
