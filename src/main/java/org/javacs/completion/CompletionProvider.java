@@ -61,6 +61,7 @@ public class CompletionProvider {
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
+    private static final Map<Path, CachedCompile> CACHE = new HashMap<>();
 
     private static final String[] TOP_LEVEL_KEYWORDS = {
         "package",
@@ -177,29 +178,48 @@ public class CompletionProvider {
         var source = new SourceFileObject(file, contents, completionModified(file, endOfLine));
         var partial = partialIdentifier(contents, (int) cursor);
         var endsWithParen = endsWithParen(contents, (int) cursor);
-        try (var task = compiler.compile(List.of(source))) {
-            LOG.info("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
-            var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
-            if (path == null) return NOT_SUPPORTED;
-            if (isAnnotationContext(contents, (int) cursor)) {
-                return completeAnnotation(task, path, partial);
+        var token = completionModified(file, endOfLine);
+        var cached = CACHE.get(file);
+        CompileTask task = null;
+        boolean reused = false;
+        if (cached != null && cached.token.equals(token)) {
+            task = cached.task;
+            reused = true;
+        } else {
+            if (cached != null) {
+                try {
+                    cached.task.close();
+                } catch (Exception e) {
+                    LOG.log(Level.FINE, "Failed to close cached compile task", e);
+                }
             }
-            switch (path.getLeaf().getKind()) {
-                case IDENTIFIER:
-                    return completeIdentifier(task, path, partial, endsWithParen);
-                case MEMBER_SELECT:
-                    return completeMemberSelect(task, path, partial, endsWithParen);
-                case MEMBER_REFERENCE:
-                    return completeMemberReference(task, path, partial);
-                case SWITCH:
-                    return completeSwitchConstant(task, path, partial);
-                case IMPORT:
-                    return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
-                default:
-                    var list = new CompletionList();
-                    addKeywords(path, partial, list);
-                    return list;
-            }
+            task = compiler.compile(List.of(source));
+            CACHE.put(file, new CachedCompile(token, task));
+        }
+        LOG.info(
+                (reused ? "...reused compile in " : "...compiled in ")
+                        + Duration.between(started, Instant.now()).toMillis()
+                        + "ms");
+        var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
+        if (path == null) return NOT_SUPPORTED;
+        if (isAnnotationContext(contents, (int) cursor)) {
+            return completeAnnotation(task, path, partial);
+        }
+        switch (path.getLeaf().getKind()) {
+            case IDENTIFIER:
+                return completeIdentifier(task, path, partial, endsWithParen);
+            case MEMBER_SELECT:
+                return completeMemberSelect(task, path, partial, endsWithParen);
+            case MEMBER_REFERENCE:
+                return completeMemberReference(task, path, partial);
+            case SWITCH:
+                return completeSwitchConstant(task, path, partial);
+            case IMPORT:
+                return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
+            default:
+                var list = new CompletionList();
+                addKeywords(path, partial, list);
+                return list;
         }
     }
 
@@ -217,6 +237,38 @@ public class CompletionProvider {
             return Instant.ofEpochMilli(token);
         }
         return Instant.EPOCH;
+    }
+
+    public static void clearCache(Path file) {
+        var cached = CACHE.remove(file);
+        if (cached != null) {
+            try {
+                cached.task.close();
+            } catch (Exception e) {
+                LOG.log(Level.FINE, "Failed to close cached completion task", e);
+            }
+        }
+    }
+
+    public static void clearAllCache() {
+        for (var entry : CACHE.values()) {
+            try {
+                entry.task.close();
+            } catch (Exception e) {
+                LOG.log(Level.FINE, "Failed to close cached completion task", e);
+            }
+        }
+        CACHE.clear();
+    }
+
+    private static class CachedCompile {
+        final Instant token;
+        final CompileTask task;
+
+        CachedCompile(Instant token, CompileTask task) {
+            this.token = token;
+            this.task = task;
+        }
     }
 
     private void addTopLevelSnippets(ParseTask task, CompletionList list) {

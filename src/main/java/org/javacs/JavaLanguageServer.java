@@ -35,7 +35,6 @@ import org.javacs.inlay.InlayHintProvider;
 import org.javacs.index.SymbolProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
-import org.javacs.markup.ColorProvider;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.navigation.DefinitionProvider;
 import org.javacs.navigation.ReferenceProvider;
@@ -55,6 +54,7 @@ class JavaLanguageServer extends LanguageServer {
     private CodeActionConfig codeActionConfig = CodeActionConfig.defaults();
     private final Object progressToken = "jls-startup";
     private String progressTitle = "";
+    private final Map<Path, CachedInlayHints> inlayCache = new HashMap<>();
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -93,9 +93,7 @@ class JavaLanguageServer extends LanguageServer {
                             new PublishDiagnosticsParams(root.getSourceFile().toUri(), List.of()));
                 }
             }
-            for (var colors : new ColorProvider(task).colors()) {
-                client.customNotification("java/colors", GSON.toJsonTree(colors));
-            }
+            // Disabled java/colors notifications for performance on large projects
             var published = Instant.now();
             LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
         } catch (AssertionError e) {
@@ -435,9 +433,14 @@ class JavaLanguageServer extends LanguageServer {
         c.addProperty("workspaceSymbolProvider", true);
         c.addProperty("documentSymbolProvider", true);
         c.addProperty("documentFormattingProvider", true);
-        var codeLensOptions = new JsonObject();
-        c.add("codeLensProvider", codeLensOptions);
-        c.addProperty("foldingRangeProvider", true);
+        // Defer expensive providers unless explicitly enabled via settings
+        if (featuresConfig.codeLens) {
+            var codeLensOptions = new JsonObject();
+            c.add("codeLensProvider", codeLensOptions);
+        }
+        if (featuresConfig.foldRange) {
+            c.addProperty("foldingRangeProvider", true);
+        }
         var codeActionOptions = new JsonObject();
         codeActionOptions.addProperty("resolveProvider", true);
         c.add("codeActionProvider", codeActionOptions);
@@ -481,6 +484,18 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void shutdown() {}
+
+    private static class CachedInlayHints {
+        final Integer version;
+        final Instant computedAt;
+        final List<InlayHint> hints;
+
+        CachedInlayHints(Integer version, Instant computedAt, List<InlayHint> hints) {
+            this.version = version;
+            this.computedAt = computedAt;
+            this.hints = hints;
+        }
+    }
 
     public JavaLanguageServer(LanguageClient client) {
         this.client = client;
@@ -586,10 +601,20 @@ class JavaLanguageServer extends LanguageServer {
         if (!featuresConfig.inlayHints) return Optional.of(List.of());
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
+        if (!FileStore.activeDocuments().contains(file)) return Optional.of(List.of());
+        var version = FileStore.documentVersion(file);
+        var cached = inlayCache.get(file);
+        if (cached != null && Objects.equals(cached.version, version)) {
+            if (Duration.between(cached.computedAt, Instant.now()).toMillis() < 750) {
+                return Optional.of(cached.hints);
+            }
+        }
         try (var task = compiler().compile(file)) {
             var range = params != null ? params.range : null;
             var root = task.root(file);
-            return Optional.of(new InlayHintProvider(task, root, range).hints());
+            var hints = new InlayHintProvider(task, root, range).hints();
+            inlayCache.put(file, new CachedInlayHints(version, Instant.now(), hints));
+            return Optional.of(hints);
         } catch (RuntimeException e) {
             LOG.log(Level.SEVERE, "Inlay hints failed", e);
             return Optional.of(List.of());
@@ -600,6 +625,8 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<SemanticTokens> semanticTokensFull(SemanticTokensParams params) {
         if (!featuresConfig.semanticTokens) return Optional.of(new SemanticTokens());
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(new SemanticTokens());
+        var file = Paths.get(params.textDocument.uri);
+        if (!FileStore.activeDocuments().contains(file)) return Optional.of(new SemanticTokens());
         return Optional.of(new SemanticTokens());
     }
 
@@ -640,6 +667,7 @@ class JavaLanguageServer extends LanguageServer {
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
+        if (!FileStore.activeDocuments().contains(file)) return List.of();
         var task = compiler().parse(file);
         var lenses = CodeLensProvider.find(task);
         var resolved = new ArrayList<CodeLens>(lenses.size());
@@ -883,6 +911,9 @@ class JavaLanguageServer extends LanguageServer {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
+            var file = Paths.get(params.textDocument.uri);
+            CompletionProvider.clearCache(file);
+            inlayCache.remove(file);
         }
     }
 
@@ -1011,14 +1042,18 @@ class JavaLanguageServer extends LanguageServer {
     private static class FeaturesConfig {
         final boolean inlayHints;
         final boolean semanticTokens;
+        final boolean codeLens;
+        final boolean foldRange;
 
-        private FeaturesConfig(boolean inlayHints, boolean semanticTokens) {
+        private FeaturesConfig(boolean inlayHints, boolean semanticTokens, boolean codeLens, boolean foldRange) {
             this.inlayHints = inlayHints;
             this.semanticTokens = semanticTokens;
+            this.codeLens = codeLens;
+            this.foldRange = foldRange;
         }
 
         static FeaturesConfig defaults() {
-            return new FeaturesConfig(true, true);
+            return new FeaturesConfig(true, true, false, false);
         }
 
         static FeaturesConfig from(JsonObject settings) {
@@ -1028,7 +1063,9 @@ class JavaLanguageServer extends LanguageServer {
                             : new JsonObject();
             var inlayHints = getBoolean(features, "inlayHints", false);
             var semanticTokens = getBoolean(features, "semanticTokens", false);
-            return new FeaturesConfig(inlayHints, semanticTokens);
+            var codeLens = getBoolean(features, "codeLens", false);
+            var foldRange = getBoolean(features, "foldRange", false);
+            return new FeaturesConfig(inlayHints, semanticTokens, codeLens, foldRange);
         }
     }
 
