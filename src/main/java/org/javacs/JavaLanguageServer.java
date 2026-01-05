@@ -68,6 +68,7 @@ class JavaLanguageServer extends LanguageServer {
     private final Set<Path> dirtyVisualDocuments = new HashSet<>();
     private Instant lastChangeAt = Instant.EPOCH;
     private volatile boolean buildInProgress = false;
+    private volatile boolean suppressDiagnostics = false;
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -99,6 +100,10 @@ class JavaLanguageServer extends LanguageServer {
 
     void lint(Collection<Path> files) {
         if (files.isEmpty()) return;
+        if (suppressDiagnostics) {
+            LOG.fine("Skipping lint because diagnostics are suppressed");
+            return;
+        }
         LOG.info("Lint " + files.size() + " files...");
         var started = Instant.now();
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
@@ -531,6 +536,10 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
+        if (suppressDiagnostics) {
+            LOG.fine("Ignoring didChangeWatchedFiles because diagnostics are suppressed");
+            return;
+        }
         for (var c : params.changes) {
             var file = Paths.get(c.uri);
             if (FileStore.isJavaFile(file)) {
@@ -561,6 +570,7 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<CompletionList> completion(TextDocumentPositionParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         try {
+            suppressDiagnostics = true;
             var file = Paths.get(params.textDocument.uri);
             var provider = new CompletionProvider(completionCompiler(), autoImportProvider);
             var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
@@ -572,6 +582,8 @@ class JavaLanguageServer extends LanguageServer {
         } catch (RuntimeException e) {
             LOG.log(Level.SEVERE, "Completion failed", e);
             return Optional.empty();
+        } finally {
+            suppressDiagnostics = false;
         }
     }
 
@@ -879,7 +891,11 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         compiler.clearCachedModified();
-        lint(referencePaths);
+        if (suppressDiagnostics) {
+            pendingLintTargets.addAll(referencePaths);
+        } else {
+            lint(referencePaths);
+        }
     }
 
     private boolean uncheckedChanges = false;
