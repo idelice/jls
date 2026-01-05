@@ -33,5 +33,11 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
+    /**
+     * Compile with processors disabled and early stop at attribution; used for fast completion.
+     * Implementations may fall back to full compile if unsupported.
+     */
+    CompileTask compileLight(Collection<? extends JavaFileObject> sources);
+
     Path NOT_FOUND = Paths.get("");
 }

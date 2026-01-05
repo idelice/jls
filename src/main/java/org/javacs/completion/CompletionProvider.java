@@ -47,6 +47,7 @@ import org.javacs.JsonHelper;
 import org.javacs.ParseTask;
 import org.javacs.SourceFileObject;
 import org.javacs.StringSearch;
+import org.javacs.compile.LightCompile;
 import org.javacs.imports.AutoImportProvider;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
@@ -180,20 +181,26 @@ public class CompletionProvider {
         var endsWithParen = endsWithParen(contents, (int) cursor);
         var token = completionModified(file, endOfLine);
         var cached = CACHE.get(file);
-        CompileTask task = null;
+        CompileTask task;
         boolean reused = false;
+
         if (cached != null && cached.token.equals(token)) {
             task = cached.task;
             reused = true;
         } else {
+            // close old cached
             if (cached != null) {
                 try {
                     cached.task.close();
                 } catch (Exception e) {
-                    LOG.log(Level.FINE, "Failed to close cached compile task", e);
+                    LOG.log(Level.FINE, "Failed to close cached completion task", e);
                 }
             }
-            task = compiler.compile(List.of(source));
+            // Try a lightweight compile without annotation processors first
+            task = LightCompile.lightCompile(compiler, List.of(source));
+            if (task == null) {
+                task = compiler.compile(List.of(source));
+            }
             CACHE.put(file, new CachedCompile(token, task));
         }
         LOG.info(

@@ -139,6 +139,18 @@ class ReusableCompiler {
         return new Borrow(task, currentContext);
     }
 
+    Borrow getTaskNoProcessors(
+            JavaFileManager fileManager,
+            DiagnosticListener<? super JavaFileObject> diagnosticListener,
+            Iterable<String> options,
+            Iterable<? extends JavaFileObject> compilationUnits) {
+        var opts = new ArrayList<String>();
+        options.forEach(opts::add);
+        opts.add("-proc:none");
+        opts.add("-Xlint:-processing");
+        return getTask(fileManager, diagnosticListener, opts, /*classes*/ null, compilationUnits);
+    }
+
     public void removeClass(JCTree.JCCompilationUnit root, String className) {
         currentContext.removeClass(root, className);
     }

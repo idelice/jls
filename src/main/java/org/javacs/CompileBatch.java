@@ -230,7 +230,7 @@ class CompileBatch implements AutoCloseable {
         return classOrSourcePath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
     }
 
-    private static List<String> options(Set<Path> classPath, Set<String> addExports) {
+    public static List<String> options(Set<Path> classPath, Set<String> addExports) {
         var list = new ArrayList<String>();
 
         var cp = joinPath(classPath);

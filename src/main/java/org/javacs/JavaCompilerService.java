@@ -129,6 +129,40 @@ class JavaCompilerService implements CompilerProvider {
         return cachedCompile;
     }
 
+    private static List<String> lightOptions(Set<Path> classPath, Set<String> addExports) {
+        var opts = CompileBatch.options(classPath, addExports);
+        // replace processor flags with no-processing and stop after attribution
+        opts.removeIf(opt -> opt.equals("-proc:full") || opt.equals("-processorpath"));
+        opts.add("-proc:none");
+        opts.add("-Xlint:-processing");
+        opts.add("-XDshouldStopPolicy=ATTR");
+        return opts;
+    }
+
+    @Override
+    public CompileTask compileLight(Collection<? extends JavaFileObject> sources) {
+        var uniqueSources = deduplicateSources(sources);
+        var diagnostics = new javax.tools.DiagnosticCollector<JavaFileObject>();
+        try {
+            var opts = lightOptions(classPath, addExports);
+            var borrow = compiler.getTaskNoProcessors(fileManager, diagnostics, opts, uniqueSources);
+            var task = borrow.task;
+            var roots = new ArrayList<com.sun.source.tree.CompilationUnitTree>();
+            try {
+                for (var t : task.parse()) {
+                    roots.add(t);
+                }
+                task.analyze();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            return new CompileTask(task, roots, diagnostics.getDiagnostics(), borrow::close);
+        } catch (RuntimeException e) {
+            LOG.fine("Light compile failed, falling back: " + e.getMessage());
+            return compile(uniqueSources);
+        }
+    }
+
     private List<JavaFileObject> deduplicateSources(Collection<? extends JavaFileObject> sources) {
         if (sources.isEmpty()) {
             return List.of();
