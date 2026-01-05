@@ -32,13 +32,13 @@ class CompileBatch implements AutoCloseable {
     final Types types;
     final List<CompilationUnitTree> roots;
 
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
+    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean completionMode) {
         this.parent = parent;
         this.borrow = batchTask(parent, files);
         boolean success = false;
         try {
             this.task = borrow.task;
-            if (LombokSupport.isEnabled()) {
+            if (LombokSupport.isEnabled() && !completionMode) {
                 relaxShouldStopPolicy(this.task);
                 configureLombokProcessor(this.task);
             }

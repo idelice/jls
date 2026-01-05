@@ -21,6 +21,7 @@ public class JavaCompilerService implements CompilerProvider {
     // Use the same file manager for multiple tasks, so we don't repeatedly re-compile the same files
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
+    private static final ThreadLocal<Boolean> COMPLETION_MODE = ThreadLocal.withInitial(() -> false);
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports) {
         var cp = new LinkedHashSet<Path>();
@@ -52,6 +53,14 @@ public class JavaCompilerService implements CompilerProvider {
         }
     }
 
+    public static void enterCompletionMode() {
+        COMPLETION_MODE.set(true);
+    }
+
+    public static void exitCompletionMode() {
+        COMPLETION_MODE.set(false);
+    }
+
     private CompileBatch cachedCompile;
     private Map<JavaFileObject, Long> cachedModified = new HashMap<>();
     private long cachedReferenceVersion = -1;
@@ -60,15 +69,6 @@ public class JavaCompilerService implements CompilerProvider {
     private long cachedLombokVersion = -1;
     private final List<Path> cachedLombokFiles = new ArrayList<>();
     private final Object taskLock = new Object();
-    private static final ThreadLocal<Boolean> COMPLETION_MODE = ThreadLocal.withInitial(() -> false);
-
-    public static void enterCompletionMode() {
-        COMPLETION_MODE.set(true);
-    }
-
-    public static void exitCompletionMode() {
-        COMPLETION_MODE.set(false);
-    }
 
     private boolean needsCompile(Collection<? extends JavaFileObject> sources) {
         if (cachedModified.size() != sources.size()) {
@@ -102,7 +102,7 @@ public class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch doCompile(Collection<? extends JavaFileObject> sources) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
-        var firstAttempt = new CompileBatch(this, sources);
+        var firstAttempt = new CompileBatch(this, sources, COMPLETION_MODE.get());
         Set<Path> addFiles;
         try {
             addFiles = firstAttempt.needsAdditionalSources();
@@ -121,7 +121,7 @@ public class JavaCompilerService implements CompilerProvider {
         for (var add : addFiles) {
             moreSources.add(new SourceFileObject(add, false));
         }
-        return new CompileBatch(this, deduplicateSources(moreSources));
+        return new CompileBatch(this, deduplicateSources(moreSources), COMPLETION_MODE.get());
     }
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {

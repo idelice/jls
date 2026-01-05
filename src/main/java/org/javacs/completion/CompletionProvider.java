@@ -41,6 +41,7 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.CompletionDocumentation;
+import org.javacs.JavaCompilerService;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.JsonHelper;
