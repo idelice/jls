@@ -9,7 +9,7 @@ import java.util.regex.Pattern;
 import javax.tools.*;
 import org.javacs.index.WorkspaceIndex;
 
-class JavaCompilerService implements CompilerProvider {
+public class JavaCompilerService implements CompilerProvider {
     // Not modifiable! If you want to edit these, you need to create a new instance
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
@@ -59,6 +59,16 @@ class JavaCompilerService implements CompilerProvider {
     private final Map<String, Path[]> cachedMemberReferences = new HashMap<>();
     private long cachedLombokVersion = -1;
     private final List<Path> cachedLombokFiles = new ArrayList<>();
+    private final Object taskLock = new Object();
+    private static final ThreadLocal<Boolean> COMPLETION_MODE = ThreadLocal.withInitial(() -> false);
+
+    public static void enterCompletionMode() {
+        COMPLETION_MODE.set(true);
+    }
+
+    public static void exitCompletionMode() {
+        COMPLETION_MODE.set(false);
+    }
 
     private boolean needsCompile(Collection<? extends JavaFileObject> sources) {
         if (cachedModified.size() != sources.size()) {
@@ -437,6 +447,12 @@ class JavaCompilerService implements CompilerProvider {
         }
         try {
             var expanded = maybeExpandSourcesForLombok(sources);
+            if (expanded.size() > sources.size()) {
+                LOG.fine(
+                        String.format(
+                                "compile: expanded sources for Lombok from %d to %d (completionMode=%s)",
+                                sources.size(), expanded.size(), COMPLETION_MODE.get()));
+            }
             var compile = compileBatch(expanded);
             return new CompileTask(compile.task, compile.roots, diags, compile::close);
         } finally {
@@ -524,6 +540,9 @@ class JavaCompilerService implements CompilerProvider {
     private Collection<? extends JavaFileObject> maybeExpandSourcesForLombok(
             Collection<? extends JavaFileObject> sources) {
         if (!LombokSupport.isEnabled()) {
+            return sources;
+        }
+        if (COMPLETION_MODE.get()) {
             return sources;
         }
         var started = System.nanoTime();

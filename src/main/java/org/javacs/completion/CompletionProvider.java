@@ -45,6 +45,7 @@ import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.JsonHelper;
 import org.javacs.ParseTask;
+import org.javacs.JavaCompilerService;
 import org.javacs.SourceFileObject;
 import org.javacs.StringSearch;
 import org.javacs.imports.AutoImportProvider;
@@ -136,6 +137,7 @@ public class CompletionProvider {
         LOG.info("Complete at " + file.getFileName() + "(" + line + "," + column + ")...");
         var started = Instant.now();
         try {
+            JavaCompilerService.enterCompletionMode();
             var task = compiler.parse(file);
             var cursor = task.root.getLineMap().getPosition(line, column);
             var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
@@ -160,6 +162,8 @@ public class CompletionProvider {
         } catch (RuntimeException e) {
             LOG.log(Level.SEVERE, "Completion failed", e);
             return NOT_SUPPORTED;
+        } finally {
+            JavaCompilerService.exitCompletionMode();
         }
     }
 
@@ -178,7 +182,7 @@ public class CompletionProvider {
         var partial = partialIdentifier(contents, (int) cursor);
         var endsWithParen = endsWithParen(contents, (int) cursor);
         try (var task = compiler.compile(List.of(source))) {
-            LOG.info("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
+            LOG.fine("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
             var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
             if (path == null) return NOT_SUPPORTED;
             if (isAnnotationContext(contents, (int) cursor)) {
