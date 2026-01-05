@@ -33,6 +33,8 @@ import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
+import javax.lang.model.util.Elements;
+import javax.lang.model.util.Types;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
@@ -143,7 +145,8 @@ public class CompletionProvider {
             var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
             var endOfLine = endOfLine(contents, (int) cursor);
             contents.insert(endOfLine, ';');
-            var list = compileAndComplete(file, contents.toString(), cursor, endOfLine);
+            // Use lightweight completion only; disable fallback full compile to keep typing latency low.
+            var list = compileAndComplete(file, contents.toString(), cursor, endOfLine, true, false);
             addTopLevelSnippets(task, list);
             logCompletionTiming(started, list.items, list.isIncomplete);
             LOG.fine(
@@ -186,7 +189,6 @@ public class CompletionProvider {
         var endsWithParen = endsWithParen(contents, (int) cursor);
         var modMillis = completionModifiedMillis(file, endOfLine);
         var cacheKey = cacheKey(file, modMillis, cursor);
-        var fallbackKey = fallbackKey(file, modMillis);
         if (lightweight) {
             var cached = lastCache;
             if (cached != null && cached.matches(cacheKey)) {
@@ -195,7 +197,6 @@ public class CompletionProvider {
             }
         }
         CompletionList result;
-        String fallbackReason = null;
         try (var task = lightweight ? compiler.compileForCompletion(List.of(source)) : compiler.compile(List.of(source))) {
             LOG.info(
                     String.format(
@@ -230,19 +231,6 @@ public class CompletionProvider {
                 }
             }
 
-            if (lightweight && allowFallback) {
-                fallbackReason = shouldFallbackToFullCompile(file, task, path, result, partial);
-                LOG.fine(
-                        String.format(
-                                "completion decision: file=%s lombok=%s partial='%s' items=%d containsLombok=%s fallback=%s sample=%s",
-                                file.getFileName(),
-                                isLikelyLombokFile(file),
-                                partial,
-                                result.items.size(),
-                                containsLombokPrefixedItem(result),
-                                fallbackReason,
-                                sampleLabels(result)));
-            }
         } catch (RuntimeException e) {
             if (lightweight && allowFallback) {
                 LOG.fine("Lightweight completion failed, retrying with full compile");
@@ -251,116 +239,13 @@ public class CompletionProvider {
             throw e;
         }
 
-        // If lightweight compile produced nothing (or was unsupported), retry once with full compile to pick up
-        // Lombok-generated members and other processor outputs, but throttle repeats at the same position.
-        if (lightweight && allowFallback && (result == NOT_SUPPORTED || result.items.isEmpty())) {
-            LOG.fine("Lightweight completion produced no items; retrying with full compile");
-            recordFallback(fallbackKey);
-            return compileAndComplete(file, contents, cursor, endOfLine, false, false);
-        }
-
-        if (lightweight && allowFallback && fallbackReason != null) {
-            LOG.fine(
-                    String.format(
-                            "Lightweight completion fallback: reason=%s items=%d partial='%s' sample=%s",
-                            fallbackReason, result.items.size(), partial, sampleLabels(result)));
-            if (!shouldCooldown(fallbackKey)) {
-                recordFallback(fallbackKey);
-                return compileAndComplete(file, contents, cursor, endOfLine, false, false);
-            } else {
-                LOG.fine("Skipping fallback due to cooldown");
-            }
-        }
-        // Cache both lightweight and fallback results to avoid recomputation at the same spot.
+        // Cache result to avoid recomputation at the same spot.
         lastCache = new CompletionCacheEntry(cacheKey, result);
         return result;
     }
 
-    /**
-     * Decide whether we should run a fallback full compile to include Lombok-generated members.
-     *
-     * The lightweight compile uses -proc:none, so Lombok accessors/builders are missing. To keep
-     * completion fast while still returning those members when the user is likely asking for them,
-     * we only fall back when both:
-     *   1) The file appears to use Lombok, and
-     *   2) The current completion context suggests Lombok-generated symbols are relevant but absent
-     *      from the lightweight result (e.g. requesting get*, set*, is*, builder*, with* and none match).
-     */
-    private String shouldFallbackToFullCompile(
-            Path file, CompileTask task, TreePath path, CompletionList result, String partial) {
-        if (!isLikelyLombokContext(file, task, path)) return null;
-        if (result == NOT_SUPPORTED || result.items.isEmpty()) return "empty-or-not-supported";
-
-        // Only consider member/name style completions where Lombok typically contributes members.
-        var kind = path.getLeaf().getKind();
-        if (kind != Tree.Kind.MEMBER_SELECT && kind != Tree.Kind.IDENTIFIER && kind != Tree.Kind.MEMBER_REFERENCE) {
-            return null;
-        }
-
-        var partialLower = partial == null ? "" : partial.toLowerCase();
-        boolean looksLikeLombokRequest = partialLower.isEmpty() || startsWithLombokPrefix(partialLower);
-        if (!looksLikeLombokRequest) return null;
-
-        if (partialLower.isEmpty()) {
-            // No typed prefix: only fall back if we don't see any typical Lombok-generated names.
-            if (!containsLombokPrefixedItem(result)) {
-                return "no-lombok-labels";
-            }
-            return null;
-        }
-
-        // If none of the returned labels match the requested prefix, it's likely missing generated members.
-        for (var item : result.items) {
-            if (item.label != null && item.label.toLowerCase().startsWith(partialLower)) {
-                return null;
-            }
-        }
-        return "lombok-prefix-missing";
-    }
-
-    private String sampleLabels(CompletionList result) {
-        var labels = new ArrayList<String>();
-        for (var item : result.items) {
-            if (item.label != null) {
-                labels.add(item.label);
-            }
-            if (labels.size() == 5) break;
-        }
-        return labels.toString();
-    }
-
-    private boolean startsWithLombokPrefix(String partialLower) {
-        return partialLower.startsWith("get")
-                || partialLower.startsWith("set")
-                || partialLower.startsWith("is")
-                || partialLower.startsWith("with")
-                || partialLower.startsWith("builder")
-                || partialLower.startsWith("toString")
-                || partialLower.startsWith("equals")
-                || partialLower.startsWith("hashcode");
-    }
-
-    private boolean containsLombokPrefixedItem(CompletionList result) {
-        // Ignore Object methods that would otherwise block fallback (they always appear).
-        var blacklist =
-                Set.of("getclass", "wait", "notify", "notifyall", "finalize", "equals", "hashcode", "tostring");
-        for (var item : result.items) {
-            if (item.label == null) continue;
-            var lower = item.label.toLowerCase();
-            if (blacklist.contains(lower)) continue;
-            if (startsWithLombokPrefix(lower)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private static long cacheKey(Path file, long token, long cursor) {
         return file.hashCode() * 31L + token * 7L + cursor;
-    }
-
-    private static long fallbackKey(Path file, long token) {
-        return file.hashCode() * 31L + token * 7L;
     }
 
     private static final class CompletionCacheEntry {
@@ -382,62 +267,6 @@ public class CompletionProvider {
         }
     }
 
-    private static final long FALLBACK_COOLDOWN_MS = 1500;
-    private long lastFallbackKey = Long.MIN_VALUE;
-    private long lastFallbackTime = 0;
-
-    private boolean shouldCooldown(long key) {
-        var now = System.currentTimeMillis();
-        return key == lastFallbackKey && (now - lastFallbackTime) < FALLBACK_COOLDOWN_MS;
-    }
-
-    private void recordFallback(long key) {
-        lastFallbackKey = key;
-        lastFallbackTime = System.currentTimeMillis();
-    }
-
-    private boolean isLikelyLombokFile(Path file) {
-        try {
-            var text = FileStore.contents(file);
-            if (text == null) return false;
-            return text.contains("lombok.") || text.contains("@Data") || text.contains("@Getter") || text.contains("@Setter")
-                    || text.contains("@Value") || text.contains("@Builder") || text.contains("@With");
-        } catch (RuntimeException e) {
-            return false;
-        }
-    }
-
-    private boolean isLikelyLombokContext(Path file, CompileTask task, TreePath path) {
-        if (isLikelyLombokFile(file)) return true;
-        try {
-            var trees = Trees.instance(task.task);
-            Tree exprTree = null;
-            switch (path.getLeaf().getKind()) {
-                case MEMBER_SELECT -> exprTree = ((MemberSelectTree) path.getLeaf()).getExpression();
-                case MEMBER_REFERENCE -> exprTree = ((MemberReferenceTree) path.getLeaf()).getQualifierExpression();
-                case IDENTIFIER -> exprTree = path.getLeaf();
-                default -> {
-                }
-            }
-            if (exprTree != null) {
-                var exprPath = new TreePath(path, exprTree);
-                var element = trees.getElement(exprPath);
-                if (element != null && isLombokAnnotated(element)) return true;
-                var type = trees.getTypeMirror(exprPath);
-                if (type instanceof DeclaredType declared) {
-                    var typeElement = (TypeElement) declared.asElement();
-                    if (isLombokAnnotated(typeElement)) return true;
-                    if (typeElement.getQualifiedName() != null
-                            && isLombokSource(typeElement.getQualifiedName().toString())) {
-                        return true;
-                    }
-                }
-            }
-        } catch (RuntimeException e) {
-            // best-effort; ignore and fall back to file-only signal
-        }
-        return false;
-    }
 
     private boolean isLombokAnnotated(Element element) {
         for (var ann : element.getAnnotationMirrors()) {
@@ -445,19 +274,6 @@ public class CompletionProvider {
             if (name.startsWith("lombok.")) return true;
         }
         return false;
-    }
-
-    private boolean isLombokSource(String className) {
-        try {
-            var source = compiler.findAnywhere(className);
-            if (source.isEmpty()) return false;
-            var uri = source.get().toUri();
-            if (!"file".equals(uri.getScheme())) return false;
-            var path = Paths.get(uri);
-            return isLikelyLombokFile(path);
-        } catch (RuntimeException e) {
-            return false;
-        }
     }
 
     private Instant completionModified(Path file, int endOfLine) {
@@ -877,6 +693,10 @@ public class CompletionProvider {
                 list.add(item(task, member));
             }
         }
+        // Add synthetic Lombok accessors if annotation processors are disabled.
+        if (!isStatic) {
+            addSyntheticLombokMembers(task, typeElement, partial, endsWithParen, list, methods);
+        }
         for (var overloads : methods.values()) {
             list.add(method(task, overloads, !endsWithParen));
         }
@@ -908,6 +728,131 @@ public class CompletionProvider {
             }
         }
         return false;
+    }
+
+    private void addSyntheticLombokMembers(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            boolean endsWithParen,
+            List<CompletionItem> list,
+            Map<String, List<ExecutableElement>> methods) {
+        if (!isLombokAnnotated(typeElement)) return;
+        var elements = task.task.getElements();
+        var types = task.task.getTypes();
+        for (var enclosed : typeElement.getEnclosedElements()) {
+            if (enclosed.getKind() != ElementKind.FIELD) continue;
+            var field = (VariableElement) enclosed;
+            var name = field.getSimpleName().toString();
+            var type = field.asType();
+            // getter
+            var getterName = getterName(field, type);
+            if (getterName != null && StringSearch.matchesPartialName(getterName, partial)) {
+                var synthetic = syntheticMethodItem(getterName, type.toString(), typeElement, field, endsWithParen, elements, types);
+                list.add(synthetic);
+            }
+            // setter (only for non-final)
+            if (!field.getModifiers().contains(Modifier.FINAL)) {
+                var setterName = setterName(field);
+                if (setterName != null && StringSearch.matchesPartialName(setterName, partial)) {
+                    var synthetic = syntheticSetterItem(setterName, typeElement, field, endsWithParen, elements, types);
+                    list.add(synthetic);
+                }
+            }
+            // withX for @With
+            if (hasLombokWith(typeElement)) {
+                var withName = "with" + capitalize(name);
+                if (StringSearch.matchesPartialName(withName, partial)) {
+                    var synthetic =
+                            syntheticMethodItem(withName, typeElement.asType().toString(), typeElement, field, endsWithParen, elements, types);
+                    list.add(synthetic);
+                }
+            }
+        }
+    }
+
+    private boolean isLombokAnnotated(TypeElement type) {
+        for (var ann : type.getAnnotationMirrors()) {
+            var qname = ann.getAnnotationType().toString();
+            if (qname.startsWith("lombok.")) return true;
+        }
+        return false;
+    }
+
+    private boolean hasLombokWith(TypeElement type) {
+        for (var ann : type.getAnnotationMirrors()) {
+            var qname = ann.getAnnotationType().toString();
+            if (qname.equals("lombok.With")) return true;
+            if (qname.equals("lombok.Value") || qname.equals("lombok.Data")) return true;
+        }
+        return false;
+    }
+
+    private String getterName(VariableElement field, TypeMirror type) {
+        var name = field.getSimpleName().toString();
+        var capitalized = capitalize(name);
+        if (type.getKind() == TypeKind.BOOLEAN && name.startsWith("is") && name.length() > 2 && Character.isUpperCase(name.charAt(2))) {
+            return name;
+        }
+        if (type.getKind() == TypeKind.BOOLEAN) {
+            return "is" + capitalized;
+        }
+        return "get" + capitalized;
+    }
+
+    private String setterName(VariableElement field) {
+        return "set" + capitalize(field.getSimpleName().toString());
+    }
+
+    private String capitalize(String name) {
+        if (name.isEmpty()) return name;
+        return Character.toUpperCase(name.charAt(0)) + name.substring(1);
+    }
+
+    private CompletionItem syntheticMethodItem(
+            String name,
+            String returnType,
+            TypeElement owner,
+            VariableElement field,
+            boolean addParens,
+            Elements elements,
+            Types types) {
+        var i = new CompletionItem();
+        i.label = name;
+        i.kind = CompletionItemKind.Method;
+        i.detail = returnType + " " + owner.getQualifiedName() + "." + name + "()";
+        i.insertText = name + (addParens ? "()$0" : "");
+        i.insertTextFormat = addParens ? InsertTextFormat.Snippet : null;
+        var data = new CompletionData();
+        data.className = owner.getQualifiedName().toString();
+        data.memberName = name;
+        data.plusOverloads = 0;
+        i.data = JsonHelper.GSON.toJsonTree(data);
+        return i;
+    }
+
+    private CompletionItem syntheticSetterItem(
+            String name,
+            TypeElement owner,
+            VariableElement field,
+            boolean addParens,
+            Elements elements,
+            Types types) {
+        var i = new CompletionItem();
+        i.label = name;
+        i.kind = CompletionItemKind.Method;
+        var fieldType = field.asType().toString();
+        i.detail = "void " + owner.getQualifiedName() + "." + name + "(" + fieldType + ")";
+        if (addParens) {
+            i.insertText = name + "($0)";
+            i.insertTextFormat = InsertTextFormat.Snippet;
+        }
+        var data = new CompletionData();
+        data.className = owner.getQualifiedName().toString();
+        data.memberName = name;
+        data.plusOverloads = 0;
+        i.data = JsonHelper.GSON.toJsonTree(data);
+        return i;
     }
 
     private CompletionList completeMemberReference(CompileTask task, TreePath path, String partial) {
