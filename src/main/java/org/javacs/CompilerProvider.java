@@ -33,5 +33,10 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
+    /** Lightweight compile for completion; default delegates to full compile. */
+    default CompileTask compileForCompletion(Collection<? extends JavaFileObject> sources) {
+        return compile(sources);
+    }
+
     Path NOT_FOUND = Paths.get("");
 }

@@ -1,11 +1,15 @@
 package org.javacs;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.*;
+import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.util.JavacTask;
 import java.util.*;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.tools.*;
 import org.javacs.index.WorkspaceIndex;
 
@@ -50,6 +54,104 @@ class JavaCompilerService implements CompilerProvider {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    @Override
+    public CompileTask compileForCompletion(Collection<? extends JavaFileObject> sources) {
+        if (sources == null || sources.isEmpty()) throw new RuntimeException("empty sources");
+        // Use a fresh, non-reused compiler instance so completion requests cannot contend with the main compiler.
+        var tempCompiler = new ReusableCompiler(true /*disableReuse*/);
+        var fm = newFileManager();
+        diags.clear();
+        var options = completionOptions(classPath, addExports);
+        LOG.fine(() -> String.format("completion compile: proc.none=%s, cpEntries=%d, sourceRoots=%d",
+                options.contains("-proc:none"),
+                classPath.size(),
+                FileStore.sourceRoots().size()));
+        var borrow = tempCompiler.getTask(fm, diags::add, options, List.of(), sources);
+        boolean success = false;
+        try {
+            var task = (JavacTask) borrow.task;
+            var roots = new ArrayList<CompilationUnitTree>();
+            for (var t : task.parse()) {
+                roots.add(t);
+            }
+            task.analyze();
+            success = true;
+            return new CompileTask(task, roots, diags, borrow::close);
+        } catch (IOException e) {
+            borrow.close();
+            throw new RuntimeException(e);
+        } finally {
+            if (!success) {
+                borrow.close();
+            }
+        }
+    }
+
+    private SourceFileManager newFileManager() {
+        var fm = new SourceFileManager();
+        try {
+            fm.setLocationFromPaths(StandardLocation.CLASS_PATH, classPath);
+            var sourceRoots = FileStore.sourceRoots();
+            if (!sourceRoots.isEmpty()) {
+                fm.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourceRoots);
+            }
+            var classOutput = Files.createTempDirectory("jls-classes-");
+            fm.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(classOutput));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return fm;
+    }
+
+    private static String joinPath(Collection<Path> paths) {
+        return paths.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
+    }
+
+    private List<String> completionOptions(Set<Path> classPath, Set<String> addExports) {
+        var list = new ArrayList<String>();
+        var cp = joinPath(classPath);
+        Collections.addAll(list, "-classpath", cp);
+        Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        var sourceRoots = FileStore.sourceRoots();
+        if (!sourceRoots.isEmpty()) {
+            Collections.addAll(list, "-sourcepath", joinPath(sourceRoots));
+        }
+        // Disable all annotation processing for completion speed
+        Collections.addAll(list, "-proc:none");
+        Collections.addAll(
+                list,
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+                "--add-opens", "jdk.compiler/com.sun.tools.javac.jvm=ALL-UNNAMED",
+                "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+                "--add-opens", "java.base/java.util=ALL-UNNAMED",
+                "--add-opens", "jdk.unsupported/sun.misc=ALL-UNNAMED");
+        Collections.addAll(
+                list,
+                "-Xlint:cast",
+                "-Xlint:deprecation",
+                "-Xlint:empty",
+                "-Xlint:fallthrough",
+                "-Xlint:finally",
+                "-Xlint:path",
+                "-Xlint:unchecked",
+                "-Xlint:varargs",
+                "-Xlint:static");
+        for (var export : addExports) {
+            list.add("--add-exports");
+            list.add(export + "=ALL-UNNAMED");
+        }
+        return list;
     }
 
     private CompileBatch cachedCompile;

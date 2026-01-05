@@ -98,7 +98,7 @@ class CompileBatch implements AutoCloseable {
             Object processor = processorClass.getDeclaredConstructor().newInstance();
             if (processor instanceof javax.annotation.processing.Processor p) {
                 task.setProcessors(java.util.List.of(p));
-                LOG.info("Configured Lombok processor explicitly");
+                LOG.fine("Configured Lombok processor explicitly");
             } else {
                 LOG.warning("Lombok processor class did not implement Processor");
             }
