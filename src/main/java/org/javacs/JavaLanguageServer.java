@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -66,9 +67,11 @@ class JavaLanguageServer extends LanguageServer {
     private static final Duration LINT_DEBOUNCE = Duration.ofMillis(750);
     private final Set<Path> pendingLintTargets = new LinkedHashSet<>();
     private final Set<Path> dirtyVisualDocuments = new HashSet<>();
+    private final Set<Path> completionInFlight = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private Instant lastChangeAt = Instant.EPOCH;
     private volatile boolean buildInProgress = false;
     private volatile boolean suppressDiagnostics = false;
+    private volatile boolean typingInProgress = false;
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -102,6 +105,10 @@ class JavaLanguageServer extends LanguageServer {
         if (files.isEmpty()) return;
         if (suppressDiagnostics) {
             LOG.fine("Skipping lint because diagnostics are suppressed");
+            return;
+        }
+        if (typingInProgress || !completionInFlight.isEmpty()) {
+            pendingLintTargets.addAll(files);
             return;
         }
         LOG.info("Lint " + files.size() + " files...");
@@ -536,8 +543,8 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
-        if (suppressDiagnostics) {
-            LOG.fine("Ignoring didChangeWatchedFiles because diagnostics are suppressed");
+        if (suppressDiagnostics || typingInProgress || !completionInFlight.isEmpty()) {
+            LOG.fine("Ignoring didChangeWatchedFiles because diagnostics are suppressed or typing/completion active");
             return;
         }
         for (var c : params.changes) {
@@ -572,6 +579,7 @@ class JavaLanguageServer extends LanguageServer {
         try {
             suppressDiagnostics = true;
             var file = Paths.get(params.textDocument.uri);
+            completionInFlight.add(file);
             var provider = new CompletionProvider(completionCompiler(), autoImportProvider);
             var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
             if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
@@ -583,7 +591,12 @@ class JavaLanguageServer extends LanguageServer {
             LOG.log(Level.SEVERE, "Completion failed", e);
             return Optional.empty();
         } finally {
+            completionInFlight.remove(Paths.get(params.textDocument.uri));
             suppressDiagnostics = false;
+            typingInProgress = false;
+            if (!pendingLintTargets.isEmpty()) {
+                uncheckedChanges = true;
+            }
         }
     }
 
@@ -891,7 +904,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         compiler.clearCachedModified();
-        if (suppressDiagnostics) {
+        if (suppressDiagnostics || typingInProgress || !completionInFlight.isEmpty()) {
             pendingLintTargets.addAll(referencePaths);
         } else {
             lint(referencePaths);
@@ -907,6 +920,7 @@ class JavaLanguageServer extends LanguageServer {
         pendingLintTargets.add(normalizePath(params.textDocument.uri));
         lastChangeAt = Instant.now();
         uncheckedChanges = true;
+        typingInProgress = true;
     }
 
     @Override
@@ -918,6 +932,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.invalidateCache(file);
         lastChangeAt = Instant.now();
         uncheckedChanges = true;
+        typingInProgress = true;
     }
 
     @Override
@@ -928,6 +943,7 @@ class JavaLanguageServer extends LanguageServer {
             var file = normalizePath(params.textDocument.uri);
             dirtyVisualDocuments.remove(file);
             pendingLintTargets.remove(file);
+            typingInProgress = false;
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }
@@ -984,6 +1000,9 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void doAsyncWork() {
         if (!uncheckedChanges) {
+            return;
+        }
+        if (typingInProgress || suppressDiagnostics || !completionInFlight.isEmpty()) {
             return;
         }
         if (pendingLintTargets.isEmpty()) {
