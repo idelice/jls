@@ -51,6 +51,7 @@ import org.javacs.ParseTask;
 import org.javacs.SourceFileObject;
 import org.javacs.StringSearch;
 import org.javacs.imports.AutoImportProvider;
+import org.javacs.lombok.LombokSyntheticMembers;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
@@ -695,7 +696,7 @@ public class CompletionProvider {
         }
         // Add synthetic Lombok accessors if annotation processors are disabled.
         if (!isStatic) {
-            addSyntheticLombokMembers(task, typeElement, partial, endsWithParen, list, methods);
+            addSyntheticLombokMembers(task, typeElement, partial, endsWithParen, list);
         }
         for (var overloads : methods.values()) {
             list.add(method(task, overloads, !endsWithParen));
@@ -731,82 +732,31 @@ public class CompletionProvider {
     }
 
     private void addSyntheticLombokMembers(
-            CompileTask task,
-            TypeElement typeElement,
-            String partial,
-            boolean endsWithParen,
-            List<CompletionItem> list,
-            Map<String, List<ExecutableElement>> methods) {
-        if (!isLombokAnnotated(typeElement)) return;
-        var elements = task.task.getElements();
-        var types = task.task.getTypes();
-        for (var enclosed : typeElement.getEnclosedElements()) {
-            if (enclosed.getKind() != ElementKind.FIELD) continue;
-            var field = (VariableElement) enclosed;
-            var name = field.getSimpleName().toString();
-            var type = field.asType();
-            // getter
-            var getterName = getterName(field, type);
-            if (getterName != null && StringSearch.matchesPartialName(getterName, partial)) {
-                var synthetic = syntheticMethodItem(getterName, type.toString(), typeElement, field, endsWithParen, elements, types);
-                list.add(synthetic);
-            }
-            // setter (only for non-final)
-            if (!field.getModifiers().contains(Modifier.FINAL)) {
-                var setterName = setterName(field);
-                if (setterName != null && StringSearch.matchesPartialName(setterName, partial)) {
-                    var synthetic = syntheticSetterItem(setterName, typeElement, field, endsWithParen, elements, types);
-                    list.add(synthetic);
+            CompileTask task, TypeElement typeElement, String partial, boolean endsWithParen, List<CompletionItem> list) {
+        var synthetic = LombokSyntheticMembers.syntheticMembers(task, typeElement, partial);
+        for (var syn : synthetic) {
+            var i = new CompletionItem();
+            i.label = syn.name();
+            i.kind = CompletionItemKind.Method;
+            i.detail = syn.returnType() + " " + typeElement.getQualifiedName() + "." + syn.name() + "()";
+            if (syn.hasParam()) {
+                if (endsWithParen) {
+                    i.insertText = syn.name();
+                } else {
+                    i.insertText = syn.name() + "($0)";
+                    i.insertTextFormat = InsertTextFormat.Snippet;
                 }
+            } else {
+                i.insertText = syn.name() + "()$0";
+                i.insertTextFormat = InsertTextFormat.Snippet;
             }
-            // withX for @With
-            if (hasLombokWith(typeElement)) {
-                var withName = "with" + capitalize(name);
-                if (StringSearch.matchesPartialName(withName, partial)) {
-                    var synthetic =
-                            syntheticMethodItem(withName, typeElement.asType().toString(), typeElement, field, endsWithParen, elements, types);
-                    list.add(synthetic);
-                }
-            }
+            var data = new CompletionData();
+            data.className = typeElement.getQualifiedName().toString();
+            data.memberName = syn.name();
+            data.plusOverloads = 0;
+            i.data = JsonHelper.GSON.toJsonTree(data);
+            list.add(i);
         }
-    }
-
-    private boolean isLombokAnnotated(TypeElement type) {
-        for (var ann : type.getAnnotationMirrors()) {
-            var qname = ann.getAnnotationType().toString();
-            if (qname.startsWith("lombok.")) return true;
-        }
-        return false;
-    }
-
-    private boolean hasLombokWith(TypeElement type) {
-        for (var ann : type.getAnnotationMirrors()) {
-            var qname = ann.getAnnotationType().toString();
-            if (qname.equals("lombok.With")) return true;
-            if (qname.equals("lombok.Value") || qname.equals("lombok.Data")) return true;
-        }
-        return false;
-    }
-
-    private String getterName(VariableElement field, TypeMirror type) {
-        var name = field.getSimpleName().toString();
-        var capitalized = capitalize(name);
-        if (type.getKind() == TypeKind.BOOLEAN && name.startsWith("is") && name.length() > 2 && Character.isUpperCase(name.charAt(2))) {
-            return name;
-        }
-        if (type.getKind() == TypeKind.BOOLEAN) {
-            return "is" + capitalized;
-        }
-        return "get" + capitalized;
-    }
-
-    private String setterName(VariableElement field) {
-        return "set" + capitalize(field.getSimpleName().toString());
-    }
-
-    private String capitalize(String name) {
-        if (name.isEmpty()) return name;
-        return Character.toUpperCase(name.charAt(0)) + name.substring(1);
     }
 
     private CompletionItem syntheticMethodItem(
