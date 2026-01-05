@@ -34,7 +34,7 @@ class CompileBatch implements AutoCloseable {
 
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean completionMode) {
         this.parent = parent;
-        this.borrow = batchTask(parent, files);
+        this.borrow = batchTask(parent, files, completionMode);
         boolean success = false;
         try {
             this.task = borrow.task;
@@ -218,9 +218,9 @@ class CompileBatch implements AutoCloseable {
     }
 
     private static ReusableCompiler.Borrow batchTask(
-            JavaCompilerService parent, Collection<? extends JavaFileObject> sources) {
+            JavaCompilerService parent, Collection<? extends JavaFileObject> sources, boolean completionMode) {
         parent.diags.clear();
-        var options = options(parent.classPath, parent.addExports);
+        var options = options(parent.classPath, parent.addExports, completionMode);
         LOG.fine("Javac options: " + options);
         return parent.compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
     }
@@ -230,7 +230,7 @@ class CompileBatch implements AutoCloseable {
         return classOrSourcePath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
     }
 
-    private static List<String> options(Set<Path> classPath, Set<String> addExports) {
+    private static List<String> options(Set<Path> classPath, Set<String> addExports, boolean completionMode) {
         var list = new ArrayList<String>();
 
         var cp = joinPath(classPath);
@@ -240,11 +240,13 @@ class CompileBatch implements AutoCloseable {
         if (!sourceRoots.isEmpty()) {
             Collections.addAll(list, "-sourcepath", joinPath(sourceRoots));
         }
-        if (LombokSupport.isEnabled()) {
+        if (LombokSupport.isEnabled() && !completionMode) {
             // JDK 21 requires explicit enable of processor discovery on classpath, or a processorpath.
             // We use -proc:full AND set processorpath to classpath to ensure discovery works.
             Collections.addAll(list, "-proc:full");
             Collections.addAll(list, "-processorpath", cp);
+        } else {
+            Collections.addAll(list, "-proc:none");
         }
         // Collections.addAll(list, "-verbose");
         Collections.addAll(list, "-g");

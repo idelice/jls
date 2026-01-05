@@ -17,6 +17,7 @@ import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -37,11 +38,11 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.type.TypeVariable;
+import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.CompletionDocumentation;
-import org.javacs.JavaCompilerService;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.JsonHelper;
@@ -138,7 +139,6 @@ public class CompletionProvider {
         LOG.info("Complete at " + file.getFileName() + "(" + line + "," + column + ")...");
         var started = Instant.now();
         try {
-            JavaCompilerService.enterCompletionMode();
             var task = compiler.parse(file);
             var cursor = task.root.getLineMap().getPosition(line, column);
             var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
@@ -163,8 +163,6 @@ public class CompletionProvider {
         } catch (RuntimeException e) {
             LOG.log(Level.SEVERE, "Completion failed", e);
             return NOT_SUPPORTED;
-        } finally {
-            JavaCompilerService.exitCompletionMode();
         }
     }
 
@@ -182,7 +180,7 @@ public class CompletionProvider {
         var source = new SourceFileObject(file, contents, completionModified(file, endOfLine));
         var partial = partialIdentifier(contents, (int) cursor);
         var endsWithParen = endsWithParen(contents, (int) cursor);
-        try (var task = compiler.compile(List.of(source))) {
+        try (var task = compileForCompletion(List.of(source))) {
             LOG.fine("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
             var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
             if (path == null) return NOT_SUPPORTED;
@@ -206,6 +204,13 @@ public class CompletionProvider {
                     return list;
             }
         }
+    }
+
+    private CompileTask compileForCompletion(Collection<? extends JavaFileObject> sources) {
+        if (compiler instanceof JavaCompilerService jcs) {
+            return jcs.compileForCompletion(sources);
+        }
+        return compiler.compile(sources);
     }
 
     private Instant completionModified(Path file, int endOfLine) {

@@ -61,6 +61,15 @@ public class JavaCompilerService implements CompilerProvider {
         COMPLETION_MODE.set(false);
     }
 
+    public CompileTask compileForCompletion(Collection<? extends JavaFileObject> sources) {
+        enterCompletionMode();
+        try {
+            return compile(sources);
+        } finally {
+            exitCompletionMode();
+        }
+    }
+
     private CompileBatch cachedCompile;
     private Map<JavaFileObject, Long> cachedModified = new HashMap<>();
     private long cachedReferenceVersion = -1;
@@ -111,7 +120,9 @@ public class JavaCompilerService implements CompilerProvider {
             firstAttempt.borrow.close();
             throw e;
         }
-        if (addFiles.isEmpty()) return firstAttempt;
+        if (addFiles.isEmpty()) {
+            return firstAttempt;
+        }
         // If the compiler needs additional source files that contain package-private files
         LOG.info("...need to recompile with " + addFiles);
         firstAttempt.close();
@@ -440,6 +451,10 @@ public class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
+        if (COMPLETION_MODE.get()) {
+            var batch = doCompile(sources);
+            return new CompileTask(batch.task, batch.roots, diags, batch::close);
+        }
         var activeRoots = selectActiveSourceRoots(sources);
         var started = System.nanoTime();
         if (!activeRoots.isEmpty()) {
