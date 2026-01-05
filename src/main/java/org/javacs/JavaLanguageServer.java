@@ -93,9 +93,10 @@ class JavaLanguageServer extends LanguageServer {
                             new PublishDiagnosticsParams(root.getSourceFile().toUri(), List.of()));
                 }
             }
-            for (var colors : new ColorProvider(task).colors()) {
-                client.customNotification("java/colors", GSON.toJsonTree(colors));
-            }
+            // Temporarily disable java/colors to measure performance without color traffic.
+            // for (var colors : new ColorProvider(task).colors()) {
+            //     client.customNotification("java/colors", GSON.toJsonTree(colors));
+            // }
             var published = Instant.now();
             LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
         } catch (AssertionError e) {
