@@ -226,15 +226,12 @@ public class CompletionProvider {
     private Instant completionModified(Path file, int endOfLine) {
         var version = FileStore.documentVersion(file);
         if (version != null) {
-            long token = ((long) version << 32) ^ (endOfLine & 0xffffffffL);
-            token = token & Long.MAX_VALUE;
-            return Instant.ofEpochMilli(token);
+            // Reuse the same compile for all cursor positions in a given buffer version
+            return Instant.ofEpochMilli(version.longValue());
         }
         var modified = FileStore.modified(file);
         if (modified != null) {
-            long token = (modified.toEpochMilli() & 0xffffffffL) ^ (endOfLine & 0xffffffffL);
-            token = token & Long.MAX_VALUE;
-            return Instant.ofEpochMilli(token);
+            return modified;
         }
         return Instant.EPOCH;
     }

@@ -55,6 +55,7 @@ class JavaLanguageServer extends LanguageServer {
     private final Object progressToken = "jls-startup";
     private String progressTitle = "";
     private final Map<Path, CachedInlayHints> inlayCache = new HashMap<>();
+    private final Map<Path, Instant> lastSemantic = new HashMap<>();
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -609,6 +610,10 @@ class JavaLanguageServer extends LanguageServer {
                 return Optional.of(cached.hints);
             }
         }
+        // Light debounce to avoid hammering on each keystroke
+        if (cached != null && Duration.between(cached.computedAt, Instant.now()).toMillis() < 150) {
+            return Optional.of(cached.hints);
+        }
         try (var task = compiler().compile(file)) {
             var range = params != null ? params.range : null;
             var root = task.root(file);
@@ -627,6 +632,11 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(new SemanticTokens());
         var file = Paths.get(params.textDocument.uri);
         if (!FileStore.activeDocuments().contains(file)) return Optional.of(new SemanticTokens());
+        var last = lastSemantic.get(file);
+        if (last != null && Duration.between(last, Instant.now()).toMillis() < 300) {
+            return Optional.of(new SemanticTokens());
+        }
+        lastSemantic.put(file, Instant.now());
         return Optional.of(new SemanticTokens());
     }
 
@@ -914,6 +924,7 @@ class JavaLanguageServer extends LanguageServer {
             var file = Paths.get(params.textDocument.uri);
             CompletionProvider.clearCache(file);
             inlayCache.remove(file);
+            lastSemantic.remove(file);
         }
     }
 
