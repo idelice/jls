@@ -58,7 +58,12 @@ public final class LombokSyntheticMembers {
         return StringSearch.matchesPartialName(name, partial == null ? "" : partial);
     }
 
-    private static boolean isLombokAnnotated(TypeElement type) {
+    public static boolean isLombokAnnotated(Element element) {
+        if (!(element instanceof TypeElement)) return false;
+        return isLombokAnnotated((TypeElement) element);
+    }
+
+    public static boolean isLombokAnnotated(TypeElement type) {
         for (var ann : type.getAnnotationMirrors()) {
             var qname = ann.getAnnotationType().toString();
             if (qname.startsWith("lombok.")) return true;

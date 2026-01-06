@@ -608,7 +608,7 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
         if (!featuresConfig.inlayHints) return Optional.of(List.of());
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
-        if (isExternalLibrary(params.textDocument.uri.toString())) return Optional.of(List.of());
+        if (FileStore.isExternalUri(params.textDocument.uri.toString())) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
         try (var task = compiler().compile(file)) {
             var range = params != null ? params.range : null;
@@ -677,7 +677,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
-        if (isExternalLibrary(params.textDocument.uri.toString())) return List.of();
+        if (FileStore.isExternalUri(params.textDocument.uri.toString())) return List.of();
         var file = Paths.get(params.textDocument.uri);
         var task = compiler().parse(file);
         var lenses = CodeLensProvider.find(task);
@@ -728,21 +728,6 @@ class JavaLanguageServer extends LanguageServer {
             count += found;
         }
         return count;
-    }
-
-    private boolean isExternalLibrary(String uri) {
-        if (uri.startsWith("jar:") || uri.startsWith("jrt:")) {
-            return true;
-        }
-        try {
-            var path = Paths.get(new URI(uri));
-            // Treat anything outside the workspace roots as external (e.g., extracted jar sources).
-            return !FileStore.isWorkspacePath(path);
-        } catch (Exception e) {
-            // If we can't parse the URI, err on the side of not sending lenses/hints.
-            LOG.log(Level.FINE, "Failed to parse uri for external check: " + uri, e);
-            return true;
-        }
     }
 
     @Override

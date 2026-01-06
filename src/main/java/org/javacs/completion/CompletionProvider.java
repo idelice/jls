@@ -269,14 +269,6 @@ public class CompletionProvider {
     }
 
 
-    private boolean isLombokAnnotated(Element element) {
-        for (var ann : element.getAnnotationMirrors()) {
-            var name = ann.getAnnotationType().toString();
-            if (name.startsWith("lombok.")) return true;
-        }
-        return false;
-    }
-
     private Instant completionModified(Path file, int endOfLine) {
         var version = FileStore.documentVersion(file);
         if (version != null) {
