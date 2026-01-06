@@ -2,12 +2,9 @@ package org.javacs.navigation;
 
 import com.sun.source.util.Trees;
 import java.net.URI;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
-import java.util.Optional;
-import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.TypeKind;
@@ -17,7 +14,6 @@ import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.JarFileHelper;
 import org.javacs.SourceFileObject;
-import org.javacs.FileStore;
 import org.javacs.lsp.Location;
 
 public class DefinitionProvider {
@@ -56,7 +52,7 @@ public class DefinitionProvider {
             resolveMs = (System.nanoTime() - resolveStart) / 1_000_000;
             if (element == null) {
                 kind = "no-element";
-                result = resolveByCursorWord().orElse(NOT_SUPPORTED);
+                result = NOT_SUPPORTED;
             } else if (element.asType().getKind() == TypeKind.ERROR) {
                 kind = "error";
                 result = findDefinitions(task, element);
@@ -69,7 +65,7 @@ public class DefinitionProvider {
                     kind = "no-class";
                     result = NOT_SUPPORTED;
                 } else {
-                    var otherFile = resolveTargetSource(className);
+                    var otherFile = JarFileHelper.resolveTargetSource(compiler, file, className);
                     if (otherFile.isEmpty()) {
                         kind = "not-found";
                         result = List.of();
@@ -158,30 +154,14 @@ public class DefinitionProvider {
     }
 
     private List<Location> resolveByName(String simpleName) {
-        var pkg = packageNameFromSource(file).orElse("");
+        var pkg = JarFileHelper.packageNameFromSource(file).orElse("");
         var className = pkg.isEmpty() ? simpleName : pkg + "." + simpleName;
-        var target = resolveTargetSource(className);
+        var target = JarFileHelper.resolveTargetSource(compiler, file, className);
         if (target.isEmpty()) {
             return List.of();
         }
         var remote = findRemoteDefinitions(target.get(), className);
         return remote.locations;
-    }
-
-    private Optional<JavaFileObject> resolveTargetSource(String className) {
-        var target = findExternalSource(className).or(() -> compiler.findAnywhere(className));
-        if (target.isEmpty()) return Optional.empty();
-        return Optional.of(JarFileHelper.materialize(target.get()));
-    }
-
-    private Optional<String> packageNameFromSource(Path path) {
-        var contents = FileStore.contents(path);
-        if (contents == null) return Optional.empty();
-        var matcher = PACKAGE_LINE.matcher(contents);
-        if (matcher.find()) {
-            return Optional.ofNullable(matcher.group(1));
-        }
-        return Optional.empty();
     }
 
     private List<Location> fallbackFindInOtherFile(JavaFileObject otherFile, String className) {
@@ -201,94 +181,4 @@ public class DefinitionProvider {
         }
     }
 
-    private Optional<List<Location>> resolveByCursorWord() {
-        var word = wordAtCursor();
-        if (word.isEmpty()) return Optional.empty();
-        return Optional.of(resolveByName(word.get()));
-    }
-
-    private Optional<String> wordAtCursor() {
-        if (line < 1) return Optional.empty();
-        var contents = FileStore.contents(file);
-        if (contents == null) return Optional.empty();
-        var lines = contents.split("\\R", -1);
-        if (line > lines.length) return Optional.empty();
-        var text = lines[line - 1];
-        if (text == null) return Optional.empty();
-        if (column < 1 || column > text.length() + 1) return Optional.empty();
-        int idx = Math.max(0, column - 1);
-        return IDENTIFIER
-                .matcher(text)
-                .results()
-                .filter(r -> r.start() <= idx && idx <= r.end())
-                .findFirst()
-                .map(r -> text.substring(r.start(), r.end()));
-    }
-
-    private Optional<JavaFileObject> findExternalSource(String className) {
-        if (!isJarDerived(file)) {
-            return Optional.empty();
-        }
-        var pkg = packageName(className);
-        var topLevel = topLevelName(className, pkg);
-        var relative =
-                pkg.isEmpty()
-                        ? Paths.get(topLevel + ".java")
-                        : Paths.get(pkg.replace('.', '/')).resolve(topLevel + ".java");
-
-        var jarRoot = externalJarRoot(file);
-        if (jarRoot != null) {
-            var candidate = jarRoot.resolve(relative);
-            if (Files.exists(candidate)) {
-                return Optional.of(new SourceFileObject(candidate));
-            }
-        }
-
-        return Optional.empty();
-    }
-
-    private boolean isJarDerived(Path path) {
-        var uri = path.toUri().toString();
-        if (FileStore.isExternalUri(uri)) {
-            return true;
-        }
-        // FileStore intentionally whitelists extracted jar sources under jls-sources as “internal”.
-        // For navigation we still want jar-aware behavior, so detect that temp cache directly.
-        return path.toString().replace('\\', '/').contains("/jls-sources/");
-    }
-
-    private Path externalJarRoot(Path path) {
-        var normalized = path.toString().replace('\\', '/');
-        var marker = "/jls-sources/";
-        var idx = normalized.indexOf(marker);
-        if (idx == -1) return null;
-        var next = normalized.indexOf('/', idx + marker.length());
-        if (next == -1) return null;
-        return Paths.get(normalized.substring(0, next));
-    }
-
-    private static final Pattern PACKAGE_EXTRACTOR =
-            Pattern.compile("^([a-z][_a-zA-Z0-9]*\\.)*[a-z][_a-zA-Z0-9]*");
-    private static final Pattern PACKAGE_LINE =
-            Pattern.compile("(?m)^\\s*package\\s+([^;\\s]+)\\s*;");
-    private static final Pattern IDENTIFIER =
-            Pattern.compile("[A-Za-z_$][A-Za-z\\d_$]*");
-
-    private String packageName(String className) {
-        var m = PACKAGE_EXTRACTOR.matcher(className);
-        if (m.find()) {
-            return m.group();
-        }
-        return "";
-    }
-
-    private String topLevelName(String className, String pkg) {
-        var start = pkg.isEmpty() ? 0 : pkg.length() + 1;
-        if (start >= className.length()) {
-            return "";
-        }
-        var remainder = className.substring(start).replace('$', '.');
-        var dot = remainder.indexOf('.');
-        return dot == -1 ? remainder : remainder.substring(0, dot);
-    }
 }
