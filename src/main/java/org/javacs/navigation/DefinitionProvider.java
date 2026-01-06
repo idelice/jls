@@ -29,34 +29,68 @@ public class DefinitionProvider {
     }
 
     public List<Location> find() {
-        var started = System.nanoTime();
+        var tStart = System.nanoTime();
+        long compileMs = 0;
+        long resolveMs = 0;
+        long remoteCompileMs = 0;
+        String kind = "unknown";
+        List<Location> result = NOT_SUPPORTED;
+
+        var compileStart = System.nanoTime();
         try (var task = compiler.compile(file)) {
+            compileMs = (System.nanoTime() - compileStart) / 1_000_000;
+            var resolveStart = System.nanoTime();
             var element = NavigationHelper.findElement(task, file, line, column);
-            if (element == null) return NOT_SUPPORTED;
-            if (element.asType().getKind() == TypeKind.ERROR) {
+            resolveMs = (System.nanoTime() - resolveStart) / 1_000_000;
+            if (element == null) {
+                kind = "no-element";
+                result = NOT_SUPPORTED;
+            } else if (element.asType().getKind() == TypeKind.ERROR) {
                 task.close();
-                return findError(element);
+                kind = "error";
+                result = findError(element);
+            } else if (NavigationHelper.isLocal(element)) {
+                kind = "local";
+                result = findDefinitions(task, element);
+            } else {
+                var className = className(element);
+                if (className.isEmpty()) {
+                    kind = "no-class";
+                    result = NOT_SUPPORTED;
+                } else {
+                    var otherFile = compiler.findAnywhere(className);
+                    if (otherFile.isEmpty()) {
+                        kind = "not-found";
+                        result = List.of();
+                    } else if (otherFile.get().toUri().equals(file.toUri())) {
+                        kind = "same-file";
+                        result = findDefinitions(task, element);
+                    } else {
+                        task.close();
+                        var remote = findRemoteDefinitions(otherFile.get());
+                        remoteCompileMs = remote.compileMs;
+                        result = remote.locations;
+                        kind = "remote";
+                    }
+                }
             }
-            // TODO instead of checking isLocal, just try to resolve the location, fall back to searching
-            if (NavigationHelper.isLocal(element)) {
-                return findDefinitions(task, element);
-            }
-            var className = className(element);
-            if (className.isEmpty()) return NOT_SUPPORTED;
-            var otherFile = compiler.findAnywhere(className);
-            if (otherFile.isEmpty()) return List.of();
-            if (otherFile.get().toUri().equals(file.toUri())) {
-                return findDefinitions(task, element);
-            }
-            task.close();
-            return findRemoteDefinitions(otherFile.get());
         } finally {
-            var elapsedMs = (System.nanoTime() - started) / 1_000_000;
-            LOG.fine(
+            var totalMs = (System.nanoTime() - tStart) / 1_000_000;
+            var size = result == null ? 0 : result.size();
+            LOG.info(
                     String.format(
-                            "Definition %s:%d:%d %dms",
-                            file.getFileName(), line, column, elapsedMs));
+                            "Definition %s:%d:%d kind=%s total=%dms compile=%dms resolve=%dms remoteCompile=%dms results=%d",
+                            file.getFileName(),
+                            line,
+                            column,
+                            kind,
+                            totalMs,
+                            compileMs,
+                            resolveMs,
+                            remoteCompileMs,
+                            size));
         }
+        return result;
     }
 
     private List<Location> findError(Element element) {
@@ -105,10 +139,13 @@ public class DefinitionProvider {
         return "";
     }
 
-    private List<Location> findRemoteDefinitions(JavaFileObject otherFile) {
+    private DefinitionResult findRemoteDefinitions(JavaFileObject otherFile) {
+        var t0 = System.nanoTime();
         try (var task = compiler.compile(List.of(new SourceFileObject(file), otherFile))) {
             var element = NavigationHelper.findElement(task, file, line, column);
-            return findDefinitions(task, element);
+            var locations = findDefinitions(task, element);
+            var compileMs = (System.nanoTime() - t0) / 1_000_000;
+            return new DefinitionResult(locations, compileMs);
         }
     }
 
@@ -124,4 +161,14 @@ public class DefinitionProvider {
     }
 
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+
+    private static final class DefinitionResult {
+        final List<Location> locations;
+        final long compileMs;
+
+        DefinitionResult(List<Location> locations, long compileMs) {
+            this.locations = locations;
+            this.compileMs = compileMs;
+        }
+    }
 }

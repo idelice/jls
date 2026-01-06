@@ -198,6 +198,18 @@ public class FileStore {
         return isJavaFile(file) && javaSources.containsKey(file);
     }
 
+    /**
+     * Returns true when the given path lives inside one of the active workspace roots.
+     * This helps distinguish user-owned sources from extracted library sources
+     * (for example, temp `jls-sources` directories created from jars).
+     */
+    public static synchronized boolean isWorkspacePath(Path file) {
+        var normalized = file.toAbsolutePath().normalize();
+        // Most installations use a single workspace root today, but keep support for multiple by
+        // checking prefixes. This remains cheap because workspaceRoots is small.
+        return workspaceRoots.stream().anyMatch(normalized::startsWith);
+    }
+
     public static synchronized Instant modified(Path file) {
         // If file is open, use last in-memory modification time
         if (activeDocuments.containsKey(file)) {

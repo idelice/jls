@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
@@ -55,6 +56,7 @@ class JavaLanguageServer extends LanguageServer {
     private CodeActionConfig codeActionConfig = CodeActionConfig.defaults();
     private final Object progressToken = "jls-startup";
     private String progressTitle = "";
+    private final AtomicLong lintRunCounter = new AtomicLong();
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -77,12 +79,29 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     void lint(Collection<Path> files) {
+        lint(files, "unspecified");
+    }
+
+    void lint(Collection<Path> files, String reason) {
         if (files.isEmpty()) return;
-        LOG.info("Lint " + files.size() + " files...");
+        var runId = lintRunCounter.incrementAndGet();
+        var sample =
+                files.stream()
+                        .limit(3)
+                        .map(Path::getFileName)
+                        .map(Path::toString)
+                        .toList();
+        LOG.fine(
+                String.format(
+                        "Lint[%d] (%s) files=%d sample=%s",
+                        runId, reason, files.size(), sample));
         var started = Instant.now();
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
             var compiled = Instant.now();
-            LOG.info("...compiled in " + Duration.between(started, compiled).toMillis() + " ms");
+            LOG.fine(
+                    String.format(
+                            "Lint[%d] compiled in %d ms",
+                            runId, Duration.between(started, compiled).toMillis()));
             if (diagnosticsConfig.enabled) {
                 for (var errs : new ErrorProvider(task, diagnosticsConfig.unusedImportsSeverity).errors()) {
                     client.publishDiagnostics(errs);
@@ -98,11 +117,14 @@ class JavaLanguageServer extends LanguageServer {
             //     client.customNotification("java/colors", GSON.toJsonTree(colors));
             // }
             var published = Instant.now();
-            LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
+            LOG.fine(
+                    String.format(
+                            "Lint[%d] published in %d ms",
+                            runId, Duration.between(started, published).toMillis()));
         } catch (AssertionError e) {
-            LOG.log(Level.SEVERE, "Lint failed with compiler assertion", e);
+            LOG.log(Level.SEVERE, "Lint failed with compiler assertion (run " + runId + ")", e);
         } catch (RuntimeException e) {
-            LOG.log(Level.SEVERE, "Lint failed", e);
+            LOG.log(Level.SEVERE, "Lint failed (run " + runId + ")", e);
         }
     }
 
@@ -612,11 +634,13 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
+        var providerStarted = System.nanoTime();
         var found = new DefinitionProvider(compiler(), file, line, column).find();
+        var providerMs = (System.nanoTime() - providerStarted) / 1_000_000;
         LOG.info(
                 String.format(
-                        "Goto definition took %d ms for %s:%d:%d",
-                        (System.nanoTime() - started) / 1_000_000, file.getFileName(), line, column));
+                        "Goto definition took %d ms total (provider=%d ms) for %s:%d:%d",
+                        (System.nanoTime() - started) / 1_000_000, providerMs, file.getFileName(), line, column));
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -630,11 +654,13 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
+        var providerStarted = System.nanoTime();
         var found = new ReferenceProvider(compiler(), file, line, column).find();
+        var providerMs = (System.nanoTime() - providerStarted) / 1_000_000;
         LOG.info(
                 String.format(
-                        "Find references took %d ms for %s:%d:%d",
-                        (System.nanoTime() - started) / 1_000_000, file.getFileName(), line, column));
+                        "Find references took %d ms total (provider=%d ms) for %s:%d:%d",
+                        (System.nanoTime() - started) / 1_000_000, providerMs, file.getFileName(), line, column));
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -705,7 +731,18 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private boolean isExternalLibrary(String uri) {
-        return uri.startsWith("jar:") || uri.startsWith("jrt:");
+        if (uri.startsWith("jar:") || uri.startsWith("jrt:")) {
+            return true;
+        }
+        try {
+            var path = Paths.get(new URI(uri));
+            // Treat anything outside the workspace roots as external (e.g., extracted jar sources).
+            return !FileStore.isWorkspacePath(path);
+        } catch (Exception e) {
+            // If we can't parse the URI, err on the side of not sending lenses/hints.
+            LOG.log(Level.FINE, "Failed to parse uri for external check: " + uri, e);
+            return true;
+        }
     }
 
     @Override
@@ -872,7 +909,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         compiler.clearCachedModified();
-        lint(referencePaths);
+        lint(referencePaths, "removeClass");
     }
 
     private boolean uncheckedChanges = false;
@@ -932,7 +969,8 @@ class JavaLanguageServer extends LanguageServer {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             var file = Paths.get(params.textDocument.uri);
             // Synchronous lint for the saved file only (keep UI responsive).
-            lint(List.of(file));
+            LOG.info("Lint (foreground) saved file: " + file.getFileName());
+            lint(List.of(file), "save-foreground");
 
             // Schedule dependents in background so they don't block the main thread.
             lintExecutor.submit(
@@ -949,7 +987,13 @@ class JavaLanguageServer extends LanguageServer {
                             LOG.log(Level.WARNING, "Failed to compute dependent files for " + file, e);
                         }
                         if (!dependents.isEmpty()) {
-                            lint(dependents);
+                            LOG.info(
+                                    String.format(
+                                            "Lint (background) dependents of %s: %d files",
+                                            file.getFileName(), dependents.size()));
+                            lint(dependents, "save-dependents");
+                        } else {
+                            LOG.fine("Lint (background) no dependents for " + file.getFileName());
                         }
                     });
         }
