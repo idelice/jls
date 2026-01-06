@@ -210,6 +210,32 @@ public class FileStore {
         return workspaceRoots.stream().anyMatch(normalized::startsWith);
     }
 
+    /**
+     * Returns true if the given URI string represents an external (non-workspace) source.
+     * Treats jar:/jrt: as external and any file path outside workspace roots as external.
+     */
+    public static boolean isExternalUri(String uri) {
+        try {
+            if (uri.startsWith("jar:") || uri.startsWith("jrt:")) {
+                return true;
+            }
+            var parsed = new java.net.URI(uri);
+            if (!"file".equalsIgnoreCase(parsed.getScheme())) {
+                return true;
+            }
+            var path = Path.of(parsed);
+            // Treat extracted jar sources (jls-sources temp cache) as internal so navigation inside jars works.
+            var pathStr = path.toString().replace('\\', '/');
+            if (pathStr.contains("/jls-sources")) {
+                return false;
+            }
+            return !isWorkspacePath(path);
+        } catch (Exception e) {
+            // If parsing fails, err on the side of treating it as external.
+            return true;
+        }
+    }
+
     public static synchronized Instant modified(Path file) {
         // If file is open, use last in-memory modification time
         if (activeDocuments.containsKey(file)) {
