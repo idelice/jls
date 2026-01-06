@@ -69,9 +69,9 @@ public final class LombokSyntheticMembers {
     private static boolean hasWith(TypeElement type) {
         for (var ann : type.getAnnotationMirrors()) {
             var qname = ann.getAnnotationType().toString();
-            if (qname.equals("lombok.With") || qname.equals("lombok.Value") || qname.equals("lombok.Data")) {
-                return true;
-            }
+            if (qname.equals("lombok.With")) return true;
+            if (qname.equals("lombok.Wither")) return true; // legacy Lombok
+            if (qname.equals("lombok.Value")) return true; // Lombok generates withers for @Value
         }
         return false;
     }

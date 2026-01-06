@@ -586,6 +586,7 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
         if (!featuresConfig.inlayHints) return Optional.of(List.of());
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
+        if (isExternalLibrary(params.textDocument.uri.toString())) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
         try (var task = compiler().compile(file)) {
             var range = params != null ? params.range : null;
@@ -607,10 +608,15 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<List<Location>> gotoDefinition(TextDocumentPositionParams position) {
         if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        var started = System.nanoTime();
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         var found = new DefinitionProvider(compiler(), file, line, column).find();
+        LOG.info(
+                String.format(
+                        "Goto definition took %d ms for %s:%d:%d",
+                        (System.nanoTime() - started) / 1_000_000, file.getFileName(), line, column));
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -620,10 +626,15 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<List<Location>> findReferences(ReferenceParams position) {
         if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        var started = System.nanoTime();
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         var found = new ReferenceProvider(compiler(), file, line, column).find();
+        LOG.info(
+                String.format(
+                        "Find references took %d ms for %s:%d:%d",
+                        (System.nanoTime() - started) / 1_000_000, file.getFileName(), line, column));
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -640,6 +651,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
+        if (isExternalLibrary(params.textDocument.uri.toString())) return List.of();
         var file = Paths.get(params.textDocument.uri);
         var task = compiler().parse(file);
         var lenses = CodeLensProvider.find(task);
@@ -690,6 +702,10 @@ class JavaLanguageServer extends LanguageServer {
             count += found;
         }
         return count;
+    }
+
+    private boolean isExternalLibrary(String uri) {
+        return uri.startsWith("jar:") || uri.startsWith("jrt:");
     }
 
     @Override
@@ -861,6 +877,12 @@ class JavaLanguageServer extends LanguageServer {
 
     private boolean uncheckedChanges = false;
     private Path lastEdited = Paths.get("");
+    private final java.util.concurrent.ExecutorService lintExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                var t = new Thread(r, "jls-lint-bg");
+                t.setDaemon(true);
+                return t;
+            });
     private static final long LINT_IDLE_DEBOUNCE_MS = 0; // lint only on save
 
     @Override
@@ -909,18 +931,27 @@ class JavaLanguageServer extends LanguageServer {
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             var file = Paths.get(params.textDocument.uri);
-            var targets = new HashSet<>(FileStore.activeDocuments());
-            targets.add(file);
-            try {
-                var className = compiler().fileManager.getClassName(file);
-                for (var ref : compiler().findTypeReferences(className)) {
-                    targets.add(ref);
-                }
-            } catch (RuntimeException e) {
-                LOG.log(Level.WARNING, "Failed to compute dependent files for " + file, e);
-            }
-            // Re-lint active + dependent documents
-            lint(targets);
+            // Synchronous lint for the saved file only (keep UI responsive).
+            lint(List.of(file));
+
+            // Schedule dependents in background so they don't block the main thread.
+            lintExecutor.submit(
+                    () -> {
+                        var dependents = new HashSet<Path>();
+                        try {
+                            var className = compiler().fileManager.getClassName(file);
+                            for (var ref : compiler().findTypeReferences(className)) {
+                                if (!ref.equals(file)) {
+                                    dependents.add(ref);
+                                }
+                            }
+                        } catch (RuntimeException e) {
+                            LOG.log(Level.WARNING, "Failed to compute dependent files for " + file, e);
+                        }
+                        if (!dependents.isEmpty()) {
+                            lint(dependents);
+                        }
+                    });
         }
     }
 
