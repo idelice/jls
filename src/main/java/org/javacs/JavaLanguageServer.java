@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.FileSystemNotFoundException;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -629,13 +630,23 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public Optional<List<Location>> gotoDefinition(TextDocumentPositionParams position) {
-        if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        var extractedUri = JarFileHelper.extractIfNeeded(position.textDocument.uri);
+        if (!FileStore.isJavaFile(extractedUri)) return Optional.empty();
         var started = System.nanoTime();
-        var file = Paths.get(position.textDocument.uri);
+        Path file;
+        try {
+            file = Paths.get(extractedUri);
+        } catch (FileSystemNotFoundException e) {
+            LOG.warning(String.format("Goto definition skipped: no filesystem for %s", extractedUri));
+            return Optional.empty();
+        } catch (IllegalArgumentException e) {
+            LOG.warning(String.format("Goto definition skipped: invalid URI %s", extractedUri));
+            return Optional.empty();
+        }
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         var providerStarted = System.nanoTime();
-        var found = new DefinitionProvider(compiler(), file, line, column).find();
+        var found = DefinitionProvider.fromUri(compiler(), extractedUri, line, column).find();
         var providerMs = (System.nanoTime() - providerStarted) / 1_000_000;
         LOG.info(
                 String.format(

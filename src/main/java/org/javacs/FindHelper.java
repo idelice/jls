@@ -180,11 +180,13 @@ public class FindHelper {
         if (end < start) end = start;
         var lines = target.getCompilationUnit().getLineMap();
         var startLine = (int) lines.getLineNumber(start);
-        var startColumn = (int) lines.getColumnNumber(start);
-        var startPos = new Position(startLine - 1, startColumn - 1);
+        var startLineStart = (int) lines.getStartPosition(startLine);
+        var startColumn = Math.max(0, start - startLineStart);
+        var startPos = new Position(startLine - 1, startColumn);
         var endLine = (int) lines.getLineNumber(end);
-        var endColumn = (int) lines.getColumnNumber(end);
-        var endPos = new Position(endLine - 1, endColumn - 1);
+        var endLineStart = (int) lines.getStartPosition(endLine);
+        var endColumn = Math.max(0, end - endLineStart);
+        var endPos = new Position(endLine - 1, endColumn);
         var range = new Range(startPos, endPos);
         var uri = target.getCompilationUnit().getSourceFile().toUri();
         return new Location(JarFileHelper.extractIfNeeded(uri), range);

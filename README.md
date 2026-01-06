@@ -17,6 +17,8 @@ This fork keeps the original behavior while adding practical improvements for da
 - Completion prioritizes already-imported types.
 - Optional timing/debug logs via `~/.config/jls/logging.properties`.
 - Unused import warnings in diagnostics.
+- Improved navigation for JDK sources and extracted jar sources (src.zip / source jars).
+- More accurate LSP ranges for tabs in reference/definition locations.
 - Inlay hints for parameter names (configurable).
 - Configurable cache directory via init options.
 

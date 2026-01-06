@@ -13,7 +13,9 @@ class NavigationHelper {
         for (var root : task.roots) {
             if (root.getSourceFile().toUri().equals(file.toUri())) {
                 var trees = Trees.instance(task.task);
-                var cursor = root.getLineMap().getPosition(line, column);
+                var lineMap = root.getLineMap();
+                var lineStart = lineMap.getStartPosition(line);
+                var cursor = lineStart + Math.max(0, column - 1);
                 var path = new FindNameAt(task).scan(root, cursor);
                 if (path == null) return null;
                 return trees.getElement(path);
