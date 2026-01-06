@@ -165,6 +165,19 @@ public class FindHelper {
             start = (int) pos.getStartPosition(comp, leaf);
             end = (int) pos.getEndPosition(comp, leaf);
         }
+        // Guard against invalid ranges (can happen with synthetic/trimmed sources).
+        int len = 0;
+        try {
+            CharSequence contents = target.getCompilationUnit().getSourceFile().getCharContent(true);
+            len = contents.length();
+        } catch (IOException e) {
+            // ignore, len stays 0
+        }
+        if (start < 0) start = 0;
+        if (end < 0) end = 0;
+        if (start > len) start = len;
+        if (end > len) end = len;
+        if (end < start) end = start;
         var lines = target.getCompilationUnit().getLineMap();
         var startLine = (int) lines.getLineNumber(start);
         var startColumn = (int) lines.getColumnNumber(start);
