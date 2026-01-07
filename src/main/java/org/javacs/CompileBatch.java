@@ -33,8 +33,16 @@ class CompileBatch implements AutoCloseable {
     final List<CompilationUnitTree> roots;
 
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
+        this(parent, parent.compiler, parent.fileManager, files);
+    }
+
+    CompileBatch(
+            JavaCompilerService parent,
+            ReusableCompiler compiler,
+            JavaFileManager fileManager,
+            Collection<? extends JavaFileObject> files) {
         this.parent = parent;
-        this.borrow = batchTask(parent, files);
+        this.borrow = batchTask(parent, compiler, fileManager, files);
         boolean success = false;
         try {
             this.task = borrow.task;
@@ -218,11 +226,14 @@ class CompileBatch implements AutoCloseable {
     }
 
     private static ReusableCompiler.Borrow batchTask(
-            JavaCompilerService parent, Collection<? extends JavaFileObject> sources) {
+            JavaCompilerService parent,
+            ReusableCompiler compiler,
+            JavaFileManager fileManager,
+            Collection<? extends JavaFileObject> sources) {
         parent.diags.clear();
         var options = options(parent.classPath, parent.addExports);
         LOG.fine("Javac options: " + options);
-        return parent.compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
+        return compiler.getTask(fileManager, parent.diags::add, options, List.of(), sources);
     }
 
     /** Combine source path or class path entries using the system separator, for example ':' in unix */

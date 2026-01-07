@@ -21,6 +21,8 @@ class JavaCompilerService implements CompilerProvider {
     // Lightweight compiler reused for completion (-proc:none) to avoid per-request init overhead.
     // reuse enabled because completion options are stable (-proc:none).
     private final ReusableCompiler completionCompiler = new ReusableCompiler(false /*disableReuse*/);
+    private final NavigationCompileCache navigationResolveCache = new NavigationCompileCache();
+    private final NavigationCompileCache navigationBatchCache = new NavigationCompileCache();
     private final Object completionLock = new Object();
     final Docs docs;
     final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
@@ -29,6 +31,8 @@ class JavaCompilerService implements CompilerProvider {
     // Use the same file manager for multiple tasks, so we don't repeatedly re-compile the same files
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
+    private final SourceFileManager navigationResolveFileManager;
+    private final SourceFileManager navigationBatchFileManager;
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports) {
         var cp = new LinkedHashSet<Path>();
@@ -74,6 +78,8 @@ class JavaCompilerService implements CompilerProvider {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+        this.navigationResolveFileManager = newNavigationFileManager(cp, "nav-resolve");
+        this.navigationBatchFileManager = newNavigationFileManager(cp, "nav-batch");
     }
 
     @Override
@@ -122,6 +128,25 @@ class JavaCompilerService implements CompilerProvider {
                 fm.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourceRoots);
             }
             var classOutput = Files.createTempDirectory("jls-classes-");
+            fm.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(classOutput));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return fm;
+    }
+
+    private SourceFileManager newNavigationFileManager(Set<Path> cp, String suffix) {
+        var fm = new SourceFileManager();
+        try {
+            fm.setLocationFromPaths(StandardLocation.CLASS_PATH, cp);
+            if (LombokSupport.isEnabled()) {
+                fm.setLocationFromPaths(StandardLocation.ANNOTATION_PROCESSOR_PATH, cp);
+            }
+            var sourceRoots = FileStore.sourceRoots();
+            if (!sourceRoots.isEmpty()) {
+                fm.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourceRoots);
+            }
+            var classOutput = Files.createTempDirectory("jls-classes-" + suffix + "-");
             fm.setLocationFromPaths(StandardLocation.CLASS_OUTPUT, List.of(classOutput));
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -586,26 +611,13 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public CompileTask compileForNavigation(
             Path activeFile, Collection<? extends JavaFileObject> sources) {
-        var activeRoots = selectActiveSourceRoots(sources);
-        var started = System.nanoTime();
-        if (!activeRoots.isEmpty()) {
-            FileStore.setActiveSourceRoots(activeRoots);
-        }
-        try {
-            var expanded = maybeExpandSourcesForNavigation(activeFile, sources);
-            var compile = compileBatch(expanded);
-            return new CompileTask(compile.task, compile.roots, diags, compile::close);
-        } finally {
-            FileStore.clearActiveSourceRoots();
-            if (!activeRoots.isEmpty()) {
-                LOG.fine(
-                        String.format(
-                                "Compile source roots: active=%d total=%d in %d ms",
-                                activeRoots.size(),
-                                FileStore.sourceRoots().size(),
-                                (System.nanoTime() - started) / 1_000_000));
-            }
-        }
+        return navigationResolveCache.compile(activeFile, sources, navigationResolveFileManager);
+    }
+
+    @Override
+    public CompileTask compileForNavigationBatch(
+            Path activeFile, Collection<? extends JavaFileObject> sources) {
+        return navigationBatchCache.compile(activeFile, sources, navigationBatchFileManager);
     }
 
     @Override
@@ -738,6 +750,115 @@ class JavaCompilerService implements CompilerProvider {
             return false;
         }
         return containsWord(file, "lombok");
+    }
+
+    private final class NavigationCompileCache {
+        private final ReusableCompiler compiler = new ReusableCompiler(LombokSupport.isEnabled());
+        private CompileBatch cachedCompile;
+        private Map<JavaFileObject, Long> cachedModified = new HashMap<>();
+        private long cachedWorkspaceVersion = -1;
+
+        CompileTask compile(
+                Path activeFile,
+                Collection<? extends JavaFileObject> sources,
+                SourceFileManager fileManager) {
+            var activeRoots = selectActiveSourceRoots(sources);
+            var started = System.nanoTime();
+            if (!activeRoots.isEmpty()) {
+                FileStore.setActiveSourceRoots(activeRoots);
+            }
+            try {
+                var expanded = maybeExpandSourcesForNavigation(activeFile, sources);
+                var compile = compileBatch(expanded, fileManager);
+                return new CompileTask(compile.task, compile.roots, diags, compile::close);
+            } finally {
+                FileStore.clearActiveSourceRoots();
+                if (!activeRoots.isEmpty()) {
+                    LOG.fine(
+                            String.format(
+                                    "Compile source roots: active=%d total=%d in %d ms",
+                                    activeRoots.size(),
+                                    FileStore.sourceRoots().size(),
+                                    (System.nanoTime() - started) / 1_000_000));
+                }
+            }
+        }
+
+        private CompileBatch compileBatch(
+                Collection<? extends JavaFileObject> sources, SourceFileManager fileManager) {
+            var uniqueSources = deduplicateSources(sources);
+            if (cachedCompile == null) {
+                if (uniqueSources.isEmpty()) {
+                    throw new RuntimeException("empty sources");
+                }
+                loadCompile(uniqueSources, fileManager);
+            } else if (needsCompile(uniqueSources)) {
+                loadCompile(uniqueSources, fileManager);
+            } else {
+                LOG.info("...using cached navigation compile");
+            }
+            return cachedCompile;
+        }
+
+        private boolean needsCompile(Collection<? extends JavaFileObject> sources) {
+            var version = FileStore.workspaceVersion();
+            if (cachedWorkspaceVersion != version) {
+                return true;
+            }
+            if (cachedModified.size() != sources.size()) {
+                return true;
+            }
+            for (var f : sources) {
+                if (!cachedModified.containsKey(f)) {
+                    return true;
+                }
+                if (f.getLastModified() != cachedModified.get(f)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void loadCompile(
+                Collection<? extends JavaFileObject> sources, SourceFileManager fileManager) {
+            if (cachedCompile != null) {
+                if (!cachedCompile.closed) {
+                    throw new RuntimeException("Compiler is still in-use!");
+                }
+                cachedCompile.borrow.close();
+            }
+            cachedCompile = null;
+            cachedCompile = doCompile(sources, fileManager);
+            cachedModified = new HashMap<>();
+            cachedWorkspaceVersion = FileStore.workspaceVersion();
+            for (var f : sources) {
+                cachedModified.put(f, f.getLastModified());
+            }
+        }
+
+        private CompileBatch doCompile(
+                Collection<? extends JavaFileObject> sources, SourceFileManager fileManager) {
+            if (sources.isEmpty()) throw new RuntimeException("empty sources");
+            var firstAttempt = new CompileBatch(JavaCompilerService.this, compiler, fileManager, sources);
+            Set<Path> addFiles;
+            try {
+                addFiles = firstAttempt.needsAdditionalSources();
+            } catch (RuntimeException e) {
+                firstAttempt.close();
+                firstAttempt.borrow.close();
+                throw e;
+            }
+            if (addFiles.isEmpty()) return firstAttempt;
+            LOG.info("...need to recompile with " + addFiles);
+            firstAttempt.close();
+            firstAttempt.borrow.close();
+            var moreSources = new ArrayList<JavaFileObject>();
+            moreSources.addAll(sources);
+            for (var add : addFiles) {
+                moreSources.add(new SourceFileObject(add, false));
+            }
+            return new CompileBatch(JavaCompilerService.this, compiler, fileManager, deduplicateSources(moreSources));
+        }
     }
 
     private static final Logger LOG = Logger.getLogger("main");

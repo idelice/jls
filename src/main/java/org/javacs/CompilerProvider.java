@@ -46,6 +46,11 @@ public interface CompilerProvider {
         return compileForNavigation(sources);
     }
 
+    /** Compile a navigation batch optimized for candidate scans. */
+    default CompileTask compileForNavigationBatch(Path activeFile, Collection<? extends JavaFileObject> sources) {
+        return compileForNavigation(activeFile, sources);
+    }
+
     /** Compile file paths optimized for navigation. */
     default CompileTask compileForNavigation(Path... files) {
         return compileForNavigation(null, toSourceFiles(files));
@@ -71,7 +76,7 @@ public interface CompilerProvider {
             boolean pruned = pruneActiveFile != null && !candidate.equals(pruneActiveFile);
             sources.add(new SourceFileObject(candidate, pruned));
         }
-        return compileForNavigation(lombokHintFile, sources);
+        return compileForNavigationBatch(lombokHintFile, sources);
     }
 
     private static List<JavaFileObject> toSourceFiles(Path... files) {
