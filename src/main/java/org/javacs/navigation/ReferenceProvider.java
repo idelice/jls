@@ -12,7 +12,6 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -26,8 +25,7 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.FileStore;
-import org.javacs.StringSearch;
-import org.javacs.index.WorkspaceIndex;
+import org.javacs.SourceFileObject;
 import org.javacs.lsp.Location;
 
 public class ReferenceProvider {
@@ -82,15 +80,19 @@ public class ReferenceProvider {
                     memberName = field.getSimpleName().toString();
                     names.add(memberName);
                     names.addAll(accessorNames(field));
-                    var indexed = WorkspaceIndex.filesContainingAny(names);
-                    files.addAll(indexed);
                     long tCandidate1 = System.nanoTime();
                     task.close();
                     long tBatchCompile0 = System.nanoTime();
-                    try (var t = compiler.compile(files.toArray(Path[]::new))) {
+                    var candidates = files.toArray(Path[]::new);
+                    try (var t = compileCandidateBatch(candidates)) {
                         long tBatchCompile1 = System.nanoTime();
                         var target = ReferenceTarget.createForField(t, className, memberName);
                         var result = findReferences(t, target);
+                        if (result.isEmpty() && shouldFallbackToFullScan(candidates)) {
+                            try (var full = compiler.compile(candidates)) {
+                                result = findReferences(full, target);
+                            }
+                        }
                         long tEnd = System.nanoTime();
                         LOG.info(
                                 String.format(
@@ -129,6 +131,12 @@ public class ReferenceProvider {
     private List<Location> findTypeReferences(String className) {
         var files = compiler.findTypeReferences(className);
         if (files.length == 0) return List.of();
+        try (var task = compileCandidateBatch(files)) {
+            var result = findReferences(task);
+            if (!result.isEmpty() || !shouldFallbackToFullScan(files)) {
+                return result;
+            }
+        }
         try (var task = compiler.compile(files)) {
             return findReferences(task);
         }
@@ -137,9 +145,31 @@ public class ReferenceProvider {
     private List<Location> findMemberReferences(String className, String memberName) {
         var files = compiler.findMemberReferences(className, memberName);
         if (files.length == 0) return List.of();
+        try (var task = compileCandidateBatch(files)) {
+            var result = findReferences(task);
+            if (!result.isEmpty() || !shouldFallbackToFullScan(files)) {
+                return result;
+            }
+        }
         try (var task = compiler.compile(files)) {
             return findReferences(task);
         }
+    }
+
+    private CompileTask compileCandidateBatch(Path[] files) {
+        if (files == null || files.length == 0) {
+            throw new RuntimeException("empty sources");
+        }
+        var sources = new ArrayList<javax.tools.JavaFileObject>();
+        for (var candidate : files) {
+            boolean pruned = !candidate.equals(file);
+            sources.add(new SourceFileObject(candidate, pruned));
+        }
+        return compiler.compile(sources);
+    }
+
+    private boolean shouldFallbackToFullScan(Path[] files) {
+        return files != null && files.length > 1;
     }
 
     private List<Location> findReferences(CompileTask task) {
