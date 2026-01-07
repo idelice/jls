@@ -794,26 +794,29 @@ class JavaCompilerService implements CompilerProvider {
                 Path activeFile,
                 Collection<? extends JavaFileObject> sources,
                 SourceFileManager fileManager) {
-            var activeRoots = selectActiveSourceRoots(sources);
-            var started = System.nanoTime();
-            if (!activeRoots.isEmpty()) {
-                FileStore.setActiveSourceRoots(activeRoots);
-            }
-            try {
-                var expanded = maybeExpandSourcesForNavigation(activeFile, sources);
-                var compile = compileBatch(expanded, fileManager);
-                return new CompileTask(compile.task, compile.roots, diags, compile::close);
-            } finally {
-                FileStore.clearActiveSourceRoots();
-                if (!activeRoots.isEmpty()) {
-                    LOG.fine(
-                            String.format(
-                                    "Compile source roots: active=%d total=%d in %d ms",
-                                    activeRoots.size(),
-                                    FileStore.sourceRoots().size(),
-                                    (System.nanoTime() - started) / 1_000_000));
-                }
-            }
+            return FileStore.withDiskContents(
+                    () -> {
+                        var activeRoots = selectActiveSourceRoots(sources);
+                        var started = System.nanoTime();
+                        if (!activeRoots.isEmpty()) {
+                            FileStore.setActiveSourceRoots(activeRoots);
+                        }
+                        try {
+                            var expanded = maybeExpandSourcesForNavigation(activeFile, sources);
+                            var compile = compileBatch(expanded, fileManager);
+                            return new CompileTask(compile.task, compile.roots, diags, compile::close);
+                        } finally {
+                            FileStore.clearActiveSourceRoots();
+                            if (!activeRoots.isEmpty()) {
+                                LOG.fine(
+                                        String.format(
+                                                "Compile source roots: active=%d total=%d in %d ms",
+                                                activeRoots.size(),
+                                                FileStore.sourceRoots().size(),
+                                                (System.nanoTime() - started) / 1_000_000));
+                            }
+                        }
+                    });
         }
 
         private CompileBatch compileBatch(

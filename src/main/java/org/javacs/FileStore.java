@@ -381,7 +381,7 @@ public class FileStore {
         if (!isJavaFile(file)) {
             throw new RuntimeException(file + " is not a java file");
         }
-        if (activeDocuments.containsKey(file)) {
+        if (!forceDiskContents.get() && activeDocuments.containsKey(file)) {
             return activeDocuments.get(file).content;
         }
         try {
@@ -396,7 +396,7 @@ public class FileStore {
 
     static InputStream inputStream(Path file) {
         var uri = file.toUri();
-        if (activeDocuments.containsKey(uri)) {
+        if (!forceDiskContents.get() && activeDocuments.containsKey(uri)) {
             var string = activeDocuments.get(uri).content;
             var bytes = string.getBytes();
             return new ByteArrayInputStream(bytes);
@@ -414,7 +414,7 @@ public class FileStore {
 
     static BufferedReader bufferedReader(Path file) {
         var uri = file.toUri();
-        if (activeDocuments.containsKey(uri)) {
+        if (!forceDiskContents.get() && activeDocuments.containsKey(uri)) {
             var string = activeDocuments.get(uri).content;
             return new BufferedReader(new StringReader(string));
         }
@@ -553,6 +553,25 @@ public class FileStore {
     }
 
     private static final Logger LOG = Logger.getLogger("main");
+    private static final ThreadLocal<Boolean> forceDiskContents = ThreadLocal.withInitial(() -> false);
+
+    static <T> T withDiskContents(java.util.function.Supplier<T> action) {
+        var prev = forceDiskContents.get();
+        forceDiskContents.set(true);
+        try {
+            return action.get();
+        } finally {
+            forceDiskContents.set(prev);
+        }
+    }
+
+    static void withDiskContents(Runnable action) {
+        withDiskContents(
+                () -> {
+                    action.run();
+                    return null;
+                });
+    }
 
     static synchronized long workspaceVersion() {
         return workspaceVersion;
