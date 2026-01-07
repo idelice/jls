@@ -81,10 +81,8 @@ public class ReferenceProvider {
                     memberName = field.getSimpleName().toString();
                     names.add(memberName);
                     names.addAll(accessorNames(field));
-                    for (var name : names) {
-                        for (var candidate : compiler.findMemberReferences(className, name)) {
-                            files.add(candidate);
-                        }
+                    for (var candidate : compiler.findMemberCandidates(className)) {
+                        files.add(candidate);
                     }
                     long tCandidate1 = System.nanoTime();
                     task.close();
@@ -152,7 +150,7 @@ public class ReferenceProvider {
     }
 
     private List<Location> findMemberReferences(String className, String memberName) {
-        var files = compiler.findMemberReferences(className, memberName);
+        var files = compiler.findMemberCandidates(className);
         if (files.length == 0) return List.of();
         var lombokHintFile = classDeclarationFile(className);
         if (lombokHintFile == null) {

@@ -28,6 +28,8 @@ public interface CompilerProvider {
 
     Path[] findMemberReferences(String className, String memberName);
 
+    Path[] findMemberCandidates(String className);
+
     ParseTask parse(Path file);
 
     ParseTask parse(JavaFileObject file);

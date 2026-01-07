@@ -208,6 +208,7 @@ class JavaCompilerService implements CompilerProvider {
     private long cachedReferenceVersion = -1;
     private final Map<String, Path[]> cachedTypeReferences = new HashMap<>();
     private final Map<String, Path[]> cachedMemberReferences = new HashMap<>();
+    private final Map<String, Path[]> cachedMemberCandidates = new HashMap<>();
     private long cachedLombokVersion = -1;
     private final List<Path> cachedLombokFiles = new ArrayList<>();
 
@@ -560,6 +561,37 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     @Override
+    public Path[] findMemberCandidates(String className) {
+        refreshReferenceCacheIfNeeded();
+        var cached = cachedMemberCandidates.get(className);
+        if (cached != null) {
+            return cached;
+        }
+        var started = System.nanoTime();
+        var candidates = new LinkedHashSet<Path>();
+        var packageName = packageName(className);
+        if (!packageName.isEmpty()) {
+            candidates.addAll(FileStore.list(packageName));
+        }
+        var simpleName = simpleName(className);
+        for (var f : WorkspaceIndex.filesContaining(simpleName)) {
+            if (containsImport(f, className)) {
+                candidates.add(f);
+            }
+        }
+        var result = candidates.toArray(Path[]::new);
+        cachedMemberCandidates.put(className, result);
+        LOG.fine(
+                String.format(
+                        "Member candidates for %s: %d files in %d ms (workspace files=%d)",
+                        className,
+                        result.length,
+                        (System.nanoTime() - started) / 1_000_000,
+                        FileStore.all().size()));
+        return result;
+    }
+
+    @Override
     public ParseTask parse(Path file) {
         var parser = Parser.parseFile(file);
         return new ParseTask(parser.task, parser.root);
@@ -869,6 +901,7 @@ class JavaCompilerService implements CompilerProvider {
             cachedReferenceVersion = version;
             cachedTypeReferences.clear();
             cachedMemberReferences.clear();
+            cachedMemberCandidates.clear();
         }
     }
 
