@@ -584,14 +584,15 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     @Override
-    public CompileTask compileForNavigation(Collection<? extends JavaFileObject> sources) {
+    public CompileTask compileForNavigation(
+            Path activeFile, Collection<? extends JavaFileObject> sources) {
         var activeRoots = selectActiveSourceRoots(sources);
         var started = System.nanoTime();
         if (!activeRoots.isEmpty()) {
             FileStore.setActiveSourceRoots(activeRoots);
         }
         try {
-            var expanded = maybeExpandSourcesForNavigation(sources);
+            var expanded = maybeExpandSourcesForNavigation(activeFile, sources);
             var compile = compileBatch(expanded);
             return new CompileTask(compile.task, compile.roots, diags, compile::close);
         } finally {
@@ -605,6 +606,11 @@ class JavaCompilerService implements CompilerProvider {
                                 (System.nanoTime() - started) / 1_000_000));
             }
         }
+    }
+
+    @Override
+    public CompileTask compileForNavigation(Collection<? extends JavaFileObject> sources) {
+        return compileForNavigation(null, sources);
     }
 
     private Set<Path> selectActiveSourceRoots(Collection<? extends JavaFileObject> sources) {
@@ -707,21 +713,31 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private Collection<? extends JavaFileObject> maybeExpandSourcesForNavigation(
-            Collection<? extends JavaFileObject> sources) {
+            Path activeFile, Collection<? extends JavaFileObject> sources) {
         if (!LombokSupport.isEnabled()) {
             return sources;
         }
-        if (!containsLombokInSources(sources)) {
+        if (!containsLombokInSources(activeFile, sources)) {
             return sources;
         }
         return maybeExpandSourcesForLombok(sources);
     }
 
-    private boolean containsLombokInSources(Collection<? extends JavaFileObject> sources) {
+    private boolean containsLombokInSources(Path activeFile, Collection<? extends JavaFileObject> sources) {
+        if (activeFile != null) {
+            return containsWord(activeFile, "lombok");
+        }
         return sources.stream()
                 .map(this::sourcePath)
                 .filter(path -> path != null)
                 .anyMatch(path -> containsWord(path, "lombok"));
+    }
+
+    boolean containsLombok(Path file) {
+        if (file == null) {
+            return false;
+        }
+        return containsWord(file, "lombok");
     }
 
     private static final Logger LOG = Logger.getLogger("main");

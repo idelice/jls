@@ -92,8 +92,13 @@ public class ReferenceProvider {
                     var candidates = files.toArray(Path[]::new);
                     var memberNameFinal = memberName;
                     var namesFinal = List.copyOf(names);
+                    var lombokHintFile = classDeclarationFile(className);
+                    if (lombokHintFile == null) {
+                        lombokHintFile = file;
+                    }
                     return compiler.runCandidatesWithFallback(
                             file,
+                            lombokHintFile,
                             candidates,
                             t -> {
                                 long tBatchCompile1 = System.nanoTime();
@@ -138,15 +143,23 @@ public class ReferenceProvider {
     private List<Location> findTypeReferences(String className) {
         var files = compiler.findTypeReferences(className);
         if (files.length == 0) return List.of();
+        var lombokHintFile = classDeclarationFile(className);
+        if (lombokHintFile == null) {
+            lombokHintFile = file;
+        }
         return compiler.runCandidatesWithFallback(
-                file, files, this::findReferences, shouldFallback);
+                file, lombokHintFile, files, this::findReferences, shouldFallback);
     }
 
     private List<Location> findMemberReferences(String className, String memberName) {
         var files = compiler.findMemberReferences(className, memberName);
         if (files.length == 0) return List.of();
+        var lombokHintFile = classDeclarationFile(className);
+        if (lombokHintFile == null) {
+            lombokHintFile = file;
+        }
         return compiler.runCandidatesWithFallback(
-                file, files, this::findReferences, shouldFallback);
+                file, lombokHintFile, files, this::findReferences, shouldFallback);
     }
 
     private final BiPredicate<List<Location>, Path[]> shouldFallback =
@@ -199,6 +212,14 @@ public class ReferenceProvider {
             }
         }
         return locations;
+    }
+
+    private Path classDeclarationFile(String className) {
+        var path = compiler.findTypeDeclaration(className);
+        if (path == null || path.equals(CompilerProvider.NOT_FOUND)) {
+            return null;
+        }
+        return path;
     }
 
     private static boolean isSpuriousGeneratedAccessorLocation(

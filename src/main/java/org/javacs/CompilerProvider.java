@@ -41,26 +41,45 @@ public interface CompilerProvider {
         return compile(sources);
     }
 
+    /** Compile a candidate set optimized for navigation, with a hint about the active file. */
+    default CompileTask compileForNavigation(Path activeFile, Collection<? extends JavaFileObject> sources) {
+        return compileForNavigation(sources);
+    }
+
     /** Compile file paths optimized for navigation. */
     default CompileTask compileForNavigation(Path... files) {
-        var sources = new java.util.ArrayList<JavaFileObject>();
-        for (var f : files) {
-            sources.add(new SourceFileObject(f));
-        }
-        return compileForNavigation(sources);
+        return compileForNavigation(null, toSourceFiles(files));
+    }
+
+    /** Compile file paths optimized for navigation, with a hint about the active file. */
+    default CompileTask compileForNavigation(Path activeFile, Path... files) {
+        return compileForNavigation(activeFile, toSourceFiles(files));
     }
 
     /** Compile a candidate set, pruning non-active files by default. */
     default CompileTask compileCandidates(Path activeFile, Path[] candidates) {
+        return compileCandidates(activeFile, activeFile, candidates);
+    }
+
+    /** Compile a candidate set with separate pruning and Lombok hints. */
+    default CompileTask compileCandidates(Path pruneActiveFile, Path lombokHintFile, Path[] candidates) {
         if (candidates == null || candidates.length == 0) {
             throw new RuntimeException("empty sources");
         }
         var sources = new java.util.ArrayList<JavaFileObject>();
         for (var candidate : candidates) {
-            boolean pruned = activeFile != null && !candidate.equals(activeFile);
+            boolean pruned = pruneActiveFile != null && !candidate.equals(pruneActiveFile);
             sources.add(new SourceFileObject(candidate, pruned));
         }
-        return compileForNavigation(sources);
+        return compileForNavigation(lombokHintFile, sources);
+    }
+
+    private static List<JavaFileObject> toSourceFiles(Path... files) {
+        var sources = new java.util.ArrayList<JavaFileObject>();
+        for (var f : files) {
+            sources.add(new SourceFileObject(f));
+        }
+        return sources;
     }
 
     /** Run on a pruned candidate batch, with optional full-compile fallback. */
@@ -69,7 +88,17 @@ public interface CompilerProvider {
             Path[] candidates,
             Function<CompileTask, T> action,
             BiPredicate<T, Path[]> shouldFallback) {
-        try (var task = compileCandidates(activeFile, candidates)) {
+        return runCandidatesWithFallback(activeFile, activeFile, candidates, action, shouldFallback);
+    }
+
+    /** Run on a pruned candidate batch with Lombok hint, with optional full-compile fallback. */
+    default <T> T runCandidatesWithFallback(
+            Path pruneActiveFile,
+            Path lombokHintFile,
+            Path[] candidates,
+            Function<CompileTask, T> action,
+            BiPredicate<T, Path[]> shouldFallback) {
+        try (var task = compileCandidates(pruneActiveFile, lombokHintFile, candidates)) {
             var result = action.apply(task);
             if (shouldFallback == null || !shouldFallback.test(result, candidates)) {
                 return result;
