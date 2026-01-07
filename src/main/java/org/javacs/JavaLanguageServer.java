@@ -917,6 +917,8 @@ class JavaLanguageServer extends LanguageServer {
                 return t;
             });
     private static final long LINT_IDLE_DEBOUNCE_MS = 0; // lint only on save
+    private final java.util.concurrent.atomic.AtomicBoolean navigationPrewarmStarted =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
@@ -924,6 +926,17 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return;
         lastEdited = Paths.get(params.textDocument.uri);
         uncheckedChanges = true;
+        if (navigationPrewarmStarted.compareAndSet(false, true)) {
+            var file = Paths.get(params.textDocument.uri);
+            lintExecutor.execute(
+                    () -> {
+                        try {
+                            compiler().prewarmNavigationCaches(file);
+                        } catch (RuntimeException e) {
+                            LOG.fine("Navigation prewarm failed: " + e.getMessage());
+                        }
+                    });
+        }
     }
 
     @Override

@@ -784,13 +784,44 @@ class JavaCompilerService implements CompilerProvider {
         return containsWord(file, "lombok");
     }
 
+    void prewarmNavigationCaches(Path file) {
+        if (file == null || !FileStore.isJavaFile(file)) {
+            return;
+        }
+        var fileName = file.getFileName().toString();
+        if (!fileName.endsWith(".java")) {
+            return;
+        }
+        var simpleName = fileName.substring(0, fileName.length() - ".java".length());
+        var pkg = FileStore.packageName(file);
+        var className = (pkg == null || pkg.isEmpty()) ? simpleName : pkg + "." + simpleName;
+        try (var task = compileForNavigation(file, List.of(new SourceFileObject(file)))) {
+            // Warm resolve cache.
+        } catch (RuntimeException e) {
+            LOG.fine("Navigation resolve prewarm skipped: " + e.getMessage());
+        }
+        var candidates = findMemberCandidates(className);
+        if (candidates.length == 0) {
+            return;
+        }
+        var lombokHintFile = findTypeDeclaration(className);
+        if (lombokHintFile == null || lombokHintFile.equals(CompilerProvider.NOT_FOUND)) {
+            lombokHintFile = file;
+        }
+        try (var task = compileCandidates(file, lombokHintFile, candidates)) {
+            // Warm batch cache.
+        } catch (RuntimeException e) {
+            LOG.fine("Navigation batch prewarm skipped: " + e.getMessage());
+        }
+    }
+
     private final class NavigationCompileCache {
         private final ReusableCompiler compiler = new ReusableCompiler(LombokSupport.isEnabled());
         private CompileBatch cachedCompile;
         private Map<JavaFileObject, Long> cachedModified = new HashMap<>();
         private long cachedWorkspaceVersion = -1;
 
-        CompileTask compile(
+        synchronized CompileTask compile(
                 Path activeFile,
                 Collection<? extends JavaFileObject> sources,
                 SourceFileManager fileManager) {
