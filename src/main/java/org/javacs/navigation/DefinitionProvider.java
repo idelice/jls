@@ -119,7 +119,7 @@ public class DefinitionProvider {
             var candidates = new Path[] {file, otherPath};
             locations =
                     compiler.runCandidatesWithFallback(
-                            file,
+                            null,
                             otherPath,
                             candidates,
                             task -> {

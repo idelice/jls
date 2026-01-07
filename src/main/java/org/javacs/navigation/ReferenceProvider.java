@@ -95,7 +95,7 @@ public class ReferenceProvider {
                         lombokHintFile = file;
                     }
                     return compiler.runCandidatesWithFallback(
-                            file,
+                            null,
                             lombokHintFile,
                             candidates,
                             t -> {
@@ -146,7 +146,7 @@ public class ReferenceProvider {
             lombokHintFile = file;
         }
         return compiler.runCandidatesWithFallback(
-                file, lombokHintFile, files, this::findReferences, shouldFallback);
+                null, lombokHintFile, files, this::findReferences, shouldFallback);
     }
 
     private List<Location> findMemberReferences(String className, String memberName) {
@@ -157,7 +157,7 @@ public class ReferenceProvider {
             lombokHintFile = file;
         }
         return compiler.runCandidatesWithFallback(
-                file, lombokHintFile, files, this::findReferences, shouldFallback);
+                null, lombokHintFile, files, this::findReferences, shouldFallback);
     }
 
     private final BiPredicate<List<Location>, Path[]> shouldFallback =
