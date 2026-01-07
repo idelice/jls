@@ -583,6 +583,30 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
+    @Override
+    public CompileTask compileForNavigation(Collection<? extends JavaFileObject> sources) {
+        var activeRoots = selectActiveSourceRoots(sources);
+        var started = System.nanoTime();
+        if (!activeRoots.isEmpty()) {
+            FileStore.setActiveSourceRoots(activeRoots);
+        }
+        try {
+            var expanded = maybeExpandSourcesForNavigation(sources);
+            var compile = compileBatch(expanded);
+            return new CompileTask(compile.task, compile.roots, diags, compile::close);
+        } finally {
+            FileStore.clearActiveSourceRoots();
+            if (!activeRoots.isEmpty()) {
+                LOG.fine(
+                        String.format(
+                                "Compile source roots: active=%d total=%d in %d ms",
+                                activeRoots.size(),
+                                FileStore.sourceRoots().size(),
+                                (System.nanoTime() - started) / 1_000_000));
+            }
+        }
+    }
+
     private Set<Path> selectActiveSourceRoots(Collection<? extends JavaFileObject> sources) {
         var allRoots = FileStore.sourceRoots();
         if (allRoots.isEmpty()) {
@@ -680,6 +704,24 @@ class JavaCompilerService implements CompilerProvider {
                         "Lombok expansion computed in %d ms",
                         (System.nanoTime() - started) / 1_000_000));
         return deduplicateSources(all);
+    }
+
+    private Collection<? extends JavaFileObject> maybeExpandSourcesForNavigation(
+            Collection<? extends JavaFileObject> sources) {
+        if (!LombokSupport.isEnabled()) {
+            return sources;
+        }
+        if (!containsLombokInSources(sources)) {
+            return sources;
+        }
+        return maybeExpandSourcesForLombok(sources);
+    }
+
+    private boolean containsLombokInSources(Collection<? extends JavaFileObject> sources) {
+        return sources.stream()
+                .map(this::sourcePath)
+                .filter(path -> path != null)
+                .anyMatch(path -> containsWord(path, "lombok"));
     }
 
     private static final Logger LOG = Logger.getLogger("main");

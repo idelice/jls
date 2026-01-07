@@ -36,6 +36,20 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
+    /** Compile a candidate set optimized for navigation. */
+    default CompileTask compileForNavigation(Collection<? extends JavaFileObject> sources) {
+        return compile(sources);
+    }
+
+    /** Compile file paths optimized for navigation. */
+    default CompileTask compileForNavigation(Path... files) {
+        var sources = new java.util.ArrayList<JavaFileObject>();
+        for (var f : files) {
+            sources.add(new SourceFileObject(f));
+        }
+        return compileForNavigation(sources);
+    }
+
     /** Compile a candidate set, pruning non-active files by default. */
     default CompileTask compileCandidates(Path activeFile, Path[] candidates) {
         if (candidates == null || candidates.length == 0) {
@@ -46,7 +60,7 @@ public interface CompilerProvider {
             boolean pruned = activeFile != null && !candidate.equals(activeFile);
             sources.add(new SourceFileObject(candidate, pruned));
         }
-        return compile(sources);
+        return compileForNavigation(sources);
     }
 
     /** Run on a pruned candidate batch, with optional full-compile fallback. */

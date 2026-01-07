@@ -26,6 +26,7 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.FileStore;
+import org.javacs.SourceFileObject;
 import org.javacs.lsp.Location;
 
 public class ReferenceProvider {
@@ -46,7 +47,7 @@ public class ReferenceProvider {
     public List<Location> find() {
         long t0 = System.nanoTime();
         long tResolveCompile0 = System.nanoTime();
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileForNavigation(List.of(new SourceFileObject(file)))) {
             long tResolveCompile1 = System.nanoTime();
             var element = NavigationHelper.findElement(task, file, line, column);
             if (element == null) return NOT_SUPPORTED;

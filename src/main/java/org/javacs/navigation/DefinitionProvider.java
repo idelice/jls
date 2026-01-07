@@ -45,7 +45,7 @@ public class DefinitionProvider {
         List<Location> result = NOT_SUPPORTED;
 
         var compileStart = System.nanoTime();
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileForNavigation(List.of(new SourceFileObject(file)))) {
             compileMs = (System.nanoTime() - compileStart) / 1_000_000;
             var resolveStart = System.nanoTime();
             var element = NavigationHelper.findElement(task, file, line, column);
