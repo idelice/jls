@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiPredicate;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -25,7 +26,6 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.FileStore;
-import org.javacs.SourceFileObject;
 import org.javacs.lsp.Location;
 
 public class ReferenceProvider {
@@ -80,36 +80,42 @@ public class ReferenceProvider {
                     memberName = field.getSimpleName().toString();
                     names.add(memberName);
                     names.addAll(accessorNames(field));
+                    for (var name : names) {
+                        for (var candidate : compiler.findMemberReferences(className, name)) {
+                            files.add(candidate);
+                        }
+                    }
                     long tCandidate1 = System.nanoTime();
                     task.close();
                     long tBatchCompile0 = System.nanoTime();
                     var candidates = files.toArray(Path[]::new);
-                    try (var t = compileCandidateBatch(candidates)) {
-                        long tBatchCompile1 = System.nanoTime();
-                        var target = ReferenceTarget.createForField(t, className, memberName);
-                        var result = findReferences(t, target);
-                        if (result.isEmpty() && shouldFallbackToFullScan(candidates)) {
-                            try (var full = compiler.compile(candidates)) {
-                                result = findReferences(full, target);
-                            }
-                        }
-                        long tEnd = System.nanoTime();
-                        LOG.info(
-                                String.format(
-                                "References(field) %s:%d:%d names=%s candidates=%d workspace=%d resolveCompile=%dms candidateScan=%dms batchCompile=%dms scan=%dms total=%dms",
-                                        file.getFileName(),
-                                        line,
-                                        column,
-                                        names,
-                                        files.size(),
-                                        FileStore.all().size(),
-                                        (tResolveCompile1 - tResolveCompile0) / 1_000_000,
-                                        (tCandidate1 - tCandidate0) / 1_000_000,
-                                        (tBatchCompile1 - tBatchCompile0) / 1_000_000,
-                                        (tEnd - tBatchCompile1) / 1_000_000,
-                                        (tEnd - t0) / 1_000_000));
-                        return result;
-                    }
+                    var memberNameFinal = memberName;
+                    var namesFinal = List.copyOf(names);
+                    return compiler.runCandidatesWithFallback(
+                            file,
+                            candidates,
+                            t -> {
+                                long tBatchCompile1 = System.nanoTime();
+                                var target = ReferenceTarget.createForField(t, className, memberNameFinal);
+                                var found = findReferences(t, target);
+                                long tEnd = System.nanoTime();
+                                LOG.info(
+                                        String.format(
+                                                "References(field) %s:%d:%d names=%s candidates=%d workspace=%d resolveCompile=%dms candidateScan=%dms batchCompile=%dms scan=%dms total=%dms",
+                                                file.getFileName(),
+                                                line,
+                                                column,
+                                                namesFinal,
+                                                candidates.length,
+                                                FileStore.all().size(),
+                                                (tResolveCompile1 - tResolveCompile0) / 1_000_000,
+                                                (tCandidate1 - tCandidate0) / 1_000_000,
+                                                (tBatchCompile1 - tBatchCompile0) / 1_000_000,
+                                                (tEnd - tBatchCompile1) / 1_000_000,
+                                                (tEnd - t0) / 1_000_000));
+                                return found;
+                            },
+                            shouldFallback);
                 }
                 task.close();
                 return findMemberReferences(className, memberName);
@@ -131,46 +137,22 @@ public class ReferenceProvider {
     private List<Location> findTypeReferences(String className) {
         var files = compiler.findTypeReferences(className);
         if (files.length == 0) return List.of();
-        try (var task = compileCandidateBatch(files)) {
-            var result = findReferences(task);
-            if (!result.isEmpty() || !shouldFallbackToFullScan(files)) {
-                return result;
-            }
-        }
-        try (var task = compiler.compile(files)) {
-            return findReferences(task);
-        }
+        return compiler.runCandidatesWithFallback(
+                file, files, this::findReferences, shouldFallback);
     }
 
     private List<Location> findMemberReferences(String className, String memberName) {
         var files = compiler.findMemberReferences(className, memberName);
         if (files.length == 0) return List.of();
-        try (var task = compileCandidateBatch(files)) {
-            var result = findReferences(task);
-            if (!result.isEmpty() || !shouldFallbackToFullScan(files)) {
-                return result;
-            }
-        }
-        try (var task = compiler.compile(files)) {
-            return findReferences(task);
-        }
+        return compiler.runCandidatesWithFallback(
+                file, files, this::findReferences, shouldFallback);
     }
 
-    private CompileTask compileCandidateBatch(Path[] files) {
-        if (files == null || files.length == 0) {
-            throw new RuntimeException("empty sources");
-        }
-        var sources = new ArrayList<javax.tools.JavaFileObject>();
-        for (var candidate : files) {
-            boolean pruned = !candidate.equals(file);
-            sources.add(new SourceFileObject(candidate, pruned));
-        }
-        return compiler.compile(sources);
-    }
-
-    private boolean shouldFallbackToFullScan(Path[] files) {
-        return files != null && files.length > 1;
-    }
+    private final BiPredicate<List<Location>, Path[]> shouldFallback =
+            (result, candidates) ->
+                    (result == null || result.isEmpty())
+                            && candidates != null
+                            && candidates.length > 1;
 
     private List<Location> findReferences(CompileTask task) {
         var element = NavigationHelper.findElement(task, file, line, column);

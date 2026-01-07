@@ -515,7 +515,12 @@ class JavaCompilerService implements CompilerProvider {
             return cached;
         }
         var started = System.nanoTime();
-        var candidates = new ArrayList<Path>(WorkspaceIndex.filesContaining(memberName));
+        var candidates = new ArrayList<Path>();
+        for (var f : WorkspaceIndex.filesContaining(memberName)) {
+            if (containsImport(f, className)) {
+                candidates.add(f);
+            }
+        }
         var result = candidates.toArray(Path[]::new);
         cachedMemberReferences.put(key, result);
         LOG.fine(

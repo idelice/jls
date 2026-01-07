@@ -114,11 +114,27 @@ public class DefinitionProvider {
         boolean needsFallback = false;
         long compileMs;
         var jdkSource = JarFileHelper.isJdkSource(otherFile.toUri());
-        try (var task = compiler.compile(List.of(new SourceFileObject(file), otherFile))) {
-            var element = NavigationHelper.findElement(task, file, line, column);
-            locations = findDefinitions(task, element);
+        var otherPath = pathForFileObject(otherFile);
+        if (otherPath != null) {
+            var candidates = new Path[] {file, otherPath};
+            locations =
+                    compiler.runCandidatesWithFallback(
+                            file,
+                            candidates,
+                            task -> {
+                                var element = NavigationHelper.findElement(task, file, line, column);
+                                return findDefinitions(task, element);
+                            },
+                            (result, files) -> result == null || result.isEmpty());
             needsFallback = locations.isEmpty();
             compileMs = (System.nanoTime() - t0) / 1_000_000;
+        } else {
+            try (var task = compiler.compile(List.of(new SourceFileObject(file), otherFile))) {
+                var element = NavigationHelper.findElement(task, file, line, column);
+                locations = findDefinitions(task, element);
+                needsFallback = locations.isEmpty();
+                compileMs = (System.nanoTime() - t0) / 1_000_000;
+            }
         }
 
         if (needsFallback && (otherFile.getKind() != JavaFileObject.Kind.SOURCE || jdkSource)) {
@@ -179,6 +195,12 @@ public class DefinitionProvider {
             var name = type.getSimpleName();
             return List.of(FindHelper.location(task, path, name));
         }
+    }
+
+    private static Path pathForFileObject(JavaFileObject file) {
+        if (file == null || file.toUri() == null) return null;
+        if (!"file".equalsIgnoreCase(file.toUri().getScheme())) return null;
+        return Paths.get(file.toUri());
     }
 
 }
