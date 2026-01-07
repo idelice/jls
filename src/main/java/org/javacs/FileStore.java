@@ -238,7 +238,7 @@ public class FileStore {
 
     public static synchronized Instant modified(Path file) {
         // If file is open, use last in-memory modification time
-        if (activeDocuments.containsKey(file)) {
+        if (!forceDiskContents.get() && activeDocuments.containsKey(file)) {
             return activeDocuments.get(file).modified;
         }
         // If we've never checked before, look up modified time on disk

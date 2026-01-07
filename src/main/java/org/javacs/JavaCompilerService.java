@@ -857,8 +857,17 @@ class JavaCompilerService implements CompilerProvider {
                 if (uniqueSources.isEmpty()) {
                     throw new RuntimeException("empty sources");
                 }
+                LOG.fine(
+                        String.format(
+                                "Navigation cache miss: no cached compile (sources=%d)",
+                                uniqueSources.size()));
                 loadCompile(uniqueSources, fileManager);
             } else if (needsCompile(uniqueSources)) {
+                LOG.fine(
+                        String.format(
+                                "Navigation cache miss: invalidated (sources=%d, cached=%d)",
+                                uniqueSources.size(),
+                                cachedModified.size()));
                 loadCompile(uniqueSources, fileManager);
             } else {
                 LOG.info("...using cached navigation compile");
@@ -869,16 +878,36 @@ class JavaCompilerService implements CompilerProvider {
         private boolean needsCompile(Collection<? extends JavaFileObject> sources) {
             var version = FileStore.workspaceVersion();
             if (cachedWorkspaceVersion != version) {
+                LOG.fine(
+                        String.format(
+                                "Navigation cache invalidated: workspaceVersion %d -> %d",
+                                cachedWorkspaceVersion,
+                                version));
                 return true;
             }
             if (cachedModified.size() != sources.size()) {
+                LOG.fine(
+                        String.format(
+                                "Navigation cache invalidated: source count %d -> %d",
+                                cachedModified.size(),
+                                sources.size()));
                 return true;
             }
             for (var f : sources) {
                 if (!cachedModified.containsKey(f)) {
+                    LOG.fine(
+                            String.format(
+                                    "Navigation cache invalidated: new source %s",
+                                    f.toUri()));
                     return true;
                 }
                 if (f.getLastModified() != cachedModified.get(f)) {
+                    LOG.fine(
+                            String.format(
+                                    "Navigation cache invalidated: modified %s (cached=%d current=%d)",
+                                    f.toUri(),
+                                    cachedModified.get(f),
+                                    f.getLastModified()));
                     return true;
                 }
             }
@@ -894,7 +923,16 @@ class JavaCompilerService implements CompilerProvider {
                 cachedCompile.borrow.close();
             }
             cachedCompile = null;
+            LOG.fine(
+                    String.format(
+                            "Navigation cache rebuild start (sources=%d, workspaceVersion=%d)",
+                            sources.size(),
+                            FileStore.workspaceVersion()));
             cachedCompile = doCompile(sources, fileManager);
+            LOG.fine(
+                    String.format(
+                            "Navigation cache rebuild complete (roots=%d)",
+                            cachedCompile.roots.size()));
             cachedModified = new HashMap<>();
             cachedWorkspaceVersion = FileStore.workspaceVersion();
             for (var f : sources) {
