@@ -38,11 +38,7 @@ JLS does not bundle a runtime. Install a compatible JDK and either add it to PAT
 
 ### Neovim (recommended)
 
-Use the companion plugin **nvim-jls** which auto-wires the launcher, Lombok, root detection, and cache handling:
-
-```
-https://github.com/idelice/nvim-jls
-```
+Use the companion plugin [**nvim-jls**](https://github.com/idelice/nvim-jls) which auto-wires the launcher, Lombok, root detection, and cache handling.
 
 Drop it into your plugin manager and set `jls_dir = "/path/to/jls"` (the folder containing `dist/`). No manual `lspconfig` setup is needed.
 
