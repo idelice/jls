@@ -85,6 +85,13 @@ class JavaLanguageServer extends LanguageServer {
 
     void lint(Collection<Path> files, String reason) {
         if (files.isEmpty()) return;
+
+        // Invalidate unified cache on lint (triggered by save)
+        if (compiler() instanceof JavaCompilerService jcs) {
+            jcs.invalidateCache();
+            LOG.fine("Unified cache invalidated on save");
+        }
+
         var runId = lintRunCounter.incrementAndGet();
         var sample =
                 files.stream()

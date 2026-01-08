@@ -21,6 +21,11 @@ class JavaCompilerService implements CompilerProvider {
     // Lightweight compiler reused for completion (-proc:none) to avoid per-request init overhead.
     // reuse enabled because completion options are stable (-proc:none).
     private final ReusableCompiler completionCompiler = new ReusableCompiler(false /*disableReuse*/);
+
+    // Unified compilation cache - single source of truth for all caching
+    private final UnifiedCompilationCache unifiedCache = new UnifiedCompilationCache(this);
+
+    // Kept for backward compatibility during transition
     private final NavigationCompileCache navigationResolveCache = new NavigationCompileCache();
     private final NavigationCompileCache navigationBatchCache = new NavigationCompileCache();
     private final Object completionLock = new Object();
@@ -84,6 +89,17 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compileForCompletion(Collection<? extends JavaFileObject> sources) {
+        if (sources == null || sources.isEmpty()) throw new RuntimeException("empty sources");
+
+        // DO NOT use unified cache for completion - completion uses modified source
+        // with pruned method bodies, so caching the disk version is incorrect
+        return compileForCompletionOld(sources);
+    }
+
+    /**
+     * OLD completion implementation - kept for reference during transition
+     */
+    private CompileTask compileForCompletionOld(Collection<? extends JavaFileObject> sources) {
         if (sources == null || sources.isEmpty()) throw new RuntimeException("empty sources");
         // Serialize lightweight compiles to avoid ReusableCompiler contention while still reusing context.
         synchronized (completionLock) {
@@ -618,6 +634,41 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
+        // Don't use unified cache yet - it breaks hover and other operations
+        // because the cached batch doesn't have proper lifecycle management
+        var activeRoots = selectActiveSourceRoots(sources);
+        var started = System.nanoTime();
+        if (!activeRoots.isEmpty()) {
+            FileStore.setActiveSourceRoots(activeRoots);
+        }
+        try {
+            // No Lombok expansion for navigation
+            var compile = compileBatch(sources);
+            return new CompileTask(compile.task, compile.roots, diags, compile::close);
+        } finally {
+            FileStore.clearActiveSourceRoots();
+            if (!activeRoots.isEmpty()) {
+                LOG.fine(
+                        String.format(
+                                "Compile source roots: active=%d total=%d in %d ms",
+                                activeRoots.size(),
+                                FileStore.sourceRoots().size(),
+                                (System.nanoTime() - started) / 1_000_000));
+            }
+        }
+    }
+
+    /**
+     * Compile with Lombok expansion for lint/save operations.
+     * This is called from JavaLanguageServer.lint()
+     */
+    public CompileTask compile(Collection<? extends JavaFileObject> sources, boolean expandLombok) {
+        if (!expandLombok) {
+            // No Lombok - use default navigation compile
+            return compile(sources);
+        }
+
+        // Full compilation with Lombok for lint/save
         var activeRoots = selectActiveSourceRoots(sources);
         var started = System.nanoTime();
         if (!activeRoots.isEmpty()) {
@@ -644,6 +695,40 @@ class JavaCompilerService implements CompilerProvider {
     public CompileTask compileForNavigation(
             Path activeFile, Collection<? extends JavaFileObject> sources) {
         return navigationResolveCache.compile(activeFile, sources, navigationResolveFileManager);
+    }
+
+    /**
+     * Helper methods for UnifiedCompilationCache
+     */
+    CompileBatch compileFullWithLombok(Collection<? extends JavaFileObject> sources) {
+        var expanded = maybeExpandSourcesForLombok(sources);
+        return compileBatch(expanded);
+    }
+
+    CompileBatch compileNavigation(Collection<? extends JavaFileObject> sources) {
+        // Navigation: use main compiler WITHOUT Lombok expansion
+        return compileBatch(sources);
+    }
+
+    CompileBatch compileCompletion(Collection<? extends JavaFileObject> sources) {
+        // Use CompileBatch constructor which will call completionCompiler.getTask()
+        // Don't manually call getTask here or we'll get "already in-use" error
+        var fm = completionFileManager.get();
+        return new CompileBatch(this, completionCompiler, fm, sources);
+    }
+
+    /**
+     * Invalidate unified cache on document save
+     */
+    public void invalidateCache() {
+        unifiedCache.invalidateAll();
+    }
+
+    /**
+     * Get cache statistics for monitoring
+     */
+    public Map<String, Object> getCacheStats() {
+        return unifiedCache.getStats();
     }
 
     @Override
