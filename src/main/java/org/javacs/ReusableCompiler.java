@@ -143,6 +143,12 @@ class ReusableCompiler {
         currentContext.removeClass(root, className);
     }
 
+    public void dirty(String className) {
+        if (currentContext != null) {
+            currentContext.dirty(className);
+        }
+    }
+
     class Borrow implements AutoCloseable {
         final JavacTask task;
         boolean closed;
@@ -180,6 +186,15 @@ class ReusableCompiler {
             put(JavaCompiler.compilerKey, ReusableJavaCompiler.factory);
         }
 
+        @Override
+        public <T> void put(Key<T> key, T data) {
+            if (ht.containsKey(key)) {
+                ht.put(key, data);
+            } else {
+                super.put(key, data);
+            }
+        }
+
         void clear() {
             drop(Arguments.argsKey);
             drop(DiagnosticListener.class);
@@ -189,6 +204,15 @@ class ReusableCompiler {
             drop(JavacTask.class);
             drop(JavacTrees.class);
             drop(JavacElements.class);
+            
+            // Aggressively clean up DiagnosticFormatter to avoid ClassCastException on reuse
+            try {
+                drop(Class.forName("com.sun.tools.javac.util.RichDiagnosticFormatter"));
+                drop(Class.forName("com.sun.tools.javac.util.AbstractDiagnosticFormatter"));
+                drop(Class.forName("com.sun.tools.javac.util.DiagnosticFormatter"));
+            } catch (ClassNotFoundException e) {
+                // Ignore if not present
+            }
 
             if (ht.get(Log.logKey) instanceof ReusableLog) {
                 // log already inited - not first round
@@ -236,6 +260,13 @@ class ReusableCompiler {
             ((ReusableJavaCompiler) get(JavaCompiler.compilerKey)).removeClass(root, className);
         }
 
+        void dirty(String className) {
+            var existing = ht.get(JavaCompiler.compilerKey);
+            if (existing instanceof ReusableJavaCompiler) {
+                ((ReusableJavaCompiler) existing).dirty(className);
+            }
+        }
+
         /**
          * Reusable JavaCompiler; exposes a method to clean up the component from leftovers associated with previous
          * compilations.
@@ -256,6 +287,16 @@ class ReusableCompiler {
             void removeClass(JCTree.JCCompilationUnit root, String className) {
                 for (var classSymbol : syms.getClassesForName(names.fromString(className))) {
                     syms.removeClass(root.modle, classSymbol.flatname);
+                    chk.removeCompiled(classSymbol);
+                }
+            }
+
+            void dirty(String className) {
+                var name = names.fromString(className);
+                for (var classSymbol : syms.getClassesForName(name)) {
+                    if (classSymbol.packge() != null && classSymbol.packge().modle != null) {
+                        syms.removeClass(classSymbol.packge().modle, classSymbol.flatname);
+                    }
                     chk.removeCompiled(classSymbol);
                 }
             }

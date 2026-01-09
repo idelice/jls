@@ -107,6 +107,9 @@ public class UnifiedCompilationCache {
             cached == null ? "not-cached" :
             cached.workspaceVersion != currentVersion ? "version-changed" : "files-changed"));
 
+        // Invalidate old cache to release the compiler
+        invalidate(scope);
+
         var batch = createCompilation(scope, sources);
         cache.put(scope, new CachedCompilation(batch, sourceFiles, currentVersion, scope));
 

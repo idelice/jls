@@ -227,7 +227,10 @@ class CompileBatch implements AutoCloseable {
 
     @Override
     public void close() {
-        closed = true;
+        if (!closed) {
+            borrow.close();
+            closed = true;
+        }
     }
 
     private static ReusableCompiler.Borrow batchTask(

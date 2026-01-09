@@ -87,12 +87,6 @@ class JavaLanguageServer extends LanguageServer {
     void lint(Collection<Path> files, String reason) {
         if (files.isEmpty()) return;
 
-        // Invalidate unified cache on lint (triggered by save)
-        if (compiler() instanceof JavaCompilerService jcs) {
-            jcs.invalidateCache();
-            LOG.fine("Unified cache invalidated on save");
-        }
-
         var runId = lintRunCounter.incrementAndGet();
         var sample =
                 files.stream()
@@ -106,7 +100,11 @@ class JavaLanguageServer extends LanguageServer {
                         runId, reason, files.size(), sample));
         var started = Instant.now();
         var sourceObjects = files.stream()
-                .map(SourceFileObject::new)
+                .map(f -> {
+                    var modified = FileStore.modified(f);
+                    if (modified == null) modified = Instant.EPOCH;
+                    return new SourceFileObject(f, FileStore.contents(f), modified);
+                })
                 .toList();
         try (var task = compiler().compile(sourceObjects, true)) {
             var compiled = Instant.now();
@@ -927,7 +925,14 @@ class JavaLanguageServer extends LanguageServer {
                 t.setDaemon(true);
                 return t;
             });
-    private static final long LINT_IDLE_DEBOUNCE_MS = 0; // lint only on save
+    private final java.util.concurrent.ScheduledExecutorService debounceExecutor =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                var t = new Thread(r, "jls-debounce");
+                t.setDaemon(true);
+                return t;
+            });
+    private java.util.concurrent.ScheduledFuture<?> pendingLint;
+    private static final long LINT_DEBOUNCE_MS = 500;
     private final java.util.concurrent.atomic.AtomicBoolean navigationPrewarmStarted =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
@@ -935,10 +940,13 @@ class JavaLanguageServer extends LanguageServer {
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isJavaFile(params.textDocument.uri)) return;
-        lastEdited = Paths.get(params.textDocument.uri);
+        var file = Paths.get(params.textDocument.uri);
+        if (compiler() instanceof JavaCompilerService jcs) {
+            jcs.invalidateFile(file);
+        }
+        lastEdited = file;
         uncheckedChanges = true;
         if (navigationPrewarmStarted.compareAndSet(false, true)) {
-            var file = Paths.get(params.textDocument.uri);
             lintExecutor.execute(
                     () -> {
                         try {
@@ -948,18 +956,38 @@ class JavaLanguageServer extends LanguageServer {
                         }
                     });
         }
+        scheduleLint(file);
     }
 
     @Override
     public void didChangeTextDocument(DidChangeTextDocumentParams params) {
         FileStore.change(params);
-        lastEdited = Paths.get(params.textDocument.uri);
+        var file = Paths.get(params.textDocument.uri);
+        if (compiler() instanceof JavaCompilerService jcs) {
+            jcs.invalidateFile(file);
+        }
+        lastEdited = file;
         uncheckedChanges = true;
+        scheduleLint(file);
+    }
+
+    private synchronized void scheduleLint(Path file) {
+        if (pendingLint != null) {
+            pendingLint.cancel(false);
+        }
+        pendingLint = debounceExecutor.schedule(() -> {
+            LOG.info("Lint (debounced) file: " + file.getFileName());
+            lint(List.of(file), "debounce");
+        }, LINT_DEBOUNCE_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     @Override
     public void didCloseTextDocument(DidCloseTextDocumentParams params) {
         FileStore.close(params);
+        var file = Paths.get(params.textDocument.uri);
+        if (compiler() instanceof JavaCompilerService jcs) {
+            jcs.invalidateFile(file);
+        }
 
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             // Clear diagnostics
@@ -988,6 +1016,9 @@ class JavaLanguageServer extends LanguageServer {
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             var file = Paths.get(params.textDocument.uri);
+            if (compiler() instanceof JavaCompilerService jcs) {
+                jcs.invalidateFile(file);
+            }
             // Synchronous lint for the saved file only (keep UI responsive).
             LOG.info("Lint (foreground) saved file: " + file.getFileName());
             lint(List.of(file), "save-foreground");

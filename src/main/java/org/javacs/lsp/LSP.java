@@ -84,20 +84,64 @@ public class LSP {
 
     private static final Charset UTF_8 = StandardCharsets.UTF_8;
 
+    private static final java.util.concurrent.ExecutorService workerPool = java.util.concurrent.Executors.newCachedThreadPool();
+    private static final java.util.concurrent.ConcurrentHashMap<Integer, java.util.concurrent.CompletableFuture<?>> activeRequests = new java.util.concurrent.ConcurrentHashMap<>();
+
     private static void writeClient(OutputStream client, String messageText) {
         var messageBytes = messageText.getBytes(UTF_8);
         var headerText = String.format("Content-Length: %d\r\n\r\n", messageBytes.length);
         var headerBytes = headerText.getBytes(UTF_8);
-        try {
-            client.write(headerBytes);
-            client.write(messageBytes);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+        synchronized (client) {
+            try {
+                client.write(headerBytes);
+                client.write(messageBytes);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 
     static String toJson(Object message) {
         return gson.toJson(message);
+    }
+
+    private static <T, R> void asyncRequest(
+            OutputStream client,
+            Message message,
+            Class<T> paramsClass,
+            Function<T, R> handler) {
+        try {
+            var params = gson.fromJson(message.params, paramsClass);
+            var future = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                if (Thread.currentThread().isInterrupted()) return null;
+                return handler.apply(params);
+            }, workerPool);
+            if (message.id != null) {
+                activeRequests.put(message.id, future);
+            }
+            future.thenAccept(result -> {
+                        if (message.id != null) activeRequests.remove(message.id);
+                        respond(client, message.id, result);
+                    })
+                    .exceptionally(
+                            ex -> {
+                                if (message.id != null) activeRequests.remove(message.id);
+                                var cause = ex instanceof java.util.concurrent.CompletionException ? ex.getCause() : ex;
+                                if (cause instanceof java.util.concurrent.CancellationException) {
+                                    LOG.info(String.format("Request %d was cancelled", message.id));
+                                } else {
+                                    LOG.log(Level.SEVERE, cause.getMessage(), cause);
+                                    error(
+                                            client,
+                                            message.id,
+                                            new ResponseError(ErrorCodes.InternalError, cause.getMessage(), null));
+                                }
+                                return null;
+                            });
+        } catch (Exception e) {
+            LOG.log(Level.SEVERE, e.getMessage(), e);
+            error(client, message.id, new ResponseError(ErrorCodes.InternalError, e.getMessage(), null));
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -204,8 +248,15 @@ public class LSP {
                 if ("$/cancelRequest".equals(message.method)) {
                     var params = gson.fromJson(message.params, CancelParams.class);
                     var removed = pending.removeIf(r -> r.id != null && r.id.equals(params.id));
-                    if (removed) LOG.info(String.format("Cancelled request %d, which had not yet started", params.id));
-                    else LOG.info(String.format("Cannot cancel request %d because it has already started", params.id));
+                    var active = activeRequests.remove(params.id);
+                    if (removed) {
+                        LOG.info(String.format("Cancelled request %d, which had not yet started", params.id));
+                    } else if (active != null) {
+                        active.cancel(true);
+                        LOG.info(String.format("Cancelled request %d, which was in-progress", params.id));
+                    } else {
+                        LOG.info(String.format("Cannot cancel request %d because it is not active", params.id));
+                    }
                 }
             }
 
@@ -319,16 +370,12 @@ public class LSP {
                         }
                     case "workspace/symbol":
                         {
-                            var params = gson.fromJson(r.params, WorkspaceSymbolParams.class);
-                            var response = server.workspaceSymbols(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, WorkspaceSymbolParams.class, server::workspaceSymbols);
                             break;
                         }
                     case "textDocument/documentLink":
                         {
-                            var params = gson.fromJson(r.params, DocumentLinkParams.class);
-                            var response = server.documentLink(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, DocumentLinkParams.class, server::documentLink);
                             break;
                         }
                     case "textDocument/didOpen":
@@ -351,9 +398,7 @@ public class LSP {
                         }
                     case "textDocument/willSaveWaitUntil":
                         {
-                            var params = gson.fromJson(r.params, WillSaveTextDocumentParams.class);
-                            var response = server.willSaveWaitUntilTextDocument(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, WillSaveTextDocumentParams.class, server::willSaveWaitUntilTextDocument);
                             break;
                         }
                     case "textDocument/didSave":
@@ -370,121 +415,87 @@ public class LSP {
                         }
                     case "textDocument/completion":
                         {
-                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.completion(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, TextDocumentPositionParams.class, server::completion);
                             break;
                         }
                     case "completionItem/resolve":
                         {
-                            var params = gson.fromJson(r.params, CompletionItem.class);
-                            var response = server.resolveCompletionItem(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, CompletionItem.class, server::resolveCompletionItem);
                             break;
                         }
                     case "textDocument/hover":
                         {
-                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.hover(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, TextDocumentPositionParams.class, server::hover);
                             break;
                         }
                     case "textDocument/signatureHelp":
                         {
-                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.signatureHelp(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, TextDocumentPositionParams.class, server::signatureHelp);
                             break;
                         }
                     case "textDocument/inlayHint":
                         {
-                            var params = gson.fromJson(r.params, InlayHintParams.class);
-                            var response = server.inlayHint(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, InlayHintParams.class, server::inlayHint);
                             break;
                         }
                     case "textDocument/semanticTokens/full":
                         {
-                            var params = gson.fromJson(r.params, SemanticTokensParams.class);
-                            var response = server.semanticTokensFull(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, SemanticTokensParams.class, server::semanticTokensFull);
                             break;
                         }
                     case "textDocument/definition":
                         {
-                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.gotoDefinition(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, TextDocumentPositionParams.class, server::gotoDefinition);
                             break;
                         }
                     case "textDocument/references":
                         {
-                            var params = gson.fromJson(r.params, ReferenceParams.class);
-                            var response = server.findReferences(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, ReferenceParams.class, server::findReferences);
                             break;
                         }
                     case "textDocument/documentSymbol":
                         {
-                            var params = gson.fromJson(r.params, DocumentSymbolParams.class);
-                            var response = server.documentSymbol(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, DocumentSymbolParams.class, server::documentSymbol);
                             break;
                         }
                     case "textDocument/codeAction":
                         {
-                            var params = gson.fromJson(r.params, CodeActionParams.class);
-                            var response = server.codeAction(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, CodeActionParams.class, server::codeAction);
                             break;
                         }
                     case "codeAction/resolve":
                         {
-                            var params = gson.fromJson(r.params, CodeAction.class);
-                            var response = server.codeActionResolve(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, CodeAction.class, server::codeActionResolve);
                             break;
                         }
                     case "textDocument/codeLens":
                         {
-                            var params = gson.fromJson(r.params, CodeLensParams.class);
-                            var response = server.codeLens(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, CodeLensParams.class, server::codeLens);
                             break;
                         }
                     case "codeLens/resolve":
                         {
-                            var params = gson.fromJson(r.params, CodeLens.class);
-                            var response = server.resolveCodeLens(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, CodeLens.class, server::resolveCodeLens);
                             break;
                         }
                     case "textDocument/prepareRename":
                         {
-                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.prepareRename(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, TextDocumentPositionParams.class, server::prepareRename);
                             break;
                         }
                     case "textDocument/rename":
                         {
-                            var params = gson.fromJson(r.params, RenameParams.class);
-                            var response = server.rename(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, RenameParams.class, server::rename);
                             break;
                         }
                     case "textDocument/formatting":
                         {
-                            var params = gson.fromJson(r.params, DocumentFormattingParams.class);
-                            var response = server.formatting(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, DocumentFormattingParams.class, server::formatting);
                             break;
                         }
                     case "textDocument/foldingRange":
                         {
-                            var params = gson.fromJson(r.params, FoldingRangeParams.class);
-                            var response = server.foldingRange(params);
-                            respond(send, r.id, response);
+                            asyncRequest(send, r, FoldingRangeParams.class, server::foldingRange);
                             break;
                         }
                     case "$/cancelRequest":

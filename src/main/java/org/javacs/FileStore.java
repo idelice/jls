@@ -337,6 +337,9 @@ public class FileStore {
         var file = Paths.get(document.uri);
         activeDocuments.put(file, new VersionedContent(document.text, document.version));
         WorkspaceIndex.updateFile(file);
+        synchronized (FileStore.class) {
+            workspaceVersion++;
+        }
         scheduleCacheSave();
     }
 
@@ -356,6 +359,9 @@ public class FileStore {
         }
         activeDocuments.put(file, new VersionedContent(newText, document.version));
         WorkspaceIndex.updateFile(file);
+        synchronized (FileStore.class) {
+            workspaceVersion++;
+        }
         scheduleCacheSave();
     }
 
@@ -364,6 +370,9 @@ public class FileStore {
         var file = Paths.get(params.textDocument.uri);
         activeDocuments.remove(file);
         WorkspaceIndex.updateFile(file);
+        synchronized (FileStore.class) {
+            workspaceVersion++;
+        }
         scheduleCacheSave();
     }
 

@@ -127,8 +127,12 @@ public class ErrorProvider {
             return null;
         }
         if (end == Diagnostic.NOPOS || end <= start) {
-            var file = Paths.get(root.getSourceFile().toUri());
-            var contents = FileStore.contents(file);
+            String contents;
+            try {
+                contents = root.getSourceFile().getCharContent(true).toString();
+            } catch (java.io.IOException e) {
+                contents = "";
+            }
             end = Math.min(start + 1, contents.length());
         }
         var qualified = tree.getQualifiedIdentifier().toString();
@@ -186,8 +190,12 @@ public class ErrorProvider {
         if (d.getSource() == null) {
             return new LineRange(start, start);
         }
-        var file = Paths.get(d.getSource().toUri());
-        var contents = FileStore.contents(file);
+        String contents;
+        try {
+            contents = d.getSource().getCharContent(true).toString();
+        } catch (java.io.IOException e) {
+            return new LineRange(start, start);
+        }
         var length = contents.length();
         if (start < 0 || start > length) {
             return new LineRange(start, start);
@@ -257,8 +265,12 @@ public class ErrorProvider {
                 start = offset;
             }
         }
-        var file = Paths.get(root.getSourceFile().toUri());
-        var contents = FileStore.contents(file);
+        String contents;
+        try {
+            contents = root.getSourceFile().getCharContent(true).toString();
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
         var name = unusedEl.getSimpleName();
         if (name.contentEquals("<init>")) {
             name = unusedEl.getEnclosingElement().getSimpleName();
