@@ -41,6 +41,7 @@ import org.javacs.markup.ColorProvider;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.navigation.DefinitionProvider;
 import org.javacs.navigation.ReferenceProvider;
+import org.javacs.SourceFileObject;
 import org.javacs.rewrite.*;
 
 class JavaLanguageServer extends LanguageServer {
@@ -104,7 +105,10 @@ class JavaLanguageServer extends LanguageServer {
                         "Lint[%d] (%s) files=%d sample=%s",
                         runId, reason, files.size(), sample));
         var started = Instant.now();
-        try (var task = compiler().compile(files.toArray(Path[]::new))) {
+        var sourceObjects = files.stream()
+                .map(SourceFileObject::new)
+                .toList();
+        try (var task = compiler().compile(sourceObjects, true)) {
             var compiled = Instant.now();
             LOG.fine(
                     String.format(
@@ -230,7 +234,7 @@ class JavaLanguageServer extends LanguageServer {
 
             javaReportProgress(new JavaReportProgressParams("Inferring doc path"), 70);
             var docStarted = Instant.now();
-            var docPath = infer.buildDocPath();
+            var docPath = new HashSet<Path>(infer.buildDocPath());
             lombokDocSources().ifPresent(source -> {
                 if (docPath.add(source)) {
                     LOG.info("Added Lombok doc path " + source);

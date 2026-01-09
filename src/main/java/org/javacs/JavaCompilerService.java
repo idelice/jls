@@ -42,8 +42,10 @@ class JavaCompilerService implements CompilerProvider {
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports) {
         var cp = new LinkedHashSet<Path>();
         var lombokPath = System.getProperty("org.javacs.lombokPath");
+        Path lombokJar = null;
         if (lombokPath != null) {
-            cp.add(Paths.get(lombokPath));
+            lombokJar = Paths.get(lombokPath);
+            cp.add(lombokJar);
         }
         cp.addAll(classPath);
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
@@ -85,6 +87,8 @@ class JavaCompilerService implements CompilerProvider {
         }
         this.navigationResolveFileManager = newNavigationFileManager(cp, "nav-resolve");
         this.navigationBatchFileManager = newNavigationFileManager(cp, "nav-batch");
+        this.lombokSourceCache =
+                LombokSupport.isEnabled() && lombokJar != null ? new LombokSourceCache(lombokJar) : null;
     }
 
     @Override
@@ -134,6 +138,7 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private final ThreadLocal<SourceFileManager> completionFileManager;
+    private final LombokSourceCache lombokSourceCache;
 
     private SourceFileManager newFileManager() {
         var fm = new SourceFileManager();
@@ -227,7 +232,6 @@ class JavaCompilerService implements CompilerProvider {
     private final Map<String, Path[]> cachedMemberCandidates = new HashMap<>();
     private long cachedLombokVersion = -1;
     private final List<Path> cachedLombokFiles = new ArrayList<>();
-
     private boolean needsCompile(Collection<? extends JavaFileObject> sources) {
         if (cachedModified.size() != sources.size()) {
             return true;
@@ -676,7 +680,10 @@ class JavaCompilerService implements CompilerProvider {
         }
         try {
             var expanded = maybeExpandSourcesForLombok(sources);
-            var compile = compileBatch(expanded);
+            var cached = maybeApplyLombokCache(expanded);
+            var compile =
+                    new CompileBatch(
+                            this, compiler, fileManager, cached.sources(), !cached.replaced());
             return new CompileTask(compile.task, compile.roots, diags, compile::close);
         } finally {
             FileStore.clearActiveSourceRoots();
@@ -702,6 +709,10 @@ class JavaCompilerService implements CompilerProvider {
      */
     CompileBatch compileFullWithLombok(Collection<? extends JavaFileObject> sources) {
         var expanded = maybeExpandSourcesForLombok(sources);
+        var cached = maybeApplyLombokCache(expanded);
+        if (cached.replaced()) {
+            return new CompileBatch(this, compiler, fileManager, cached.sources(), false);
+        }
         return compileBatch(expanded);
     }
 
@@ -816,28 +827,15 @@ class JavaCompilerService implements CompilerProvider {
         if (!LombokSupport.isEnabled()) {
             return sources;
         }
-        var started = System.nanoTime();
         var lombokFiles = lombokAnnotatedFiles();
         if (lombokFiles.isEmpty()) {
             return sources;
         }
-        // Lombok only needs annotated sources in the same compilation round to generate members.
-        // Include all Lombok-annotated files plus the requested sources.
         var all = new ArrayList<JavaFileObject>(sources.size() + lombokFiles.size());
         all.addAll(sources);
         for (var f : lombokFiles) {
             all.add(new SourceFileObject(f, false));
         }
-        LOG.fine(
-                String.format(
-                        "Lombok expansion: sources=%d lombokFiles=%d total=%d",
-                        sources.size(),
-                        lombokFiles.size(),
-                        all.size()));
-        LOG.fine(
-                String.format(
-                        "Lombok expansion computed in %d ms",
-                        (System.nanoTime() - started) / 1_000_000));
         return deduplicateSources(all);
     }
 
@@ -850,6 +848,37 @@ class JavaCompilerService implements CompilerProvider {
             return sources;
         }
         return maybeExpandSourcesForLombok(sources);
+    }
+
+    private record LombokCacheResult(Collection<? extends JavaFileObject> sources, boolean replaced) {}
+
+    private LombokCacheResult maybeApplyLombokCache(Collection<? extends JavaFileObject> sources) {
+        if (lombokSourceCache == null) {
+            return new LombokCacheResult(sources, false);
+        }
+        var replaced = new ArrayList<JavaFileObject>(sources.size());
+        boolean sawLombok = false;
+        boolean allReplaced = true;
+        for (var source : sources) {
+            var path = sourcePath(source);
+            if (path != null && containsWord(path, "lombok")) {
+                sawLombok = true;
+                var cached = lombokSourceCache.generated(path);
+                if (cached != null) {
+                    replaced.add(cached);
+                    continue;
+                }
+                allReplaced = false;
+            }
+            replaced.add(source);
+        }
+        if (!sawLombok) {
+            return new LombokCacheResult(sources, false);
+        }
+        if (!allReplaced) {
+            return new LombokCacheResult(deduplicateSources(replaced), false);
+        }
+        return new LombokCacheResult(deduplicateSources(replaced), true);
     }
 
     private boolean containsLombokInSources(Path activeFile, Collection<? extends JavaFileObject> sources) {
@@ -1077,4 +1106,5 @@ class JavaCompilerService implements CompilerProvider {
         cachedLombokVersion = version;
         return cachedLombokFiles;
     }
+
 }

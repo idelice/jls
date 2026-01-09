@@ -69,7 +69,7 @@ class Parser {
         if (needsParse(file)) {
             loadParse(file);
         } else {
-            LOG.info("...using cached parse");
+            LOG.fine("...using cached parse");
         }
         return cachedParse;
     }

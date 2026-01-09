@@ -595,6 +595,11 @@ public class CompletionProvider {
                 type = element.asType();
             }
         }
+        if (type == null || type.getKind() == TypeKind.ERROR) {
+            if (element != null) {
+                type = element.asType();
+            }
+        }
         if (!isStatic && type instanceof DeclaredType && select.getExpression().getKind() == Tree.Kind.IDENTIFIER) {
             var typeElement = ((DeclaredType) type).asElement();
             if (typeElement instanceof TypeElement) {

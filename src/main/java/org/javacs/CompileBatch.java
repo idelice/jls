@@ -31,9 +31,10 @@ class CompileBatch implements AutoCloseable {
     final Elements elements;
     final Types types;
     final List<CompilationUnitTree> roots;
+    final boolean useLombokProcessors;
 
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
-        this(parent, parent.compiler, parent.fileManager, files);
+        this(parent, parent.compiler, parent.fileManager, files, true);
     }
 
     CompileBatch(
@@ -41,14 +42,23 @@ class CompileBatch implements AutoCloseable {
             ReusableCompiler compiler,
             JavaFileManager fileManager,
             Collection<? extends JavaFileObject> files) {
+        this(parent, compiler, fileManager, files, true);
+    }
+
+    CompileBatch(
+            JavaCompilerService parent,
+            ReusableCompiler compiler,
+            JavaFileManager fileManager,
+            Collection<? extends JavaFileObject> files,
+            boolean useLombokProcessors) {
         this.parent = parent;
-        this.borrow = batchTask(parent, compiler, fileManager, files);
+        this.useLombokProcessors = useLombokProcessors;
+        this.borrow = batchTask(parent, compiler, fileManager, files, useLombokProcessors);
         boolean success = false;
         try {
             this.task = borrow.task;
-            if (LombokSupport.isEnabled()) {
+            if (useLombokProcessors && LombokSupport.isEnabled()) {
                 relaxShouldStopPolicy(this.task);
-                configureLombokProcessor(this.task);
             }
             registerTaskLogging(this.task);
             this.trees = Trees.instance(borrow.task);
@@ -62,7 +72,7 @@ class CompileBatch implements AutoCloseable {
             // Ensure annotation processors run (especially Lombok) without forcing codegen,
             // which would clean up the task context. enter() triggers processing rounds;
             // analyze() drives flow/attr for diagnostics.
-            if (LombokSupport.isEnabled() && borrow.task instanceof JavacTaskImpl jt) {
+            if (useLombokProcessors && LombokSupport.isEnabled() && borrow.task instanceof JavacTaskImpl jt) {
                 jt.enter();
             }
             borrow.task.analyze();
@@ -97,24 +107,6 @@ class CompileBatch implements AutoCloseable {
             return;
         }
         // Intentionally omit logging annotation processing phases to reduce log noise.
-    }
-
-    private static void configureLombokProcessor(JavacTask task) {
-        try {
-            Class<?> processorClass =
-                    Class.forName("lombok.launch.AnnotationProcessorHider$AnnotationProcessor");
-            Object processor = processorClass.getDeclaredConstructor().newInstance();
-            if (processor instanceof javax.annotation.processing.Processor p) {
-                task.setProcessors(java.util.List.of(p));
-                LOG.fine("Configured Lombok processor explicitly");
-            } else {
-                LOG.warning("Lombok processor class did not implement Processor");
-            }
-        } catch (ClassNotFoundException e) {
-            LOG.warning("Lombok processor class not found on classpath");
-        } catch (ReflectiveOperationException e) {
-            LOG.warning("Failed to create Lombok processor: " + e.getMessage());
-        }
     }
 
     /**
@@ -190,7 +182,20 @@ class CompileBatch implements AutoCloseable {
     }
 
     private String errorText(javax.tools.Diagnostic<? extends javax.tools.JavaFileObject> err) {
-        var file = Paths.get(err.getSource().toUri());
+        var source = err.getSource();
+        if (source != null) {
+            try {
+                var contents = source.getCharContent(true).toString();
+                var begin = (int) err.getStartPosition();
+                var end = (int) err.getEndPosition();
+                if (begin >= 0 && end >= begin && end <= contents.length()) {
+                    return contents.substring(begin, end);
+                }
+            } catch (IOException e) {
+                LOG.fine("Failed to read source content for error text: " + e.getMessage());
+            }
+        }
+        var file = Paths.get(source.toUri());
         var contents = FileStore.contents(file);
         var begin = (int) err.getStartPosition();
         var end = (int) err.getEndPosition();
@@ -229,9 +234,10 @@ class CompileBatch implements AutoCloseable {
             JavaCompilerService parent,
             ReusableCompiler compiler,
             JavaFileManager fileManager,
-            Collection<? extends JavaFileObject> sources) {
+            Collection<? extends JavaFileObject> sources,
+            boolean useLombokProcessors) {
         parent.diags.clear();
-        var options = options(parent.classPath, parent.addExports);
+        var options = options(parent.classPath, parent.addExports, useLombokProcessors);
         LOG.fine("Javac options: " + options);
         return compiler.getTask(fileManager, parent.diags::add, options, List.of(), sources);
     }
@@ -241,7 +247,8 @@ class CompileBatch implements AutoCloseable {
         return classOrSourcePath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
     }
 
-    private static List<String> options(Set<Path> classPath, Set<String> addExports) {
+    private static List<String> options(
+            Set<Path> classPath, Set<String> addExports, boolean useLombokProcessors) {
         var list = new ArrayList<String>();
 
         var cp = joinPath(classPath);
@@ -251,7 +258,7 @@ class CompileBatch implements AutoCloseable {
         if (!sourceRoots.isEmpty()) {
             Collections.addAll(list, "-sourcepath", joinPath(sourceRoots));
         }
-        if (LombokSupport.isEnabled()) {
+        if (useLombokProcessors && LombokSupport.isEnabled()) {
             // JDK 21 requires explicit enable of processor discovery on classpath, or a processorpath.
             // We use -proc:full AND set processorpath to classpath to ensure discovery works.
             Collections.addAll(list, "-proc:full");
