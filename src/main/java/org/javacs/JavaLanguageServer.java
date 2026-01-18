@@ -30,6 +30,7 @@ class JavaLanguageServer extends LanguageServer {
     private Path workspaceRoot;
     private final LanguageClient client;
     private JavaCompilerService cacheCompiler;
+    private LombokMetadataCache lombokCache;
     private JsonObject cacheSettings;
     private JsonObject settings = new JsonObject();
     private boolean modifiedBuild = true;
@@ -37,6 +38,9 @@ class JavaLanguageServer extends LanguageServer {
     JavaCompilerService compiler() {
         if (needsCompiler()) {
             cacheCompiler = createCompiler();
+            if (lombokCache != null) {
+                lombokCache.clear(); // Clear cache when compiler changes
+            }
             cacheSettings = settings;
             modifiedBuild = false;
         }
@@ -61,7 +65,7 @@ class JavaLanguageServer extends LanguageServer {
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
             var compiled = Instant.now();
             LOG.info("...compiled in " + Duration.between(started, compiled).toMillis() + " ms");
-            for (var errs : new ErrorProvider(task).errors()) {
+            for (var errs : new ErrorProvider(task, lombokCache).errors()) {
                 client.publishDiagnostics(errs);
             }
             for (var colors : new ColorProvider(task).colors()) {
@@ -92,11 +96,14 @@ class JavaLanguageServer extends LanguageServer {
 
         var externalDependencies = externalDependencies();
         var classPath = classPath();
+        var extraArgs = extraCompilerArgs();
         var addExports = addExports();
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
             javaEndProgress();
-            return new JavaCompilerService(classPath, docPath(), addExports);
+            var compiler = new JavaCompilerService(classPath, docPath(), addExports, extraArgs);
+            lombokCache = new LombokMetadataCache(compiler);
+            return compiler;
         }
         // Otherwise, combine inference with user-specified external dependencies
         else {
@@ -109,7 +116,9 @@ class JavaLanguageServer extends LanguageServer {
             var docPath = infer.buildDocPath();
 
             javaEndProgress();
-            return new JavaCompilerService(classPath, docPath, addExports);
+            var compiler = new JavaCompilerService(classPath, docPath, addExports, extraArgs);
+            lombokCache = new LombokMetadataCache(compiler);
+            return compiler;
         }
     }
 
@@ -131,6 +140,17 @@ class JavaLanguageServer extends LanguageServer {
             paths.add(Paths.get(each.getAsString()).toAbsolutePath());
         }
         return paths;
+    }
+
+    private Set<String> extraCompilerArgs() {
+        if (!settings.has("extraCompilerArgs")) return Set.of();
+        var array = settings.getAsJsonArray("extraCompilerArgs");
+        var args = new HashSet<String>();
+        for (var each : array) {
+            // split "a b  c" to ["a","b","c"]
+            args.addAll(Arrays.asList(each.getAsString().split("\\s+")));
+        }
+        return args;
     }
 
     private Set<Path> docPath() {
@@ -240,9 +260,11 @@ class JavaLanguageServer extends LanguageServer {
                         break;
                     case FileChangeType.Changed:
                         FileStore.externalChange(file);
+                        invalidateLombokCacheForFile(file);
                         break;
                     case FileChangeType.Deleted:
                         FileStore.externalDelete(file);
+                        invalidateLombokCacheForFile(file);
                         break;
                 }
                 return;
@@ -257,11 +279,40 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
+    /**
+     * Invalidate Lombok cache entries for all classes in a file.
+     *
+     * <p>Called when a file is modified or deleted to ensure cache consistency.
+     */
+    private void invalidateLombokCacheForFile(Path file) {
+        if (lombokCache == null) return;
+
+        try {
+            var packageName = FileStore.packageName(file);
+
+            // Invalidate cache for public class (filename usually matches)
+            var fileName = file.getFileName().toString();
+            if (fileName.endsWith(".java")) {
+                var simpleClassName = fileName.substring(0, fileName.length() - 5);
+                var qualifiedName = packageName.isEmpty()
+                    ? simpleClassName
+                    : packageName + "." + simpleClassName;
+                lombokCache.invalidate(qualifiedName);
+            }
+
+            // Note: We could also parse the file to find all classes, but invalidating
+            // just the main class is usually sufficient since Lombok classes are typically
+            // one class per file.
+        } catch (Exception e) {
+            LOG.fine("Failed to invalidate Lombok cache for " + file + ": " + e.getMessage());
+        }
+    }
+
     @Override
     public Optional<CompletionList> completion(TextDocumentPositionParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         var file = Paths.get(params.textDocument.uri);
-        var provider = new CompletionProvider(compiler());
+        var provider = new CompletionProvider(compiler(), lombokCache);
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(list);
@@ -294,7 +345,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
-        var help = new SignatureProvider(compiler()).signatureHelp(file, line, column);
+        var help = new SignatureProvider(compiler(), lombokCache).signatureHelp(file, line, column);
         if (help == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(help);
     }
@@ -318,7 +369,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var found = new ReferenceProvider(compiler(), file, line, column).find();
+        var found = new ReferenceProvider(compiler(), lombokCache, file, line, column).find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -530,8 +581,15 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void doAsyncWork() {
         if (uncheckedChanges && FileStore.activeDocuments().contains(lastEdited)) {
-            lint(List.of(lastEdited));
-            uncheckedChanges = false;
+            try {
+                lint(List.of(lastEdited));
+            } catch (Exception e) {
+                // Log but don't crash server. Lint failures should not terminate the language server.
+                LOG.warning("Async lint failed for " + lastEdited + ": " + e.getMessage());
+                LOG.log(java.util.logging.Level.FINE, "", e);
+            } finally {
+                uncheckedChanges = false;
+            }
         }
     }
 

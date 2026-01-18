@@ -8,17 +8,22 @@ import javax.lang.model.element.TypeElement;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.LombokHandler;
+import org.javacs.LombokMetadataCache;
 import org.javacs.lsp.Location;
 
 public class ReferenceProvider {
     private final CompilerProvider compiler;
+    private final LombokMetadataCache lombokCache;
     private final Path file;
     private final int line, column;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
-    public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
+    public ReferenceProvider(
+            CompilerProvider compiler, LombokMetadataCache lombokCache, Path file, int line, int column) {
         this.compiler = compiler;
+        this.lombokCache = lombokCache;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -28,9 +33,6 @@ public class ReferenceProvider {
         try (var task = compiler.compile(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
             if (element == null) return NOT_SUPPORTED;
-            if (NavigationHelper.isLocal(element)) {
-                return findReferences(task);
-            }
             if (NavigationHelper.isType(element)) {
                 var type = (TypeElement) element;
                 var className = type.getQualifiedName().toString();
@@ -45,7 +47,18 @@ public class ReferenceProvider {
                     memberName = parentClass.getSimpleName().toString();
                 }
                 task.close();
+                if (element.getKind() == javax.lang.model.element.ElementKind.FIELD) {
+                    var references = new ArrayList<Location>();
+                    references.addAll(findFieldReferencesScoped(className, memberName));
+                    references.addAll(
+                            LombokHandler.findAccessorReferences(
+                                    compiler, className, memberName, lombokCache));
+                    return references;
+                }
                 return findMemberReferences(className, memberName);
+            }
+            if (NavigationHelper.isLocal(element)) {
+                return findReferences(task);
             }
             return NOT_SUPPORTED;
         }
@@ -61,6 +74,25 @@ public class ReferenceProvider {
 
     private List<Location> findMemberReferences(String className, String memberName) {
         var files = compiler.findMemberReferences(className, memberName);
+        if (files.length == 0) return List.of();
+        try (var task = compiler.compile(files)) {
+            return findReferences(task);
+        }
+    }
+
+    private List<Location> findFieldReferencesScoped(String className, String memberName) {
+        var files = compiler.findTypeReferences(className);
+        var classFile = compiler.findTypeDeclaration(className);
+        if (classFile != null && !classFile.equals(CompilerProvider.NOT_FOUND)) {
+            var combined = new java.util.ArrayList<Path>();
+            for (var f : files) {
+                combined.add(f);
+            }
+            if (!combined.contains(classFile)) {
+                combined.add(classFile);
+            }
+            files = combined.toArray(Path[]::new);
+        }
         if (files.length == 0) return List.of();
         try (var task = compiler.compile(files)) {
             return findReferences(task);

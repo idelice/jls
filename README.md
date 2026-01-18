@@ -17,7 +17,7 @@ A Java [language server](https://github.com/Microsoft/vscode-languageserver-prot
 - Add the vim plugin [natebosch/vim-lsc](https://github.com/natebosch/vim-lsc) to your vimrc
 - Add vim-lsc configuration:
   ```vimrc
-  let g:lsc_server_commands = {'java': '<path-to-java-language-server>/java-language-server/dist/lang_server_{linux|mac|windows}.sh'}
+  let g:lsc_server_commands = {'java': '<path-to-jls>/jls/dist/lang_server_{linux|mac|windows}.sh'}
   ```
 - See the [vim-lsc README](https://github.com/natebosch/vim-lsc/blob/master/README.md) for other configuration options.
 
@@ -38,7 +38,7 @@ Note: This tool is not compatible with [vim-lsp](https://github.com/prabirshrest
     {
         "java":
         {
-            "command": ["bash","<path-to-java-language-server>/java-language-server/dist/lang_server_{linux|mac|windows}.sh"],
+            "command": ["bash","<path-to-jls>/jls/dist/lang_server_{linux|mac|windows}.sh"],
             "url": "https://github.com/georgewfraser/java-language-server",
             "highlightingModeRegex": "^Java$"
         }
@@ -65,7 +65,7 @@ Note: This tool is not compatible with [vim-lsp](https://github.com/prabirshrest
         "jls":
         {
             "enabled": true,
-            "command": ["bash", "<path-to-java-language-server>/java-language-server/dist/lang_server_{linux|mac|windows}.sh"],
+            "command": ["bash", "<path-to-jls>/jls/dist/lang_server_{linux|mac|windows}.sh"],
             "scopes": ["source.java"],
             "syntaxes": ["Packages/Java/Java.sublime-syntax"],
             "languageId": "java"

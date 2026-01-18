@@ -162,7 +162,7 @@ public class LSP {
             var id = new Random().nextInt();
             var messageText =
                     String.format(
-                            "{\"jsonrpc\":\"2.0\",\"id\":\"%d\",\"method\":\"%s\",\"params\":%s}",
+                            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}",
                             id, requestMethod, jsonText);
             writeClient(send, messageText);
         }
@@ -251,6 +251,10 @@ public class LSP {
             }
             // Otherwise, process the new message
             hasAsyncWork = true;
+            if (r.method == null) {
+                // Response to a server-initiated request; we don't track callbacks.
+                continue;
+            }
             try {
                 switch (r.method) {
                     case "initialize":

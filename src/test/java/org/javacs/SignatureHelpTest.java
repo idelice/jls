@@ -54,6 +54,20 @@ public class SignatureHelpTest {
         assertThat(method.documentation.value, containsString("A great method"));
     }
 
+    @Test
+    public void lombokSetterSignature() {
+        var help = doHelp("/org/javacs/example/LombokSignatureHelp.java", 15, 23);
+        assertThat(help.signatures, hasSize(1));
+        assertThat(help.signatures.get(0).label, containsString("setItems(List<String> items)"));
+    }
+
+    @Test
+    public void lombokBuilderSetterSignature() {
+        var help = doHelp("/org/javacs/example/LombokSignatureHelp.java", 16, 53);
+        assertThat(help.signatures, hasSize(1));
+        assertThat(help.signatures.get(0).label, containsString("items(List<String> items)"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private SignatureHelp doHelp(String file, int row, int column) {

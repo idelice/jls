@@ -3,9 +3,9 @@
 set -e
 
 # Needed once
-if [ ! -e node_modules ]; then
-    npm install
-fi
+# if [ ! -e node_modules ]; then
+#     npm install
+# fi
 
 # Build standalone java
 if [ ! -e jdks/linux/jdk-21 ]; then
@@ -32,8 +32,8 @@ fi
 mvn package -DskipTests
 
 # Build vsix
-npm run-script vscode:build
-
-code --install-extension build.vsix --force
+# npm run-script vscode:build
+#
+# code --install-extension build.vsix --force
 
 echo 'Reload VSCode to update extension'

@@ -11,6 +11,7 @@ import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.LombokHandler;
 import org.javacs.SourceFileObject;
 import org.javacs.lsp.Location;
 
@@ -76,12 +77,19 @@ public class DefinitionProvider {
             var trees = Trees.instance(task.task);
             var elements = task.task.getElements();
             var parentClass = elements.getTypeElement(className);
+
+            // First, try to find the member normally
             for (var member : elements.getAllMembers(parentClass)) {
                 if (!member.getSimpleName().contentEquals(memberName)) continue;
                 var path = trees.getPath(member);
                 if (path == null) continue;
                 var location = FindHelper.location(task, path, memberName);
                 locations.add(location);
+            }
+
+            // If not found, check if it's a Lombok-generated member
+            if (locations.isEmpty()) {
+                locations.addAll(LombokHandler.findGeneratedMemberLocations(task, className, memberName));
             }
         }
         return locations;

@@ -12,6 +12,7 @@ class JavaCompilerService implements CompilerProvider {
     // Not modifiable! If you want to edit these, you need to create a new instance
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
+    final Set<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
     final Docs docs;
     final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
@@ -21,7 +22,7 @@ class JavaCompilerService implements CompilerProvider {
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
 
-    JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports) {
+    JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
         System.err.println("Class path:");
         for (var p : classPath) {
             System.err.println("  " + p);
@@ -34,6 +35,7 @@ class JavaCompilerService implements CompilerProvider {
         this.classPath = Collections.unmodifiableSet(classPath);
         this.docPath = Collections.unmodifiableSet(docPath);
         this.addExports = Collections.unmodifiableSet(addExports);
+        this.extraArgs = Collections.unmodifiableSet(extraArgs);
         this.docs = new Docs(docPath);
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
         this.fileManager = new SourceFileManager();
@@ -74,7 +76,22 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch doCompile(Collection<? extends JavaFileObject> sources) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
-        var firstAttempt = new CompileBatch(this, sources);
+
+        CompileBatch firstAttempt = null;
+        try {
+            firstAttempt = new CompileBatch(this, sources);
+        } catch (CompileBatch.APFailureException e) {
+            // AP failed - retry without AP if Lombok is present
+            if (isLombokPresentOnClasspath()) {
+                LOG.warning("Annotation processing failed: " + e.getMessage() + ", retrying without AP");
+                return doCompileWithoutAP(sources);
+            }
+            throw e;
+        } catch (RuntimeException e) {
+            // Other compilation errors
+            throw e;
+        }
+
         Set<Path> addFiles;
         try {
             addFiles = firstAttempt.needsAdditionalSources();
@@ -83,17 +100,36 @@ class JavaCompilerService implements CompilerProvider {
             firstAttempt.borrow.close();
             throw e;
         }
+
         if (addFiles.isEmpty()) return firstAttempt;
+
         // If the compiler needs additional source files that contain package-private files
         LOG.info("...need to recompile with " + addFiles);
         firstAttempt.close();
         firstAttempt.borrow.close();
+
         var moreSources = new ArrayList<JavaFileObject>();
         moreSources.addAll(sources);
         for (var add : addFiles) {
             moreSources.add(new SourceFileObject(add));
         }
-        return new CompileBatch(this, moreSources);
+
+        CompileBatch secondAttempt = null;
+        try {
+            secondAttempt = new CompileBatch(this, moreSources);
+        } catch (CompileBatch.APFailureException e) {
+            // AP failed on second attempt too - retry without AP
+            if (isLombokPresentOnClasspath()) {
+                LOG.warning("Annotation processing failed on retry: " + e.getMessage() + ", using non-AP compilation");
+                return doCompileWithoutAP(moreSources);
+            }
+            throw e;
+        } catch (RuntimeException e) {
+            // Other compilation errors
+            throw e;
+        }
+
+        return secondAttempt;
     }
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
@@ -357,6 +393,26 @@ class JavaCompilerService implements CompilerProvider {
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
         var compile = compileBatch(sources);
         return new CompileTask(compile.task, compile.roots, diags, compile::close);
+    }
+
+    /**
+     * Compile sources without annotation processing.
+     * Used as fallback when AP fails.
+     */
+    private CompileBatch doCompileWithoutAP(Collection<? extends JavaFileObject> sources) {
+        return new CompileBatch(this, sources, false);  // false = no AP
+    }
+
+    /**
+     * Check if Lombok is present on the classpath.
+     */
+    private boolean isLombokPresentOnClasspath() {
+        return classPath.stream()
+                .anyMatch(
+                        p -> {
+                            var name = p.getFileName().toString().toLowerCase();
+                            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
+                        });
     }
 
     private static final Logger LOG = Logger.getLogger("main");

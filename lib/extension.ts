@@ -340,7 +340,7 @@ function visualVmConfig(context: ExtensionContext): ServerOptions {
     }
     const jars = [
         'gson-2.8.9.jar',
-        'java-language-server.jar',
+        'jls.jar',
         'protobuf-java-3.19.3.jar',
     ];
     const classpath = jars.map(jar => Path.resolve(context.extensionPath, "dist", "classpath", jar)).join(':');

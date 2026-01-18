@@ -123,6 +123,13 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void lombokBuilderMemberCompletion() {
+        var file = "/org/javacs/example/LombokBuilderCompletion.java";
+        var suggestions = filterText(file, 10, 43);
+        assertThat(suggestions, hasItems("name", "count", "build"));
+    }
+
+    @Test
     public void enumMapMembers() {
         var suggestions = filterText("/org/javacs/example/CompleteEnumMap.java", 9, 13);
         String[] expect = {

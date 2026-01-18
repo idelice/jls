@@ -33,7 +33,7 @@ public class JavaDebugServer implements DebugServer {
         try {
             // TODO make location configurable
             var logFile =
-                    new FileHandler("/Users/georgefraser/Documents/java-language-server/java-debug-server.log", false);
+                    new FileHandler("/Users/georgefraser/Documents/jls/java-debug-server.log", false);
             logFile.setFormatter(new LogFormat());
             Logger.getLogger("").addHandler(logFile);
         } catch (IOException e) {

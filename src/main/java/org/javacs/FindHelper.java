@@ -13,6 +13,15 @@ import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.JarURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -22,6 +31,8 @@ import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 
 public class FindHelper {
+    private static final Map<URI, URI> jarUriCache = new ConcurrentHashMap<>();
+    private static Path jarCacheDir;
 
     public static String[] erasedParameterTypes(CompileTask task, ExecutableElement method) {
         var types = task.task.getTypes();
@@ -149,8 +160,45 @@ public class FindHelper {
         var endColumn = (int) lines.getColumnNumber(end);
         var endPos = new Position(endLine - 1, endColumn - 1);
         var range = new Range(startPos, endPos);
-        var uri = path.getCompilationUnit().getSourceFile().toUri();
+        var uri = normalizeUri(path.getCompilationUnit().getSourceFile().toUri());
         return new Location(uri, range);
+    }
+
+    private static URI normalizeUri(URI uri) {
+        if (uri == null) return null;
+        if (!"jar".equals(uri.getScheme())) return uri;
+        return jarUriCache.computeIfAbsent(uri, FindHelper::extractJarUri);
+    }
+
+    private static URI extractJarUri(URI uri) {
+        try {
+            URL url = uri.toURL();
+            JarURLConnection connection = (JarURLConnection) url.openConnection();
+            String entryName = connection.getEntryName();
+            URL jarFileUrl = connection.getJarFileURL();
+            if (entryName == null || jarFileUrl == null) return uri;
+
+            Path base = jarCacheDir();
+            String jarKey = Integer.toHexString(jarFileUrl.toString().hashCode());
+            Path out = base.resolve(jarKey).resolve(entryName);
+            if (!Files.exists(out)) {
+                Files.createDirectories(out.getParent());
+                try (InputStream in = connection.getInputStream()) {
+                    Files.copy(in, out);
+                }
+            }
+            return out.toUri();
+        } catch (IOException e) {
+            return uri;
+        }
+    }
+
+    private static Path jarCacheDir() throws IOException {
+        if (jarCacheDir != null) return jarCacheDir;
+        Path base = Paths.get(System.getProperty("java.io.tmpdir")).resolve("jls-jar-sources");
+        Files.createDirectories(base);
+        jarCacheDir = base;
+        return jarCacheDir;
     }
 
     public static int findNameIn(CompilationUnitTree root, CharSequence name, int start, int end) {

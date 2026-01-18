@@ -1,8 +1,0 @@
-{
-    "recommendations": [
-        "georgewfraser.vscode-javac"
-    ],
-    "unwantedRecommendations": [
-        "vscjava.vscode-java-pack"
-    ]
-}

@@ -139,18 +139,32 @@ class ReusableCompiler {
         @Override
         public void close() {
             if (closed) return;
-            // not returning the context to the pool if task crashes with an exception
-            // the task/context may be in a broken state
-            currentContext.clear();
             try {
-                var method = JavacTaskImpl.class.getDeclaredMethod("cleanup");
-                method.setAccessible(true);
-                method.invoke(task);
-            } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-                throw new RuntimeException(e);
+                // Try to clean up the context and task.
+                // If either fails due to a corrupted state (e.g., after AP failure),
+                // we still need to unlock the compiler so subsequent attempts can proceed.
+                try {
+                    currentContext.clear();
+                } catch (Throwable e) {
+                    // Context cleanup failed - likely due to AP infrastructure corruption.
+                    // Log and continue. We need to unlock the compiler.
+                    LOG.fine("Context cleanup failed (likely due to AP error): " + e.getMessage());
+                }
+
+                try {
+                    var method = JavacTaskImpl.class.getDeclaredMethod("cleanup");
+                    method.setAccessible(true);
+                    method.invoke(task);
+                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+                    LOG.fine("Task cleanup failed: " + e.getMessage());
+                    // Don't throw - we still need to unlock the compiler
+                }
+            } finally {
+                // CRITICAL: Always unlock the compiler, even if cleanup operations fail.
+                // If we don't do this, the compiler will be permanently locked.
+                checkedOut = false;
+                closed = true;
             }
-            checkedOut = false;
-            closed = true;
         }
     }
 

@@ -23,6 +23,8 @@ import javax.lang.model.type.*;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.LombokHandler;
+import org.javacs.LombokMetadataCache;
 import org.javacs.MarkdownHelper;
 import org.javacs.hover.ShortTypePrinter;
 import org.javacs.lsp.ParameterInformation;
@@ -32,11 +34,13 @@ import org.javacs.lsp.SignatureInformation;
 public class SignatureProvider {
 
     private final CompilerProvider compiler;
+    private final LombokMetadataCache lombokCache;
 
     public static final SignatureHelp NOT_SUPPORTED = new SignatureHelp(List.of(), -1, -1);
 
-    public SignatureProvider(CompilerProvider compiler) {
+    public SignatureProvider(CompilerProvider compiler, LombokMetadataCache lombokCache) {
         this.compiler = compiler;
+        this.lombokCache = lombokCache;
     }
 
     public SignatureHelp signatureHelp(Path file, int line, int column) {
@@ -48,6 +52,16 @@ public class SignatureProvider {
             if (path.getLeaf() instanceof MethodInvocationTree) {
                 var invoke = (MethodInvocationTree) path.getLeaf();
                 var overloads = methodOverloads(task, invoke);
+                var activeParameter = activeParameter(task, invoke.getArguments(), cursor);
+                if (overloads.isEmpty()
+                        && invoke.getMethodSelect() instanceof MemberSelectTree) {
+                    var lombokHelp =
+                            LombokHandler.signatureHelpForMethod(
+                                    task, (MemberSelectTree) invoke.getMethodSelect(), activeParameter, lombokCache);
+                    if (lombokHelp != null) {
+                        return lombokHelp;
+                    }
+                }
                 var signatures = new ArrayList<SignatureInformation>();
                 for (var method : overloads) {
                     var info = info(method);
@@ -56,12 +70,19 @@ public class SignatureProvider {
                     signatures.add(info);
                 }
                 var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
-                var activeParameter = activeParameter(task, invoke.getArguments(), cursor);
                 return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
             if (path.getLeaf() instanceof NewClassTree) {
                 var invoke = (NewClassTree) path.getLeaf();
                 var overloads = constructorOverloads(task, invoke);
+                var activeParameter = activeParameter(task, invoke.getArguments(), cursor);
+                if (overloads.isEmpty()) {
+                    var lombokHelp =
+                            LombokHandler.signatureHelpForConstructor(task, invoke, activeParameter, lombokCache);
+                    if (lombokHelp != null) {
+                        return lombokHelp;
+                    }
+                }
                 var signatures = new ArrayList<SignatureInformation>();
                 for (var method : overloads) {
                     var info = info(method);
@@ -70,7 +91,6 @@ public class SignatureProvider {
                     signatures.add(info);
                 }
                 var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
-                var activeParameter = activeParameter(task, invoke.getArguments(), cursor);
                 return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
             return NOT_SUPPORTED;

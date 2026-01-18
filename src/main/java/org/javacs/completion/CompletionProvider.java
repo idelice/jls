@@ -4,10 +4,12 @@ import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
+import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Scope;
 import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
@@ -37,6 +39,8 @@ import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FileStore;
 import org.javacs.JsonHelper;
+import org.javacs.LombokHandler;
+import org.javacs.LombokMetadataCache;
 import org.javacs.ParseTask;
 import org.javacs.SourceFileObject;
 import org.javacs.StringSearch;
@@ -45,9 +49,12 @@ import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.InsertTextFormat;
+import org.javacs.lsp.TextEdit;
+import org.javacs.rewrite.AddImport;
 
 public class CompletionProvider {
     private final CompilerProvider compiler;
+    private final LombokMetadataCache lombokCache;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
@@ -116,8 +123,9 @@ public class CompletionProvider {
         "double",
     };
 
-    public CompletionProvider(CompilerProvider compiler) {
+    public CompletionProvider(CompilerProvider compiler, LombokMetadataCache lombokCache) {
         this.compiler = compiler;
+        this.lombokCache = lombokCache;
     }
 
     public CompletionList complete(Path file, int line, int column) {
@@ -235,7 +243,7 @@ public class CompletionProvider {
         list.items = completeUsingScope(task, path, partial, endsWithParen);
         addStaticImports(task, path.getCompilationUnit(), partial, endsWithParen, list);
         if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
-            addClassNames(path.getCompilationUnit(), partial, list);
+            addClassNames(path.getCompilationUnit(), Trees.instance(task.task).getSourcePositions(), partial, list);
         }
         addKeywords(path, partial, list);
         return list;
@@ -332,13 +340,24 @@ public class CompletionProvider {
         return staticImport.contentEquals("*") || staticImport.contentEquals(member.getSimpleName());
     }
 
-    private void addClassNames(CompilationUnitTree root, String partial, CompletionList list) {
+    private void addClassNames(
+            CompilationUnitTree root, SourcePositions sourcePositions, String partial, CompletionList list) {
         var packageName = Objects.toString(root.getPackageName(), "");
         var uniques = new HashSet<String>();
         var previousSize = list.items.size();
         for (var className : compiler.packagePrivateTopLevelTypes(packageName)) {
             if (!StringSearch.matchesPartialName(className, partial)) continue;
-            list.items.add(classItem(className));
+            var item = classItem(className);
+            if (hasImportConflict(root, className)) {
+                item.insertText = className;
+                item.insertTextFormat = InsertTextFormat.PlainText;
+            } else {
+                var edits = autoImportEdits(className, root, sourcePositions);
+                if (!edits.isEmpty()) {
+                    item.additionalTextEdits = edits;
+                }
+            }
+            list.items.add(item);
             uniques.add(className);
         }
         for (var className : compiler.publicTopLevelTypes()) {
@@ -348,10 +367,71 @@ public class CompletionProvider {
                 list.isIncomplete = true;
                 break;
             }
-            list.items.add(classItem(className));
+            var item = classItem(className);
+            if (hasImportConflict(root, className)) {
+                item.insertText = className;
+                item.insertTextFormat = InsertTextFormat.PlainText;
+            } else {
+                var edits = autoImportEdits(className, root, sourcePositions);
+                if (!edits.isEmpty()) {
+                    item.additionalTextEdits = edits;
+                }
+            }
+            list.items.add(item);
             uniques.add(className);
         }
         LOG.info("...found " + (list.items.size() - previousSize) + " class names");
+    }
+
+    private List<TextEdit> autoImportEdits(
+            String className, CompilationUnitTree root, SourcePositions sourcePositions) {
+        if (className.indexOf('.') < 0) {
+            return List.of();
+        }
+        if (className.startsWith("java.lang.")) {
+            return List.of();
+        }
+        var packageTree = root.getPackage();
+        if (packageTree != null) {
+            var packageName = packageTree.getPackageName().toString();
+            if (className.startsWith(packageName + ".")
+                    && !className.substring(packageName.length() + 1).contains(".")) {
+                return List.of();
+            }
+        }
+        for (var i : root.getImports()) {
+            var imported = i.getQualifiedIdentifier().toString();
+            if (imported.equals(className)) {
+                return List.of();
+            }
+            if (imported.endsWith(".*")) {
+                var importedPackage = imported.substring(0, imported.length() - 1);
+                if (className.startsWith(importedPackage)) {
+                    return List.of();
+                }
+            }
+        }
+
+        var edits = AddImport.createTextEdits(className, root, sourcePositions);
+        return List.of(edits[0]);
+    }
+
+    private boolean hasImportConflict(CompilationUnitTree root, String className) {
+        if (className.indexOf('.') < 0) {
+            return false;
+        }
+        var targetSimple = simpleName(className).toString();
+        for (var i : root.getImports()) {
+            if (i.isStatic()) continue;
+            var imported = i.getQualifiedIdentifier().toString();
+            if (imported.endsWith(".*")) continue;
+            if (imported.equals(className)) continue;
+            var importedSimple = simpleName(imported).toString();
+            if (importedSimple.equals(targetSimple)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private CompletionList completeMemberSelect(
@@ -359,6 +439,14 @@ public class CompletionProvider {
         var trees = Trees.instance(task.task);
         var select = (MemberSelectTree) path.getLeaf();
         LOG.info("...complete members of " + select.getExpression());
+        if (select.getExpression() instanceof MethodInvocationTree) {
+            var builderList =
+                    LombokHandler.builderCompletionsForInvocation(
+                            task, (MethodInvocationTree) select.getExpression(), partial, lombokCache, compiler);
+            if (builderList != null) {
+                return builderList;
+            }
+        }
         path = new TreePath(path, select.getExpression());
         var isStatic = trees.getElement(path) instanceof TypeElement;
         var scope = trees.getScope(path);
@@ -417,6 +505,14 @@ public class CompletionProvider {
         for (var overloads : methods.values()) {
             list.add(method(task, overloads, !endsWithParen));
         }
+
+        // Add Lombok-generated members
+        if (!isStatic) {
+            addLombokCompletions(task, typeElement, partial, list);
+        } else {
+            LombokHandler.addStaticCompletions(task, typeElement, partial, list, lombokCache);
+        }
+
         if (isStatic) {
             list.add(keyword("class"));
         }
@@ -425,6 +521,15 @@ public class CompletionProvider {
             list.add(keyword("super"));
         }
         return new CompletionList(false, list);
+    }
+
+    /**
+     * Add completion items for Lombok-generated members.
+     * Searches the compilation task for the ClassTree of the given TypeElement and synthesizes
+     * completions for generated getters, setters, toString, equals, hashCode, and constructors.
+     */
+    private void addLombokCompletions(CompileTask task, TypeElement typeElement, String partial, List<CompletionItem> list) {
+        LombokHandler.addCompletions(task, typeElement, partial, list, lombokCache);
     }
 
     private boolean isEnclosingClass(DeclaredType type, Scope start) {

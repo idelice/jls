@@ -33,6 +33,13 @@
             <artifactId>protobuf-java</artifactId>
             <version>3.19.6</version>
         </dependency>
+        <!-- Lombok annotation processor -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.30</version>
+            <scope>compile</scope>
+        </dependency>
         <!-- Testing framework -->
         <dependency>
             <groupId>junit</groupId>
@@ -195,7 +202,7 @@
                 <version>2.3.1</version>
                 <configuration>
                 <outputDirectory>${project.basedir}/dist/classpath</outputDirectory>
-                <finalName>java-language-server</finalName>
+                <finalName>jls</finalName>
                 </configuration>
             </plugin>
         </plugins>
