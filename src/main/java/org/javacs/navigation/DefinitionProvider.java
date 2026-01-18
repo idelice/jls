@@ -5,7 +5,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeKind;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
@@ -49,7 +51,15 @@ public class DefinitionProvider {
                 return findDefinitions(task, element);
             }
             task.close();
-            return findRemoteDefinitions(otherFile.get());
+
+            // For JAR files, use simplified logic that only matches by name
+            var uri = otherFile.get().toUri();
+            if ("jar".equals(uri.getScheme()) || uri.getPath().contains("jls-jar-sources")) {
+                return findRemoteDefinitions(otherFile.get(), className, element);
+            }
+
+            // For workspace files, use original logic that better handles overloading
+            return findRemoteDefinitionsLocal(otherFile.get(), element);
         }
     }
 
@@ -69,7 +79,7 @@ public class DefinitionProvider {
         if (otherFile.isEmpty()) return List.of();
         var fileAsSource = new SourceFileObject(file);
         var sources = List.of(fileAsSource, otherFile.get());
-        if (otherFile.get().toString().equals(file.toUri())) {
+        if (otherFile.get().toUri().equals(file.toUri())) {
             sources = List.of(fileAsSource);
         }
         var locations = new ArrayList<Location>();
@@ -106,10 +116,44 @@ public class DefinitionProvider {
         return "";
     }
 
-    private List<Location> findRemoteDefinitions(JavaFileObject otherFile) {
+    private List<Location> findRemoteDefinitionsLocal(JavaFileObject otherFile, Element element) {
         try (var task = compiler.compile(List.of(new SourceFileObject(file), otherFile))) {
-            var element = NavigationHelper.findElement(task, file, line, column);
-            return findDefinitions(task, element);
+            var elementFromLocal = NavigationHelper.findElement(task, file, line, column);
+            return findDefinitions(task, elementFromLocal);
+        }
+    }
+
+    private List<Location> findRemoteDefinitions(JavaFileObject otherFile, String className, Element element) {
+        try (var task = compiler.compile(List.of(otherFile))) {
+            var elements = task.task.getElements();
+            var typeElement = elements.getTypeElement(className);
+            if (typeElement == null) {
+                return List.of();
+            }
+            var trees = com.sun.source.util.Trees.instance(task.task);
+
+            // Try to find a matching member if the element is a member
+            if (element instanceof ExecutableElement || element instanceof VariableElement) {
+                for (var member : typeElement.getEnclosedElements()) {
+                    if (member.getSimpleName().contentEquals(element.getSimpleName())) {
+                        var memberPath = trees.getPath(member);
+                        if (memberPath != null) {
+                            // For constructors, use the class name instead of <init>
+                            var displayName = "<init>".equals(element.getSimpleName().toString())
+                                ? typeElement.getSimpleName()
+                                : element.getSimpleName();
+                            return List.of(FindHelper.location(task, memberPath, displayName));
+                        }
+                    }
+                }
+            }
+
+            // Fall back to type definition
+            var path = trees.getPath(typeElement);
+            if (path == null) {
+                return List.of();
+            }
+            return List.of(FindHelper.location(task, path, typeElement.getSimpleName()));
         }
     }
 

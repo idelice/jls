@@ -32,8 +32,14 @@ public class ErrorProvider {
         var result = new PublishDiagnosticsParams[task.roots.size()];
         for (var i = 0; i < task.roots.size(); i++) {
             var root = task.roots.get(i);
+            var uri = root.getSourceFile().toUri();
             result[i] = new PublishDiagnosticsParams();
-            result[i].uri = root.getSourceFile().toUri();
+            result[i].uri = uri;
+            // Skip diagnostics for JAR-based files (they are not user code)
+            if (isJarOrCachedSource(uri)) {
+                LOG.fine("Skipping diagnostics for JAR source: " + uri);
+                continue;
+            }
             result[i].diagnostics.addAll(compilerErrors(root));
             result[i].diagnostics.addAll(LombokHandler.constructorDiagnostics(task, lombokCache, root));
             result[i].diagnostics.addAll(LombokHandler.builderConstructorDiagnostics(task, root));
@@ -43,6 +49,16 @@ public class ErrorProvider {
         // TODO hint fields that could be final
 
         return result;
+    }
+
+    private boolean isJarOrCachedSource(java.net.URI uri) {
+        // Check if it's a jar: URI
+        if ("jar".equals(uri.getScheme())) {
+            return true;
+        }
+        // Check if it's in the jls-jar-sources cache directory
+        String path = uri.getPath();
+        return path != null && path.contains("jls-jar-sources");
     }
 
     private List<org.javacs.lsp.Diagnostic> compilerErrors(CompilationUnitTree root) {

@@ -146,15 +146,15 @@ public class GotoTest {
     @Test
     public void gotoImplementsRunnable() {
         var file = "/org/javacs/example/GotoOtherPackageMethod.java";
-        assertThat(doGoto(file, 7, 12), empty());
-        // assertThat(doGoto(file, 7, 12), hasItem("ImplementsRunnable.java:5"));
+        // Now that JDK sources are accessible, we can go to definition on JDK interfaces
+        assertThat(doGoto(file, 7, 12), hasItem(startsWith("Runnable.java:")));
     }
 
     @Test
     public void gotoImplementsConsumer() {
         var file = "/org/javacs/example/GotoOtherPackageMethod.java";
-        assertThat(doGoto(file, 11, 12), empty());
-        // assertThat(doGoto(file, 11, 12), hasItem("ImplementsConsumer.java:7"));
+        // Now that JDK sources are accessible, we can go to definition on JDK interfaces
+        assertThat(doGoto(file, 11, 12), hasItem(startsWith("Consumer.java:")));
     }
 
     @Test

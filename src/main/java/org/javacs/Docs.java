@@ -15,16 +15,19 @@ public class Docs {
     final SourceFileManager fileManager = new SourceFileManager();
 
     Docs(Set<Path> docPath) {
-        var srcZipPath = srcZip();
+        var srcZipFile = findSrcZip();
         // Path to source .jars + src.zip
         var sourcePath = new ArrayList<Path>(docPath);
-        if (srcZipPath != NOT_FOUND) {
-            sourcePath.add(srcZipPath);
+        if (srcZipFile != NOT_FOUND) {
+            sourcePath.add(srcZipFile);
         }
         try {
             fileManager.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourcePath);
-            if (srcZipPath != NOT_FOUND) {
-                fileManager.setLocationFromPaths(StandardLocation.MODULE_SOURCE_PATH, Set.of(srcZipPath));
+            if (srcZipFile != NOT_FOUND) {
+                var srcZipVirtualPath = srcZipVirtualPath(srcZipFile);
+                if (srcZipVirtualPath != NOT_FOUND) {
+                    fileManager.setLocationFromPaths(StandardLocation.MODULE_SOURCE_PATH, Set.of(srcZipVirtualPath));
+                }
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -32,21 +35,19 @@ public class Docs {
     }
 
     static final Path NOT_FOUND = Paths.get("");
-    private static Path cacheSrcZip;
+    private static Path cacheSrcZipVirtualPath;
 
-    private static Path srcZip() {
-        if (cacheSrcZip == null) {
-            cacheSrcZip = findSrcZip();
+    private static Path srcZipVirtualPath(Path srcZipFile) {
+        if (cacheSrcZipVirtualPath == null) {
+            try {
+                var fs = FileSystems.newFileSystem(srcZipFile, Docs.class.getClassLoader());
+                cacheSrcZipVirtualPath = fs.getPath("/");
+            } catch (IOException e) {
+                LOG.warning("Failed to create virtual filesystem for " + srcZipFile + ": " + e.getMessage());
+                cacheSrcZipVirtualPath = NOT_FOUND;
+            }
         }
-        if (cacheSrcZip == NOT_FOUND) {
-            return NOT_FOUND;
-        }
-        try {
-            var fs = FileSystems.newFileSystem(cacheSrcZip, Docs.class.getClassLoader());
-            return fs.getPath("/");
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        return cacheSrcZipVirtualPath;
     }
 
     static Path findSrcZip() {
