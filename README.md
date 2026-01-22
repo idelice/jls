@@ -126,21 +126,15 @@ The Java compiler API provides incremental compilation at the level of files: yo
 
 ### Installing
 
-Before installing locally, you need to install prerequisites: npm, maven, protobuf.
+Before installing locally, you need to install prerequisites: maven, protobuf.
 
 You also need to have Java 20+ installed. Point the `JAVA_HOME` environment variable to it.
 
 Assuming you have these prerequisites, you should be able to install locally using:
 
 ```bash
-npm install -g vsce
-npm install
 ./scripts/build.sh
 ```
-
-### Editing
-
-Please run `./configure` before your first commit to install a pre-commit hook that formats the code.
 
 ## Logs
 
