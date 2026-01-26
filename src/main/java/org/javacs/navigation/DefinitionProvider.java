@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.List;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeKind;
@@ -88,18 +89,23 @@ public class DefinitionProvider {
             var elements = task.task.getElements();
             var parentClass = elements.getTypeElement(className);
 
-            // First, try to find the member normally
+            // First, try to find Lombok-generated members (these take priority)
+            locations.addAll(LombokHandler.findGeneratedMemberLocations(task, className, memberName));
+
+            // Then, find instance methods with this name (skip static methods)
             for (var member : elements.getAllMembers(parentClass)) {
                 if (!member.getSimpleName().contentEquals(memberName)) continue;
+                // Skip static methods when looking for instance method definitions
+                if (member instanceof ExecutableElement) {
+                    var method = (ExecutableElement) member;
+                    if (method.getModifiers().contains(Modifier.STATIC)) {
+                        continue;
+                    }
+                }
                 var path = trees.getPath(member);
                 if (path == null) continue;
                 var location = FindHelper.location(task, path, memberName);
                 locations.add(location);
-            }
-
-            // If not found, check if it's a Lombok-generated member
-            if (locations.isEmpty()) {
-                locations.addAll(LombokHandler.findGeneratedMemberLocations(task, className, memberName));
             }
         }
         return locations;

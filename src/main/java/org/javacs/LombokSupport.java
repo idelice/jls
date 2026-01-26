@@ -67,7 +67,12 @@ public class LombokSupport {
             if (member instanceof com.sun.source.tree.MethodTree) {
                 var method = (com.sun.source.tree.MethodTree) member;
                 var name = method.getName().toString();
-                metadata.explicitMethodNames.add(name);
+                // Only track instance methods, not static methods
+                // Static methods don't conflict with instance getters/setters
+                var isStatic = method.getModifiers().getFlags().contains(javax.lang.model.element.Modifier.STATIC);
+                if (!isStatic) {
+                    metadata.explicitMethodNames.add(name);
+                }
                 if (method.getReturnType() == null) {
                     metadata.hasExplicitConstructor = true;
                 }

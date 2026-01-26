@@ -38,6 +38,7 @@ public class LombokMetadata {
     // Field information
     public List<VariableTree> allFields = new ArrayList<>();
     public Map<String, VariableTree> fieldsByName = new HashMap<>();
+    public Set<String> inheritedFieldNames = new HashSet<>();  // Track inherited fields for getter/setter generation
     public Set<String> excludedFromEquals = new HashSet<>();
     public Set<String> excludedFromToString = new HashSet<>();
     public Set<String> explicitMethodNames = new HashSet<>();
@@ -55,9 +56,18 @@ public class LombokMetadata {
      * Check if a method name is a generated getter.
      */
     public boolean isGeneratedGetter(String methodName) {
+        // Check current class fields
         for (var field : allFields) {
             if (methodName.equals(getterName(field)) && shouldGenerateGetter(field)) {
                 return true;
+            }
+        }
+        // Check inherited fields
+        if ((hasGetter || hasData || hasValue) && !inheritedFieldNames.isEmpty()) {
+            for (var fieldName : inheritedFieldNames) {
+                if (methodName.equals("get" + capitalize(fieldName))) {
+                    return true;
+                }
             }
         }
         return false;
@@ -67,9 +77,18 @@ public class LombokMetadata {
      * Check if a method name is a generated setter.
      */
     public boolean isGeneratedSetter(String methodName) {
+        // Check current class fields
         for (var field : allFields) {
             if (methodName.equals(setterName(field)) && shouldGenerateSetter(field)) {
                 return true;
+            }
+        }
+        // Check inherited fields
+        if ((hasSetter || hasData) && !inheritedFieldNames.isEmpty()) {
+            for (var fieldName : inheritedFieldNames) {
+                if (methodName.equals("set" + capitalize(fieldName))) {
+                    return true;
+                }
             }
         }
         return false;
@@ -126,9 +145,16 @@ public class LombokMetadata {
     public List<String> getGeneratedGetterNames() {
         var names = new ArrayList<String>();
         if (hasGetter || hasData || hasValue || !getterFields.isEmpty()) {
+            // Current class fields
             for (var field : allFields) {
                 if (!shouldGenerateGetter(field)) continue;
                 names.add(getterName(field));
+            }
+            // Inherited fields (no VariableTree available, so just generate names)
+            if ((hasGetter || hasData || hasValue) && !inheritedFieldNames.isEmpty()) {
+                for (var fieldName : inheritedFieldNames) {
+                    names.add("get" + capitalize(fieldName));
+                }
             }
         }
         return names;
@@ -139,10 +165,17 @@ public class LombokMetadata {
      */
     public List<String> getGeneratedSetterNames() {
         var names = new ArrayList<String>();
-        if ((hasSetter || hasData || !setterFields.isEmpty()) && !allFields.isEmpty()) {
+        if ((hasSetter || hasData || !setterFields.isEmpty()) && (!allFields.isEmpty() || !inheritedFieldNames.isEmpty())) {
+            // Current class fields
             for (var field : allFields) {
                 if (!shouldGenerateSetter(field)) continue;
                 names.add(setterName(field));
+            }
+            // Inherited fields (no VariableTree available, so just generate names)
+            if ((hasSetter || hasData) && !inheritedFieldNames.isEmpty()) {
+                for (var fieldName : inheritedFieldNames) {
+                    names.add("set" + capitalize(fieldName));
+                }
             }
         }
         return names;

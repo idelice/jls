@@ -45,6 +45,26 @@ public final class LombokHandler {
         if (classTree != null) {
             var metadata = LombokSupport.analyze(classTree);
             if (!LombokSupport.hasLombokAnnotations(metadata)) return null;
+
+            // Populate inherited fields using semantic analysis
+            try {
+                var typeElement = task.task.getElements().getTypeElement(qualifiedName);
+                if (typeElement != null) {
+                    var allMembers = task.task.getElements().getAllMembers(typeElement);
+                    for (var member : allMembers) {
+                        if (member.getKind() == ElementKind.FIELD) {
+                            var fieldName = member.getSimpleName().toString();
+                            // Only add if not already in current class fields
+                            if (!metadata.fieldsByName.containsKey(fieldName)) {
+                                metadata.inheritedFieldNames.add(fieldName);
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // Gracefully continue without inherited fields if semantic analysis fails
+            }
+
             return metadata;
         }
         if (cache != null) {
@@ -585,29 +605,69 @@ public final class LombokHandler {
         var message = d.getMessage(null);
         if (message == null) return false;
 
-        var methodPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
-        var methodMatcher = methodPattern.matcher(message);
-        if (!methodMatcher.find()) return false;
+        String methodName = null;
+        String className = null;
+        List<String> paramTypes = null;
 
-        var methodName = methodMatcher.group(1);
-        var params = methodMatcher.group(2);
-        var paramTypes = parseMethodParamTypes(params);
-        if (paramTypes.size() != 1) return false;
+        // Try pattern 1: "method foo(...)" - when signature is shown
+        var methodWithParamPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
+        var methodWithParamMatcher = methodWithParamPattern.matcher(message);
+        if (methodWithParamMatcher.find()) {
+            methodName = methodWithParamMatcher.group(1);
+            var params = methodWithParamMatcher.group(2);
+            paramTypes = parseMethodParamTypes(params);
+        } else {
+            // Try pattern 2: "method foo in class Bar" - when signature not fully resolved
+            var methodInClassPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s+in\\s+(?:class|enum)\\s+([\\w.]+)");
+            var methodInClassMatcher = methodInClassPattern.matcher(message);
+            if (methodInClassMatcher.find()) {
+                methodName = methodInClassMatcher.group(1);
+                className = methodInClassMatcher.group(2);
+                // When params aren't in signature, check "found:" clause
+                var foundPattern = java.util.regex.Pattern.compile("found:\\s*(.+?)(?:\\s+reason:|$)");
+                var foundMatcher = foundPattern.matcher(message);
+                if (foundMatcher.find()) {
+                    var found = foundMatcher.group(1).trim();
+                    if (found.equals("no arguments")) {
+                        paramTypes = new ArrayList<>();
+                    } else {
+                        paramTypes = parseMethodParamTypes(found);
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
 
-        var classPattern = java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
-        var classMatcher = classPattern.matcher(message);
-        if (!classMatcher.find()) return false;
+        if (methodName == null || paramTypes == null) return false;
 
-        var className = classMatcher.group(1);
+        // Extract class name if not already found
+        if (className == null) {
+            var classPattern = java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
+            var classMatcher = classPattern.matcher(message);
+            if (!classMatcher.find()) return false;
+            className = classMatcher.group(1);
+        }
+
         var metadata = cache.get(className, task.roots);
         if (metadata == null) return false;
 
-        var field = metadata.fieldForSetter(methodName);
-        if (field == null) return false;
+        // Handle getters: 0 parameters - filter if Lombok would generate a getter
+        if (paramTypes.isEmpty()) {
+            return metadata.isGeneratedGetter(methodName);
+        }
 
-        var expectedType = field.getType().toString();
-        var actualType = paramTypes.get(0);
-        return typesMatch(expectedType, actualType);
+        // Handle setters: 1 parameter - filter if types match
+        if (paramTypes.size() == 1) {
+            var field = metadata.fieldForSetter(methodName);
+            if (field == null) return false;
+
+            var expectedType = field.getType().toString();
+            var actualType = paramTypes.get(0);
+            return typesMatch(expectedType, actualType);
+        }
+
+        return false;
     }
 
     private static boolean shouldFilterEnumConstructorError(

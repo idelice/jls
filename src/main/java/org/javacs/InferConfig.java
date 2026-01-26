@@ -211,6 +211,7 @@ class InferConfig {
                 goal,
                 "-DincludeScope=test",
                 "-DoutputAbsoluteArtifactFilename=true",
+                "-DexcludeOptional=false",
             };
             var output = Files.createTempFile("jls-maven-output", ".txt");
             LOG.info("Running " + String.join(" ", command) + " ...");

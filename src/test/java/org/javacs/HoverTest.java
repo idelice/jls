@@ -79,8 +79,15 @@ public class HoverTest {
                 new TextDocumentPositionParams(
                         new TextDocumentIdentifier(FindResource.uri(file)), new Position(line - 1, character - 1));
         var result = new StringJoiner("\n");
-        for (var h : server.hover(pos).get().contents) {
-            result.add(h.value);
+        var hover = server.hover(pos).get();
+        if (hover.contents instanceof java.util.List) {
+            for (var h : (java.util.List<?>) hover.contents) {
+                if (h instanceof MarkedString) {
+                    result.add(((MarkedString) h).value);
+                }
+            }
+        } else if (hover.contents instanceof MarkupContent) {
+            result.add(((MarkupContent) hover.contents).value);
         }
         return result.toString();
     }
