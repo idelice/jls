@@ -92,6 +92,8 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
                 return SymbolKind.Enum;
             case INTERFACE:
                 return SymbolKind.Interface;
+            case RECORD:
+                return SymbolKind.Class;  // Records are treated as classes for symbol kind
             case METHOD:
                 return SymbolKind.Method;
             case TYPE_PARAMETER:

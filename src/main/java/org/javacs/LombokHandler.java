@@ -675,21 +675,40 @@ public final class LombokHandler {
         var message = d.getMessage(null);
         if (message == null) return false;
 
-        // Pattern: "constructor EnumName in enum com.example.EnumName cannot be applied"
+        // Pattern 1: "constructor EnumName in enum com.example.EnumName cannot be applied"
         var enumPattern = java.util.regex.Pattern.compile("constructor\\s+(\\w+)\\s+in enum\\s+([\\w.]+)");
         var enumMatcher = enumPattern.matcher(message);
-        if (!enumMatcher.find()) return false;
+        if (enumMatcher.find()) {
+            var enumClassName = enumMatcher.group(2);
+            var metadata = cache.get(enumClassName, task.roots);
+            if (metadata == null) return false;
 
-        var enumClassName = enumMatcher.group(2);
-        var metadata = cache.get(enumClassName, task.roots);
-        if (metadata == null) return false;
+            // Filter if the enum has a Lombok constructor annotation
+            return metadata.hasAllArgsConstructor ||
+                   metadata.hasRequiredArgsConstructor ||
+                   metadata.hasNoArgsConstructor ||
+                   metadata.hasData ||
+                   metadata.hasValue;
+        }
 
-        // Filter if the enum has a Lombok constructor annotation
-        return metadata.hasAllArgsConstructor ||
-               metadata.hasRequiredArgsConstructor ||
-               metadata.hasNoArgsConstructor ||
-               metadata.hasData ||
-               metadata.hasValue;
+        // Pattern 2: "constructor ClassName in class com.example.ClassName cannot be applied"
+        // This handles @AllArgsConstructor, @RequiredArgsConstructor, @NoArgsConstructor on regular classes
+        var classPattern = java.util.regex.Pattern.compile("constructor\\s+(\\w+)\\s+in class\\s+([\\w.]+)");
+        var classMatcher = classPattern.matcher(message);
+        if (classMatcher.find()) {
+            var className = classMatcher.group(2);
+            var metadata = cache.get(className, task.roots);
+            if (metadata == null) return false;
+
+            // Filter if the class has a Lombok constructor annotation
+            return metadata.hasAllArgsConstructor ||
+                   metadata.hasRequiredArgsConstructor ||
+                   metadata.hasNoArgsConstructor ||
+                   metadata.hasData ||
+                   metadata.hasValue;
+        }
+
+        return false;
     }
 
     public static org.javacs.lsp.Diagnostic adjustDiagnostic(
