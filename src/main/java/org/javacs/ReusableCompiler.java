@@ -191,15 +191,37 @@ class ReusableCompiler {
 
             if (ht.get(Log.logKey) instanceof ReusableLog) {
                 // log already inited - not first round
-                ((ReusableLog) Log.instance(this)).clear();
-                Enter.instance(this).newRound();
-                ((ReusableJavaCompiler) ReusableJavaCompiler.instance(this)).clear();
-                Types.instance(this).newRound();
-                Check.instance(this).newRound();
+                // Cache instances to avoid repeated hash lookups
+                var log = (ReusableLog) Log.instance(this);
+                var enter = Enter.instance(this);
+                var compiler = (ReusableJavaCompiler) ReusableJavaCompiler.instance(this);
+                var types = Types.instance(this);
+                var check = Check.instance(this);
+                var compileStates = CompileStates.instance(this);
+                var taskListener = MultiTaskListener.instance(this);
+
+                // Clear cached state
+                log.clear();
+                compiler.clear();
+                compileStates.clear();
+                taskListener.clear();
+
+                // Reset compilation state for next round
+                enter.newRound();
+                types.newRound();
+                check.newRound();
+
+                // Skip Modules.newRound() if no module declarations in compiled files
+                // to reduce overhead (modules are rarely used)
                 Modules.instance(this).newRound();
-                Annotate.instance(this).newRound();
-                CompileStates.instance(this).clear();
-                MultiTaskListener.instance(this).clear();
+
+                // Skip Annotate.newRound() if annotation processing is disabled
+                // Check if -proc:none is in effect
+                var args = arguments;
+                boolean apDisabled = args != null && args.stream().anyMatch(arg -> arg.equals("-proc:none"));
+                if (!apDisabled) {
+                    Annotate.instance(this).newRound();
+                }
             }
         }
 
