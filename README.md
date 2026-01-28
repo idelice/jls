@@ -13,8 +13,12 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Diagnostics** - Real-time linting and error reporting
 - **Signature help** - Parameter information for method calls
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
-- **Private repository support** - Seamless integration with Maven repositories requiring authentication
-- **JAR navigation** - Go-to-definition works on dependency JARs with source files
+  - Nested Lombok type completion (e.g., `obj.getLombokField().get` shows all members)
+  - **Note**: Lombok support covers standard use cases but cannot handle all edge cases due to Lombok's advanced metaprogramming features
+- **Record support** - Full IDE support for Java records (16+)
+  - Find references on record parameters and accessor methods
+  - Go-to-definition on record accessor calls navigates to parameter definition
+- **JAR navigation** - Go-to-definition works on dependency JARs with source files (public repositories)
 
 ## Installation
 
@@ -85,27 +89,29 @@ Or specify them directly:
 }
 ```
 
-### Enabling private repository support
+### Known Limitation: Private Repository Support
 
-Ensure your Maven credentials are configured in `~/.m2/settings.xml`:
+Private Maven repositories are currently not supported. Go-to-definition on dependencies from private repositories will not work. Only public repositories (Maven Central, etc.) are supported at this time.
 
-```xml
-<servers>
-    <server>
-        <id>my-private-repo</id>
-        <username>your-username</username>
-        <password>your-password</password>
-    </server>
-</servers>
+**Technical Details**: The Maven subprocess launched by JLS to resolve dependencies does not inherit the parent process's environment variables. This means:
+- Maven credentials stored in `~/.m2/settings.xml` are not available to the subprocess
+- The subprocess cannot authenticate with private repositories
+- `mvn dependency:sources` fails silently when encountering private repository artifacts
+- Source JARs for private dependencies are never downloaded, making go-to-definition impossible
+
+**Workaround**: For private dependencies, you can manually download source JARs and configure them:
+
+```json
+{
+    "classPath": [
+        "/path/to/private-dep.jar"
+    ],
+    "docPath": [
+        "/path/to/private-dep-sources.jar"
+    ]
+}
 ```
 
-Then download source JARs:
-
-```bash
-mvn dependency:sources
-```
-
-The language server will inherit the environment and use your Maven credentials for private repositories.
 
 ## Usage
 
@@ -121,6 +127,46 @@ The Java language server uses the [Java compiler API](https://docs.oracle.com/ja
 ### Incremental updates
 
 The Java compiler API provides incremental compilation at the level of files: you can create a long-lived instance of the Java compiler, and as the user edits, you only need to recompile files that have changed. The Java language server optimizes this further by *focusing* compilation on the region of interest by erasing irrelevant code.
+
+## Recent Enhancements
+
+### Java Records Support (Java 16+)
+
+Full IDE support for Java records, including:
+
+- **Find References**: Click on a record parameter (e.g., `foo` in `record MyRec(String foo)`) and use "Find References" to locate all uses of the generated accessor method
+- **Go-to-Definition**: Click on a record accessor call (e.g., `p.foo()`) and navigate directly to the parameter definition in the record declaration
+
+### Nested Lombok Type Completion
+
+Improved completion for nested Lombok-generated types. When you call a Lombok-generated getter that returns another Lombok type, completion now correctly shows all members:
+
+```java
+@Data
+class Container {
+    private Item item;  // Lombok generates getItem()
+}
+
+@Data
+class Item {
+    private String value;  // Lombok generates getValue()
+}
+
+// Completion on container.getItem(). now shows: getValue(), setValue(), etc.
+container.getItem().get
+```
+
+This works through semantic type resolution using the Java compiler API's type system, ensuring 100% accuracy with zero performance impact.
+
+### Limitations of Lombok Support
+
+Lombok support is designed to cover the most common use cases (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.). However, due to Lombok's advanced metaprogramming and AST manipulation capabilities, not all edge cases are supported:
+
+- **Custom annotation handlers**: Lombok plugins with custom annotations may not be recognized
+- **Complex builder patterns**: Some advanced @Builder configurations with custom methods
+- **Conditional field generation**: Annotations with conditions that affect which fields are generated
+- **Nested/inherited Lombok classes**: Complex inheritance hierarchies with mixed Lombok and non-Lombok classes
+- **Record-specific Lombok annotations**: Future Lombok features designed specifically for records
 
 ## Contributing
 
