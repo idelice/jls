@@ -10,6 +10,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors; // Added for Collectors.toSet()
@@ -28,6 +31,27 @@ class InferConfig {
     private final Path gradleHome;
     /** Environment variables, primarily for testing */
     private final Map<String, String> envVars;
+    /** Optional cache manager for speeding up dependency resolution */
+    private final CacheManager cacheManager;
+    /** Resolved classpath (from cache or parallel Maven, used to coordinate classPath() and buildDocPath()) */
+    private Set<Path> resolvedClassPath;
+    /** Resolved docpath (from cache or parallel Maven, used to coordinate classPath() and buildDocPath()) */
+    private Set<Path> resolvedDocPath;
+
+    InferConfig(
+            Path workspaceRoot,
+            Collection<String> externalDependencies,
+            Path mavenHome,
+            Path gradleHome,
+            Map<String, String> envVars,
+            CacheManager cacheManager) {
+        this.workspaceRoot = workspaceRoot;
+        this.externalDependencies = externalDependencies;
+        this.mavenHome = mavenHome;
+        this.gradleHome = gradleHome;
+        this.envVars = Objects.requireNonNullElseGet(envVars, System::getenv);
+        this.cacheManager = cacheManager;
+    }
 
     InferConfig(
             Path workspaceRoot,
@@ -35,28 +59,28 @@ class InferConfig {
             Path mavenHome,
             Path gradleHome,
             Map<String, String> envVars) {
-        this.workspaceRoot = workspaceRoot;
-        this.externalDependencies = externalDependencies;
-        this.mavenHome = mavenHome;
-        this.gradleHome = gradleHome;
-        this.envVars = Objects.requireNonNullElseGet(envVars, System::getenv);
+        this(workspaceRoot, externalDependencies, mavenHome, gradleHome, envVars, null);
     }
 
     InferConfig(Path workspaceRoot, Collection<String> externalDependencies, Path mavenHome, Path gradleHome) {
-        this(workspaceRoot, externalDependencies, mavenHome, gradleHome, null); // Null envVars defaults to System.getenv()
+        this(workspaceRoot, externalDependencies, mavenHome, gradleHome, null, null); // Null envVars defaults to System.getenv()
+    }
+
+    InferConfig(Path workspaceRoot, Collection<String> externalDependencies, CacheManager cacheManager) {
+        this(workspaceRoot, externalDependencies, defaultMavenHome(), defaultGradleHome(), null, cacheManager);
     }
 
     InferConfig(Path workspaceRoot, Collection<String> externalDependencies) {
-        this(workspaceRoot, externalDependencies, defaultMavenHome(), defaultGradleHome(), null);
+        this(workspaceRoot, externalDependencies, defaultMavenHome(), defaultGradleHome(), null, null);
     }
 
     InferConfig(Path workspaceRoot) {
-        this(workspaceRoot, Collections.emptySet(), defaultMavenHome(), defaultGradleHome(), null);
+        this(workspaceRoot, Collections.emptySet(), defaultMavenHome(), defaultGradleHome(), null, null);
     }
 
     // Constructor for testing, allowing envVars injection.
     InferConfig(Path workspaceRoot, Map<String, String> envVars) {
-        this(workspaceRoot, Collections.emptySet(), defaultMavenHome(), defaultGradleHome(), envVars);
+        this(workspaceRoot, Collections.emptySet(), defaultMavenHome(), defaultGradleHome(), envVars, null);
     }
 
     private static Path defaultMavenHome() {
@@ -65,6 +89,51 @@ class InferConfig {
 
     private static Path defaultGradleHome() {
         return Paths.get(System.getProperty("user.home")).resolve(".gradle");
+    }
+
+    /**
+     * Resolve both classpath and docpath in parallel via Maven. This runs both
+     * `dependency:list` and `dependency:sources` concurrently instead of sequentially,
+     * improving performance when cache misses.
+     */
+    private void resolveMavenDependenciesInParallel(Path pomXml) {
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            // Task 1: resolve classpath via dependency:list
+            var classPathFuture = executor.submit(() -> {
+                LOG.info("Starting parallel Maven dependency:list...");
+                return mvnDependencies(pomXml, "dependency:list", this.envVars);
+            });
+
+            // Task 2: resolve docpath via dependency:sources
+            var docPathFuture = executor.submit(() -> {
+                LOG.info("Starting parallel Maven dependency:sources...");
+                return mvnDependencies(pomXml, "dependency:sources", this.envVars);
+            });
+
+            // Wait for both to complete
+            try {
+                resolvedClassPath = classPathFuture.get();
+                resolvedDocPath = docPathFuture.get();
+                LOG.info("Parallel Maven resolution completed");
+
+                // Save both to cache after successful resolution
+                if (cacheManager != null) {
+                    cacheManager.saveCache(workspaceRoot, externalDependencies, resolvedClassPath,
+                            resolvedDocPath);
+                }
+            } catch (ExecutionException e) {
+                LOG.severe("Maven resolution failed: " + e.getCause().getMessage());
+                resolvedClassPath = Set.of();
+                resolvedDocPath = Set.of();
+            }
+        } catch (InterruptedException e) {
+            LOG.severe("Maven resolution interrupted: " + e.getMessage());
+            resolvedClassPath = Set.of();
+            resolvedDocPath = Set.of();
+        } finally {
+            executor.shutdown();
+        }
     }
 
     /** Find .jar files for external dependencies, for examples maven dependencies in ~/.m2 or jars in bazel-genfiles */
@@ -92,10 +161,26 @@ class InferConfig {
             return result;
         }
 
-        // Maven
+        // Try cache first (for Maven and Bazel projects)
+        if (cacheManager != null) {
+            var cached = cacheManager.loadCache(workspaceRoot, externalDependencies);
+            if (cached.isPresent()) {
+                // Store both classpath and docpath in instance variables for buildDocPath() to use
+                resolvedClassPath = cached.get().classPath;
+                resolvedDocPath = cached.get().docPath;
+                LOG.info("Using cached dependencies for classpath");
+                return resolvedClassPath;
+            }
+        }
+
+        // Maven (with parallel resolution for better performance)
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:list", this.envVars);
+            // Trigger parallel resolution of both classpath and docpath
+            if (resolvedClassPath == null) {
+                resolveMavenDependenciesInParallel(pomXml);
+            }
+            return resolvedClassPath;
         }
 
         // Bazel
@@ -118,6 +203,12 @@ class InferConfig {
 
     /** Find source .jar files in local maven repository. */
     Set<Path> buildDocPath() {
+        // If we already resolved (from cache or parallel Maven), return resolved docPath
+        if (resolvedDocPath != null) {
+            LOG.info("Using resolved dependencies for docpath");
+            return resolvedDocPath;
+        }
+
         // externalDependencies
         if (!externalDependencies.isEmpty()) {
             var result = new HashSet<Path>();
@@ -133,10 +224,21 @@ class InferConfig {
             return result;
         }
 
-        // Maven
+        // Maven (with parallel resolution for better performance)
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:sources", this.envVars);
+            // Ensure classPath is resolved first (triggers parallel resolution if needed)
+            classPath();
+
+            // Should now have resolved docpath from parallel resolution
+            if (resolvedDocPath != null) {
+                LOG.info("Using resolved dependencies for docpath");
+                return resolvedDocPath;
+            }
+
+            // Shouldn't reach here, but fallback to sequential resolution
+            var result = mvnDependencies(pomXml, "dependency:sources", this.envVars);
+            return result;
         }
 
         // Bazel

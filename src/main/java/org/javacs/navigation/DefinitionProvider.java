@@ -93,6 +93,10 @@ public class DefinitionProvider {
             locations.addAll(LombokHandler.findGeneratedMemberLocations(task, className, memberName));
 
             // Then, find instance methods with this name (skip static methods)
+            // For records, prefer METHOD over FIELD (both have the same name)
+            javax.lang.model.element.Element methodMember = null;
+            javax.lang.model.element.Element fieldMember = null;
+
             for (var member : elements.getAllMembers(parentClass)) {
                 if (!member.getSimpleName().contentEquals(memberName)) continue;
                 // Skip static methods when looking for instance method definitions
@@ -101,11 +105,20 @@ public class DefinitionProvider {
                     if (method.getModifiers().contains(Modifier.STATIC)) {
                         continue;
                     }
+                    methodMember = member;
+                } else if (member instanceof VariableElement && fieldMember == null) {
+                    fieldMember = member;
                 }
-                var path = trees.getPath(member);
-                if (path == null) continue;
-                var location = FindHelper.location(task, path, memberName);
-                locations.add(location);
+            }
+
+            // Prefer METHOD (for record accessors) over FIELD
+            var targetMember = methodMember != null ? methodMember : fieldMember;
+            if (targetMember != null) {
+                var path = trees.getPath(targetMember);
+                if (path != null) {
+                    var location = FindHelper.location(task, path, memberName);
+                    locations.add(location);
+                }
             }
         }
         return locations;
@@ -166,7 +179,21 @@ public class DefinitionProvider {
     private List<Location> findDefinitions(CompileTask task, Element element) {
         var trees = Trees.instance(task.task);
         var path = trees.getPath(element);
+
         if (path == null) {
+            // For synthetic methods (like record accessors), navigate to the parameter in the record declaration
+            if (element instanceof ExecutableElement) {
+                var enclosing = element.getEnclosingElement();
+                if (enclosing != null && enclosing.getKind() == javax.lang.model.element.ElementKind.RECORD) {
+                    var recordElement = (TypeElement) enclosing;
+                    var recordPath = trees.getPath(recordElement);
+                    if (recordPath != null) {
+                        // Use the method name (which matches the parameter name) to find the parameter location
+                        var paramName = element.getSimpleName();
+                        return List.of(FindHelper.location(task, recordPath, paramName));
+                    }
+                }
+            }
             return List.of();
         }
         var name = element.getSimpleName();

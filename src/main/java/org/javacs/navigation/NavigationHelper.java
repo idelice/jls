@@ -43,6 +43,7 @@ class NavigationHelper {
             case FIELD:
             case METHOD:
             case CONSTRUCTOR:
+            case RECORD_COMPONENT:  // Record fields are members too
                 return true;
             default:
                 return false;
@@ -55,6 +56,7 @@ class NavigationHelper {
             case CLASS:
             case ENUM:
             case INTERFACE:
+            case RECORD:  // Records are types too
                 return true;
             default:
                 return false;

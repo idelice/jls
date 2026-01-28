@@ -19,6 +19,7 @@ import java.util.Set;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
@@ -70,6 +71,74 @@ public final class LombokHandler {
         if (cache != null) {
             return cache.getFromSource(qualifiedName);
         }
+        return null;
+    }
+
+    /**
+     * Resolve the return type of a Lombok-generated method by analyzing field types.
+     * Called when javac returns an ERROR type for a method that should be synthesized by Lombok.
+     *
+     * Example: errorTypeName = "com.example.Foo.getBar"
+     * Returns: The TypeMirror for "Bar" (the type of the bar field)
+     *
+     * @param task compilation context
+     * @param errorTypeName qualified name like "com.example.Foo.getBar" or "com.example.Foo.setBar"
+     * @param cache metadata cache
+     * @return the resolved TypeMirror, or null if not resolvable
+     */
+    public static javax.lang.model.type.TypeMirror resolveLombokGeneratedMethodType(
+            CompileTask task, String errorTypeName, LombokMetadataCache cache) {
+        // Parse errorTypeName: last part is method name, rest is class name
+        if (!errorTypeName.contains(".")) {
+            return null;
+        }
+
+        var lastDotIndex = errorTypeName.lastIndexOf('.');
+        var className = errorTypeName.substring(0, lastDotIndex);
+        var methodName = errorTypeName.substring(lastDotIndex + 1);
+
+        // Get the TypeElement for the class using semantic API
+        var classElement = task.task.getElements().getTypeElement(className);
+        if (classElement == null) {
+            return null;
+        }
+
+        // Try to match the method name to a generated getter/setter
+        // Getter: getXxx or isXxx -> field xxx
+        // Setter: setXxx -> field xxx
+        String fieldName = null;
+
+        if (methodName.startsWith("get") && methodName.length() > 3) {
+            fieldName = Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
+        } else if (methodName.startsWith("is") && methodName.length() > 2) {
+            fieldName = Character.toLowerCase(methodName.charAt(2)) + methodName.substring(3);
+        } else if (methodName.startsWith("set") && methodName.length() > 3) {
+            fieldName = Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
+        }
+
+        if (fieldName == null) {
+            return null;
+        }
+
+        // Find the field in the class (including inherited fields)
+        var allMembers = task.task.getElements().getAllMembers(classElement);
+        for (var member : allMembers) {
+            if (member.getKind() == ElementKind.FIELD && member.getSimpleName().toString().equals(fieldName)) {
+                var fieldElement = (VariableElement) member;
+                var fieldType = fieldElement.asType();
+
+                // For getter (getXxx or isXxx), return the field type
+                if (methodName.startsWith("get") || methodName.startsWith("is")) {
+                    return fieldType;
+                }
+            }
+        }
+
+        // For setter (setXxx), return void type
+        if (methodName.startsWith("set")) {
+            return task.task.getTypes().getNoType(javax.lang.model.type.TypeKind.VOID);
+        }
+
         return null;
     }
 
@@ -367,7 +436,15 @@ public final class LombokHandler {
 
     public static boolean shouldSuppressUnusedField(
             Element unusedEl, CompileTask task, LombokMetadataCache cache) {
-        if (unusedEl == null || unusedEl.getKind() != ElementKind.FIELD) return false;
+        if (unusedEl == null) return false;
+
+        // Record components are implicitly used (part of the implicit constructor)
+        if (unusedEl.getKind() == ElementKind.RECORD_COMPONENT) {
+            return true;
+        }
+
+        // Regular fields in Lombok classes are suppressed
+        if (unusedEl.getKind() != ElementKind.FIELD) return false;
         var parent = unusedEl.getEnclosingElement();
         if (!(parent instanceof TypeElement)) return false;
         var className = ((TypeElement) parent).getQualifiedName().toString();
@@ -1006,7 +1083,55 @@ public final class LombokHandler {
         if ("<nulltype>".equals(actualType)) {
             return true;
         }
-        return normalizeType(expectedType).equals(normalizeType(actualType));
+        var normalized_expected = normalizeType(expectedType);
+        var normalized_actual = normalizeType(actualType);
+
+        if (normalized_expected.equals(normalized_actual)) {
+            return true;
+        }
+
+        // Check auto-boxing: primitive types are assignable to their boxed equivalents and vice versa
+        return areBoxingEquivalent(normalized_expected, normalized_actual);
+    }
+
+    /** Check if two types are equivalent under Java's auto-boxing rules */
+    private static boolean areBoxingEquivalent(String type1, String type2) {
+        var boxed1 = getBoxedEquivalent(type1);
+        var boxed2 = getBoxedEquivalent(type2);
+
+        // If either type doesn't have a boxing equivalent, they're not boxing-equivalent
+        if (boxed1 == null || boxed2 == null) {
+            return false;
+        }
+
+        // They're equivalent if their boxed forms match
+        return boxed1.equals(boxed2);
+    }
+
+    /** Get the boxed equivalent of a primitive type, or null if not a primitive */
+    private static String getBoxedEquivalent(String type) {
+        // Remove array suffixes temporarily
+        var arraySuffix = "";
+        var baseType = type;
+        while (baseType.endsWith("[]")) {
+            arraySuffix += "[]";
+            baseType = baseType.substring(0, baseType.length() - 2);
+        }
+
+        var boxed = switch(baseType) {
+            case "int" -> "Integer";
+            case "long" -> "Long";
+            case "double" -> "Double";
+            case "float" -> "Float";
+            case "boolean" -> "Boolean";
+            case "byte" -> "Byte";
+            case "char" -> "Character";
+            case "short" -> "Short";
+            case "Integer", "Long", "Double", "Float", "Boolean", "Byte", "Character", "Short" -> baseType;
+            default -> null;
+        };
+
+        return boxed != null ? boxed + arraySuffix : null;
     }
 
     private static String normalizeType(String typeName) {

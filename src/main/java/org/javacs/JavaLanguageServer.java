@@ -34,6 +34,8 @@ class JavaLanguageServer extends LanguageServer {
     private JsonObject cacheSettings;
     private JsonObject settings = new JsonObject();
     private boolean modifiedBuild = true;
+    private CacheManager cacheManager;
+    private String progressToken;
 
     JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -76,23 +78,60 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
+    /**
+     * Start a new progress report using standard LSP WorkDoneProgress. Token is generated
+     * as "jls-progress-{timestamp}" to uniquely identify this progress session.
+     */
+    private void startProgress(String title) {
+        progressToken = "jls-progress-" + System.currentTimeMillis();
+        var begin = new WorkDoneProgressBegin(title);
+        var params = new WorkDoneProgressParams(progressToken, begin);
+        client.customNotification("$/progress", GSON.toJsonTree(params));
+    }
+
+    /**
+     * Report progress update using standard LSP WorkDoneProgress.
+     */
+    private void reportProgress(String message) {
+        if (progressToken != null) {
+            var report = new WorkDoneProgressReport(message);
+            var params = new WorkDoneProgressParams(progressToken, report);
+            client.customNotification("$/progress", GSON.toJsonTree(params));
+        }
+    }
+
+    /**
+     * End the current progress report using standard LSP WorkDoneProgress.
+     */
+    private void endProgress() {
+        if (progressToken != null) {
+            var end = new WorkDoneProgressEnd();
+            var params = new WorkDoneProgressParams(progressToken, end);
+            client.customNotification("$/progress", GSON.toJsonTree(params));
+            progressToken = null;
+        }
+    }
+
+    // Deprecated: kept for backward compatibility but now uses standard LSP
     private void javaStartProgress(JavaStartProgressParams params) {
-        client.customNotification("java/startProgress", GSON.toJsonTree(params));
+        startProgress(params.getMessage());
     }
 
+    // Deprecated: kept for backward compatibility but now uses standard LSP
     private void javaReportProgress(JavaReportProgressParams params) {
-        client.customNotification("java/reportProgress", GSON.toJsonTree(params));
+        reportProgress(params.getMessage());
     }
 
+    // Deprecated: kept for backward compatibility but now uses standard LSP
     private void javaEndProgress() {
-        client.customNotification("java/endProgress", JsonNull.INSTANCE);
+        endProgress();
     }
 
     private JavaCompilerService createCompiler() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
 
-        javaStartProgress(new JavaStartProgressParams("Configure javac"));
-        javaReportProgress(new JavaReportProgressParams("Finding source roots"));
+        startProgress("Configure javac");
+        reportProgress("Finding source roots");
 
         var externalDependencies = externalDependencies();
         var classPath = classPath();
@@ -100,22 +139,25 @@ class JavaLanguageServer extends LanguageServer {
         var addExports = addExports();
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
-            javaEndProgress();
+            endProgress();
             var compiler = new JavaCompilerService(classPath, docPath(), addExports, extraArgs);
             lombokCache = new LombokMetadataCache(compiler);
             return compiler;
         }
         // Otherwise, combine inference with user-specified external dependencies
         else {
-            var infer = new InferConfig(workspaceRoot, externalDependencies);
+            var infer = new InferConfig(workspaceRoot, externalDependencies, cacheManager);
 
-            javaReportProgress(new JavaReportProgressParams("Inferring class path"));
+            if (cacheManager != null) {
+                reportProgress("Checking dependency cache");
+            }
+            reportProgress("Resolving dependencies (parallel)");
             classPath = infer.classPath();
 
-            javaReportProgress(new JavaReportProgressParams("Inferring doc path"));
+            reportProgress("Building documentation index");
             var docPath = infer.buildDocPath();
 
-            javaEndProgress();
+            endProgress();
             var compiler = new JavaCompilerService(classPath, docPath, addExports, extraArgs);
             lombokCache = new LombokMetadataCache(compiler);
             return compiler;
@@ -235,6 +277,7 @@ class JavaLanguageServer extends LanguageServer {
 
     public JavaLanguageServer(LanguageClient client) {
         this.client = client;
+        this.cacheManager = new CacheManager();
     }
 
     @Override
@@ -275,8 +318,14 @@ class JavaLanguageServer extends LanguageServer {
             switch (name) {
                 case "BUILD":
                 case "pom.xml":
+                case "build.gradle":
+                case "WORKSPACE":
                     LOG.info("Compiler needs to be re-created because " + file + " has changed");
                     modifiedBuild = true;
+                    if (cacheManager != null) {
+                        cacheManager.clearCache(workspaceRoot);
+                        LOG.info("Cleared dependency cache for workspace " + workspaceRoot);
+                    }
             }
         }
     }

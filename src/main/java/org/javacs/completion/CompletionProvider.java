@@ -34,6 +34,7 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
@@ -481,7 +482,22 @@ public class CompletionProvider {
         } else if (type instanceof TypeVariable) {
             return completeTypeVariableMemberSelect(task, scope, (TypeVariable) type, isStatic, partial, endsWithParen);
         } else if (type instanceof DeclaredType) {
-            return completeDeclaredTypeMemberSelect(task, scope, (DeclaredType) type, isStatic, partial, endsWithParen);
+            var declaredType = (DeclaredType) type;
+
+            // Augmentation (Option C): Handle ERROR types from unresolved Lombok-generated methods
+            if (type.getKind() == TypeKind.ERROR) {
+                var errorTypeName = type.toString();
+                var resolvedType = LombokHandler.resolveLombokGeneratedMethodType(task, errorTypeName, lombokCache);
+
+                if (resolvedType != null && resolvedType instanceof DeclaredType) {
+                    var resolvedDeclaredType = (DeclaredType) resolvedType;
+                    // ERROR types from method calls are always instance access, not static
+                    return completeDeclaredTypeMemberSelect(task, scope, resolvedDeclaredType, false, partial, endsWithParen);
+                }
+                return NOT_SUPPORTED;
+            }
+
+            return completeDeclaredTypeMemberSelect(task, scope, declaredType, isStatic, partial, endsWithParen);
         } else {
             return NOT_SUPPORTED;
         }

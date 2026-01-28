@@ -198,6 +198,22 @@ public class GotoTest {
         assertThat(doGoto(file, 7, 15, false), hasItem("Gson.java:105"));
     }
 
+    @Test
+    public void recordFieldParameter() {
+        // Go to definition on record accessor name() call
+        var suggestions = doGoto("/org/javacs/example/RecordFieldReferences.java", 14, 19);  // on name() call
+        // Should go to the record parameter definition
+        assertThat(suggestions, hasItem("RecordFieldReferences.java:7"));
+    }
+
+    @Test
+    public void recordAccessorDefinition() {
+        // Go to definition on record accessor call rec.name()
+        var suggestions = doGoto("/org/javacs/example/RecordAccessorUsage.java", 11, 19);  // on rec.name() call
+        // Should go to the record parameter that defines the accessor
+        assertThat(suggestions, hasItem("RecordFieldReferences.java:7"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

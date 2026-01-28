@@ -760,4 +760,13 @@ public class CompletionsTest extends CompletionsBase {
         var inserts = filterText("/org/javacs/example/MultilineChain.java", 6, 14);
         assertThat(inserts, hasItem("concat"));
     }
+
+    @Test
+    public void nestedLombokCompletion() {
+        // Test completion for chained Lombok-generated method calls
+        // c.getNested() returns NestedLombokType (which has Lombok-generated getters)
+        // Completion on c.getNested().get should show getValue, getCount, etc.
+        var inserts = filterText("/org/javacs/example/NestedLombokCompletion.java", 20, 25);
+        assertThat(inserts, hasItems("getValue", "getCount"));
+    }
 }

@@ -61,4 +61,20 @@ public class FindReferencesTest {
     public void varTypeReferences() {
         assertThat(items("/org/javacs/example/VarTypeReferences.java", 4, 27), contains("VarTypeReferences.java(9)"));
     }
+
+    @Test
+    public void recordFieldReferencesInside() {
+        // Find references to record accessor name() when clicking on it
+        var refs = items("/org/javacs/example/RecordFieldReferences.java", 14, 19);  // on name() call
+        // Should find other usages of name() in the file
+        assertThat(refs, not(empty()));
+    }
+
+    @Test
+    public void recordAccessorUsage() {
+        // Find references to record accessor in usage file
+        var refs = items("/org/javacs/example/RecordAccessorUsage.java", 11, 19);  // on rec.name() call
+        // Should find both usages of rec.name()
+        assertThat(refs, hasSize(greaterThan(0)));
+    }
 }
