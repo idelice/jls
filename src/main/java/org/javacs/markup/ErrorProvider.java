@@ -21,11 +21,24 @@ import org.javacs.lsp.*;
 public class ErrorProvider {
     final CompileTask task;
     private final LombokMetadataCache lombokCache;
+    private final boolean includeWarnings;
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
 
     public ErrorProvider(CompileTask task, LombokMetadataCache lombokCache) {
+        this(task, lombokCache, true);
+    }
+
+    /**
+     * Create an ErrorProvider with optional warning generation.
+     *
+     * @param task the compiled task
+     * @param lombokCache the Lombok metadata cache
+     * @param includeWarnings if false, skip expensive warning scans (unused variables, not thrown exceptions)
+     */
+    public ErrorProvider(CompileTask task, LombokMetadataCache lombokCache, boolean includeWarnings) {
         this.task = task;
         this.lombokCache = lombokCache;
+        this.includeWarnings = includeWarnings;
     }
 
     public PublishDiagnosticsParams[] errors() {
@@ -43,8 +56,12 @@ public class ErrorProvider {
             result[i].diagnostics.addAll(compilerErrors(root));
             result[i].diagnostics.addAll(LombokHandler.constructorDiagnostics(task, lombokCache, root));
             result[i].diagnostics.addAll(LombokHandler.builderConstructorDiagnostics(task, root));
-            result[i].diagnostics.addAll(unusedWarnings(root));
-            result[i].diagnostics.addAll(notThrownWarnings(root));
+
+            // Skip expensive warning scans if not needed (e.g., for navigation-only requests)
+            if (includeWarnings) {
+                result[i].diagnostics.addAll(unusedWarnings(root));
+                result[i].diagnostics.addAll(notThrownWarnings(root));
+            }
         }
         // TODO hint fields that could be final
 

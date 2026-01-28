@@ -67,15 +67,23 @@ class JavaLanguageServer extends LanguageServer {
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
             var compiled = Instant.now();
             LOG.info("...compiled in " + Duration.between(started, compiled).toMillis() + " ms");
-            for (var errs : new ErrorProvider(task, lombokCache).errors()) {
-                client.publishDiagnostics(errs);
-            }
-            for (var colors : new ColorProvider(task).colors()) {
-                client.customNotification("java/colors", GSON.toJsonTree(colors));
-            }
-            var published = Instant.now();
-            LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
+            publishDiagnosticsAndColors(task, started);
         }
+    }
+
+    /**
+     * Publish diagnostics (errors/warnings) and color information for a compiled task.
+     * This is separated from compilation so navigation can compile without this overhead.
+     */
+    void publishDiagnosticsAndColors(CompileTask task, Instant started) {
+        for (var errs : new ErrorProvider(task, lombokCache).errors()) {
+            client.publishDiagnostics(errs);
+        }
+        // for (var colors : new ColorProvider(task).colors()) {
+        //     client.customNotification("java/colors", GSON.toJsonTree(colors));
+        // }
+        var published = Instant.now();
+        LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
     }
 
     /**
