@@ -272,9 +272,9 @@ class CompileBatch implements AutoCloseable {
         Collections.addAll(list, "-g");
 
         // Set release version to match project's target Java version
-        if (releaseVersion != null && !releaseVersion.isEmpty()) {
-            Collections.addAll(list, "--release", releaseVersion);
-        }
+        // if (releaseVersion != null && !releaseVersion.isEmpty()) {
+        //     Collections.addAll(list, "--release", releaseVersion);
+        // }
 
         // You would think we could do -Xlint:all,
         // but some lints trigger fatal errors in the presence of parse errors
@@ -310,9 +310,9 @@ class CompileBatch implements AutoCloseable {
         Collections.addAll(list, "-g");
 
         // Set release version to match project's target Java version
-        if (releaseVersion != null && !releaseVersion.isEmpty()) {
-            Collections.addAll(list, "--release", releaseVersion);
-        }
+        // if (releaseVersion != null && !releaseVersion.isEmpty()) {
+        //     Collections.addAll(list, "--release", releaseVersion);
+        // }
 
         Collections.addAll(
                 list,
