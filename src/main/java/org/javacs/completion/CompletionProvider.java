@@ -466,37 +466,53 @@ public class CompletionProvider {
         }
 
         if (select.getExpression() instanceof MethodInvocationTree) {
+            LOG.info("...expression is MethodInvocationTree, attempting Lombok resolution");
             var builderList =
                     LombokHandler.builderCompletionsForInvocation(
                             task, (MethodInvocationTree) select.getExpression(), partial, lombokCache, compiler);
             if (builderList != null) {
+                LOG.info("...builder pattern detected, returning builder completions");
                 return builderList;
+            }
+
+            // Try to resolve Lombok-generated method return type for nested chaining
+            var invocationPath = new TreePath(path, select.getExpression());
+            var lombokType = LombokHandler.resolveMethodInvocationReturnType(
+                    task, (MethodInvocationTree) select.getExpression(), invocationPath, lombokCache);
+            LOG.info("...Lombok type resolved: " + lombokType);
+            if (lombokType != null && lombokType instanceof DeclaredType) {
+                LOG.info("...returning completions for resolved Lombok type: " + lombokType);
+                var scope = trees.getScope(invocationPath);
+                // Method invocations are always instance access (not static)
+                return completeDeclaredTypeMemberSelect(task, scope, (DeclaredType) lombokType, false, partial, endsWithParen);
+            } else {
+                LOG.info("...Lombok type resolution failed or not DeclaredType");
             }
         }
         path = new TreePath(path, select.getExpression());
         var isStatic = trees.getElement(path) instanceof TypeElement;
         var scope = trees.getScope(path);
         var type = trees.getTypeMirror(path);
+
+        // Handle ERROR types from unresolved Lombok-generated methods (recursive support)
+        if (type.getKind() == TypeKind.ERROR) {
+            var errorTypeName = type.toString();
+            var resolvedType = LombokHandler.resolveLombokGeneratedMethodType(task, errorTypeName, lombokCache);
+
+            if (resolvedType != null && resolvedType instanceof DeclaredType) {
+                var resolvedDeclaredType = (DeclaredType) resolvedType;
+                // ERROR types from method calls are always instance access, not static
+                return completeDeclaredTypeMemberSelect(task, scope, resolvedDeclaredType, false, partial, endsWithParen);
+            }
+            return NOT_SUPPORTED;
+        }
+
         if (type instanceof ArrayType) {
             return completeArrayMemberSelect(isStatic);
         } else if (type instanceof TypeVariable) {
             return completeTypeVariableMemberSelect(task, scope, (TypeVariable) type, isStatic, partial, endsWithParen);
         } else if (type instanceof DeclaredType) {
             var declaredType = (DeclaredType) type;
-
-            // Augmentation (Option C): Handle ERROR types from unresolved Lombok-generated methods
-            if (type.getKind() == TypeKind.ERROR) {
-                var errorTypeName = type.toString();
-                var resolvedType = LombokHandler.resolveLombokGeneratedMethodType(task, errorTypeName, lombokCache);
-
-                if (resolvedType != null && resolvedType instanceof DeclaredType) {
-                    var resolvedDeclaredType = (DeclaredType) resolvedType;
-                    // ERROR types from method calls are always instance access, not static
-                    return completeDeclaredTypeMemberSelect(task, scope, resolvedDeclaredType, false, partial, endsWithParen);
-                }
-                return NOT_SUPPORTED;
-            }
-
             return completeDeclaredTypeMemberSelect(task, scope, declaredType, isStatic, partial, endsWithParen);
         } else {
             return NOT_SUPPORTED;

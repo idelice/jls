@@ -43,9 +43,13 @@ public class ReferenceProvider {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
+
+                // For constructors, find constructor calls (which are type references)
                 if (memberName.equals("<init>")) {
-                    memberName = parentClass.getSimpleName().toString();
+                    task.close();
+                    return findTypeReferences(className);
                 }
+
                 task.close();
 
                 // Handle both FIELD and RECORD_COMPONENT (record fields are like fields)

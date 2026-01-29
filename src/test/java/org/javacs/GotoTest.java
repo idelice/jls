@@ -178,7 +178,8 @@ public class GotoTest {
     @Test
     public void gotoMismatchedMethod() {
         var file = "/org/javacs/example/GotoMismatchedMethod.java";
-        assertThat(doGoto(file, 5, 12, false), hasItems("GotoMismatchedMethod.java:7", "GotoMismatchedMethod.java:8"));
+        // Calling method(1.0) with double matches int overload better than String
+        assertThat(doGoto(file, 5, 12, false), hasItem("GotoMismatchedMethod.java:8"));
     }
 
     @Test
@@ -201,7 +202,7 @@ public class GotoTest {
     @Test
     public void recordFieldParameter() {
         // Go to definition on record accessor name() call
-        var suggestions = doGoto("/org/javacs/example/RecordFieldReferences.java", 14, 19);  // on name() call
+        var suggestions = doGoto("/org/javacs/example/RecordFieldReferences.java", 14, 14);  // on "name" identifier
         // Should go to the record parameter definition
         assertThat(suggestions, hasItem("RecordFieldReferences.java:7"));
     }
@@ -209,7 +210,7 @@ public class GotoTest {
     @Test
     public void recordAccessorDefinition() {
         // Go to definition on record accessor call rec.name()
-        var suggestions = doGoto("/org/javacs/example/RecordAccessorUsage.java", 11, 19);  // on rec.name() call
+        var suggestions = doGoto("/org/javacs/example/RecordAccessorUsage.java", 11, 18);  // on "name" identifier
         // Should go to the record parameter that defines the accessor
         assertThat(suggestions, hasItem("RecordFieldReferences.java:7"));
     }

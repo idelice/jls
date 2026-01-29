@@ -11,9 +11,9 @@ public class HoverTest {
 
     @Test
     public void classIdentifier() {
-        assertThat(
-                symbolAt("/org/javacs/example/SymbolUnderCursor.java", 12, 23),
-                containsString("org.javacs.example.SymbolUnderCursor"));
+        var hover = symbolAt("/org/javacs/example/SymbolUnderCursor.java", 12, 23);
+        assertThat(hover, containsString("org.javacs.example"));
+        assertThat(hover, containsString("SymbolUnderCursor"));
     }
 
     @Test

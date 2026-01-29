@@ -18,6 +18,7 @@ import java.util.Objects;
 import java.util.Set;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.DeclaredType;
@@ -139,6 +140,122 @@ public final class LombokHandler {
             return task.task.getTypes().getNoType(javax.lang.model.type.TypeKind.VOID);
         }
 
+        return null;
+    }
+
+    /**
+     * Resolve the return type of a MethodInvocationTree that may call a Lombok-generated method.
+     * This handles nested method chaining like: obj.getField1().getField2().getField3()
+     *
+     * @param task compilation context
+     * @param invocation the method invocation tree
+     * @param invocationPath the TreePath to the invocation
+     * @param cache metadata cache
+     * @return the resolved return type, or null if not a Lombok-generated method
+     */
+    public static javax.lang.model.type.TypeMirror resolveMethodInvocationReturnType(
+            CompileTask task, MethodInvocationTree invocation, TreePath invocationPath, LombokMetadataCache cache) {
+        var trees = Trees.instance(task.task);
+        var methodSelect = invocation.getMethodSelect();
+
+        java.util.logging.Logger.getLogger("main").info("...resolveMethodInvocationReturnType called");
+
+        // Only handle MemberSelectTree (e.g., obj.getField())
+        if (!(methodSelect instanceof MemberSelectTree)) {
+            java.util.logging.Logger.getLogger("main").info("...methodSelect is not MemberSelectTree, returning null");
+            return null;
+        }
+
+        var memberSelect = (MemberSelectTree) methodSelect;
+        var methodName = memberSelect.getIdentifier().toString();
+        java.util.logging.Logger.getLogger("main").info("...method name: " + methodName);
+
+        // Get the receiver (expression being called on)
+        var receiverPath = new TreePath(invocationPath, memberSelect.getExpression());
+        var receiverType = trees.getTypeMirror(receiverPath);
+        java.util.logging.Logger.getLogger("main").info("...receiver type: " + receiverType + ", kind: " + receiverType.getKind());
+
+        // If receiver type is ERROR, try to resolve it recursively
+        if (receiverType.getKind() == TypeKind.ERROR) {
+            java.util.logging.Logger.getLogger("main").info("...receiver type is ERROR, attempting recursive resolution");
+            // Check if the receiver is also a MethodInvocationTree that needs resolution
+            if (memberSelect.getExpression() instanceof MethodInvocationTree) {
+                java.util.logging.Logger.getLogger("main").info("...receiver is also MethodInvocationTree, resolving recursively");
+                receiverType = resolveMethodInvocationReturnType(
+                        task, (MethodInvocationTree) memberSelect.getExpression(), receiverPath, cache);
+                if (receiverType == null) {
+                    java.util.logging.Logger.getLogger("main").info("...recursive resolution returned null");
+                    return null;
+                }
+                java.util.logging.Logger.getLogger("main").info("...recursive resolution succeeded: " + receiverType);
+            } else {
+                java.util.logging.Logger.getLogger("main").info("...receiver is not MethodInvocationTree, cannot resolve ERROR type");
+                return null;
+            }
+        }
+
+        // Extract TypeElement from the receiver type
+        TypeElement receiverTypeElement = null;
+        if (receiverType instanceof DeclaredType) {
+            var element = ((DeclaredType) receiverType).asElement();
+            if (element instanceof TypeElement) {
+                receiverTypeElement = (TypeElement) element;
+            }
+        }
+
+        if (receiverTypeElement == null) {
+            java.util.logging.Logger.getLogger("main").info("...receiverTypeElement is null, cannot extract TypeElement");
+            return null;
+        }
+
+        // Try Lombok metadata first for generated getters
+        var className = receiverTypeElement.getQualifiedName().toString();
+        java.util.logging.Logger.getLogger("main").info("...receiver class name: " + className);
+        var metadata = metadataForClass(task, className, cache);
+        java.util.logging.Logger.getLogger("main").info("...Lombok metadata: " + (metadata != null ? "found" : "not found"));
+
+        // If Lombok metadata exists, check if this is a generated getter
+        if (metadata != null) {
+            String fieldName = null;
+            if (methodName.startsWith("get") && methodName.length() > 3) {
+                fieldName = Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
+            } else if (methodName.startsWith("is") && methodName.length() > 2) {
+                fieldName = Character.toLowerCase(methodName.charAt(2)) + methodName.substring(3);
+            }
+
+            java.util.logging.Logger.getLogger("main").info("...field name extracted: " + fieldName);
+
+            if (fieldName != null && metadata.isGeneratedGetter(methodName)) {
+                java.util.logging.Logger.getLogger("main").info("...method is confirmed as generated getter, looking for field");
+
+                // Find the field and return its type
+                var allMembers = task.task.getElements().getAllMembers(receiverTypeElement);
+                for (var member : allMembers) {
+                    if (member.getKind() == ElementKind.FIELD && member.getSimpleName().toString().equals(fieldName)) {
+                        var fieldType = ((VariableElement) member).asType();
+                        java.util.logging.Logger.getLogger("main").info("...found field, returning type: " + fieldType);
+                        return fieldType;
+                    }
+                }
+            }
+        }
+
+        // Fallback: Try to find the method using javac (for explicit methods or when Lombok metadata is unavailable)
+        java.util.logging.Logger.getLogger("main").info("...falling back to javac method resolution");
+        var allMembers = task.task.getElements().getAllMembers(receiverTypeElement);
+        for (var member : allMembers) {
+            if (member.getKind() == ElementKind.METHOD && member.getSimpleName().toString().equals(methodName)) {
+                var method = (ExecutableElement) member;
+                // Only match no-arg methods (getters don't have parameters)
+                if (method.getParameters().isEmpty()) {
+                    var returnType = method.getReturnType();
+                    java.util.logging.Logger.getLogger("main").info("...found method via javac, returning type: " + returnType);
+                    return returnType;
+                }
+            }
+        }
+
+        java.util.logging.Logger.getLogger("main").info("...method not found via Lombok or javac");
         return null;
     }
 
@@ -1038,28 +1155,59 @@ public final class LombokHandler {
     }
 
     private static ClassTree findClassTree(List<CompilationUnitTree> roots, String qualifiedName) {
+        java.util.logging.Logger.getLogger("main").info("...findClassTree looking for: " + qualifiedName);
+
+        // Try to find as a nested class first (e.g., OuterClass.InnerClass)
+        // Work backwards through the qualified name to find outer/inner class boundaries
         var parts = qualifiedName.split("\\.");
-        var simpleClassName = parts[parts.length - 1];
-        var packageName = qualifiedName.substring(0, Math.max(0, qualifiedName.length() - simpleClassName.length() - 1));
+        for (int i = parts.length - 1; i >= 0; i--) {
+            var potentialPackage = String.join(".", java.util.Arrays.copyOfRange(parts, 0, i));
+            var potentialClassPath = java.util.Arrays.copyOfRange(parts, i, parts.length);
 
-        for (var root : roots) {
-            var rootPackage = root.getPackage();
-            if (rootPackage == null) {
-                if (!packageName.isEmpty()) continue;
-            } else {
-                var rootPackageName = rootPackage.getPackageName().toString();
-                if (!rootPackageName.equals(packageName)) continue;
-            }
+            java.util.logging.Logger.getLogger("main").info("...trying package: " + potentialPackage + ", class path: " + String.join(".", potentialClassPath));
 
-            for (var typeDecl : root.getTypeDecls()) {
-                if (typeDecl.getKind() == Tree.Kind.CLASS || typeDecl.getKind() == Tree.Kind.ENUM) {
+            for (var root : roots) {
+                var rootPackage = root.getPackage();
+                var rootPackageName = rootPackage == null ? "" : rootPackage.getPackageName().toString();
+
+                if (!rootPackageName.equals(potentialPackage)) continue;
+
+                // Search for the outer class
+                for (var typeDecl : root.getTypeDecls()) {
+                    if (typeDecl.getKind() != Tree.Kind.CLASS && typeDecl.getKind() != Tree.Kind.ENUM) continue;
+
                     var classTree = (ClassTree) typeDecl;
-                    if (classTree.getSimpleName().toString().equals(simpleClassName)) {
-                        return classTree;
+                    if (classTree.getSimpleName().toString().equals(potentialClassPath[0])) {
+                        // Found the outer class, now search for nested classes
+                        var result = findNestedClass(classTree, potentialClassPath, 1);
+                        if (result != null) {
+                            java.util.logging.Logger.getLogger("main").info("...found class: " + qualifiedName);
+                            return result;
+                        }
                     }
                 }
             }
         }
+
+        java.util.logging.Logger.getLogger("main").info("...class not found: " + qualifiedName);
+        return null;
+    }
+
+    private static ClassTree findNestedClass(ClassTree outerClass, String[] classPath, int index) {
+        if (index >= classPath.length) {
+            return outerClass;
+        }
+
+        var targetName = classPath[index];
+        for (var member : outerClass.getMembers()) {
+            if (member.getKind() == Tree.Kind.CLASS || member.getKind() == Tree.Kind.ENUM) {
+                var nestedClass = (ClassTree) member;
+                if (nestedClass.getSimpleName().toString().equals(targetName)) {
+                    return findNestedClass(nestedClass, classPath, index + 1);
+                }
+            }
+        }
+
         return null;
     }
 

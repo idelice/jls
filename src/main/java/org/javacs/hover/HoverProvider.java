@@ -22,22 +22,77 @@ import org.javacs.lsp.MarkupKind;
 
 public class HoverProvider {
     final CompilerProvider compiler;
+    final org.javacs.LombokMetadataCache lombokCache;
 
-    public HoverProvider(CompilerProvider compiler) {
+    public HoverProvider(CompilerProvider compiler, org.javacs.LombokMetadataCache lombokCache) {
         this.compiler = compiler;
+        this.lombokCache = lombokCache;
     }
 
     public MarkupContent hover(Path file, int line, int column) {
         try (var task = compiler.compile(file)) {
             var position = task.root().getLineMap().getPosition(line, column);
             var element = new FindHoverElement(task.task).scan(task.root(), position);
+            LOG.info("...HoverProvider element: " + element);
             if (element == null) return null;
+            LOG.info("...element kind: " + element.getKind());
+            LOG.info("...element class: " + element.getClass().getName());
+
+            // Handle case where javac returns CLASS for Lombok methods
+            if (element.getKind() == ElementKind.CLASS) {
+                var elementName = element.toString();
+                LOG.info("...element name: " + elementName);
+                // Check if this looks like a Lombok method (e.g., "com.example.Foo.getBar")
+                if (elementName.contains(".")) {
+                    var lastDot = elementName.lastIndexOf('.');
+                    var className = elementName.substring(0, lastDot);
+                    var methodName = elementName.substring(lastDot + 1);
+                    LOG.info("...possible Lombok method: class=" + className + ", method=" + methodName);
+
+                    // Try to get Lombok metadata for this class
+                    var metadata = org.javacs.LombokHandler.metadataForClass(task, className, this.lombokCache);
+                    if (metadata != null) {
+                        LOG.info("...found Lombok metadata");
+                        // Check if it's a generated getter
+                        if (metadata.isGeneratedGetter(methodName)) {
+                            LOG.info("...it's a generated getter");
+                            var field = metadata.fieldForGetter(methodName);
+                            if (field != null) {
+                                var fieldType = field.getType().toString();
+                                var signature = "public " + fieldType + " " + methodName + "()";
+                                LOG.info("...generated signature: " + signature);
+                                return new MarkupContent(MarkupKind.Markdown, "```java\n" + signature + "\n```");
+                            }
+                        }
+                        // Check if it's a generated setter
+                        else if (metadata.isGeneratedSetter(methodName)) {
+                            LOG.info("...it's a generated setter");
+                            var field = metadata.fieldForSetter(methodName);
+                            if (field != null) {
+                                var fieldType = field.getType().toString();
+                                var fieldName = field.getName().toString();
+                                var signature = "public void " + methodName + "(" + fieldType + " " + fieldName + ")";
+                                LOG.info("...generated signature: " + signature);
+                                return new MarkupContent(MarkupKind.Markdown, "```java\n" + signature + "\n```");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (element instanceof ExecutableElement) {
+                var exec = (ExecutableElement) element;
+                LOG.info("...method name: " + exec.getSimpleName());
+                LOG.info("...return type: " + exec.getReturnType());
+                LOG.info("...enclosing element: " + exec.getEnclosingElement());
+            }
             var docs = docs(task, element);
             var markdown = new StringBuilder();
             if (element instanceof TypeElement) {
                 markdown.append(renderTypeHeader((TypeElement) element));
             } else {
                 var code = printType(element);
+                LOG.info("...printType result: " + code);
                 markdown.append("```java\n").append(code).append("\n```");
             }
             if (!docs.isEmpty()) {
@@ -141,9 +196,14 @@ public class HoverProvider {
     // TODO this should parameterize the type
     // TODO show more information about declarations---was this a parameter, a field? What were the modifiers?
     private String printType(Element e) {
+        LOG.info("...printType called for element: " + e);
+        LOG.info("...printType element kind: " + e.getKind());
         if (e instanceof ExecutableElement) {
             var m = (ExecutableElement) e;
-            return ShortTypePrinter.DEFAULT.printMethod(m);
+            LOG.info("...printType using ShortTypePrinter.printMethod");
+            var result = ShortTypePrinter.DEFAULT.printMethod(m);
+            LOG.info("...printMethod result: " + result);
+            return result;
         } else if (e instanceof VariableElement) {
             var v = (VariableElement) e;
             return ShortTypePrinter.DEFAULT.print(v.asType()) + " " + v;

@@ -13,6 +13,7 @@ class JavaCompilerService implements CompilerProvider {
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
     final Set<String> extraArgs;
+    final String releaseVersion;
     final ReusableCompiler compiler = new ReusableCompiler();
     final Docs docs;
     final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
@@ -22,7 +23,7 @@ class JavaCompilerService implements CompilerProvider {
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
 
-    JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
+    JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs, String releaseVersion) {
         System.err.println("Class path:");
         for (var p : classPath) {
             System.err.println("  " + p);
@@ -31,10 +32,14 @@ class JavaCompilerService implements CompilerProvider {
         for (var p : docPath) {
             System.err.println("  " + p);
         }
+        if (releaseVersion != null) {
+            System.err.println("Release version: " + releaseVersion);
+        }
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
         this.classPath = Collections.unmodifiableSet(classPath);
         this.docPath = Collections.unmodifiableSet(docPath);
         this.addExports = Collections.unmodifiableSet(addExports);
+        this.releaseVersion = releaseVersion;
         this.extraArgs = Collections.unmodifiableSet(extraArgs);
         this.docs = new Docs(docPath);
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);

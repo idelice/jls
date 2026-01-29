@@ -145,10 +145,30 @@ class JavaLanguageServer extends LanguageServer {
         var classPath = classPath();
         var extraArgs = extraCompilerArgs();
         var addExports = addExports();
+
+        // Detect Java version from build files for --release flag
+        var detectedVersion = JavaVersionDetector.detectVersion(workspaceRoot);
+        var runtimeVersion = JavaVersionDetector.getRuntimeVersion();
+        String releaseVersion = null;
+
+        if (detectedVersion.isPresent()) {
+            var detected = Integer.parseInt(detectedVersion.get());
+            if (detected <= runtimeVersion) {
+                releaseVersion = detectedVersion.get();
+                LOG.info("Using --release " + releaseVersion + " for compilation");
+            } else {
+                LOG.warning("Project targets Java " + detected + " but runtime is Java " + runtimeVersion);
+                LOG.warning("Cannot use --release flag. Compilation will use Java " + runtimeVersion + " semantics.");
+                LOG.warning("Consider updating the bundled JDK or reducing project's target version.");
+            }
+        } else {
+            LOG.info("No Java version detected, using compiler default (Java " + runtimeVersion + ")");
+        }
+
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
             endProgress();
-            var compiler = new JavaCompilerService(classPath, docPath(), addExports, extraArgs);
+            var compiler = new JavaCompilerService(classPath, docPath(), addExports, extraArgs, releaseVersion);
             lombokCache = new LombokMetadataCache(compiler);
             return compiler;
         }
@@ -166,7 +186,7 @@ class JavaLanguageServer extends LanguageServer {
             var docPath = infer.buildDocPath();
 
             endProgress();
-            var compiler = new JavaCompilerService(classPath, docPath, addExports, extraArgs);
+            var compiler = new JavaCompilerService(classPath, docPath, addExports, extraArgs, releaseVersion);
             lombokCache = new LombokMetadataCache(compiler);
             return compiler;
         }
@@ -379,7 +399,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public CompletionItem resolveCompletionItem(CompletionItem unresolved) {
-        new HoverProvider(compiler()).resolveCompletionItem(unresolved);
+        new HoverProvider(compiler(), lombokCache).resolveCompletionItem(unresolved);
         return unresolved;
     }
 
@@ -390,7 +410,7 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
-        var content = new HoverProvider(compiler()).hover(file, line, column);
+        var content = new HoverProvider(compiler(), lombokCache).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
         }

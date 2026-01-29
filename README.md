@@ -18,6 +18,11 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Record support** - Full IDE support for Java records (16+)
   - Find references on record parameters and accessor methods
   - Go-to-definition on record accessor calls navigates to parameter definition
+- **Automatic Java version detection** - Detects your project's target Java version from build files and compiles accordingly
+  - Reads `<java.version>`, `<maven.compiler.source>` from `pom.xml`
+  - Reads `sourceCompatibility` from `build.gradle` or `gradle.properties`
+  - Uses `--release` flag to enforce correct Java semantics (8, 11, 17, 21, etc.)
+  - No manual configuration needed - works automatically
 - **JAR navigation** - Go-to-definition works on dependency JARs with source files (public repositories)
 
 ## Installation
@@ -57,6 +62,28 @@ lspconfig.jls.setup({
 ```
 
 ## Configuration
+
+### Automatic Java Version Detection
+
+JLS automatically detects your project's target Java version from build files and compiles with the correct Java semantics. **No configuration needed.**
+
+**How it works:**
+1. Detects Java version from your project's build files:
+   - Maven: `<java.version>`, `<maven.compiler.source>`, `<maven.compiler.target>`, or `<source>` in `pom.xml`
+   - Gradle: `sourceCompatibility` or `targetCompatibility` in `build.gradle` or `gradle.properties`
+2. Passes `--release <version>` to the Java compiler
+3. Enforces correct language features and standard library APIs for your target version
+
+**Example:** If your `pom.xml` has `<java.version>17</java.version>`, JLS compiles with `--release 17`, ensuring:
+- Only Java 17 language features are allowed
+- Only Java 17 standard library APIs are available
+- Java 18+ features are rejected with compile errors
+
+**Supported versions:** Any version up to the bundled JDK version (currently Java 21)
+
+**Note:** If your project targets a Java version higher than the bundled JDK (e.g., Java 22+ with bundled Java 21), the `--release` flag will be skipped and compilation will use the bundled JDK's version semantics. To properly support newer Java versions, update the bundled JDK by running `./scripts/download_jdk.sh` or rebuilding with a newer JDK.
+
+### Dependency Resolution
 
 The language server will automatically detect dependencies from:
 - Maven (`pom.xml`)
@@ -129,6 +156,19 @@ The Java language server uses the [Java compiler API](https://docs.oracle.com/ja
 The Java compiler API provides incremental compilation at the level of files: you can create a long-lived instance of the Java compiler, and as the user edits, you only need to recompile files that have changed. The Java language server optimizes this further by *focusing* compilation on the region of interest by erasing irrelevant code.
 
 ## Recent Enhancements
+
+### Automatic Java Version Detection
+
+The language server now automatically detects your project's target Java version from build files (`pom.xml`, `build.gradle`, etc.) and uses the `--release` flag to ensure correct compilation semantics. This means:
+
+- Java 17 projects reject Java 18+ features automatically
+- No manual runtime configuration needed
+- Compilation behavior matches Maven/Gradle exactly
+- Works with any Java version up to the bundled JDK version (currently Java 21)
+
+**Limitation:** Projects targeting Java versions newer than the bundled JDK (e.g., Java 22+) will compile with the bundled JDK's semantics instead. The `--release` flag cannot target versions higher than the compiler itself.
+
+Previously, the server required manual runtime configuration and didn't enforce version constraints. Now it's completely automatic and accurate (within the bundled JDK's capabilities).
 
 ### Java Records Support (Java 16+)
 

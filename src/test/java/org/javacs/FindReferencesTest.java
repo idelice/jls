@@ -65,7 +65,7 @@ public class FindReferencesTest {
     @Test
     public void recordFieldReferencesInside() {
         // Find references to record accessor name() when clicking on it
-        var refs = items("/org/javacs/example/RecordFieldReferences.java", 14, 19);  // on name() call
+        var refs = items("/org/javacs/example/RecordFieldReferences.java", 14, 14);  // on "name" identifier
         // Should find other usages of name() in the file
         assertThat(refs, not(empty()));
     }
@@ -73,7 +73,7 @@ public class FindReferencesTest {
     @Test
     public void recordAccessorUsage() {
         // Find references to record accessor in usage file
-        var refs = items("/org/javacs/example/RecordAccessorUsage.java", 11, 19);  // on rec.name() call
+        var refs = items("/org/javacs/example/RecordAccessorUsage.java", 11, 18);  // on "name" identifier
         // Should find both usages of rec.name()
         assertThat(refs, hasSize(greaterThan(0)));
     }
