@@ -326,8 +326,16 @@ class InferConfig {
                             .redirectOutput(output.toFile())
                             .start();
 
-            var result = process.waitFor();
+            // Wait for Maven with a 60-second timeout to prevent hanging on slow/complex projects
+            var completed = process.waitFor(60, java.util.concurrent.TimeUnit.SECONDS);
+            if (!completed) {
+                LOG.fine("Maven " + goal + " timed out after 60 seconds, killing process");
+                process.destroyForcibly();
+                return Set.of();
+            }
+            var result = process.exitValue();
             if (result != 0) {
+                LOG.fine("Maven " + goal + " failed with exit code: " + result);
                 return Set.of();
             }
             // Read output
