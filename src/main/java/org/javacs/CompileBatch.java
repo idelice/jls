@@ -232,8 +232,8 @@ class CompileBatch implements AutoCloseable {
             boolean allowAP) {
         parent.diags.clear();
         var options = allowAP
-                ? options(parent.classPath, parent.addExports, parent.extraArgs, parent.releaseVersion)
-                : optionsWithoutAP(parent.classPath, parent.addExports, parent.extraArgs, parent.releaseVersion);
+                ? options(parent.classPath, parent.addExports, parent.extraArgs)
+                : optionsWithoutAP(parent.classPath, parent.addExports, parent.extraArgs);
         return parent.compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
     }
 
@@ -255,7 +255,7 @@ class CompileBatch implements AutoCloseable {
                         });
     }
 
-    private static List<String> options(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, String releaseVersion) {
+    private static List<String> options(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs) {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
@@ -270,12 +270,6 @@ class CompileBatch implements AutoCloseable {
         Collections.addAll(list, "-proc:none");
 
         Collections.addAll(list, "-g");
-
-        // Set release version to match project's target Java version
-        // if (releaseVersion != null && !releaseVersion.isEmpty()) {
-        //     Collections.addAll(list, "--release", releaseVersion);
-        // }
-
         // You would think we could do -Xlint:all,
         // but some lints trigger fatal errors in the presence of parse errors
         Collections.addAll(
@@ -302,17 +296,12 @@ class CompileBatch implements AutoCloseable {
      * Create compilation options with annotation processing disabled.
      * Used for retrying compilation after AP failure.
      */
-    static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, String releaseVersion) {
+    static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs) {
         var list = new ArrayList<String>();
         Collections.addAll(list, "-classpath", joinPath(classPath));
         Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         Collections.addAll(list, "-proc:none");
         Collections.addAll(list, "-g");
-
-        // Set release version to match project's target Java version
-        // if (releaseVersion != null && !releaseVersion.isEmpty()) {
-        //     Collections.addAll(list, "--release", releaseVersion);
-        // }
 
         Collections.addAll(
                 list,
