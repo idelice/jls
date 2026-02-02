@@ -12,6 +12,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Find references** - Find all usages of symbols
 - **Diagnostics** - Real-time linting and error reporting
 - **Signature help** - Parameter information for method calls
+- **Inlay hints** - Parameter names and `var` type hints
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
   - Nested Lombok type completion (e.g., `obj.getLombokField().get` shows all members)
   - **Note**: Lombok support covers standard use cases but cannot handle all edge cases due to Lombok's advanced metaprogramming features
@@ -139,6 +140,51 @@ Private Maven repositories are currently not supported. Go-to-definition on depe
 }
 ```
 
+## Inlay Hints
+
+JLS supports LSP inlay hints for:
+- parameter names
+- `var` type hints
+
+These are controlled by the `java.inlayHints` settings block sent by your client:
+
+```json
+{
+    "java": {
+        "inlayHints": {
+            "enabled": true,
+            "parameterNames": true,
+            "varTypes": true
+        }
+    }
+}
+```
+
+Behavior details:
+- If `inlayHints` is a boolean `true`, both parameter names and var types are enabled.
+- If `inlayHints` is a boolean `false`, both are disabled.
+- If `inlayHints` is an object:
+  - `enabled` sets the default for both kinds.
+  - `parameterNames` and `varTypes` override `enabled` when present.
+
+Examples:
+
+```json
+{ "java": { "inlayHints": true } }
+```
+
+```json
+{ "java": { "inlayHints": { "enabled": true, "parameterNames": false } } }
+```
+
+```json
+{ "java": { "inlayHints": { "enabled": false, "varTypes": true } } }
+```
+
+## CodeLens
+
+JLS currently provides CodeLens entries for test classes and methods (JUnit 4/5 and TestNG annotations). Non-test CodeLens are not yet implemented.
+
 
 ## Usage
 
@@ -197,6 +243,10 @@ container.getItem().get
 ```
 
 This works through semantic type resolution using the Java compiler API's type system, ensuring 100% accuracy with zero performance impact.
+
+### Inlay Hints
+
+Inlay hints are now available for parameter names and `var` types. When enabled, hints are derived from source when possible and avoid displaying synthetic `argN` names.
 
 ### Limitations of Lombok Support
 
