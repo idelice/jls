@@ -17,6 +17,7 @@ import org.javacs.completion.SignatureProvider;
 import org.javacs.fold.FoldProvider;
 import org.javacs.hover.HoverProvider;
 import org.javacs.index.SymbolProvider;
+import org.javacs.inlay.InlayHintProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ColorProvider;
@@ -251,6 +252,9 @@ class JavaLanguageServer extends LanguageServer {
         c.addProperty("documentFormattingProvider", true);
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
+        var inlayHintOptions = new JsonObject();
+        inlayHintOptions.addProperty("resolveProvider", false);
+        c.add("inlayHintProvider", inlayHintOptions);
         c.addProperty("foldingRangeProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
@@ -448,7 +452,18 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
         var task = compiler().parse(file);
-        return CodeLensProvider.find(task);
+        var lenses = CodeLensProvider.find(task);
+        LOG.fine("CodeLens: " + lenses.size() + " items for " + file.getFileName());
+        return lenses;
+    }
+
+    @Override
+    public List<InlayHint> inlayHint(InlayHintParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
+        if (!inlayHintsEnabled()) return List.of();
+        var file = Paths.get(params.textDocument.uri);
+        var provider = new InlayHintProvider(compiler());
+        return provider.inlayHints(file, params.range, inlayHintsParameterNames(), inlayHintsVarTypes());
     }
 
     @Override
@@ -594,6 +609,51 @@ class JavaLanguageServer extends LanguageServer {
 
     private boolean uncheckedChanges = false;
     private Path lastEdited = Paths.get("");
+
+    private boolean inlayHintsEnabled() {
+        if (!settings.has("inlayHints")) return false;
+        var hints = settings.get("inlayHints");
+        if (hints.isJsonPrimitive() && hints.getAsJsonPrimitive().isBoolean()) {
+            return hints.getAsBoolean();
+        }
+        if (hints.isJsonObject()) {
+            var obj = hints.getAsJsonObject();
+            if (obj.has("enabled")) {
+                return obj.get("enabled").getAsBoolean();
+            }
+        }
+        return false;
+    }
+
+    private boolean inlayHintsParameterNames() {
+        if (!settings.has("inlayHints")) return true;
+        var hints = settings.get("inlayHints");
+        if (hints.isJsonObject()) {
+            var obj = hints.getAsJsonObject();
+            if (obj.has("parameterNames")) {
+                return obj.get("parameterNames").getAsBoolean();
+            }
+        }
+        return true;
+    }
+
+    private boolean inlayHintsVarTypes() {
+        if (!settings.has("inlayHints")) return false;
+        var hints = settings.get("inlayHints");
+        if (hints.isJsonPrimitive() && hints.getAsJsonPrimitive().isBoolean()) {
+            return hints.getAsBoolean();
+        }
+        if (hints.isJsonObject()) {
+            var obj = hints.getAsJsonObject();
+            if (obj.has("varTypes")) {
+                return obj.get("varTypes").getAsBoolean();
+            }
+            if (obj.has("enabled")) {
+                return obj.get("enabled").getAsBoolean();
+            }
+        }
+        return false;
+    }
 
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {

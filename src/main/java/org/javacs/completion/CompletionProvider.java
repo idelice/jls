@@ -286,17 +286,22 @@ public class CompletionProvider {
         var trees = Trees.instance(task.task);
         var list = new ArrayList<CompletionItem>();
         var methods = new HashMap<String, List<ExecutableElement>>();
+        var methodPriority = new HashMap<String, Integer>();
         var scope = trees.getScope(path);
         Predicate<CharSequence> filter = name -> StringSearch.matchesPartialName(name, partial);
-        for (var member : ScopeHelper.scopeMembers(task, scope, filter)) {
+        for (var scoped : ScopeHelper.scopedMembers(task, scope, filter)) {
+            var member = scoped.element;
+            var priority = priorityForScopedMember(scoped);
             if (member.getKind() == ElementKind.METHOD) {
-                putMethod((ExecutableElement) member, methods);
+                putMethod((ExecutableElement) member, methods, methodPriority, priority);
             } else {
-                list.add(item(task, member));
+                list.add(item(task, member, priority));
             }
         }
-        for (var overloads : methods.values()) {
-            list.add(method(task, overloads, !endsWithParen));
+        for (var entry : methods.entrySet()) {
+            var overloads = entry.getValue();
+            var priority = methodPriority.getOrDefault(entry.getKey(), Priority.METHOD);
+            list.add(method(task, overloads, !endsWithParen, priority));
         }
         LOG.info("...found " + list.size() + " scope members");
         return list;
@@ -306,6 +311,7 @@ public class CompletionProvider {
             CompileTask task, CompilationUnitTree root, String partial, boolean endsWithParen, CompletionList list) {
         var trees = Trees.instance(task.task);
         var methods = new HashMap<String, List<ExecutableElement>>();
+        var methodPriority = new HashMap<String, Integer>();
         var previousSize = list.items.size();
         outer:
         for (var i : root.getImports()) {
@@ -319,9 +325,9 @@ public class CompletionProvider {
                 if (!memberMatchesImport(id.getIdentifier(), member)) continue;
                 if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
                 if (member.getKind() == ElementKind.METHOD) {
-                    putMethod((ExecutableElement) member, methods);
+                    putMethod((ExecutableElement) member, methods, methodPriority, Priority.METHOD);
                 } else {
-                    list.items.add(item(task, member));
+                    list.items.add(item(task, member, Priority.FIELD));
                 }
                 if (list.items.size() + methods.size() > MAX_COMPLETION_ITEMS) {
                     list.isIncomplete = true;
@@ -329,8 +335,10 @@ public class CompletionProvider {
                 }
             }
         }
-        for (var overloads : methods.values()) {
-            list.items.add(method(task, overloads, !endsWithParen));
+        for (var entry : methods.entrySet()) {
+            var overloads = entry.getValue();
+            var priority = methodPriority.getOrDefault(entry.getKey(), Priority.METHOD);
+            list.items.add(method(task, overloads, !endsWithParen, priority));
         }
         LOG.info("...found " + (list.items.size() - previousSize) + " static imports");
     }
@@ -350,7 +358,7 @@ public class CompletionProvider {
         var previousSize = list.items.size();
         for (var className : compiler.packagePrivateTopLevelTypes(packageName)) {
             if (!StringSearch.matchesPartialName(className, partial)) continue;
-            var item = classItem(className);
+            var item = classItem(className, Priority.IMPORTED_CLASS);
             if (hasImportConflict(root, className)) {
                 item.insertText = className;
                 item.insertTextFormat = InsertTextFormat.PlainText;
@@ -360,6 +368,7 @@ public class CompletionProvider {
                     item.additionalTextEdits = edits;
                 }
             }
+            item.sortText = sortKey(item.additionalTextEdits == null ? Priority.IMPORTED_CLASS : Priority.NOT_IMPORTED_CLASS, item.label);
             list.items.add(item);
             uniques.add(className);
         }
@@ -370,7 +379,7 @@ public class CompletionProvider {
                 list.isIncomplete = true;
                 break;
             }
-            var item = classItem(className);
+            var item = classItem(className, Priority.NOT_IMPORTED_CLASS);
             if (hasImportConflict(root, className)) {
                 item.insertText = className;
                 item.insertTextFormat = InsertTextFormat.PlainText;
@@ -380,6 +389,7 @@ public class CompletionProvider {
                     item.additionalTextEdits = edits;
                 }
             }
+            item.sortText = sortKey(item.additionalTextEdits == null ? Priority.IMPORTED_CLASS : Priority.NOT_IMPORTED_CLASS, item.label);
             list.items.add(item);
             uniques.add(className);
         }
@@ -544,24 +554,17 @@ public class CompletionProvider {
 
     private CompletionList completeDeclaredTypeMemberSelect(
             CompileTask task, Scope scope, DeclaredType type, boolean isStatic, String partial, boolean endsWithParen) {
-        var trees = Trees.instance(task.task);
         var typeElement = (TypeElement) type.asElement();
-        var list = new ArrayList<CompletionItem>();
-        var methods = new HashMap<String, List<ExecutableElement>>();
-        for (var member : task.task.getElements().getAllMembers(typeElement)) {
-            if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
-            if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
-            if (!trees.isAccessible(scope, member, type)) continue;
-            if (isStatic != member.getModifiers().contains(Modifier.STATIC)) continue;
-            if (member.getKind() == ElementKind.METHOD) {
-                putMethod((ExecutableElement) member, methods);
-            } else {
-                list.add(item(task, member));
-            }
-        }
-        for (var overloads : methods.values()) {
-            list.add(method(task, overloads, !endsWithParen));
-        }
+        var collected =
+                collectTypeMembers(
+                        task,
+                        scope,
+                        type,
+                        partial,
+                        true,
+                        member -> isStatic == member.getModifiers().contains(Modifier.STATIC));
+        var list = collected.items;
+        addMethodCompletions(task, collected, !endsWithParen, list);
 
         // Add Lombok-generated members
         if (!isStatic) {
@@ -577,6 +580,7 @@ public class CompletionProvider {
             list.add(keyword("this"));
             list.add(keyword("super"));
         }
+        applySortTextIfMissing(list);
         return new CompletionList(false, list);
     }
 
@@ -654,39 +658,24 @@ public class CompletionProvider {
 
     private CompletionList completeDeclaredTypeMemberReference(
             CompileTask task, Scope scope, DeclaredType type, boolean isStatic, String partial) {
-        var trees = Trees.instance(task.task);
-        var typeElement = (TypeElement) type.asElement();
-        var list = new ArrayList<CompletionItem>();
-        var methods = new HashMap<String, List<ExecutableElement>>();
-        for (var member : task.task.getElements().getAllMembers(typeElement)) {
-            if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
-            if (member.getKind() != ElementKind.METHOD) continue;
-            if (!trees.isAccessible(scope, member, type)) continue;
-            if (!isStatic && member.getModifiers().contains(Modifier.STATIC)) continue;
-            if (member.getKind() == ElementKind.METHOD) {
-                putMethod((ExecutableElement) member, methods);
-            } else {
-                list.add(item(task, member));
-            }
-        }
-        for (var overloads : methods.values()) {
-            list.add(method(task, overloads, false));
-        }
+        var collected =
+                collectTypeMembers(
+                        task,
+                        scope,
+                        type,
+                        partial,
+                        false,
+                        member -> isStatic || !member.getModifiers().contains(Modifier.STATIC));
+        var list = collected.items;
+        addMethodCompletions(task, collected, false, list);
         if (isStatic) {
             list.add(keyword("new"));
         }
+        applySortTextIfMissing(list);
         return new CompletionList(false, list);
     }
 
     private static final CompletionList EMPTY = new CompletionList(false, List.of());
-
-    private void putMethod(ExecutableElement method, Map<String, List<ExecutableElement>> methods) {
-        var name = method.getSimpleName().toString();
-        if (!methods.containsKey(name)) {
-            methods.put(name, new ArrayList<>());
-        }
-        methods.get(name).add(method);
-    }
 
     private CompletionList completeSwitchConstant(CompileTask task, TreePath path, String partial) {
         var switchTree = (SwitchTree) path.getLeaf();
@@ -702,7 +691,7 @@ public class CompletionProvider {
         for (var member : task.task.getElements().getAllMembers(element)) {
             if (member.getKind() != ElementKind.ENUM_CONSTANT) continue;
             if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
-            list.add(item(task, member));
+            list.add(item(task, member, Priority.CASE_LABEL));
         }
         return new CompletionList(false, list);
     }
@@ -738,14 +727,20 @@ public class CompletionProvider {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Module;
+        i.sortText = sortKey(Priority.PACKAGE_MEMBER, i.label);
         return i;
     }
 
     private CompletionItem classItem(String className) {
+        return classItem(className, Priority.IMPORTED_CLASS);
+    }
+
+    private CompletionItem classItem(String className, int priority) {
         var i = new CompletionItem();
         i.label = simpleName(className).toString();
         i.kind = CompletionItemKind.Class;
         i.detail = className;
+        i.sortText = sortKey(priority, i.label);
         var data = new CompletionData();
         data.className = className;
         i.data = JsonHelper.GSON.toJsonTree(data);
@@ -758,26 +753,29 @@ public class CompletionProvider {
         i.kind = CompletionItemKind.Snippet;
         i.insertText = snippet;
         i.insertTextFormat = InsertTextFormat.Snippet;
-        i.sortText = String.format("%02d%s", Priority.SNIPPET, i.label);
+        i.sortText = sortKey(Priority.SNIPPET, i.label);
         return i;
     }
 
-    private CompletionItem item(CompileTask task, Element element) {
+    private CompletionItem item(CompileTask task, Element element, int priority) {
         if (element.getKind() == ElementKind.METHOD) throw new RuntimeException("method");
         var i = new CompletionItem();
         i.label = element.getSimpleName().toString();
         i.kind = kind(element);
         i.detail = element.toString();
+        i.sortText = sortKey(priority, i.label);
         i.data = JsonHelper.GSON.toJsonTree(data(task, element, 1));
         return i;
     }
 
-    private CompletionItem method(CompileTask task, List<ExecutableElement> overloads, boolean addParens) {
+    private CompletionItem method(
+            CompileTask task, List<ExecutableElement> overloads, boolean addParens, int priority) {
         var first = overloads.get(0);
         var i = new CompletionItem();
         i.label = first.getSimpleName().toString();
         i.kind = CompletionItemKind.Method;
         i.detail = first.getReturnType() + " " + first;
+        i.sortText = sortKey(priority, i.label);
         var data = data(task, first, overloads.size());
         i.data = JsonHelper.GSON.toJsonTree(data);
         if (addParens) {
@@ -868,13 +866,13 @@ public class CompletionProvider {
         i.label = keyword;
         i.kind = CompletionItemKind.Keyword;
         i.detail = "keyword";
-        i.sortText = String.format("%02d%s", Priority.KEYWORD, i.label);
+        i.sortText = sortKey(Priority.KEYWORD, i.label);
         return i;
     }
 
     private static class Priority {
         static int iota = 0;
-        static final int SNIPPET = iota;
+        static final int SNIPPET = iota++;
         static final int LOCAL = iota++;
         static final int FIELD = iota++;
         static final int INHERITED_FIELD = iota++;
@@ -900,6 +898,141 @@ public class CompletionProvider {
         var dot = className.lastIndexOf('.');
         if (dot == -1) return className;
         return className.subSequence(dot + 1, className.length());
+    }
+
+    private int priorityForScopedMember(ScopeHelper.ScopedMember scoped) {
+        var member = scoped.element;
+        if (scoped.local) {
+            return Priority.LOCAL;
+        }
+        switch (member.getKind()) {
+            case FIELD:
+                return declaredInOwner(scoped) ? Priority.FIELD : Priority.INHERITED_FIELD;
+            case METHOD:
+                if (isObjectMethod(member)) return Priority.OBJECT_METHOD;
+                return declaredInOwner(scoped) ? Priority.METHOD : Priority.INHERITED_METHOD;
+            case CLASS:
+            case INTERFACE:
+            case ENUM:
+            case ANNOTATION_TYPE:
+                return declaredInOwner(scoped) ? Priority.INNER_CLASS : Priority.INHERITED_INNER_CLASS;
+            case ENUM_CONSTANT:
+                return Priority.FIELD;
+            default:
+                return Priority.LOCAL;
+        }
+    }
+
+    private boolean declaredInOwner(ScopeHelper.ScopedMember scoped) {
+        return scoped.owner != null && scoped.element.getEnclosingElement().equals(scoped.owner);
+    }
+
+    private int priorityForMemberOfType(Element member, TypeElement owner) {
+        switch (member.getKind()) {
+            case FIELD:
+                return member.getEnclosingElement().equals(owner) ? Priority.FIELD : Priority.INHERITED_FIELD;
+            case METHOD:
+                if (isObjectMethod(member)) return Priority.OBJECT_METHOD;
+                return member.getEnclosingElement().equals(owner) ? Priority.METHOD : Priority.INHERITED_METHOD;
+            case CLASS:
+            case INTERFACE:
+            case ENUM:
+            case ANNOTATION_TYPE:
+                return member.getEnclosingElement().equals(owner) ? Priority.INNER_CLASS : Priority.INHERITED_INNER_CLASS;
+            case ENUM_CONSTANT:
+                return Priority.FIELD;
+            default:
+                return Priority.LOCAL;
+        }
+    }
+
+    private boolean isObjectMethod(Element member) {
+        if (member.getKind() != ElementKind.METHOD) return false;
+        var enclosing = member.getEnclosingElement();
+        if (!(enclosing instanceof TypeElement)) return false;
+        var type = (TypeElement) enclosing;
+        return "java.lang.Object".contentEquals(type.getQualifiedName());
+    }
+
+    private void applySortTextIfMissing(List<CompletionItem> items) {
+        for (var item : items) {
+            if (item.sortText != null || item.label == null) continue;
+            switch (item.kind) {
+                case CompletionItemKind.Method:
+                    item.sortText = sortKey(Priority.METHOD, item.label);
+                    break;
+                case CompletionItemKind.Field:
+                case CompletionItemKind.Variable:
+                case CompletionItemKind.Property:
+                    item.sortText = sortKey(Priority.FIELD, item.label);
+                    break;
+                case CompletionItemKind.Class:
+                case CompletionItemKind.Interface:
+                case CompletionItemKind.Enum:
+                case CompletionItemKind.EnumMember:
+                    item.sortText = sortKey(Priority.INNER_CLASS, item.label);
+                    break;
+                default:
+                    item.sortText = sortKey(Priority.LOCAL, item.label);
+                    break;
+            }
+        }
+    }
+
+    private void putMethod(
+            ExecutableElement method,
+            Map<String, List<ExecutableElement>> methods,
+            Map<String, Integer> priorities,
+            int priority) {
+        var name = method.getSimpleName().toString();
+        methods.computeIfAbsent(name, __ -> new ArrayList<>()).add(method);
+        priorities.merge(name, priority, Math::min);
+    }
+
+    private String sortKey(int priority, String label) {
+        return String.format("%02d%s", priority, label);
+    }
+
+    private MemberCompletions collectTypeMembers(
+            CompileTask task,
+            Scope scope,
+            DeclaredType type,
+            String partial,
+            boolean includeNonMethods,
+            Predicate<Element> memberFilter) {
+        var trees = Trees.instance(task.task);
+        var typeElement = (TypeElement) type.asElement();
+        var collected = new MemberCompletions();
+        for (var member : task.task.getElements().getAllMembers(typeElement)) {
+            if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
+            if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
+            if (!trees.isAccessible(scope, member, type)) continue;
+            if (memberFilter != null && !memberFilter.test(member)) continue;
+            if (!includeNonMethods && member.getKind() != ElementKind.METHOD) continue;
+
+            var priority = priorityForMemberOfType(member, typeElement);
+            if (member.getKind() == ElementKind.METHOD) {
+                putMethod((ExecutableElement) member, collected.methods, collected.methodPriority, priority);
+            } else if (includeNonMethods) {
+                collected.items.add(item(task, member, priority));
+            }
+        }
+        return collected;
+    }
+
+    private void addMethodCompletions(
+            CompileTask task, MemberCompletions collected, boolean addParens, List<CompletionItem> list) {
+        for (var entry : collected.methods.entrySet()) {
+            var overloads = entry.getValue();
+            var priority = collected.methodPriority.getOrDefault(entry.getKey(), Priority.METHOD);
+            list.add(method(task, overloads, addParens, priority));
+        }
+    }
+
+    private static class MemberCompletions {
+        final List<CompletionItem> items = new ArrayList<>();
+        final Map<String, List<ExecutableElement>> methods = new HashMap<>();
+        final Map<String, Integer> methodPriority = new HashMap<>();
     }
 
     private static final Logger LOG = Logger.getLogger("main");

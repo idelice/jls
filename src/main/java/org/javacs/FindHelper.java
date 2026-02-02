@@ -215,4 +215,19 @@ public class FindHelper {
         }
         return -1;
     }
+
+    public static int findNameIn(CompilationUnitTree root, CharSequence name, int start) {
+        CharSequence contents;
+        try {
+            contents = root.getSourceFile().getCharContent(true);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        var matcher = Pattern.compile("\\b" + name + "\\b").matcher(contents);
+        matcher.region(start, contents.length());
+        if (matcher.find()) {
+            return matcher.start();
+        }
+        return -1;
+    }
 }

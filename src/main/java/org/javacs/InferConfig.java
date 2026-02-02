@@ -206,7 +206,7 @@ class InferConfig {
         // If we already resolved (from cache or parallel Maven), return resolved docPath
         if (resolvedDocPath != null) {
             LOG.info("Using resolved dependencies for docpath");
-            return resolvedDocPath;
+            return addSourceJarsFromClassPath(resolvedDocPath);
         }
 
         // externalDependencies
@@ -221,7 +221,7 @@ class InferConfig {
                 }
                 result.add(found);
             }
-            return result;
+            return addSourceJarsFromClassPath(result);
         }
 
         // Maven (with parallel resolution for better performance)
@@ -233,21 +233,39 @@ class InferConfig {
             // Should now have resolved docpath from parallel resolution
             if (resolvedDocPath != null) {
                 LOG.info("Using resolved dependencies for docpath");
-                return resolvedDocPath;
+                return addSourceJarsFromClassPath(resolvedDocPath);
             }
 
             // Shouldn't reach here, but fallback to sequential resolution
             var result = mvnDependencies(pomXml, "dependency:sources", this.envVars);
-            return result;
+            return addSourceJarsFromClassPath(result);
         }
 
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
         if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
-            return bazelSourcepath(bazelWorkspaceRoot);
+            return addSourceJarsFromClassPath(bazelSourcepath(bazelWorkspaceRoot));
         }
 
-        return Collections.emptySet();
+        return addSourceJarsFromClassPath(Collections.emptySet());
+    }
+
+    private Set<Path> addSourceJarsFromClassPath(Set<Path> docPath) {
+        var augmented = new HashSet<Path>(docPath);
+        for (var jar : classPath()) {
+            var name = jar.getFileName().toString();
+            if (!name.endsWith(".jar")) continue;
+            if (name.endsWith("-sources.jar")) continue;
+            var base = name.substring(0, name.length() - ".jar".length());
+            var sourceJar = jar.getParent().resolve(base + "-sources.jar");
+            if (Files.exists(sourceJar)) {
+                augmented.add(sourceJar);
+            }
+        }
+        if (augmented.size() != docPath.size()) {
+            LOG.info("Augmented docpath with " + (augmented.size() - docPath.size()) + " source jars from classpath");
+        }
+        return augmented;
     }
 
     private Path findAnyJar(Artifact artifact, boolean source) {
@@ -333,6 +351,7 @@ class InferConfig {
                 process.destroyForcibly();
                 return Set.of();
             }
+
             var result = process.exitValue();
             if (result != 0) {
                 LOG.fine("Maven " + goal + " failed with exit code: " + result);

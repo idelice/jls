@@ -7,6 +7,7 @@ import com.sun.source.util.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import org.javacs.FileStore;
 import org.javacs.lsp.CodeLens;
 import org.javacs.lsp.Command;
@@ -14,6 +15,17 @@ import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 
 class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
+    private static final Set<String> TEST_ANNOTATIONS =
+            Set.of(
+                    "Test",
+                    "org.junit.Test",
+                    "org.junit.jupiter.api.Test",
+                    "org.junit.jupiter.api.TestFactory",
+                    "org.junit.jupiter.api.TestTemplate",
+                    "org.junit.jupiter.api.RepeatedTest",
+                    "org.junit.jupiter.params.ParameterizedTest",
+                    "org.testng.annotations.Test");
+
     private final JavacTask task;
     private CompilationUnitTree root;
     private List<CharSequence> qualifiedName = new ArrayList<>();
@@ -64,15 +76,21 @@ class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
     private boolean isTestMethod(MethodTree t) {
         for (var ann : t.getModifiers().getAnnotations()) {
             var type = ann.getAnnotationType();
-            if (type instanceof IdentifierTree) {
-                var id = (IdentifierTree) type;
-                var name = id.getName();
-                if (name.contentEquals("Test") || name.contentEquals("org.junit.Test")) {
-                    return true;
-                }
-            }
+            var name = annotationName(type);
+            if (name != null && TEST_ANNOTATIONS.contains(name)) return true;
         }
         return false;
+    }
+
+    private String annotationName(Tree type) {
+        if (type instanceof IdentifierTree) {
+            var id = (IdentifierTree) type;
+            return id.getName().toString();
+        }
+        if (type instanceof MemberSelectTree) {
+            return type.toString();
+        }
+        return null;
     }
 
     private CodeLens runAllTests(ClassTree t) {

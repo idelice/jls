@@ -153,6 +153,22 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void objectMethodsSortAfterDeclaredMembers() {
+        var items = items("/org/javacs/example/CompleteStringBuilderLength.java", 6, 11);
+        CompletionItem length = null;
+        CompletionItem getClass = null;
+        for (var item : items) {
+            if ("length".equals(item.label)) length = item;
+            if ("getClass".equals(item.label)) getClass = item;
+        }
+        assertThat("length should be present", length, notNullValue());
+        assertThat("getClass should be present", getClass, notNullValue());
+        assertThat("length should have sortText", length.sortText, notNullValue());
+        assertThat("getClass should have sortText", getClass.sortText, notNullValue());
+        assertThat("length should sort before getClass", length.sortText, lessThan(getClass.sortText));
+    }
+
+    @Test
     public void fieldFromInitBlock() {
         var file = "/org/javacs/example/AutocompleteMembers.java";
         var suggestions = filterText(file, 8, 10);

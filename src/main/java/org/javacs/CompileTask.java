@@ -21,17 +21,16 @@ public class CompileTask implements AutoCloseable {
     }
 
     public CompilationUnitTree root(Path file) {
-        for (var root : roots) {
-            if (root.getSourceFile().toUri().equals(file.toUri())) {
-                return root;
-            }
-        }
-        throw new RuntimeException("not found");
+        return rootByUri(file.toUri());
     }
 
     public CompilationUnitTree root(JavaFileObject file) {
+        return rootByUri(file.toUri());
+    }
+
+    private CompilationUnitTree rootByUri(java.net.URI uri) {
         for (var root : roots) {
-            if (root.getSourceFile().toUri().equals(file.toUri())) {
+            if (root.getSourceFile().toUri().equals(uri)) {
                 return root;
             }
         }

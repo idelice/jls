@@ -7,7 +7,6 @@ import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
-import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -15,7 +14,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
-import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
@@ -168,15 +166,7 @@ class RenameHelper {
     }
 
     private long findName(CompilationUnitTree root, long startPos, CharSequence name) {
-        try {
-            var contents = root.getSourceFile().getCharContent(true);
-            var matcher = Pattern.compile("\\b" + name + "\\b").matcher(contents);
-            if (matcher.find((int) startPos)) {
-                return matcher.start();
-            }
-            return startPos;
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        var found = FindHelper.findNameIn(root, name, (int) startPos);
+        return found >= 0 ? found : startPos;
     }
 }

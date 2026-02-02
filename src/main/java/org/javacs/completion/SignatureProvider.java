@@ -62,13 +62,7 @@ public class SignatureProvider {
                         return lombokHelp;
                     }
                 }
-                var signatures = new ArrayList<SignatureInformation>();
-                for (var method : overloads) {
-                    var info = info(method);
-                    addSourceInfo(task, method, info);
-                    addFancyLabel(info);
-                    signatures.add(info);
-                }
+                var signatures = buildSignatures(task, overloads);
                 var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
                 return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
@@ -83,13 +77,7 @@ public class SignatureProvider {
                         return lombokHelp;
                     }
                 }
-                var signatures = new ArrayList<SignatureInformation>();
-                for (var method : overloads) {
-                    var info = info(method);
-                    addSourceInfo(task, method, info);
-                    addFancyLabel(info);
-                    signatures.add(info);
-                }
+                var signatures = buildSignatures(task, overloads);
                 var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
                 return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
@@ -215,6 +203,17 @@ public class SignatureProvider {
             join.add(p.label);
         }
         info.label = info.label + "(" + join + ")";
+    }
+
+    private List<SignatureInformation> buildSignatures(CompileTask task, List<ExecutableElement> overloads) {
+        var signatures = new ArrayList<SignatureInformation>();
+        for (var method : overloads) {
+            var info = info(method);
+            addSourceInfo(task, method, info);
+            addFancyLabel(info);
+            signatures.add(info);
+        }
+        return signatures;
     }
 
     private List<ParameterInformation> parametersFromSource(MethodTree source) {

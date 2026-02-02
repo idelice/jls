@@ -7,10 +7,23 @@ import java.util.List;
 import java.util.function.Predicate;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import org.javacs.CompileTask;
 
 class ScopeHelper {
+    static class ScopedMember {
+        final Element element;
+        final TypeElement owner;
+        final boolean local;
+
+        ScopedMember(Element element, TypeElement owner, boolean local) {
+            this.element = element;
+            this.owner = owner;
+            this.local = local;
+        }
+    }
+
     // TODO is this still necessary? Test speed. We could get rid of the extra static-imports step.
     static List<Scope> fastScopes(Scope start) {
         var scopes = new ArrayList<Scope>();
@@ -26,10 +39,18 @@ class ScopeHelper {
     }
 
     static List<Element> scopeMembers(CompileTask task, Scope inner, Predicate<CharSequence> filter) {
+        var list = new ArrayList<Element>();
+        for (var scoped : scopedMembers(task, inner, filter)) {
+            list.add(scoped.element);
+        }
+        return list;
+    }
+
+    static List<ScopedMember> scopedMembers(CompileTask task, Scope inner, Predicate<CharSequence> filter) {
         var trees = Trees.instance(task.task);
         var elements = task.task.getElements();
         var isStatic = false;
-        var list = new ArrayList<Element>();
+        var list = new ArrayList<ScopedMember>();
         for (var scope : fastScopes(inner)) {
             if (scope.getEnclosingMethod() != null) {
                 isStatic = isStatic || scope.getEnclosingMethod().getModifiers().contains(Modifier.STATIC);
@@ -38,7 +59,7 @@ class ScopeHelper {
                 if (!filter.test(member.getSimpleName())) continue;
                 if (isStatic && member.getSimpleName().contentEquals("this")) continue;
                 if (isStatic && member.getSimpleName().contentEquals("super")) continue;
-                list.add(member);
+                list.add(new ScopedMember(member, null, true));
             }
             if (scope.getEnclosingClass() != null) {
                 var typeElement = scope.getEnclosingClass();
@@ -47,7 +68,7 @@ class ScopeHelper {
                     if (!filter.test(member.getSimpleName())) continue;
                     if (!trees.isAccessible(scope, member, typeType)) continue;
                     if (isStatic && !member.getModifiers().contains(Modifier.STATIC)) continue;
-                    list.add(member);
+                    list.add(new ScopedMember(member, typeElement, false));
                 }
                 isStatic = isStatic || typeElement.getModifiers().contains(Modifier.STATIC);
             }
