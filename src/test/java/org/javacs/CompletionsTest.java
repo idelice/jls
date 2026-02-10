@@ -786,4 +786,28 @@ public class CompletionsTest extends CompletionsBase {
         var inserts = filterText("/org/javacs/example/NestedLombokCompletion.java", 20, 21);
         assertThat(inserts, hasItems("getValue", "getCount"));
     }
+
+    @Test
+    public void currencyVarCompletion() {
+        var inserts = filterText("/org/javacs/example/CurrencyCompletion.java", 8, 11);
+        assertThat(inserts, hasItem("getCurrencyCode"));
+    }
+
+    @Test
+    public void slf4jRecordInstanceCompletionDoesNotContainLog() {
+        var labels = label("/org/javacs/example/Slf4jRecordCompletion.java", 11, 12);
+        assertThat(labels, not(hasItem("log")));
+    }
+
+    @Test
+    public void slf4jRecordScopeCompletionContainsLog() {
+        var labels = label("/org/javacs/example/Slf4jRecordScopeCompletion.java", 8, 10);
+        assertThat(labels, hasItem("log"));
+    }
+
+    @Test
+    public void slf4jRecordScopeInstanceCompletionDoesNotContainLog() {
+        var labels = label("/org/javacs/example/Slf4jRecordScopeCompletion.java", 13, 12);
+        assertThat(labels, not(hasItem("log")));
+    }
 }

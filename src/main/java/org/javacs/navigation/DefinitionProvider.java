@@ -417,15 +417,31 @@ public class DefinitionProvider {
         var path = trees.getPath(element);
 
         if (path == null) {
+            // Record compact constructor parameters have no explicit parameter tree
+            if (element.getKind() == javax.lang.model.element.ElementKind.PARAMETER) {
+                var enclosing = element.getEnclosingElement();
+                if (enclosing != null && enclosing.getKind() == javax.lang.model.element.ElementKind.CONSTRUCTOR) {
+                    var record = enclosing.getEnclosingElement();
+                    if (record != null && record.getKind() == javax.lang.model.element.ElementKind.RECORD) {
+                        var recordElement = (TypeElement) record;
+                        var recordPath = trees.getPath(recordElement);
+                        if (recordPath != null) {
+                            java.util.logging.Logger.getLogger("main")
+                                    .fine("...record compact constructor param, resolving to record component");
+                            return List.of(FindHelper.location(task, recordPath, element.getSimpleName()));
+                        }
+                    }
+                }
+            }
             // For synthetic methods (like record accessors), navigate to the parameter in the record declaration
             if (element instanceof ExecutableElement) {
                 var enclosing = element.getEnclosingElement();
                 if (enclosing != null && enclosing.getKind() == javax.lang.model.element.ElementKind.RECORD) {
                     var recordElement = (TypeElement) enclosing;
+                    // Use the method name (which matches the parameter name) to find the parameter location
+                    var paramName = element.getSimpleName();
                     var recordPath = trees.getPath(recordElement);
                     if (recordPath != null) {
-                        // Use the method name (which matches the parameter name) to find the parameter location
-                        var paramName = element.getSimpleName();
                         return List.of(FindHelper.location(task, recordPath, paramName));
                     }
                 }
@@ -436,4 +452,5 @@ public class DefinitionProvider {
         if (name.contentEquals("<init>")) name = element.getEnclosingElement().getSimpleName();
         return List.of(FindHelper.location(task, path, name));
     }
+
 }

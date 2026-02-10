@@ -12,6 +12,7 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.TypeKind;
 
 class WarnUnused extends TreeScanner<Void, Void> {
+    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
     // Copied from TreePathScanner
     // We need to be able to call scan(path, _) recursively
     private TreePath path;
@@ -74,24 +75,31 @@ class WarnUnused extends TreeScanner<Void, Void> {
             return;
         }
         if (toEl.asType().getKind() == TypeKind.ERROR) {
-            foundPseudoReference(toEl);
+            var pseudo = foundPseudoReference(toEl);
+            if (!pseudo) {
+                // Still mark locals/params as used even if their type is ERROR (e.g. var inference issues)
+                LOG.fine("...marking ERROR-typed element as used: " + toEl);
+                sweep(toEl);
+            }
             return;
         }
         sweep(toEl);
     }
 
-    private void foundPseudoReference(Element toEl) {
+    private boolean foundPseudoReference(Element toEl) {
         var parent = toEl.getEnclosingElement();
         if (!(parent instanceof TypeElement)) {
-            return;
+            return false;
         }
         var memberName = toEl.getSimpleName();
         var type = (TypeElement) parent;
         for (var member : type.getEnclosedElements()) {
             if (member.getSimpleName().contentEquals(memberName)) {
                 sweep(member);
+                return true;
             }
         }
+        return false;
     }
 
     private void sweep(Element toEl) {

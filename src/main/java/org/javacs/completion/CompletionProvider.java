@@ -10,6 +10,7 @@ import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Scope;
 import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.VariableTree;
 import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
@@ -459,7 +460,8 @@ public class CompletionProvider {
             if ("log".equals(ident.getName().toString())) {
                 var enclosingPath = path;
                 while (enclosingPath != null) {
-                    if (enclosingPath.getLeaf().getKind() == Tree.Kind.CLASS) {
+                    var kind = enclosingPath.getLeaf().getKind();
+                    if (kind == Tree.Kind.CLASS || kind == Tree.Kind.RECORD) {
                         var enclosingElement = trees.getElement(enclosingPath);
                         if (enclosingElement instanceof TypeElement) {
                             var list = new ArrayList<CompletionItem>();
@@ -514,6 +516,11 @@ public class CompletionProvider {
                 // ERROR types from method calls are always instance access, not static
                 return completeDeclaredTypeMemberSelect(task, scope, resolvedDeclaredType, false, partial, endsWithParen);
             }
+            var varInferred = inferVarDeclaredType(task, path);
+            if (varInferred != null) {
+                LOG.fine("...resolved var type for completion: " + varInferred);
+                return completeDeclaredTypeMemberSelect(task, scope, varInferred, false, partial, endsWithParen);
+            }
             return NOT_SUPPORTED;
         }
 
@@ -550,6 +557,38 @@ public class CompletionProvider {
         } else {
             return NOT_SUPPORTED;
         }
+    }
+
+    private DeclaredType inferVarDeclaredType(CompileTask task, TreePath expressionPath) {
+        if (!(expressionPath.getLeaf() instanceof IdentifierTree)) {
+            return null;
+        }
+        var trees = Trees.instance(task.task);
+        var element = trees.getElement(expressionPath);
+        if (!(element instanceof VariableElement)) {
+            return null;
+        }
+        var declarationPath = trees.getPath(element);
+        if (declarationPath == null || !(declarationPath.getLeaf() instanceof VariableTree)) {
+            return null;
+        }
+        var declaration = (VariableTree) declarationPath.getLeaf();
+        if (!(declaration.getType() instanceof IdentifierTree)) {
+            return null;
+        }
+        var typeIdent = (IdentifierTree) declaration.getType();
+        if (!typeIdent.getName().contentEquals("var")) {
+            return null;
+        }
+        if (declaration.getInitializer() == null) {
+            return null;
+        }
+        var initializerPath = new TreePath(declarationPath, declaration.getInitializer());
+        var initType = trees.getTypeMirror(initializerPath);
+        if (initType instanceof DeclaredType) {
+            return (DeclaredType) initType;
+        }
+        return null;
     }
 
     private CompletionList completeDeclaredTypeMemberSelect(

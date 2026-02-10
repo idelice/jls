@@ -26,6 +26,7 @@ import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import javax.tools.Diagnostic;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
@@ -149,6 +150,19 @@ public class FindHelper {
         var pos = Trees.instance(task.task).getSourcePositions();
         var start = (int) pos.getStartPosition(path.getCompilationUnit(), path.getLeaf());
         var end = (int) pos.getEndPosition(path.getCompilationUnit(), path.getLeaf());
+        if (start == Diagnostic.NOPOS || end == Diagnostic.NOPOS) {
+            try {
+                var contents = path.getCompilationUnit().getSourceFile().getCharContent(true);
+                if (start == Diagnostic.NOPOS) {
+                    start = 0;
+                }
+                if (end == Diagnostic.NOPOS) {
+                    end = contents.length();
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
         if (name.length() > 0) {
             start = FindHelper.findNameIn(path.getCompilationUnit(), name, start, end);
             end = start + name.length();

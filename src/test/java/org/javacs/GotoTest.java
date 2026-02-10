@@ -215,6 +215,14 @@ public class GotoTest {
         assertThat(suggestions, hasItem("RecordFieldReferences.java:7"));
     }
 
+    @Test
+    public void recordCompactConstructorParameter() {
+        // Go to definition on record component inside compact constructor
+        var suggestions = doGoto("/org/javacs/example/RecordCompactConstructor.java", 5, 9);  // on "asd" identifier
+        // Should go to the record parameter definition in the header
+        assertThat(suggestions, hasItem("RecordCompactConstructor.java:3"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

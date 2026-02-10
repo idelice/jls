@@ -96,6 +96,12 @@ public class WarningsTest {
     }
 
     @Test
+    public void varUsedNotUnused() {
+        server.lint(List.of(FindResource.path("org/javacs/warn/VarUsed.java")));
+        assertThat(errors, not(hasItem("unused_local(5)")));
+    }
+
+    @Test
     public void pseudoUsed() {
         server.lint(List.of(FindResource.path("org/javacs/warn/PseudoUsed.java")));
         assertThat(errors, not(hasItem("unused_method(8)"))); // void pseudoUsed(int)
@@ -124,6 +130,30 @@ public class WarningsTest {
     public void notThrownConstructor() {
         server.lint(List.of(FindResource.path("org/javacs/warn/NotThrownConstructor.java")));
         assertThat(errors, empty());
+    }
+
+    @Test
+    public void bigDecimalAssignReportsError() {
+        server.lint(List.of(FindResource.path("org/javacs/err/BigDecimalAssign.java")));
+        assertThat(
+                errors,
+                hasItem(
+                        anyOf(
+                                equalTo("compiler.err.prob.found.req(9)"),
+                                equalTo("compiler.err.incompatible.types(9)"))));
+    }
+
+    @Test
+    public void lombokInheritanceSetterAcceptsSubclass() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokInheritanceUsage.java")));
+        assertThat(errors, not(hasItem(startsWith("lombok.err.type_mismatch("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+    }
+
+    @Test
+    public void lombokInheritedGetterOnPatternVariable() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokPatternInheritedGetter.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
     }
 
     // TODO warn on type.equals(otherType)
