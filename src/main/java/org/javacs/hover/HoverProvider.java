@@ -9,6 +9,8 @@ import java.util.Set;
 import java.util.StringJoiner;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeMirror;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
@@ -48,6 +50,13 @@ public class HoverProvider {
                     var className = elementName.substring(0, lastDot);
                     var methodName = elementName.substring(lastDot + 1);
                     LOG.info("...possible Lombok method: class=" + className + ", method=" + methodName);
+
+                    var resolvedChainType = resolveMethodChainReturnType(task, elementName);
+                    if (resolvedChainType != null) {
+                        var signature = "public " + displayTypeName(resolvedChainType.toString()) + " " + methodName + "()";
+                        LOG.info("...resolved method-chain signature: " + signature);
+                        return new MarkupContent(MarkupKind.Markdown, "```java\n" + signature + "\n```");
+                    }
 
                     // Try to get Lombok metadata for this class
                     var metadata = org.javacs.LombokHandler.metadataForClass(task, className, this.lombokCache);
@@ -109,6 +118,15 @@ public class HoverProvider {
         if (source.isEmpty()) return;
         var task = compiler.parse(source.get());
         var tree = findItem(task, data);
+        if (tree == null) {
+            LOG.fine(
+                    () ->
+                            "Skipping completion item resolve for missing source member: "
+                                    + data.className
+                                    + "."
+                                    + data.memberName);
+            return;
+        }
         resolveDetail(item, data, tree);
         var path = Trees.instance(task.task).getPath(task.root, tree);
         var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
@@ -140,10 +158,14 @@ public class HoverProvider {
 
     private Tree findItem(ParseTask task, CompletionData data) {
         if (data.erasedParameterTypes != null) {
-            return FindHelper.findMethod(task, data.className, data.memberName, data.erasedParameterTypes);
+            return FindHelper.findMethodOrNull(task, data.className, data.memberName, data.erasedParameterTypes);
         }
         if (data.memberName != null) {
-            return FindHelper.findField(task, data.className, data.memberName);
+            try {
+                return FindHelper.findField(task, data.className, data.memberName);
+            } catch (RuntimeException e) {
+                return null;
+            }
         }
         if (data.className != null) {
             return FindHelper.findType(task, data.className);
@@ -178,11 +200,81 @@ public class HoverProvider {
             var file = compiler.findAnywhere(className);
             if (file.isEmpty()) return "";
             var parse = compiler.parse(file.get());
-            var tree = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
+            var tree = FindHelper.findMethodOrNull(parse, className, methodName, erasedParameterTypes);
+            if (tree == null) return "";
             return docs(parse, tree);
         } else {
             return "";
         }
+    }
+
+    private TypeMirror resolveMethodChainReturnType(CompileTask task, String chain) {
+        var lastDot = chain.lastIndexOf('.');
+        if (lastDot < 0) {
+            return null;
+        }
+        var ownerExpr = chain.substring(0, lastDot);
+        var methodName = chain.substring(lastDot + 1);
+        var ownerType = resolveTypeOrMethodChain(task, ownerExpr);
+        if (!(ownerType instanceof DeclaredType)) {
+            return null;
+        }
+        var ownerElement = ((DeclaredType) ownerType).asElement();
+        if (!(ownerElement instanceof TypeElement)) {
+            return null;
+        }
+        var ownerClass = (TypeElement) ownerElement;
+
+        var metadata =
+                org.javacs.LombokHandler.metadataForClass(
+                        task, ownerClass.getQualifiedName().toString(), this.lombokCache);
+        if (metadata != null) {
+            String fieldName = null;
+            if (methodName.startsWith("get") && methodName.length() > 3) {
+                fieldName = Character.toLowerCase(methodName.charAt(3)) + methodName.substring(4);
+            } else if (methodName.startsWith("is") && methodName.length() > 2) {
+                fieldName = Character.toLowerCase(methodName.charAt(2)) + methodName.substring(3);
+            }
+            if (fieldName != null && metadata.isGeneratedGetter(methodName)) {
+                for (var member : task.task.getElements().getAllMembers(ownerClass)) {
+                    if (member.getKind() == ElementKind.FIELD && member.getSimpleName().contentEquals(fieldName)) {
+                        return ((VariableElement) member).asType();
+                    }
+                }
+            }
+        }
+
+        for (var member : task.task.getElements().getAllMembers(ownerClass)) {
+            if (member.getKind() != ElementKind.METHOD) continue;
+            if (!member.getSimpleName().contentEquals(methodName)) continue;
+            var method = (ExecutableElement) member;
+            if (!method.getParameters().isEmpty()) continue;
+            return method.getReturnType();
+        }
+        return null;
+    }
+
+    private TypeMirror resolveTypeOrMethodChain(CompileTask task, String value) {
+        var direct = task.task.getElements().getTypeElement(value);
+        if (direct != null) {
+            return direct.asType();
+        }
+        if (!looksLikeMethodChain(value)) {
+            return null;
+        }
+        return resolveMethodChainReturnType(task, value);
+    }
+
+    private boolean looksLikeMethodChain(String value) {
+        var lastDot = value.lastIndexOf('.');
+        if (lastDot < 0 || lastDot >= value.length() - 1) return false;
+        var segment = value.substring(lastDot + 1);
+        return Character.isLowerCase(segment.charAt(0));
+    }
+
+    private String displayTypeName(String fullName) {
+        var dot = fullName.lastIndexOf('.');
+        return dot >= 0 ? fullName.substring(dot + 1) : fullName;
     }
 
     private String docs(ParseTask task, Tree tree) {

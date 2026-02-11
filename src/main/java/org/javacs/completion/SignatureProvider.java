@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.StringJoiner;
 import java.util.function.Predicate;
+import java.util.logging.Logger;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
@@ -32,6 +33,7 @@ import org.javacs.lsp.SignatureHelp;
 import org.javacs.lsp.SignatureInformation;
 
 public class SignatureProvider {
+    private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
     private final LombokMetadataCache lombokCache;
@@ -187,14 +189,35 @@ public class SignatureProvider {
         var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
         var file = compiler.findAnywhere(className);
         if (file.isEmpty()) return;
-        var parse = compiler.parse(file.get());
-        var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-        var path = Trees.instance(task.task).getPath(parse.root, source);
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
-        if (docTree != null) {
-            info.documentation = MarkdownHelper.asMarkupContent(docTree);
+        try {
+            var parse = compiler.parse(file.get());
+            var source = FindHelper.findMethodOrNull(parse, className, methodName, erasedParameterTypes);
+            if (source == null) {
+                LOG.fine(
+                        () ->
+                                "Signature source method not found: "
+                                        + className
+                                        + "."
+                                        + methodName
+                                        + java.util.Arrays.toString(erasedParameterTypes));
+                return;
+            }
+            var path = Trees.instance(task.task).getPath(parse.root, source);
+            var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+            if (docTree != null) {
+                info.documentation = MarkdownHelper.asMarkupContent(docTree);
+            }
+            info.parameters = parametersFromSource(source);
+        } catch (RuntimeException e) {
+            LOG.fine(
+                    () ->
+                            "Skipping signature source info for "
+                                    + className
+                                    + "."
+                                    + methodName
+                                    + ": "
+                                    + e.getMessage());
         }
-        info.parameters = parametersFromSource(source);
     }
 
     private void addFancyLabel(SignatureInformation info) {

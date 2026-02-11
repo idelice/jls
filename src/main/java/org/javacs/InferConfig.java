@@ -324,15 +324,7 @@ class InferConfig {
         try {
             // TODO consider using mvn valide dependency:copy-dependencies -DoutputDirectory=??? instead
             // Run maven as a subprocess
-            String[] command = {
-                getMvnCommand(envVars),
-                "--batch-mode", // Turns off ANSI control sequences
-                "validate",
-                goal,
-                "-DincludeScope=test",
-                "-DoutputAbsoluteArtifactFilename=true",
-                "-DexcludeOptional=false",
-            };
+            var command = buildMavenCommand(goal, envVars);
             var output = Files.createTempFile("jls-maven-output", ".txt");
             LOG.info("Running " + String.join(" ", command) + " ...");
             var workingDirectory = pomXml.toAbsolutePath().getParent().toFile();
@@ -354,7 +346,12 @@ class InferConfig {
 
             var result = process.exitValue();
             if (result != 0) {
-                LOG.fine("Maven " + goal + " failed with exit code: " + result);
+                LOG.warning("Maven " + goal + " failed with exit code: " + result);
+                if ("dependency:sources".equals(goal)) {
+                    LOG.warning(
+                            "Maven dependency:sources failed. JAR classes may still compile, but go-to-definition "
+                                    + "into dependency sources will not work until source jars are resolvable.");
+                }
                 return Set.of();
             }
             // Read output
@@ -371,8 +368,36 @@ class InferConfig {
         }
     }
 
+    static List<String> buildMavenCommand(String goal, Map<String, String> envVars) {
+        var command = new ArrayList<String>();
+        command.add(getMvnCommand(envVars));
+        command.add("--batch-mode"); // Turns off ANSI control sequences
+        var userSettings = userMavenSettings();
+        if (userSettings != NOT_FOUND) {
+            command.add("-s");
+            command.add(userSettings.toString());
+        }
+        command.add("validate");
+        command.add(goal);
+        command.add("-DincludeScope=test");
+        command.add("-DoutputAbsoluteArtifactFilename=true");
+        command.add("-DexcludeOptional=false");
+        return command;
+    }
+
+    private static Path userMavenSettings() {
+        var home = System.getProperty("user.home");
+        if (home == null || home.isBlank()) return NOT_FOUND;
+        var settings = Paths.get(home).resolve(".m2").resolve("settings.xml");
+        if (Files.exists(settings)) {
+            return settings;
+        }
+        return NOT_FOUND;
+    }
+
     private static final Pattern DEPENDENCY =
-            Pattern.compile("^\\[INFO\\]\\s+(.*:.*:.*:.*:.*):(/.*?)( -- module .*)?$");
+            Pattern.compile(
+                    "^\\[INFO\\]\\s+(.*:.*:.*:.*:.*):((?:[A-Za-z]:)?[/\\\\]\\S+)(?:\\s+\\(optional\\))?(?:\\s+-- module .*)?$");
 
     static Path readDependency(String line) {
         var match = DEPENDENCY.matcher(line);

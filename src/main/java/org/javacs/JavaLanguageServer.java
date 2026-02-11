@@ -462,8 +462,13 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         if (!inlayHintsEnabled()) return List.of();
         var file = Paths.get(params.textDocument.uri);
-        var provider = new InlayHintProvider(compiler());
-        return provider.inlayHints(file, params.range, inlayHintsParameterNames(), inlayHintsVarTypes());
+        var provider =
+                new InlayHintProvider(
+                        compiler(),
+                        Duration.ofMillis(inlayHintsDebounceMs()),
+                        Duration.ofMillis(inlayHintsCacheIdleMs()),
+                        inlayHintsCacheMaxEntries());
+        return provider.inlayHints(file, params.range, inlayHintsParameterNames());
     }
 
     @Override
@@ -637,22 +642,32 @@ class JavaLanguageServer extends LanguageServer {
         return true;
     }
 
-    private boolean inlayHintsVarTypes() {
-        if (!settings.has("inlayHints")) return false;
+    private int inlayHintsDebounceMs() {
+        return readInlayHintsIntSetting("debounceMs", 250, 0, 2000);
+    }
+
+    private int inlayHintsCacheIdleMs() {
+        return readInlayHintsIntSetting("cacheIdleMs", 120000, 5000, 1800000);
+    }
+
+    private int inlayHintsCacheMaxEntries() {
+        return readInlayHintsIntSetting("cacheMaxEntries", 256, 16, 4096);
+    }
+
+    private int readInlayHintsIntSetting(String key, int fallback, int min, int max) {
+        if (!settings.has("inlayHints")) return fallback;
         var hints = settings.get("inlayHints");
-        if (hints.isJsonPrimitive() && hints.getAsJsonPrimitive().isBoolean()) {
-            return hints.getAsBoolean();
+        if (!hints.isJsonObject()) return fallback;
+        var obj = hints.getAsJsonObject();
+        if (!obj.has(key)) return fallback;
+        try {
+            var value = obj.get(key).getAsInt();
+            if (value < min) return min;
+            if (value > max) return max;
+            return value;
+        } catch (Exception ignored) {
+            return fallback;
         }
-        if (hints.isJsonObject()) {
-            var obj = hints.getAsJsonObject();
-            if (obj.has("varTypes")) {
-                return obj.get("varTypes").getAsBoolean();
-            }
-            if (obj.has("enabled")) {
-                return obj.get("enabled").getAsBoolean();
-            }
-        }
-        return false;
     }
 
     @Override
@@ -675,6 +690,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.close(params);
 
         if (FileStore.isJavaFile(params.textDocument.uri)) {
+            InlayHintProvider.invalidate(Paths.get(params.textDocument.uri));
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }

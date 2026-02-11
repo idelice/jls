@@ -9,13 +9,19 @@ import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import javax.tools.Diagnostic;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.ParseTask;
 import org.javacs.lsp.InlayHint;
@@ -24,19 +30,81 @@ import org.javacs.lsp.Range;
 
 public class InlayHintProvider {
     private final CompilerProvider compiler;
+    private final Duration debounceWindow;
+    private final Duration cacheIdleTtl;
+    private final int cacheMaxEntries;
 
     public InlayHintProvider(CompilerProvider compiler) {
-        this.compiler = compiler;
+        this(compiler, DEFAULT_DEBOUNCE_WINDOW, DEFAULT_CACHE_IDLE_TTL, DEFAULT_CACHE_MAX_ENTRIES);
     }
 
-    public List<InlayHint> inlayHints(Path file, Range range, boolean parameterNames, boolean varTypes) {
-        if (!parameterNames && !varTypes) return List.of();
+    public InlayHintProvider(
+            CompilerProvider compiler, Duration debounceWindow, Duration cacheIdleTtl, int cacheMaxEntries) {
+        this.compiler = compiler;
+        this.debounceWindow = debounceWindow == null ? DEFAULT_DEBOUNCE_WINDOW : debounceWindow;
+        this.cacheIdleTtl = cacheIdleTtl == null ? DEFAULT_CACHE_IDLE_TTL : cacheIdleTtl;
+        this.cacheMaxEntries = Math.max(1, cacheMaxEntries);
+    }
+
+    public List<InlayHint> inlayHints(Path file, Range range, boolean parameterNames) {
+        var now = Instant.now();
+        pruneCache(now);
+        var documentVersion = FileStore.activeVersion(file).orElse(-1);
+        var cached = hintCache.get(file);
+        if (cached != null) {
+            if (!cached.matches(range, parameterNames)) {
+                LOG.fine(
+                        () ->
+                                "Inlay cache bypass (scope/settings changed), file="
+                                        + file.getFileName()
+                                        + ", cachedVersion="
+                                        + cached.version
+                                        + ", currentVersion="
+                                        + documentVersion);
+            } else if (documentVersion == cached.version) {
+                LOG.fine(
+                        () ->
+                                "Inlay cache hit file="
+                                        + file.getFileName()
+                                        + " version="
+                                        + documentVersion
+                                        + " hints="
+                                        + cached.hints.size());
+                return cached.hints;
+            } else if (documentVersion > cached.version
+                    && Duration.between(cached.createdAt, now).compareTo(debounceWindow) <= 0) {
+                LOG.fine(
+                        () ->
+                                "Inlay debounce hit file="
+                                        + file.getFileName()
+                                        + " currentVersion="
+                                        + documentVersion
+                                        + " cachedVersion="
+                                        + cached.version
+                                        + " ageMs="
+                                        + Duration.between(cached.createdAt, now).toMillis()
+                                        + " hints="
+                                        + cached.hints.size());
+                return cached.hints;
+            } else if (documentVersion >= 0 && documentVersion < cached.version) {
+                hintCache.remove(file);
+                LOG.fine(
+                        () ->
+                                "Inlay cache invalidated (version rollback), file="
+                                        + file.getFileName()
+                                        + ", currentVersion="
+                                        + documentVersion
+                                        + ", cachedVersion="
+                                        + cached.version);
+            }
+        }
         try (var task = compiler.compile(file)) {
             var root = task.root();
             var lineMap = root.getLineMap();
             var trees = Trees.instance(task.task);
             var positions = trees.getSourcePositions();
-            var hints = new ArrayList<InlayHint>();
+            var scannedHints = new ArrayList<InlayHint>();
+            var parameterNameCache = new java.util.HashMap<String, String>();
 
             new TreePathScanner<Void, Void>() {
                 @Override
@@ -57,7 +125,7 @@ public class InlayHintProvider {
 
                 @Override
                 public Void visitVariable(VariableTree tree, Void p) {
-                    if (varTypes && isVarDeclaration(tree, positions, root)) {
+                    if (isVarDeclaration(tree, positions, root)) {
                         addVarTypeHint(tree);
                     }
                     return super.visitVariable(tree, p);
@@ -76,10 +144,10 @@ public class InlayHintProvider {
                         var col = (int) lineMap.getColumnNumber(pos) - 1;
                         var hintPos = new Position(line, col);
                         if (!withinRange(range, hintPos)) continue;
-                        var name = parameterName(task, method, i);
+                        var name = parameterName(task, method, i, parameterNameCache);
                         if (name.isEmpty()) continue;
                         var hint = new InlayHint(hintPos, name + ": ", 2);
-                        hints.add(hint);
+                        scannedHints.add(hint);
                     }
                 }
 
@@ -108,11 +176,30 @@ public class InlayHintProvider {
                     if (hintPos == null) return;
                     if (!withinRange(range, hintPos)) return;
                     var hint = new InlayHint(hintPos, ": " + typeName, 1);
-                    hints.add(hint);
-                    LOG.info("Inlay var hint: " + tree.getName() + " -> " + typeName);
+                    scannedHints.add(hint);
+                    LOG.fine("Inlay var hint: " + tree.getName() + " -> " + typeName);
                 }
             }.scan(root, null);
 
+            var hints = List.copyOf(scannedHints);
+            if (documentVersion >= 0) {
+                hintCache.put(
+                        file,
+                        new HintSnapshot(
+                                hints,
+                                Instant.now(),
+                                documentVersion,
+                                range,
+                                parameterNames));
+                LOG.fine(
+                        () ->
+                                "Inlay cache store file="
+                                        + file.getFileName()
+                                        + " version="
+                                        + documentVersion
+                                        + " hints="
+                                        + hints.size());
+            }
             LOG.fine("Inlay hints: " + hints.size() + " items for " + file.getFileName());
             return hints;
         }
@@ -148,6 +235,29 @@ public class InlayHintProvider {
     }
 
     private String parameterName(org.javacs.CompileTask task, ExecutableElement method, int index) {
+        return parameterName(task, method, index, null);
+    }
+
+    private String parameterName(
+            org.javacs.CompileTask task,
+            ExecutableElement method,
+            int index,
+            java.util.Map<String, String> parameterNameCache) {
+        var params = method.getParameters();
+        if (index >= params.size()) return "";
+        if (parameterNameCache != null) {
+            var key = parameterNameCacheKey(task, method, index);
+            if (parameterNameCache.containsKey(key)) {
+                return parameterNameCache.get(key);
+            }
+            var resolved = resolveParameterName(task, method, index);
+            parameterNameCache.put(key, resolved);
+            return resolved;
+        }
+        return resolveParameterName(task, method, index);
+    }
+
+    private String resolveParameterName(org.javacs.CompileTask task, ExecutableElement method, int index) {
         var params = method.getParameters();
         if (index >= params.size()) return "";
         var name = params.get(index).getSimpleName().toString();
@@ -158,6 +268,13 @@ public class InlayHintProvider {
             LOG.fine("Resolved parameter name " + name + " -> " + resolved + " for " + method.getSimpleName());
         }
         return resolved != null ? resolved : "";
+    }
+
+    private String parameterNameCacheKey(org.javacs.CompileTask task, ExecutableElement method, int index) {
+        var owner = method.getEnclosingElement().toString();
+        var methodName = method.getSimpleName().toString();
+        var erased = FindHelper.erasedParameterTypes(task, method);
+        return owner + "#" + methodName + "(" + String.join(",", erased) + ")@" + index;
     }
 
     private boolean looksSynthetic(String name) {
@@ -260,4 +377,102 @@ public class InlayHintProvider {
     }
 
     private static final Logger LOG = Logger.getLogger("main");
+    private static final Duration DEFAULT_DEBOUNCE_WINDOW = Duration.ofMillis(250);
+    private static final Duration DEFAULT_CACHE_IDLE_TTL = Duration.ofMinutes(2);
+    private static final int DEFAULT_CACHE_MAX_ENTRIES = 256;
+    private static final Map<Path, HintSnapshot> hintCache = new ConcurrentHashMap<>();
+
+    public static void invalidate(Path file) {
+        if (file == null) return;
+        var removed = hintCache.remove(file);
+        if (removed != null) {
+            LOG.fine(() -> "Inlay cache invalidated file=" + file.getFileName());
+        }
+    }
+
+    private void pruneCache(Instant now) {
+        int removedByIdle = 0;
+        for (var it = hintCache.entrySet().iterator(); it.hasNext(); ) {
+            var entry = it.next();
+            if (Duration.between(entry.getValue().createdAt, now).compareTo(cacheIdleTtl) > 0) {
+                it.remove();
+                removedByIdle++;
+            }
+        }
+        if (removedByIdle > 0) {
+            final int removed = removedByIdle;
+            LOG.fine(() -> "Inlay cache prune idle removed=" + removed + " size=" + hintCache.size());
+        }
+
+        if (hintCache.size() <= cacheMaxEntries) return;
+        var entries = new ArrayList<>(hintCache.entrySet());
+        entries.sort(java.util.Comparator.comparing(e -> e.getValue().createdAt));
+        int toRemove = hintCache.size() - cacheMaxEntries;
+        int removed = 0;
+        for (var entry : entries) {
+            if (removed >= toRemove) break;
+            if (hintCache.remove(entry.getKey(), entry.getValue())) {
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            final int removedCount = removed;
+            LOG.fine(
+                    () ->
+                            "Inlay cache prune size removed="
+                                    + removedCount
+                                    + " max="
+                                    + cacheMaxEntries
+                                    + " size="
+                                    + hintCache.size());
+        }
+    }
+
+    private static final class HintSnapshot {
+        private final List<InlayHint> hints;
+        private final Instant createdAt;
+        private final int version;
+        private final int startLine;
+        private final int startCharacter;
+        private final int endLine;
+        private final int endCharacter;
+        private final boolean parameterNames;
+
+        private HintSnapshot(
+                List<InlayHint> hints,
+                Instant createdAt,
+                int version,
+                Range range,
+                boolean parameterNames) {
+            this.hints = List.copyOf(hints);
+            this.createdAt = createdAt;
+            this.version = version;
+            this.parameterNames = parameterNames;
+            if (range == null || range.start == null || range.end == null) {
+                this.startLine = Integer.MIN_VALUE;
+                this.startCharacter = Integer.MIN_VALUE;
+                this.endLine = Integer.MAX_VALUE;
+                this.endCharacter = Integer.MAX_VALUE;
+            } else {
+                this.startLine = range.start.line;
+                this.startCharacter = range.start.character;
+                this.endLine = range.end.line;
+                this.endCharacter = range.end.character;
+            }
+        }
+
+        private boolean matches(Range range, boolean parameterNames) {
+            if (this.parameterNames != parameterNames) return false;
+            if (range == null || range.start == null || range.end == null) {
+                return this.startLine == Integer.MIN_VALUE
+                        && this.startCharacter == Integer.MIN_VALUE
+                        && this.endLine == Integer.MAX_VALUE
+                        && this.endCharacter == Integer.MAX_VALUE;
+            }
+            return this.startLine == range.start.line
+                    && this.startCharacter == range.start.character
+                    && this.endLine == range.end.line
+                    && this.endCharacter == range.end.character;
+        }
+    }
 }

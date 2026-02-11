@@ -43,6 +43,7 @@ class WarnUnused extends TreeScanner<Void, Void> {
     private final Trees trees;
     private final Map<Element, TreePath> privateDeclarations = new HashMap<>(), localVariables = new HashMap<>();
     private final Set<Element> used = new HashSet<>();
+    private final Set<String> loggedErrorTypedUsages = new HashSet<>();
 
     WarnUnused(JavacTask task) {
         this.trees = Trees.instance(task);
@@ -78,7 +79,10 @@ class WarnUnused extends TreeScanner<Void, Void> {
             var pseudo = foundPseudoReference(toEl);
             if (!pseudo) {
                 // Still mark locals/params as used even if their type is ERROR (e.g. var inference issues)
-                LOG.fine("...marking ERROR-typed element as used: " + toEl);
+                var key = String.valueOf(toEl);
+                if (loggedErrorTypedUsages.add(key)) {
+                    LOG.fine("...marking ERROR-typed element as used: " + toEl);
+                }
                 sweep(toEl);
             }
             return;

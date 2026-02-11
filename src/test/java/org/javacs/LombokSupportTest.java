@@ -581,4 +581,43 @@ public class LombokSupportTest {
         assertThat(setterNames, hasItem("setMutable"));
         assertThat(setterNames, not(hasItem("setImmutable")));
     }
+
+    @Test
+    public void testRebuildIndexesAfterInheritedFieldsChange() {
+        var classTree = compiler.compile(
+                "package test;\n" +
+                "import lombok.Data;\n" +
+                "@Data\n" +
+                "public class TestClass {\n" +
+                "    private String local;\n" +
+                "}");
+
+        var metadata = LombokSupport.analyze(classTree);
+        assertThat(metadata.isGeneratedGetter("getInherited"), is(false));
+
+        metadata.inheritedFieldNames.add("inherited");
+        metadata.markIndexesDirty();
+        metadata.rebuildGeneratedIndexes();
+
+        assertThat(metadata.isGeneratedGetter("getInherited"), is(true));
+        assertThat(metadata.isGeneratedSetter("setInherited"), is(true));
+    }
+
+    @Test
+    public void testBuilderIndexesHonorExplicitBuildMethod() {
+        var classTree = compiler.compile(
+                "package test;\n" +
+                "import lombok.Builder;\n" +
+                "@Builder\n" +
+                "public class TestClass {\n" +
+                "    private String value;\n" +
+                "}");
+
+        var metadata = LombokSupport.analyze(classTree);
+        metadata.explicitBuilderMethodNames.add("build");
+        metadata.markIndexesDirty();
+        metadata.rebuildGeneratedIndexes();
+        assertThat(metadata.isGeneratedBuilderMethod("value"), is(true));
+        assertThat(metadata.isGeneratedBuilderMethod("build"), is(false));
+    }
 }

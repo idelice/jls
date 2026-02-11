@@ -156,6 +156,37 @@ public class WarningsTest {
         assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
     }
 
+    @Test
+    public void lombokFieldTypeChangeRefreshesDiagnostics() {
+        var file = FindResource.path("org/javacs/err/LombokFieldTypeChange.java");
+        open(file);
+
+        server.lint(List.of(file));
+        assertThat(errors, not(hasItem(startsWith("compiler.err."))));
+
+        var newContents =
+                "package org.javacs.err;\n"
+                        + "\n"
+                        + "import lombok.Data;\n"
+                        + "\n"
+                        + "@Data\n"
+                        + "class LombokFieldTypeChangeFoo {\n"
+                        + "    private int amount;\n"
+                        + "}\n"
+                        + "\n"
+                        + "public class LombokFieldTypeChange {\n"
+                        + "    void test() {\n"
+                        + "        var foo = new LombokFieldTypeChangeFoo();\n"
+                        + "        foo.setAmount(\"1\");\n"
+                        + "    }\n"
+                        + "}\n";
+        edit(file, newContents);
+        errors.clear();
+
+        server.lint(List.of(file));
+        assertThat(errors, hasItem(startsWith("compiler.err.")));
+    }
+
     // TODO warn on type.equals(otherType)
     // TODO warn on map.get(wrongKeyType)
 }

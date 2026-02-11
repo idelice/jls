@@ -104,6 +104,14 @@ public class InferConfigTest {
                 "[INFO]    org.openjdk.jmh:jmh-generator-annprocess:jar:1.21:provided:/Users/georgefraser/.m2/repository/org/openjdk/jmh/jmh-generator-annprocess/1.21/jmh-generator-annprocess-1.21.jar -- module jmh.generator.annprocess (auto)",
                 "/Users/georgefraser/.m2/repository/org/openjdk/jmh/jmh-generator-annprocess/1.21/jmh-generator-annprocess-1.21.jar",
             },
+            {
+                "[INFO]    org.projectlombok:lombok:jar:1.18.30:compile:/Users/georgefraser/.m2/repository/org/projectlombok/lombok/1.18.30/lombok-1.18.30.jar (optional)",
+                "/Users/georgefraser/.m2/repository/org/projectlombok/lombok/1.18.30/lombok-1.18.30.jar",
+            },
+            {
+                "[INFO]    org.projectlombok:lombok:jar:1.18.30:compile:/Users/georgefraser/.m2/repository/org/projectlombok/lombok/1.18.30/lombok-1.18.30.jar (optional) -- module lombok",
+                "/Users/georgefraser/.m2/repository/org/projectlombok/lombok/1.18.30/lombok-1.18.30.jar",
+            },
         };
         for (var pair : testCases) {
             assert pair.length == 2;
@@ -112,5 +120,12 @@ public class InferConfigTest {
             var path = InferConfig.readDependency(line);
             assertThat(path, equalTo(Paths.get(expect)));
         }
+    }
+
+    @Test
+    public void mavenCommandIncludesOptionalExclusionFlag() {
+        var cmd = InferConfig.buildMavenCommand("dependency:sources", System.getenv());
+        assertThat(cmd, hasItem("-DexcludeOptional=false"));
+        assertThat(cmd, hasItem("dependency:sources"));
     }
 }

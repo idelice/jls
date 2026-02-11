@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.nio.file.attribute.*;
 import java.time.Instant;
 import java.util.*;
+import java.util.OptionalInt;
 import java.util.logging.Logger;
 import javax.lang.model.element.TypeElement;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -251,6 +252,12 @@ public class FileStore {
 
     static Set<Path> activeDocuments() {
         return activeDocuments.keySet();
+    }
+
+    public static OptionalInt activeVersion(Path file) {
+        var active = activeDocuments.get(file);
+        if (active == null) return OptionalInt.empty();
+        return OptionalInt.of(active.version);
     }
 
     public static String contents(Path file) {

@@ -12,8 +12,10 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import javax.lang.model.element.Element;
@@ -40,40 +42,147 @@ import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 
 public final class LombokHandler {
+    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+
     private LombokHandler() {}
 
     public static LombokMetadata metadataForClass(
             CompileTask task, String qualifiedName, LombokMetadataCache cache) {
+        return metadataForClass(task, qualifiedName, cache, null);
+    }
+
+    private static LombokMetadata metadataForClass(
+            CompileTask task, String qualifiedName, LombokMetadataCache cache, RequestCache requestCache) {
+        if (shouldSkipLombokLookup(qualifiedName)) {
+            if (requestCache != null) {
+                requestCache.metadataByClassName.put(qualifiedName, null);
+                LOG.fine(
+                        () ->
+                                "[lombok-cache] metadata skip scope="
+                                        + requestCache.scope
+                                        + " class="
+                                        + qualifiedName);
+            }
+            return null;
+        }
+        if (cache != null) {
+            var cached = metadataForClassName(cache, qualifiedName, task.roots, requestCache);
+            if (cached != null) {
+                enrichInheritedFields(task, qualifiedName, cached, requestCache);
+                return cached;
+            }
+        }
+
         var classTree = findClassTree(task.roots, qualifiedName);
         if (classTree != null) {
             var metadata = LombokSupport.analyze(classTree);
-            if (!LombokSupport.hasLombokAnnotations(metadata)) return null;
-
-            // Populate inherited fields using semantic analysis
-            try {
-                var typeElement = task.task.getElements().getTypeElement(qualifiedName);
-                if (typeElement != null) {
-                    var allMembers = task.task.getElements().getAllMembers(typeElement);
-                    for (var member : allMembers) {
-                        if (member.getKind() == ElementKind.FIELD) {
-                            var fieldName = member.getSimpleName().toString();
-                            // Only add if not already in current class fields
-                            if (!metadata.fieldsByName.containsKey(fieldName)) {
-                                metadata.inheritedFieldNames.add(fieldName);
-                            }
-                        }
-                    }
+            if (!LombokSupport.hasLombokAnnotations(metadata)) {
+                if (requestCache != null) {
+                    requestCache.metadataByClassName.put(qualifiedName, null);
+                    LOG.fine(
+                            () ->
+                                    "[lombok-cache] metadata non-lombok scope="
+                                            + requestCache.scope
+                                            + " class="
+                                            + qualifiedName);
                 }
-            } catch (Exception e) {
-                // Gracefully continue without inherited fields if semantic analysis fails
+                return null;
+            }
+
+            enrichInheritedFields(task, qualifiedName, metadata, requestCache);
+            if (requestCache != null) {
+                requestCache.metadataByClassName.put(qualifiedName, metadata);
+                LOG.fine(
+                        () ->
+                                "[lombok-cache] metadata store scope="
+                                        + requestCache.scope
+                                        + " class="
+                                        + qualifiedName);
             }
 
             return metadata;
         }
         if (cache != null) {
-            return cache.getFromSource(qualifiedName);
+            var fromSource = cache.getFromSource(qualifiedName);
+            if (fromSource != null) {
+                enrichInheritedFields(task, qualifiedName, fromSource, requestCache);
+                if (requestCache != null) {
+                    requestCache.metadataByClassName.put(qualifiedName, fromSource);
+                    LOG.fine(
+                            () ->
+                                    "[lombok-cache] metadata store scope="
+                                            + requestCache.scope
+                                            + " class="
+                                            + qualifiedName);
+                }
+            }
+            if (requestCache != null && fromSource == null) {
+                requestCache.metadataByClassName.put(qualifiedName, null);
+            }
+            return fromSource;
+        }
+        if (requestCache != null) {
+            requestCache.metadataByClassName.put(qualifiedName, null);
         }
         return null;
+    }
+
+    private static void enrichInheritedFields(CompileTask task, String qualifiedName, LombokMetadata metadata) {
+        enrichInheritedFields(task, qualifiedName, metadata, null);
+    }
+
+    private static void enrichInheritedFields(
+            CompileTask task, String qualifiedName, LombokMetadata metadata, RequestCache requestCache) {
+        // Skip semantic inherited-field enrichment when Lombok annotations cannot synthesize accessors.
+        if (!(metadata.hasGetter || metadata.hasData || metadata.hasValue || metadata.hasSetter)) {
+            return;
+        }
+        if (requestCache != null && requestCache.inheritedFieldsEnriched.contains(qualifiedName)) {
+            LOG.fine(
+                    () ->
+                            "[lombok-cache] inherited-fields hit scope="
+                                    + requestCache.scope
+                                    + " class="
+                                    + qualifiedName);
+            return;
+        }
+        try {
+            var typeElement = task.task.getElements().getTypeElement(qualifiedName);
+            if (typeElement == null) {
+                return;
+            }
+            var allMembers =
+                    requestCache == null ? task.task.getElements().getAllMembers(typeElement) : allMembers(task, typeElement, requestCache);
+            var inherited = new HashSet<String>();
+            for (var member : allMembers) {
+                if (member.getKind() != ElementKind.FIELD) {
+                    continue;
+                }
+                var fieldName = member.getSimpleName().toString();
+                if (!metadata.fieldsByName.containsKey(fieldName)) {
+                    inherited.add(fieldName);
+                }
+            }
+            if (!metadata.inheritedFieldNames.equals(inherited)) {
+                metadata.inheritedFieldNames.clear();
+                metadata.inheritedFieldNames.addAll(inherited);
+                metadata.markIndexesDirty();
+                metadata.rebuildGeneratedIndexes();
+            }
+            if (requestCache != null) {
+                requestCache.inheritedFieldsEnriched.add(qualifiedName);
+                LOG.fine(
+                        () ->
+                                "[lombok-cache] inherited-fields store scope="
+                                        + requestCache.scope
+                                        + " class="
+                                        + qualifiedName
+                                        + " count="
+                                        + inherited.size());
+            }
+        } catch (RuntimeException e) {
+            // Continue without inherited field enrichment if semantic analysis is unavailable.
+        }
     }
 
     /**
@@ -90,6 +199,12 @@ public final class LombokHandler {
      */
     public static javax.lang.model.type.TypeMirror resolveLombokGeneratedMethodType(
             CompileTask task, String errorTypeName, LombokMetadataCache cache) {
+        var requestCache = new RequestCache("resolveLombokGeneratedMethodType:" + errorTypeName);
+        return resolveLombokGeneratedMethodType(task, errorTypeName, cache, requestCache);
+    }
+
+    private static javax.lang.model.type.TypeMirror resolveLombokGeneratedMethodType(
+            CompileTask task, String errorTypeName, LombokMetadataCache cache, RequestCache requestCache) {
         // Parse errorTypeName: last part is method name, rest is class name
         if (!errorTypeName.contains(".")) {
             return null;
@@ -123,7 +238,7 @@ public final class LombokHandler {
         }
 
         // Find the field in the class (including inherited fields)
-        var allMembers = task.task.getElements().getAllMembers(classElement);
+        var allMembers = allMembers(task, classElement, requestCache);
         for (var member : allMembers) {
             if (member.getKind() == ElementKind.FIELD && member.getSimpleName().toString().equals(fieldName)) {
                 var fieldElement = (VariableElement) member;
@@ -156,41 +271,51 @@ public final class LombokHandler {
      */
     public static javax.lang.model.type.TypeMirror resolveMethodInvocationReturnType(
             CompileTask task, MethodInvocationTree invocation, TreePath invocationPath, LombokMetadataCache cache) {
+        var requestCache = new RequestCache("resolveMethodInvocationReturnType");
+        return resolveMethodInvocationReturnType(task, invocation, invocationPath, cache, requestCache);
+    }
+
+    private static javax.lang.model.type.TypeMirror resolveMethodInvocationReturnType(
+            CompileTask task,
+            MethodInvocationTree invocation,
+            TreePath invocationPath,
+            LombokMetadataCache cache,
+            RequestCache requestCache) {
         var trees = Trees.instance(task.task);
         var methodSelect = invocation.getMethodSelect();
 
-        java.util.logging.Logger.getLogger("main").info("...resolveMethodInvocationReturnType called");
+        LOG.fine("...resolveMethodInvocationReturnType called");
 
         // Only handle MemberSelectTree (e.g., obj.getField())
         if (!(methodSelect instanceof MemberSelectTree)) {
-            java.util.logging.Logger.getLogger("main").info("...methodSelect is not MemberSelectTree, returning null");
+            LOG.fine("...methodSelect is not MemberSelectTree, returning null");
             return null;
         }
 
         var memberSelect = (MemberSelectTree) methodSelect;
         var methodName = memberSelect.getIdentifier().toString();
-        java.util.logging.Logger.getLogger("main").info("...method name: " + methodName);
+        LOG.fine(() -> "...method name: " + methodName);
 
         // Get the receiver (expression being called on)
         var receiverPath = new TreePath(invocationPath, memberSelect.getExpression());
         var receiverType = trees.getTypeMirror(receiverPath);
-        java.util.logging.Logger.getLogger("main").info("...receiver type: " + receiverType + ", kind: " + receiverType.getKind());
+        LOG.fine("...receiver type: " + receiverType + ", kind: " + receiverType.getKind());
 
         // If receiver type is ERROR, try to resolve it recursively
         if (receiverType.getKind() == TypeKind.ERROR) {
-            java.util.logging.Logger.getLogger("main").info("...receiver type is ERROR, attempting recursive resolution");
+            LOG.fine("...receiver type is ERROR, attempting recursive resolution");
             // Check if the receiver is also a MethodInvocationTree that needs resolution
             if (memberSelect.getExpression() instanceof MethodInvocationTree) {
-                java.util.logging.Logger.getLogger("main").info("...receiver is also MethodInvocationTree, resolving recursively");
+                LOG.fine("...receiver is also MethodInvocationTree, resolving recursively");
                 receiverType = resolveMethodInvocationReturnType(
-                        task, (MethodInvocationTree) memberSelect.getExpression(), receiverPath, cache);
+                        task, (MethodInvocationTree) memberSelect.getExpression(), receiverPath, cache, requestCache);
                 if (receiverType == null) {
-                    java.util.logging.Logger.getLogger("main").info("...recursive resolution returned null");
+                    LOG.fine("...recursive resolution returned null");
                     return null;
                 }
-                java.util.logging.Logger.getLogger("main").info("...recursive resolution succeeded: " + receiverType);
+                LOG.fine("...recursive resolution succeeded: " + receiverType);
             } else {
-                java.util.logging.Logger.getLogger("main").info("...receiver is not MethodInvocationTree, cannot resolve ERROR type");
+                LOG.fine("...receiver is not MethodInvocationTree, cannot resolve ERROR type");
                 return null;
             }
         }
@@ -205,15 +330,15 @@ public final class LombokHandler {
         }
 
         if (receiverTypeElement == null) {
-            java.util.logging.Logger.getLogger("main").info("...receiverTypeElement is null, cannot extract TypeElement");
+            LOG.fine("...receiverTypeElement is null, cannot extract TypeElement");
             return null;
         }
 
         // Try Lombok metadata first for generated getters
         var className = receiverTypeElement.getQualifiedName().toString();
-        java.util.logging.Logger.getLogger("main").info("...receiver class name: " + className);
-        var metadata = metadataForClass(task, className, cache);
-        java.util.logging.Logger.getLogger("main").info("...Lombok metadata: " + (metadata != null ? "found" : "not found"));
+        LOG.fine(() -> "...receiver class name: " + className);
+        var metadata = metadataForClass(task, className, cache, requestCache);
+        LOG.fine(() -> "...Lombok metadata: " + (metadata != null ? "found" : "not found"));
 
         // If Lombok metadata exists, check if this is a generated getter
         if (metadata != null) {
@@ -224,17 +349,17 @@ public final class LombokHandler {
                 fieldName = Character.toLowerCase(methodName.charAt(2)) + methodName.substring(3);
             }
 
-            java.util.logging.Logger.getLogger("main").info("...field name extracted: " + fieldName);
+            LOG.fine("...field name extracted: " + fieldName);
 
             if (fieldName != null && metadata.isGeneratedGetter(methodName)) {
-                java.util.logging.Logger.getLogger("main").info("...method is confirmed as generated getter, looking for field");
+                LOG.fine("...method is confirmed as generated getter, looking for field");
 
                 // Find the field and return its type
-                var allMembers = task.task.getElements().getAllMembers(receiverTypeElement);
+                var allMembers = allMembers(task, receiverTypeElement, requestCache);
                 for (var member : allMembers) {
                     if (member.getKind() == ElementKind.FIELD && member.getSimpleName().toString().equals(fieldName)) {
                         var fieldType = ((VariableElement) member).asType();
-                        java.util.logging.Logger.getLogger("main").info("...found field, returning type: " + fieldType);
+                        LOG.fine(() -> "...found field, returning type: " + fieldType);
                         return fieldType;
                     }
                 }
@@ -242,21 +367,21 @@ public final class LombokHandler {
         }
 
         // Fallback: Try to find the method using javac (for explicit methods or when Lombok metadata is unavailable)
-        java.util.logging.Logger.getLogger("main").info("...falling back to javac method resolution");
-        var allMembers = task.task.getElements().getAllMembers(receiverTypeElement);
+        LOG.fine("...falling back to javac method resolution");
+        var allMembers = allMembers(task, receiverTypeElement, requestCache);
         for (var member : allMembers) {
             if (member.getKind() == ElementKind.METHOD && member.getSimpleName().toString().equals(methodName)) {
                 var method = (ExecutableElement) member;
                 // Only match no-arg methods (getters don't have parameters)
                 if (method.getParameters().isEmpty()) {
                     var returnType = method.getReturnType();
-                    java.util.logging.Logger.getLogger("main").info("...found method via javac, returning type: " + returnType);
+                    LOG.fine(() -> "...found method via javac, returning type: " + returnType);
                     return returnType;
                 }
             }
         }
 
-        java.util.logging.Logger.getLogger("main").info("...method not found via Lombok or javac");
+        LOG.fine("...method not found via Lombok or javac");
         return null;
     }
 
@@ -266,18 +391,25 @@ public final class LombokHandler {
             String partial,
             List<CompletionItem> list,
             LombokMetadataCache cache) {
+        var requestCache = new RequestCache("addCompletions:" + typeElement.getQualifiedName());
+        addCompletions(task, typeElement, partial, list, cache, requestCache);
+    }
+
+    private static void addCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            RequestCache requestCache) {
         var qualifiedName = typeElement.getQualifiedName().toString();
-        var metadata = metadataForClass(task, qualifiedName, cache);
+        var metadata = metadataForClass(task, qualifiedName, cache, requestCache);
         if (metadata == null) {
             return;
         }
 
-        var existing = new HashSet<String>();
-        for (var item : list) {
-            if (item.label != null) {
-                existing.add(item.label);
-            }
-        }
+        var sizeBefore = list.size();
+        var existing = existingLabels(list);
 
         if (metadata.hasGetter || metadata.hasData || metadata.hasValue) {
             for (var getterName : metadata.getGeneratedGetterNames()) {
@@ -341,6 +473,17 @@ public final class LombokHandler {
             item.detail = "(generated by Lombok)";
             list.add(item);
         }
+        var added = list.size() - sizeBefore;
+        LOG.fine(
+                () ->
+                        "[lombok-cache] completion direct scope="
+                                + requestCache.scope
+                                + " class="
+                                + qualifiedName
+                                + " partial="
+                                + partial
+                                + " added="
+                                + added);
 
     }
 
@@ -350,6 +493,7 @@ public final class LombokHandler {
             String partial,
             List<CompletionItem> list,
             LombokMetadataCache cache) {
+        var requestCache = new RequestCache("addScopeCompletions");
         // Find enclosing class
         while (path != null) {
             var kind = path.getLeaf().getKind();
@@ -358,8 +502,8 @@ public final class LombokHandler {
                 var enclosingElement = trees.getElement(path);
                 if (enclosingElement instanceof TypeElement) {
                     var typeElement = (TypeElement) enclosingElement;
-                    addCompletions(task, typeElement, partial, list, cache);
-                    addSlf4jLogVariableCompletion(task, typeElement, partial, list, cache);
+                    addCompletions(task, typeElement, partial, list, cache, requestCache);
+                    addSlf4jLogVariableCompletion(task, typeElement, partial, list, cache, requestCache);
                 }
                 return;
             }
@@ -373,18 +517,25 @@ public final class LombokHandler {
             String partial,
             List<CompletionItem> list,
             LombokMetadataCache cache) {
+        var requestCache = new RequestCache("addSlf4jLogMethodCompletions:" + typeElement.getQualifiedName());
+        addSlf4jLogMethodCompletions(task, typeElement, partial, list, cache, requestCache);
+    }
+
+    private static void addSlf4jLogMethodCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            RequestCache requestCache) {
         var qualifiedName = typeElement.getQualifiedName().toString();
-        var metadata = metadataForClass(task, qualifiedName, cache);
+        var metadata = metadataForClass(task, qualifiedName, cache, requestCache);
         if (metadata == null || !metadata.hasSlf4j) {
             return;
         }
 
-        var existing = new HashSet<String>();
-        for (var item : list) {
-            if (item.label != null) {
-                existing.add(item.label);
-            }
-        }
+        var sizeBefore = list.size();
+        var existing = existingLabels(list);
 
         // Slf4j log methods
         String[] methods = {"trace", "debug", "info", "warn", "error"};
@@ -399,6 +550,17 @@ public final class LombokHandler {
             item.detail = "(generated by Slf4j)";
             list.add(item);
         }
+        var added = list.size() - sizeBefore;
+        LOG.fine(
+                () ->
+                        "[lombok-cache] slf4j-method completion scope="
+                                + requestCache.scope
+                                + " class="
+                                + qualifiedName
+                                + " partial="
+                                + partial
+                                + " added="
+                                + added);
     }
 
     public static void addStaticCompletions(
@@ -407,18 +569,25 @@ public final class LombokHandler {
             String partial,
             List<CompletionItem> list,
             LombokMetadataCache cache) {
+        var requestCache = new RequestCache("addStaticCompletions:" + typeElement.getQualifiedName());
+        addStaticCompletions(task, typeElement, partial, list, cache, requestCache);
+    }
+
+    private static void addStaticCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            RequestCache requestCache) {
         var qualifiedName = typeElement.getQualifiedName().toString();
-        var metadata = metadataForClass(task, qualifiedName, cache);
+        var metadata = metadataForClass(task, qualifiedName, cache, requestCache);
         if (metadata == null) {
             return;
         }
 
-        var existing = new HashSet<String>();
-        for (var item : list) {
-            if (item.label != null) {
-                existing.add(item.label);
-            }
-        }
+        var sizeBefore = list.size();
+        var existing = existingLabels(list);
 
         if (metadata.hasBuilder && !metadata.explicitMethodNames.contains(metadata.builderMethodName)) {
             if (!existing.contains(metadata.builderMethodName)
@@ -434,7 +603,18 @@ public final class LombokHandler {
         }
 
         // @Slf4j generates a static `log` field, so it should appear only in static/class completion.
-        addSlf4jLogVariableCompletion(task, typeElement, partial, list, cache);
+        addSlf4jLogVariableCompletion(task, typeElement, partial, list, cache, requestCache);
+        var added = list.size() - sizeBefore;
+        LOG.fine(
+                () ->
+                        "[lombok-cache] completion static scope="
+                                + requestCache.scope
+                                + " class="
+                                + qualifiedName
+                                + " partial="
+                                + partial
+                                + " added="
+                                + added);
     }
 
     public static CompletionList builderCompletionsForInvocation(
@@ -951,7 +1131,26 @@ public final class LombokHandler {
 
     public static boolean shouldFilterDiagnostic(
             CompileTask task, LombokMetadataCache cache, javax.tools.Diagnostic<? extends JavaFileObject> d) {
+        var filterContext = newDiagnosticFilterContext(d != null ? d.getCode() : null);
+        return shouldFilterDiagnostic(task, cache, d, filterContext);
+    }
+
+    public static DiagnosticFilterContext newDiagnosticFilterContext(String code) {
+        var effectiveCode = code != null ? code : "<null>";
+        return new DiagnosticFilterContext(new RequestCache("shouldFilterDiagnostic:" + effectiveCode));
+    }
+
+    public static boolean shouldFilterDiagnostic(
+            CompileTask task,
+            LombokMetadataCache cache,
+            javax.tools.Diagnostic<? extends JavaFileObject> d,
+            DiagnosticFilterContext context) {
         if (cache == null) return false;
+        if (d == null) return false;
+        var requestCache =
+                context != null
+                        ? context.requestCache
+                        : new RequestCache("shouldFilterDiagnostic:" + d.getCode());
         var code = d.getCode();
         if (code == null) {
             return false;
@@ -979,7 +1178,7 @@ public final class LombokHandler {
             var classMatcher = classPattern.matcher(message);
             if (classMatcher.find()) {
                 var className = classMatcher.group(1);
-                return isGeneratedMemberOfClass(task, cache, className, methodName, paramTypes);
+                return isGeneratedMemberOfClass(task, cache, className, methodName, paramTypes, requestCache);
             }
         }
 
@@ -998,11 +1197,19 @@ public final class LombokHandler {
                         return true;
                     }
                 }
-                return isGeneratedMemberOfClass(task, cache, className, variableName, null);
+                return isGeneratedMemberOfClass(task, cache, className, variableName, null, requestCache);
             }
         }
 
         return false;
+    }
+
+    public static final class DiagnosticFilterContext {
+        private final RequestCache requestCache;
+
+        private DiagnosticFilterContext(RequestCache requestCache) {
+            this.requestCache = requestCache;
+        }
     }
 
     public static List<Location> findAccessorReferences(
@@ -1085,14 +1292,15 @@ public final class LombokHandler {
             LombokMetadataCache cache,
             String className,
             String memberName,
-            List<String> paramTypes) {
+            List<String> paramTypes,
+            RequestCache requestCache) {
         var elements = task.task.getElements();
         var current = elements.getTypeElement(className);
         while (current != null) {
             var currentClassName = current.getQualifiedName().toString();
-            var metadata = metadataForClassName(cache, currentClassName, task.roots);
+            var metadata = metadataForClassName(cache, currentClassName, task.roots, requestCache);
             if (metadata != null
-                    && generatedMemberMatches(task, metadata, currentClassName, memberName, paramTypes)) {
+                    && generatedMemberMatches(task, metadata, currentClassName, memberName, paramTypes, requestCache)) {
                 return true;
             }
             var superType = current.getSuperclass();
@@ -1116,7 +1324,8 @@ public final class LombokHandler {
             LombokMetadata metadata,
             String className,
             String memberName,
-            List<String> paramTypes) {
+            List<String> paramTypes,
+            RequestCache requestCache) {
         if (paramTypes != null) {
             if (paramTypes.isEmpty()) {
                 if (metadata.isGeneratedGetter(memberName) || metadata.isGeneratedSpecialMethod(memberName)) {
@@ -1137,7 +1346,7 @@ public final class LombokHandler {
                 var field = metadata.fieldForSetter(memberName);
                 if (field != null
                         && (typesMatch(field.getType().toString(), paramTypes.get(0))
-                                || isAssignableToField(task, className, field, paramTypes.get(0)))) {
+                                || isAssignableToField(task, className, field, paramTypes.get(0), requestCache))) {
                     return true;
                 }
                 if (metadata.hasBuilder
@@ -1146,7 +1355,7 @@ public final class LombokHandler {
                     var builderField = metadata.builderParamForName(memberName);
                     if (builderField != null
                             && (typesMatch(builderField.getType().toString(), paramTypes.get(0))
-                                    || isAssignableToField(task, className, builderField, paramTypes.get(0)))) {
+                                    || isAssignableToField(task, className, builderField, paramTypes.get(0), requestCache))) {
                         return true;
                     }
                 }
@@ -1167,6 +1376,38 @@ public final class LombokHandler {
 
     private static LombokMetadata metadataForClassName(
             LombokMetadataCache cache, String className, List<CompilationUnitTree> roots) {
+        return metadataForClassName(cache, className, roots, null);
+    }
+
+    private static LombokMetadata metadataForClassName(
+            LombokMetadataCache cache,
+            String className,
+            List<CompilationUnitTree> roots,
+            RequestCache requestCache) {
+        if (requestCache != null) {
+            if (requestCache.metadataByClassName.containsKey(className)) {
+                var existing = requestCache.metadataByClassName.get(className);
+                if (requestCache.loggedMetadataHits.add(className)) {
+                    LOG.fine(
+                            () ->
+                                    "[lombok-cache] metadata hit scope="
+                                            + requestCache.scope
+                                            + " class="
+                                            + className
+                                            + " present="
+                                            + (existing != null));
+                }
+                return existing;
+            }
+            if (requestCache.loggedMetadataMisses.add(className)) {
+                LOG.fine(
+                        () ->
+                                "[lombok-cache] metadata miss scope="
+                                        + requestCache.scope
+                                        + " class="
+                                        + className);
+            }
+        }
         if (cache == null) {
             return null;
         }
@@ -1178,6 +1419,20 @@ public final class LombokHandler {
                 metadata = null;
             }
         }
+        if (requestCache != null) {
+            requestCache.metadataByClassName.put(className, metadata);
+            final boolean present = metadata != null;
+            if (requestCache.loggedMetadataStores.add(className)) {
+                LOG.fine(
+                        () ->
+                                "[lombok-cache] metadata store scope="
+                                        + requestCache.scope
+                                        + " class="
+                                        + className
+                                        + " present="
+                                        + present);
+            }
+        }
         return metadata;
     }
 
@@ -1187,8 +1442,18 @@ public final class LombokHandler {
             String partial,
             List<CompletionItem> list,
             LombokMetadataCache cache) {
+        addSlf4jLogVariableCompletion(task, typeElement, partial, list, cache, null);
+    }
+
+    private static void addSlf4jLogVariableCompletion(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            RequestCache requestCache) {
         var qualifiedName = typeElement.getQualifiedName().toString();
-        var metadata = metadataForClass(task, qualifiedName, cache);
+        var metadata = metadataForClass(task, qualifiedName, cache, requestCache);
         if (metadata == null || !metadata.hasSlf4j) {
             return;
         }
@@ -1207,6 +1472,17 @@ public final class LombokHandler {
         item.insertTextFormat = InsertTextFormat.PlainText;
         item.detail = "(generated by Slf4j)";
         list.add(item);
+        if (requestCache != null) {
+            LOG.fine(
+                    () ->
+                            "[lombok-cache] slf4j-field completion scope="
+                                    + requestCache.scope
+                                    + " class="
+                                    + qualifiedName
+                                    + " partial="
+                                    + partial
+                                    + " added=1");
+        }
     }
 
     private static String simpleName(String className) {
@@ -1215,8 +1491,26 @@ public final class LombokHandler {
         return className;
     }
 
+    static boolean shouldSkipLombokLookup(String qualifiedName) {
+        if (qualifiedName == null || qualifiedName.isBlank()) return true;
+        return qualifiedName.startsWith("java.")
+                || qualifiedName.startsWith("javax.")
+                || qualifiedName.startsWith("jdk.")
+                || qualifiedName.startsWith("sun.");
+    }
+
+    private static Set<String> existingLabels(List<CompletionItem> list) {
+        var existing = new HashSet<String>();
+        for (var item : list) {
+            if (item.label != null) {
+                existing.add(item.label);
+            }
+        }
+        return existing;
+    }
+
     private static ClassTree findClassTree(List<CompilationUnitTree> roots, String qualifiedName) {
-        java.util.logging.Logger.getLogger("main").info("...findClassTree looking for: " + qualifiedName);
+        LOG.fine(() -> "...findClassTree looking for: " + qualifiedName);
 
         // Try to find as a nested class first (e.g., OuterClass.InnerClass)
         // Work backwards through the qualified name to find outer/inner class boundaries
@@ -1225,7 +1519,12 @@ public final class LombokHandler {
             var potentialPackage = String.join(".", java.util.Arrays.copyOfRange(parts, 0, i));
             var potentialClassPath = java.util.Arrays.copyOfRange(parts, i, parts.length);
 
-            java.util.logging.Logger.getLogger("main").info("...trying package: " + potentialPackage + ", class path: " + String.join(".", potentialClassPath));
+            LOG.fine(
+                    () ->
+                            "...trying package: "
+                                    + potentialPackage
+                                    + ", class path: "
+                                    + String.join(".", potentialClassPath));
 
             for (var root : roots) {
                 var rootPackage = root.getPackage();
@@ -1242,7 +1541,7 @@ public final class LombokHandler {
                         // Found the outer class, now search for nested classes
                         var result = findNestedClass(classTree, potentialClassPath, 1);
                         if (result != null) {
-                            java.util.logging.Logger.getLogger("main").info("...found class: " + qualifiedName);
+                            LOG.fine(() -> "...found class: " + qualifiedName);
                             return result;
                         }
                     }
@@ -1250,7 +1549,7 @@ public final class LombokHandler {
             }
         }
 
-        java.util.logging.Logger.getLogger("main").info("...class not found: " + qualifiedName);
+        LOG.fine(() -> "...class not found: " + qualifiedName);
         return null;
     }
 
@@ -1304,19 +1603,37 @@ public final class LombokHandler {
     }
 
     private static boolean isAssignableToField(
-            CompileTask task, String ownerClassName, VariableTree field, String actualTypeName) {
+            CompileTask task, String ownerClassName, VariableTree field, String actualTypeName, RequestCache requestCache) {
+        var assignableKey = ownerClassName + "|" + field.getType() + "|" + actualTypeName;
+        var cachedAssignable = requestCache.assignableBySignature.get(assignableKey);
+        if (cachedAssignable != null) {
+            LOG.fine(
+                    () ->
+                            "[lombok-cache] assignable hit scope="
+                                    + requestCache.scope
+                                    + " key="
+                                    + assignableKey
+                                    + " value="
+                                    + cachedAssignable);
+            return cachedAssignable;
+        }
+        LOG.fine(() -> "[lombok-cache] assignable miss scope=" + requestCache.scope + " key=" + assignableKey);
         var expectedType = fieldTypeMirror(task, field);
         if (expectedType == null) {
-            expectedType = resolveTypeMirror(task, field.getType().toString(), ownerClassName);
+            expectedType = resolveTypeMirror(task, field.getType().toString(), ownerClassName, requestCache);
         }
         if (expectedType == null) {
+            requestCache.assignableBySignature.put(assignableKey, false);
             return false;
         }
-        var actualType = resolveTypeMirror(task, actualTypeName, ownerClassName);
+        var actualType = resolveTypeMirror(task, actualTypeName, ownerClassName, requestCache);
         if (actualType == null) {
+            requestCache.assignableBySignature.put(assignableKey, false);
             return false;
         }
-        return task.task.getTypes().isAssignable(actualType, expectedType);
+        var assignable = task.task.getTypes().isAssignable(actualType, expectedType);
+        requestCache.assignableBySignature.put(assignableKey, assignable);
+        return assignable;
     }
 
     private static TypeMirror fieldTypeMirror(CompileTask task, VariableTree field) {
@@ -1330,46 +1647,78 @@ public final class LombokHandler {
         return null;
     }
 
-    private static TypeMirror resolveTypeMirror(CompileTask task, String typeName, String ownerClassName) {
+    private static TypeMirror resolveTypeMirror(
+            CompileTask task, String typeName, String ownerClassName, RequestCache requestCache) {
         if (typeName == null) {
             return null;
         }
+        var cacheKey = ownerClassName + "|" + typeName;
+        if (requestCache.resolvedTypeByName.containsKey(cacheKey)) {
+            LOG.fine(
+                    () ->
+                            "[lombok-cache] type hit scope="
+                                    + requestCache.scope
+                                    + " key="
+                                    + cacheKey);
+            return requestCache.resolvedTypeByName.get(cacheKey);
+        }
+        LOG.fine(() -> "[lombok-cache] type miss scope=" + requestCache.scope + " key=" + cacheKey);
         if (typeName.endsWith("[]")) {
             var componentName = typeName.substring(0, typeName.length() - 2);
-            var component = resolveTypeMirror(task, componentName, ownerClassName);
+            var component = resolveTypeMirror(task, componentName, ownerClassName, requestCache);
             if (component == null) {
+                requestCache.resolvedTypeByName.put(cacheKey, null);
                 return null;
             }
-            return task.task.getTypes().getArrayType(component);
+            var type = task.task.getTypes().getArrayType(component);
+            requestCache.resolvedTypeByName.put(cacheKey, type);
+            return type;
         }
+        TypeMirror resolved = null;
         switch (typeName) {
             case "byte":
-                return task.task.getTypes().getPrimitiveType(TypeKind.BYTE);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.BYTE);
+                break;
             case "short":
-                return task.task.getTypes().getPrimitiveType(TypeKind.SHORT);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.SHORT);
+                break;
             case "int":
-                return task.task.getTypes().getPrimitiveType(TypeKind.INT);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.INT);
+                break;
             case "long":
-                return task.task.getTypes().getPrimitiveType(TypeKind.LONG);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.LONG);
+                break;
             case "float":
-                return task.task.getTypes().getPrimitiveType(TypeKind.FLOAT);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.FLOAT);
+                break;
             case "double":
-                return task.task.getTypes().getPrimitiveType(TypeKind.DOUBLE);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.DOUBLE);
+                break;
             case "char":
-                return task.task.getTypes().getPrimitiveType(TypeKind.CHAR);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.CHAR);
+                break;
             case "boolean":
-                return task.task.getTypes().getPrimitiveType(TypeKind.BOOLEAN);
+                resolved = task.task.getTypes().getPrimitiveType(TypeKind.BOOLEAN);
+                break;
             case "void":
-                return task.task.getTypes().getNoType(TypeKind.VOID);
+                resolved = task.task.getTypes().getNoType(TypeKind.VOID);
+                break;
             case "<nulltype>":
-                return task.task.getTypes().getNullType();
+                resolved = task.task.getTypes().getNullType();
+                break;
             default:
                 break;
+        }
+        if (resolved != null) {
+            requestCache.resolvedTypeByName.put(cacheKey, resolved);
+            return resolved;
         }
         var elements = task.task.getElements();
         var typeElement = elements.getTypeElement(typeName);
         if (typeElement != null) {
-            return typeElement.asType();
+            resolved = typeElement.asType();
+            requestCache.resolvedTypeByName.put(cacheKey, resolved);
+            return resolved;
         }
         // Try same package as the owner class for simple names like `MSReference`
         if (ownerClassName != null && typeName.indexOf('.') < 0) {
@@ -1378,7 +1727,9 @@ public final class LombokHandler {
                 var packageName = ownerClassName.substring(0, lastDot);
                 typeElement = elements.getTypeElement(packageName + "." + typeName);
                 if (typeElement != null) {
-                    return typeElement.asType();
+                    resolved = typeElement.asType();
+                    requestCache.resolvedTypeByName.put(cacheKey, resolved);
+                    return resolved;
                 }
             }
         }
@@ -1386,10 +1737,58 @@ public final class LombokHandler {
         if (typeName.indexOf('.') < 0) {
             typeElement = elements.getTypeElement("java.lang." + typeName);
             if (typeElement != null) {
-                return typeElement.asType();
+                resolved = typeElement.asType();
+                requestCache.resolvedTypeByName.put(cacheKey, resolved);
+                return resolved;
             }
         }
+        requestCache.resolvedTypeByName.put(cacheKey, null);
         return null;
+    }
+
+    private static List<? extends Element> allMembers(
+            CompileTask task, TypeElement typeElement, RequestCache requestCache) {
+        var className = typeElement.getQualifiedName().toString();
+        var cached = requestCache.allMembersByClassName.get(className);
+        if (cached != null) {
+            LOG.fine(
+                    () ->
+                            "[lombok-cache] members hit scope="
+                                    + requestCache.scope
+                                    + " class="
+                                    + className
+                                    + " count="
+                                    + cached.size());
+            return cached;
+        }
+        var members = task.task.getElements().getAllMembers(typeElement);
+        requestCache.allMembersByClassName.put(className, members);
+        LOG.fine(
+                () ->
+                        "[lombok-cache] members miss/store scope="
+                                + requestCache.scope
+                                + " class="
+                                + className
+                                + " count="
+                                + members.size());
+        return members;
+    }
+
+    private static final class RequestCache {
+        private final String scope;
+        private final Map<String, List<? extends Element>> allMembersByClassName = new HashMap<>();
+        private final Map<String, LombokMetadata> metadataByClassName = new HashMap<>();
+        private final Map<String, TypeMirror> resolvedTypeByName = new HashMap<>();
+        private final Map<String, Boolean> assignableBySignature = new HashMap<>();
+        private final Set<String> inheritedFieldsEnriched = new HashSet<>();
+        private final Set<String> loggedMetadataMisses = new HashSet<>();
+        private final Set<String> loggedMetadataStores = new HashSet<>();
+        private final Set<String> loggedMetadataHits = new HashSet<>();
+
+        private RequestCache(String scope) {
+            this.scope = scope;
+            LOG.fine(() -> "[lombok-cache] create scope=" + scope);
+        }
     }
 
     /** Check if two types are equivalent under Java's auto-boxing rules */

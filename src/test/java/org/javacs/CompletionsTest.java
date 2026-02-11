@@ -6,6 +6,7 @@ import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -809,5 +810,69 @@ public class CompletionsTest extends CompletionsBase {
     public void slf4jRecordScopeInstanceCompletionDoesNotContainLog() {
         var labels = label("/org/javacs/example/Slf4jRecordScopeCompletion.java", 13, 12);
         assertThat(labels, not(hasItem("log")));
+    }
+
+    @Test
+    public void lombokFieldRenameRefreshesCompletionItems() {
+        var file = FindResource.path("/org/javacs/example/LombokCompletionFieldChange.java");
+        open(file);
+
+        var before = labels(file, 13, 15);
+        assertThat(before, hasItem("setName"));
+        assertThat(before, not(hasItem("setAge")));
+
+        var newContents =
+                "package org.javacs.example;\n"
+                        + "\n"
+                        + "import lombok.Data;\n"
+                        + "\n"
+                        + "public class LombokCompletionFieldChange {\n"
+                        + "    @Data\n"
+                        + "    static class Foo {\n"
+                        + "        private int age;\n"
+                        + "    }\n"
+                        + "\n"
+                        + "    void test() {\n"
+                        + "        var foo = new Foo();\n"
+                        + "        foo.se\n"
+                        + "    }\n"
+                        + "}\n";
+        edit(file, newContents);
+
+        var after = labels(file, 13, 15);
+        assertThat(after, hasItem("setAge"));
+        assertThat(after, not(hasItem("setName")));
+    }
+
+    private static int editVersion = 1;
+
+    private void open(Path file) {
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.text = FileStore.contents(file);
+        open.textDocument.version = editVersion++;
+        open.textDocument.languageId = "java";
+        server.didOpenTextDocument(open);
+    }
+
+    private void edit(Path file, String contents) {
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = file.toUri();
+        change.textDocument.version = editVersion++;
+        var evt = new TextDocumentContentChangeEvent();
+        evt.text = contents;
+        change.contentChanges.add(evt);
+        server.didChangeTextDocument(change);
+    }
+
+    private List<String> labels(Path file, int row, int column) {
+        var position =
+                new TextDocumentPositionParams(
+                        new TextDocumentIdentifier(file.toUri()), new Position(row - 1, column - 1));
+        var maybe = server.completion(position);
+        if (maybe.isEmpty()) {
+            fail("no items");
+        }
+        return maybe.get().items.stream().map(item -> item.label).collect(Collectors.toList());
     }
 }

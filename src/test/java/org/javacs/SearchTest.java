@@ -91,4 +91,11 @@ public class SearchTest {
 
         assertThat("includes explicit constructor", all, hasItem("ReferenceConstructor"));
     }
+
+    @Test
+    public void documentSymbolsOnParseErrorDoesNotThrow() {
+        var path = "/org/javacs/example/FixParseErrorBefore.java";
+        var all = searchFile(FindResource.uri(path));
+        assertThat(all, notNullValue());
+    }
 }

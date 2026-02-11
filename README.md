@@ -144,7 +144,7 @@ Private Maven repositories are currently not supported. Go-to-definition on depe
 
 JLS supports LSP inlay hints for:
 - parameter names
-- `var` type hints
+- `var` type hints (always on when inlay hints are enabled)
 
 These are controlled by the `java.inlayHints` settings block sent by your client:
 
@@ -154,18 +154,25 @@ These are controlled by the `java.inlayHints` settings block sent by your client
         "inlayHints": {
             "enabled": true,
             "parameterNames": true,
-            "varTypes": true
+            "debounceMs": 250,
+            "cacheIdleMs": 120000,
+            "cacheMaxEntries": 256
         }
     }
 }
 ```
 
+Options:
+- `enabled`: master switch for inlay hints.
+- `parameterNames`: show/hide parameter name hints.
+- `debounceMs`: delay window to reuse previous hints while typing (reduces flicker).
+- `cacheIdleMs`: remove idle cached hint snapshots after this time.
+- `cacheMaxEntries`: maximum number of cached files before oldest entries are evicted.
+
 Behavior details:
-- If `inlayHints` is a boolean `true`, both parameter names and var types are enabled.
-- If `inlayHints` is a boolean `false`, both are disabled.
-- If `inlayHints` is an object:
-  - `enabled` sets the default for both kinds.
-  - `parameterNames` and `varTypes` override `enabled` when present.
+- If `inlayHints` is boolean `true`, all inlay hints are enabled.
+- If `inlayHints` is boolean `false`, all inlay hints are disabled.
+- `var` type hints are no longer configurable separately.
 
 Examples:
 
@@ -174,11 +181,7 @@ Examples:
 ```
 
 ```json
-{ "java": { "inlayHints": { "enabled": true, "parameterNames": false } } }
-```
-
-```json
-{ "java": { "inlayHints": { "enabled": false, "varTypes": true } } }
+{ "java": { "inlayHints": { "enabled": true, "parameterNames": false, "debounceMs": 200 } } }
 ```
 
 ## CodeLens

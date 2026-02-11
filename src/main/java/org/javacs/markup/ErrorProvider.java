@@ -83,6 +83,14 @@ public class ErrorProvider {
 
         // Create a copy to avoid ConcurrentModificationException during cache compilation
         var diagnosticsCopy = new ArrayList<>(task.diagnostics);
+        var filterContext = LombokHandler.newDiagnosticFilterContext("batch:" + root.getSourceFile().toUri());
+        LOG.fine(
+                () ->
+                        "[lombok-cache] diagnostics batch start uri="
+                                + root.getSourceFile().toUri()
+                                + " diagnostics="
+                                + diagnosticsCopy.size());
+        int filteredByLombok = 0;
 
         for (var d : diagnosticsCopy) {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
@@ -94,12 +102,23 @@ public class ErrorProvider {
                 result.add(lombokAdjusted);
                 continue;
             }
-            if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d)) {
+            if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d, filterContext)) {
+                filteredByLombok++;
                 continue;  // Skip this error
             }
 
             result.add(lspDiagnostic(d, root.getLineMap()));
         }
+        var kept = result.size();
+        var filteredCount = filteredByLombok;
+        LOG.fine(
+                () ->
+                        "[lombok-cache] diagnostics batch end uri="
+                                + root.getSourceFile().toUri()
+                                + " filtered="
+                                + filteredCount
+                                + " kept="
+                                + kept);
         return result;
     }
 

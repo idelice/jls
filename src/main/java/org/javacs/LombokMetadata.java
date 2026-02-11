@@ -52,56 +52,37 @@ public class LombokMetadata {
     public List<VariableTree> builderParams = new ArrayList<>();
     public Map<String, VariableTree> builderParamsByName = new HashMap<>();
 
+    // Precomputed generated-member indexes for hot-path lookups.
+    private final Set<String> generatedGetterNames = new HashSet<>();
+    private final Set<String> generatedSetterNames = new HashSet<>();
+    private final Set<String> generatedSpecialMethodNames = new HashSet<>();
+    private final Set<String> generatedBuilderMethodNames = new HashSet<>();
+    private final Map<String, VariableTree> getterFieldByMethodName = new HashMap<>();
+    private final Map<String, VariableTree> setterFieldByMethodName = new HashMap<>();
+    private volatile boolean indexesInitialized = false;
+
     /**
      * Check if a method name is a generated getter.
      */
     public boolean isGeneratedGetter(String methodName) {
-        // Check current class fields
-        for (var field : allFields) {
-            if (methodName.equals(getterName(field)) && shouldGenerateGetter(field)) {
-                return true;
-            }
-        }
-        // Check inherited fields
-        if ((hasGetter || hasData || hasValue) && !inheritedFieldNames.isEmpty()) {
-            for (var fieldName : inheritedFieldNames) {
-                if (methodName.equals("get" + capitalize(fieldName))) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        ensureIndexes();
+        return generatedGetterNames.contains(methodName);
     }
 
     /**
      * Check if a method name is a generated setter.
      */
     public boolean isGeneratedSetter(String methodName) {
-        // Check current class fields
-        for (var field : allFields) {
-            if (methodName.equals(setterName(field)) && shouldGenerateSetter(field)) {
-                return true;
-            }
-        }
-        // Check inherited fields
-        if ((hasSetter || hasData) && !inheritedFieldNames.isEmpty()) {
-            for (var fieldName : inheritedFieldNames) {
-                if (methodName.equals("set" + capitalize(fieldName))) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        ensureIndexes();
+        return generatedSetterNames.contains(methodName);
     }
 
     /**
      * Check if a method name is toString, equals, or hashCode (generated).
      */
     public boolean isGeneratedSpecialMethod(String methodName) {
-        if (hasToString && methodName.equals("toString")) return true;
-        if (hasEqualsAndHashCode && methodName.equals("equals")) return true;
-        if (hasEqualsAndHashCode && methodName.equals("hashCode")) return true;
-        return false;
+        ensureIndexes();
+        return generatedSpecialMethodNames.contains(methodName);
     }
 
     /**
@@ -119,66 +100,32 @@ public class LombokMetadata {
      * Get the field that corresponds to a getter method.
      */
     public VariableTree fieldForGetter(String methodName) {
-        for (var field : allFields) {
-            if (methodName.equals(getterName(field)) && shouldGenerateGetter(field)) {
-                return field;
-            }
-        }
-        return null;
+        ensureIndexes();
+        return getterFieldByMethodName.get(methodName);
     }
 
     /**
      * Get the field that corresponds to a setter method.
      */
     public VariableTree fieldForSetter(String methodName) {
-        for (var field : allFields) {
-            if (methodName.equals(setterName(field)) && shouldGenerateSetter(field)) {
-                return field;
-            }
-        }
-        return null;
+        ensureIndexes();
+        return setterFieldByMethodName.get(methodName);
     }
 
     /**
      * Get all generated getter method names.
      */
     public List<String> getGeneratedGetterNames() {
-        var names = new ArrayList<String>();
-        if (hasGetter || hasData || hasValue || !getterFields.isEmpty()) {
-            // Current class fields
-            for (var field : allFields) {
-                if (!shouldGenerateGetter(field)) continue;
-                names.add(getterName(field));
-            }
-            // Inherited fields (no VariableTree available, so just generate names)
-            if ((hasGetter || hasData || hasValue) && !inheritedFieldNames.isEmpty()) {
-                for (var fieldName : inheritedFieldNames) {
-                    names.add("get" + capitalize(fieldName));
-                }
-            }
-        }
-        return names;
+        ensureIndexes();
+        return new ArrayList<>(generatedGetterNames);
     }
 
     /**
      * Get all generated setter method names.
      */
     public List<String> getGeneratedSetterNames() {
-        var names = new ArrayList<String>();
-        if ((hasSetter || hasData || !setterFields.isEmpty()) && (!allFields.isEmpty() || !inheritedFieldNames.isEmpty())) {
-            // Current class fields
-            for (var field : allFields) {
-                if (!shouldGenerateSetter(field)) continue;
-                names.add(setterName(field));
-            }
-            // Inherited fields (no VariableTree available, so just generate names)
-            if ((hasSetter || hasData) && !inheritedFieldNames.isEmpty()) {
-                for (var fieldName : inheritedFieldNames) {
-                    names.add("set" + capitalize(fieldName));
-                }
-            }
-        }
-        return names;
+        ensureIndexes();
+        return new ArrayList<>(generatedSetterNames);
     }
 
     /**
@@ -216,15 +163,79 @@ public class LombokMetadata {
     }
 
     public boolean isGeneratedBuilderMethod(String methodName) {
-        if (!hasBuilder) return false;
-        if (explicitBuilderMethodNames.contains(methodName)) return false;
-        if (methodName.equals(buildMethodName)) return true;
-        for (var param : builderParams) {
-            if (param.getName().contentEquals(methodName)) {
-                return true;
+        ensureIndexes();
+        return generatedBuilderMethodNames.contains(methodName);
+    }
+
+    public synchronized void rebuildGeneratedIndexes() {
+        indexesInitialized = false;
+        generatedGetterNames.clear();
+        generatedSetterNames.clear();
+        generatedSpecialMethodNames.clear();
+        generatedBuilderMethodNames.clear();
+        getterFieldByMethodName.clear();
+        setterFieldByMethodName.clear();
+
+        if (hasGetter || hasData || hasValue || !getterFields.isEmpty()) {
+            for (var field : allFields) {
+                if (!shouldGenerateGetter(field)) continue;
+                var getter = getterName(field);
+                generatedGetterNames.add(getter);
+                getterFieldByMethodName.put(getter, field);
+            }
+            if ((hasGetter || hasData || hasValue) && !inheritedFieldNames.isEmpty()) {
+                for (var fieldName : inheritedFieldNames) {
+                    generatedGetterNames.add("get" + capitalize(fieldName));
+                }
             }
         }
-        return false;
+
+        if ((hasSetter || hasData || !setterFields.isEmpty())
+                && (!allFields.isEmpty() || !inheritedFieldNames.isEmpty())) {
+            for (var field : allFields) {
+                if (!shouldGenerateSetter(field)) continue;
+                var setter = setterName(field);
+                generatedSetterNames.add(setter);
+                setterFieldByMethodName.put(setter, field);
+            }
+            if ((hasSetter || hasData) && !inheritedFieldNames.isEmpty()) {
+                for (var fieldName : inheritedFieldNames) {
+                    generatedSetterNames.add("set" + capitalize(fieldName));
+                }
+            }
+        }
+
+        if (hasToString) {
+            generatedSpecialMethodNames.add("toString");
+        }
+        if (hasEqualsAndHashCode) {
+            generatedSpecialMethodNames.add("equals");
+            generatedSpecialMethodNames.add("hashCode");
+        }
+
+        if (hasBuilder) {
+            if (!explicitBuilderMethodNames.contains(buildMethodName)) {
+                generatedBuilderMethodNames.add(buildMethodName);
+            }
+            for (var param : builderParams) {
+                var name = param.getName().toString();
+                if (!explicitBuilderMethodNames.contains(name)) {
+                    generatedBuilderMethodNames.add(name);
+                }
+            }
+        }
+        indexesInitialized = true;
+    }
+
+    public void markIndexesDirty() {
+        indexesInitialized = false;
+    }
+
+    private void ensureIndexes() {
+        if (indexesInitialized) {
+            return;
+        }
+        rebuildGeneratedIndexes();
     }
 
     public List<String> getBuilderSetterNames() {

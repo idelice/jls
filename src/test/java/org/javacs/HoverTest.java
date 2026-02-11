@@ -70,6 +70,27 @@ public class HoverTest {
                 containsString("Returns an unmodifiable list containing zero elements."));
     }
 
+    @Test
+    public void lombokNestedGetterHoverGetBiz() {
+        var hover = symbolAt("/org/javacs/example/LombokNestedHover.java", 29, 22);
+        assertThat(hover, containsString("public Biz getBiz()"));
+        assertThat(hover, not(containsString("public static class getBiz")));
+    }
+
+    @Test
+    public void lombokNestedGetterHoverGetMyRec() {
+        var hover = symbolAt("/org/javacs/example/LombokNestedHover.java", 29, 33);
+        assertThat(hover, containsString("public MyRec getMyRec()"));
+        assertThat(hover, not(containsString("public static class getMyRec")));
+    }
+
+    @Test
+    public void lombokNestedGetterHoverExplicitFoo() {
+        var hover = symbolAt("/org/javacs/example/LombokNestedHover.java", 29, 41);
+        assertThat(hover, containsString("public String foo()"));
+        assertThat(hover, not(containsString("public static class foo")));
+    }
+
     // Re-using the language server makes these tests go a lot faster, but it will potentially produce surprising output
     // if things go wrong
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();

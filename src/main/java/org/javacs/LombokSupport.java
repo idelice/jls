@@ -45,6 +45,8 @@ public class LombokSupport {
         // Finalize builder params for class-level @Builder
         finalizeBuilderParams(metadata);
 
+        metadata.rebuildGeneratedIndexes();
+
         return metadata;
     }
 

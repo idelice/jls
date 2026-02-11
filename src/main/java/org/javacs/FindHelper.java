@@ -47,7 +47,19 @@ public class FindHelper {
 
     public static MethodTree findMethod(
             ParseTask task, String className, String methodName, String[] erasedParameterTypes) {
+        var method = findMethodOrNull(task, className, methodName, erasedParameterTypes);
+        if (method != null) {
+            return method;
+        }
+        throw new RuntimeException("no method");
+    }
+
+    public static MethodTree findMethodOrNull(
+            ParseTask task, String className, String methodName, String[] erasedParameterTypes) {
         var classTree = findType(task, className);
+        if (classTree == null) {
+            return null;
+        }
         for (var member : classTree.getMembers()) {
             if (member.getKind() != Tree.Kind.METHOD) continue;
             var method = (MethodTree) member;
@@ -55,7 +67,7 @@ public class FindHelper {
             if (!isSameMethodType(method, erasedParameterTypes)) continue;
             return method;
         }
-        throw new RuntimeException("no method");
+        return null;
     }
 
     public static VariableTree findField(ParseTask task, String className, String memberName) {
@@ -127,10 +139,13 @@ public class FindHelper {
         }
         if (candidate instanceof IdentifierTree) {
             var simpleName = candidate.toString();
-            return erasedType.endsWith(simpleName);
+            return erasedType.equals(simpleName) || erasedType.endsWith("." + simpleName);
         }
         if (candidate instanceof MemberSelectTree) {
-            return candidate.toString().equals(erasedType);
+            var selected = candidate.toString();
+            return erasedType.equals(selected)
+                    || erasedType.endsWith("." + selected)
+                    || selected.endsWith("." + erasedType);
         }
         if (candidate instanceof ArrayTypeTree) {
             var array = (ArrayTypeTree) candidate;

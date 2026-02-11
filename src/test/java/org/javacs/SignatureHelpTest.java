@@ -70,6 +70,13 @@ public class SignatureHelpTest {
         assertThat(help.signatures.get(0).label, containsString("items(List<String> items)"));
     }
 
+    @Test
+    public void memberSelectParameterTypeDoesNotBreakSignatureHelp() {
+        var help = doHelp("/org/javacs/example/SignatureHelpMemberSelectParam.java", 9, 21);
+        assertThat(help.signatures, hasSize(1));
+        assertThat(help.signatures.get(0).label, containsString("consume(Map.Entry<String, String> entry)"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private SignatureHelp doHelp(String file, int row, int column) {

@@ -2,8 +2,10 @@ package org.javacs.index;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
+import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
+import javax.tools.Diagnostic;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
 import org.javacs.lsp.Location;
@@ -113,10 +115,43 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
         var lines = task.root.getLineMap();
         var start = pos.getStartPosition(root, t);
         var end = pos.getEndPosition(root, t);
-        var startLine = (int) lines.getLineNumber(start);
-        var startColumn = (int) lines.getColumnNumber(start);
-        var endLine = (int) lines.getLineNumber(end);
-        var endColumn = (int) lines.getColumnNumber(end);
+
+        if (start == Diagnostic.NOPOS || end == Diagnostic.NOPOS) {
+            try {
+                var contents = root.getSourceFile().getCharContent(true);
+                if (start == Diagnostic.NOPOS) {
+                    start = 0;
+                }
+                if (end == Diagnostic.NOPOS) {
+                    end = contents.length();
+                }
+            } catch (IOException e) {
+                if (start == Diagnostic.NOPOS) {
+                    start = 0;
+                }
+                if (end == Diagnostic.NOPOS) {
+                    end = start;
+                }
+            }
+        }
+        start = Math.max(0, start);
+        end = Math.max(start, end);
+
+        int startLine;
+        int startColumn;
+        int endLine;
+        int endColumn;
+        try {
+            startLine = Math.max(1, (int) lines.getLineNumber(start));
+            startColumn = Math.max(1, (int) lines.getColumnNumber(start));
+            endLine = Math.max(startLine, (int) lines.getLineNumber(end));
+            endColumn = Math.max(1, (int) lines.getColumnNumber(end));
+        } catch (RuntimeException e) {
+            startLine = 1;
+            startColumn = 1;
+            endLine = 1;
+            endColumn = 1;
+        }
         var range = new Range(new Position(startLine - 1, startColumn - 1), new Position(endLine - 1, endColumn - 1));
         return new Location(root.getSourceFile().toUri(), range);
     }
