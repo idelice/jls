@@ -1133,51 +1133,13 @@ public final class LombokHandler {
             CompileTask task, LombokMetadataCache cache, javax.tools.Diagnostic<? extends JavaFileObject> d) {
         var message = d.getMessage(null);
         if (message == null) return false;
-
-        String methodName = null;
-        String className = null;
-        List<String> paramTypes = null;
-
-        // Try pattern 1: "method foo(...)" - when signature is shown
-        var methodWithParamMatcher = METHOD_WITH_PARAMS_PATTERN.matcher(message);
-        if (methodWithParamMatcher.find()) {
-            methodName = methodWithParamMatcher.group(1);
-            var params = methodWithParamMatcher.group(2);
-            paramTypes = parseMethodParamTypes(params);
-        } else {
-            // Try pattern 2: "method foo in class Bar" - when signature not fully resolved
-            var methodInClassMatcher = METHOD_IN_CLASS_PATTERN.matcher(message);
-            if (methodInClassMatcher.find()) {
-                methodName = methodInClassMatcher.group(1);
-                className = methodInClassMatcher.group(2);
-                // When params aren't in signature, check "found:" clause
-                var foundMatcher = FOUND_ARGUMENTS_PATTERN.matcher(message);
-                if (foundMatcher.find()) {
-                    var found = foundMatcher.group(1).trim();
-                    if (found.equals("no arguments")) {
-                        paramTypes = new ArrayList<>();
-                    } else {
-                        paramTypes = parseMethodParamTypes(found);
-                    }
-                } else {
-                    return false;
-                }
-            }
+        var parsed = parseDiagnostic(task, d, message);
+        if (parsed == null || parsed.methodName == null || parsed.paramTypes == null || parsed.className == null) {
+            return false;
         }
-
-        if (methodName == null || paramTypes == null) return false;
-
-        // Extract class name if not already found
-        if (className == null) {
-            var classMatcher = LOCATION_CLASS_PATTERN.matcher(message);
-            if (classMatcher.find()) {
-                className = classMatcher.group(1);
-            } else {
-                className = enclosingClassNameAtDiagnostic(task, d);
-                if (className == null) return false;
-            }
-        }
-        className = resolveDiagnosticClassName(task, d, className);
+        var methodName = parsed.methodName;
+        var paramTypes = parsed.paramTypes;
+        var className = parsed.className;
 
         var metadata = cache.get(className, task.roots);
         if (metadata == null) return false;
@@ -1218,13 +1180,7 @@ public final class LombokHandler {
             var enumClassName = enumMatcher.group(2);
             var metadata = cache.get(enumClassName, task.roots);
             if (metadata == null) return false;
-
-            // Filter if the enum has a Lombok constructor annotation
-            return metadata.hasAllArgsConstructor ||
-                   metadata.hasRequiredArgsConstructor ||
-                   metadata.hasNoArgsConstructor ||
-                   metadata.hasData ||
-                   metadata.hasValue;
+            return hasLombokConstructorAnnotations(metadata);
         }
 
         // Pattern 2: "constructor ClassName in class com.example.ClassName cannot be applied"
@@ -1234,13 +1190,7 @@ public final class LombokHandler {
             var className = classMatcher.group(2);
             var metadata = cache.get(className, task.roots);
             if (metadata == null) return false;
-
-            // Filter if the class has a Lombok constructor annotation
-            return metadata.hasAllArgsConstructor ||
-                   metadata.hasRequiredArgsConstructor ||
-                   metadata.hasNoArgsConstructor ||
-                   metadata.hasData ||
-                   metadata.hasValue;
+            return hasLombokConstructorAnnotations(metadata);
         }
 
         return false;
@@ -1348,7 +1298,7 @@ public final class LombokHandler {
         var parsed = parseDiagnostic(task, d, message);
         if (parsed == null) return false;
 
-        var quickDecision = quickDiagnosticFilterDecision(task, cache, d, requestCache, message);
+        var quickDecision = quickDiagnosticFilterDecision(task, cache, d, requestCache, parsed);
         if (quickDecision == DiagnosticDecision.FILTER) {
             return true;
         }
@@ -1507,19 +1457,7 @@ public final class LombokHandler {
             RequestCache requestCache) {
         if (paramTypes != null) {
             if (paramTypes.isEmpty()) {
-                if (metadata.isGeneratedGetter(memberName) || metadata.isGeneratedSpecialMethod(memberName)) {
-                    return true;
-                }
-                if (metadata.hasBuilder
-                        && memberName.equals(metadata.builderMethodName)
-                        && !metadata.explicitMethodNames.contains(metadata.builderMethodName)
-                        && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)) {
-                    return true;
-                }
-                return metadata.hasBuilder
-                        && memberName.equals(metadata.buildMethodName)
-                        && !metadata.explicitBuilderMethodNames.contains(metadata.buildMethodName)
-                        && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName);
+                return matchesGeneratedZeroArgMethod(metadata, memberName);
             }
             if (paramTypes.size() == 1) {
                 var field = metadata.fieldForSetter(memberName);
@@ -1538,19 +1476,11 @@ public final class LombokHandler {
                         return true;
                     }
                 }
-                return metadata.hasEqualsAndHashCode
-                        && memberName.equals("equals")
-                        && isObjectType(paramTypes.get(0));
+                return matchesEqualsSignature(metadata, memberName, paramTypes.get(0));
             }
             return false;
         }
-        return metadata.isGeneratedGetter(memberName)
-                || metadata.isGeneratedSetter(memberName)
-                || metadata.isGeneratedSpecialMethod(memberName)
-                || (metadata.hasBuilder
-                        && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)
-                        && (memberName.equals(metadata.builderMethodName)
-                                || metadata.isGeneratedBuilderMethod(memberName)));
+        return matchesGeneratedMemberWithoutSignature(metadata, memberName);
     }
 
     private static boolean hasMethodGeneratingLombokAnnotations(LombokMetadata metadata) {
@@ -1565,6 +1495,15 @@ public final class LombokHandler {
                 || metadata.hasAllArgsConstructor
                 || metadata.hasRequiredArgsConstructor
                 || metadata.hasNoArgsConstructor;
+    }
+
+    private static boolean hasLombokConstructorAnnotations(LombokMetadata metadata) {
+        if (metadata == null) return false;
+        return metadata.hasAllArgsConstructor
+                || metadata.hasRequiredArgsConstructor
+                || metadata.hasNoArgsConstructor
+                || metadata.hasData
+                || metadata.hasValue;
     }
 
     private static LombokMetadata metadataForClassName(
@@ -1606,6 +1545,19 @@ public final class LombokHandler {
             var params = methodMatcher.group(2);
             return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
         }
+        var methodInClassMatcher = METHOD_IN_CLASS_PATTERN.matcher(message);
+        if (methodInClassMatcher.find()) {
+            var methodName = methodInClassMatcher.group(1);
+            var inClassName = resolveDiagnosticClassName(task, d, methodInClassMatcher.group(2));
+            var foundMatcher = FOUND_ARGUMENTS_PATTERN.matcher(message);
+            if (foundMatcher.find()) {
+                var found = foundMatcher.group(1).trim();
+                var params = found.equals("no arguments") ? List.<String>of() : parseMethodParamTypes(found);
+                return new ParsedDiagnostic(inClassName, methodName, params, null);
+            }
+            // Signature not available; keep method/class but unknown parameters.
+            return new ParsedDiagnostic(inClassName, methodName, null, null);
+        }
         var methodNoParamsMatcher = METHOD_NO_PARAMS_PATTERN.matcher(message);
         if (methodNoParamsMatcher.find()) {
             return new ParsedDiagnostic(className, methodNoParamsMatcher.group(1), List.of(), null);
@@ -1622,11 +1574,7 @@ public final class LombokHandler {
             LombokMetadataCache cache,
             javax.tools.Diagnostic<? extends JavaFileObject> d,
             RequestCache requestCache,
-            String message) {
-        var parsed = parseDiagnostic(task, d, message);
-        if (parsed == null) {
-            return DiagnosticDecision.UNKNOWN;
-        }
+            ParsedDiagnostic parsed) {
         if (parsed.methodName != null) {
             var className = parsed.className;
             if (className == null) return DiagnosticDecision.UNKNOWN;
@@ -1670,21 +1618,13 @@ public final class LombokHandler {
             LombokMetadata metadata, String memberName, List<String> paramTypes) {
         if (paramTypes != null) {
             if (paramTypes.isEmpty()) {
-                if (metadata.isGeneratedGetter(memberName) || metadata.isGeneratedSpecialMethod(memberName)) {
-                    return DiagnosticDecision.FILTER;
-                }
-                if (metadata.hasBuilder
-                        && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)
-                        && (memberName.equals(metadata.builderMethodName)
-                                || memberName.equals(metadata.buildMethodName))) {
+                if (matchesGeneratedZeroArgMethod(metadata, memberName)) {
                     return DiagnosticDecision.FILTER;
                 }
                 return DiagnosticDecision.UNKNOWN;
             }
             if (paramTypes.size() == 1) {
-                if (metadata.hasEqualsAndHashCode
-                        && memberName.equals("equals")
-                        && isObjectType(paramTypes.get(0))) {
+                if (matchesEqualsSignature(metadata, memberName, paramTypes.get(0))) {
                     return DiagnosticDecision.FILTER;
                 }
                 if (metadata.hasBuilder
@@ -1700,15 +1640,40 @@ public final class LombokHandler {
             }
             return DiagnosticDecision.UNKNOWN;
         }
-        return (metadata.isGeneratedGetter(memberName)
-                        || metadata.isGeneratedSetter(memberName)
-                        || metadata.isGeneratedSpecialMethod(memberName)
-                        || (metadata.hasBuilder
-                                && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)
-                                && (memberName.equals(metadata.builderMethodName)
-                                        || metadata.isGeneratedBuilderMethod(memberName))))
+        return matchesGeneratedMemberWithoutSignature(metadata, memberName)
                 ? DiagnosticDecision.FILTER
                 : DiagnosticDecision.KEEP;
+    }
+
+    private static boolean matchesGeneratedZeroArgMethod(LombokMetadata metadata, String memberName) {
+        if (metadata.isGeneratedGetter(memberName) || metadata.isGeneratedSpecialMethod(memberName)) {
+            return true;
+        }
+        if (!hasActiveBuilder(metadata)) {
+            return false;
+        }
+        if (memberName.equals(metadata.builderMethodName) && !metadata.explicitMethodNames.contains(metadata.builderMethodName)) {
+            return true;
+        }
+        return memberName.equals(metadata.buildMethodName) && !metadata.explicitBuilderMethodNames.contains(metadata.buildMethodName);
+    }
+
+    private static boolean matchesGeneratedMemberWithoutSignature(LombokMetadata metadata, String memberName) {
+        if (metadata.isGeneratedGetter(memberName)
+                || metadata.isGeneratedSetter(memberName)
+                || metadata.isGeneratedSpecialMethod(memberName)) {
+            return true;
+        }
+        return hasActiveBuilder(metadata)
+                && (memberName.equals(metadata.builderMethodName) || metadata.isGeneratedBuilderMethod(memberName));
+    }
+
+    private static boolean matchesEqualsSignature(LombokMetadata metadata, String memberName, String paramType) {
+        return metadata.hasEqualsAndHashCode && memberName.equals("equals") && isObjectType(paramType);
+    }
+
+    private static boolean hasActiveBuilder(LombokMetadata metadata) {
+        return metadata.hasBuilder && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName);
     }
 
     private static String classNameFromMessage(

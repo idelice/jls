@@ -10,11 +10,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
-import javax.lang.model.element.ElementKind;
-import javax.lang.model.element.ExecutableElement;
-import javax.lang.model.element.Modifier;
-import javax.lang.model.element.TypeElement;
-import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.tools.Diagnostic;
@@ -22,6 +17,7 @@ import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
+import org.javacs.LocalTypeInference;
 import org.javacs.LombokMetadataCache;
 import org.javacs.LombokHandler;
 import org.javacs.lsp.*;
@@ -308,7 +304,7 @@ public class ErrorProvider {
                 }
                 var declarationPath = getCurrentPath();
                 var initializerPath = new TreePath(declarationPath, variable.getInitializer());
-                var type = inferExpressionType(initializerPath, scope);
+                var type = LocalTypeInference.inferExpressionType(task, initializerPath, lombokCache, scope);
                 if (type != null && type.getKind() != TypeKind.ERROR) {
                     return type;
                 }
@@ -316,62 +312,7 @@ public class ErrorProvider {
             }
 
             private TypeMirror inferExpressionType(TreePath expressionPath, HashMap<String, TypeMirror> scope) {
-                var type = trees.getTypeMirror(expressionPath);
-                if (type != null && type.getKind() != TypeKind.ERROR && type.getKind() != TypeKind.NONE) {
-                    return type;
-                }
-                var leaf = expressionPath.getLeaf();
-                if (leaf instanceof IdentifierTree) {
-                    return scope.get(((IdentifierTree) leaf).getName().toString());
-                }
-                if (leaf instanceof MethodInvocationTree) {
-                    var invocation = (MethodInvocationTree) leaf;
-                    var lombokResolved =
-                            LombokHandler.resolveMethodInvocationReturnType(task, invocation, expressionPath, lombokCache);
-                    if (lombokResolved != null && lombokResolved.getKind() != TypeKind.ERROR) {
-                        return lombokResolved;
-                    }
-                    var scopeResolved = resolveFromInferredReceiver(invocation, scope);
-                    if (scopeResolved != null && scopeResolved.getKind() != TypeKind.ERROR) {
-                        return scopeResolved;
-                    }
-                }
-                return type;
-            }
-
-            private TypeMirror resolveFromInferredReceiver(MethodInvocationTree invocation, HashMap<String, TypeMirror> scope) {
-                if (!(invocation.getMethodSelect() instanceof MemberSelectTree)) {
-                    return null;
-                }
-                var memberSelect = (MemberSelectTree) invocation.getMethodSelect();
-                if (!(memberSelect.getExpression() instanceof IdentifierTree)) {
-                    return null;
-                }
-                var receiverName = ((IdentifierTree) memberSelect.getExpression()).getName().toString();
-                var receiverType = scope.get(receiverName);
-                if (!(receiverType instanceof DeclaredType)) {
-                    return null;
-                }
-                var receiverElement = (TypeElement) ((DeclaredType) receiverType).asElement();
-                var methodName = memberSelect.getIdentifier().toString();
-                var argumentCount = invocation.getArguments().size();
-                for (var member : task.task.getElements().getAllMembers(receiverElement)) {
-                    if (member.getKind() != ElementKind.METHOD) {
-                        continue;
-                    }
-                    var method = (ExecutableElement) member;
-                    if (!method.getSimpleName().contentEquals(methodName)) {
-                        continue;
-                    }
-                    if (method.getModifiers().contains(Modifier.STATIC)) {
-                        continue;
-                    }
-                    if (method.getParameters().size() != argumentCount) {
-                        continue;
-                    }
-                    return method.getReturnType();
-                }
-                return null;
+                return LocalTypeInference.inferExpressionType(task, expressionPath, lombokCache, scope);
             }
         }
 
