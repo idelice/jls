@@ -13,6 +13,7 @@ import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -603,6 +604,9 @@ public class CompletionProvider {
         }
         var declarationPath = trees.getPath(element);
         if (declarationPath == null || !(declarationPath.getLeaf() instanceof VariableTree)) {
+            declarationPath = findVariableDeclarationPath(task, expressionPath, variable.getSimpleName().toString());
+        }
+        if (declarationPath == null || !(declarationPath.getLeaf() instanceof VariableTree)) {
             return null;
         }
         var declaration = (VariableTree) declarationPath.getLeaf();
@@ -621,6 +625,19 @@ public class CompletionProvider {
         if (initType instanceof DeclaredType) {
             return (DeclaredType) initType;
         }
+        if (initType != null && initType.getKind() == TypeKind.ERROR) {
+            if (declaration.getInitializer() instanceof MethodInvocationTree) {
+                var resolved = LombokHandler.resolveMethodInvocationReturnType(
+                        task, (MethodInvocationTree) declaration.getInitializer(), initializerPath, lombokCache);
+                if (resolved instanceof DeclaredType) {
+                    return (DeclaredType) resolved;
+                }
+            }
+            var resolved = LombokHandler.resolveLombokGeneratedMethodType(task, initType.toString(), lombokCache);
+            if (resolved instanceof DeclaredType) {
+                return (DeclaredType) resolved;
+            }
+        }
         if (declaration.getType() != null) {
             var declaredTypePath = new TreePath(declarationPath, declaration.getType());
             var declaredType = trees.getTypeMirror(declaredTypePath);
@@ -629,6 +646,41 @@ public class CompletionProvider {
             }
         }
         return null;
+    }
+
+    private TreePath findVariableDeclarationPath(CompileTask task, TreePath usagePath, String variableName) {
+        if (usagePath == null || variableName == null || variableName.isEmpty()) {
+            return null;
+        }
+        var root = usagePath.getCompilationUnit();
+        if (root == null) {
+            return null;
+        }
+        var trees = Trees.instance(task.task);
+        var sourcePositions = trees.getSourcePositions();
+        var usageStart = sourcePositions.getStartPosition(root, usagePath.getLeaf());
+        if (usageStart == javax.tools.Diagnostic.NOPOS) {
+            return null;
+        }
+        class Finder extends TreePathScanner<Void, Void> {
+            private TreePath best;
+            private long bestEnd = Long.MIN_VALUE;
+
+            @Override
+            public Void visitVariable(VariableTree node, Void unused) {
+                if (node.getName().contentEquals(variableName)) {
+                    var end = sourcePositions.getEndPosition(root, node);
+                    if (end != javax.tools.Diagnostic.NOPOS && end <= usageStart && end > bestEnd) {
+                        bestEnd = end;
+                        best = getCurrentPath();
+                    }
+                }
+                return super.visitVariable(node, unused);
+            }
+        }
+        var finder = new Finder();
+        finder.scan(root, null);
+        return finder.best;
     }
 
     private CompletionList completeDeclaredTypeMemberSelect(

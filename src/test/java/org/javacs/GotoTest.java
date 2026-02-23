@@ -229,6 +229,12 @@ public class GotoTest {
         assertThat(suggestions, hasItem("RecordCompactConstructor.java:3"));
     }
 
+    @Test
+    public void gotoVarFromLombokGetterBasedSplitFlow() {
+        var suggestions = doGoto("/org/javacs/example/LombokVarSplitFlow.java", 15, 13);
+        assertThat(suggestions, hasItem("LombokVarSplitFlow.java:14"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

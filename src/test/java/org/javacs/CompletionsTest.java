@@ -819,6 +819,12 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void lombokGetterVarCompletionSupportsStringMembers() {
+        var labels = label("/org/javacs/example/LombokVarSplitCompletion.java", 14, 11);
+        assertThat(labels, hasItem("split"));
+    }
+
+    @Test
     public void instanceofPatternVariableAppearsInIdentifierCompletion() {
         var labels = label("/org/javacs/example/LombokPatternCompletion.java", 8, 20);
         assertThat(labels, hasItem("somepojo"));

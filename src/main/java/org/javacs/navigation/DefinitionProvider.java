@@ -42,6 +42,9 @@ public class DefinitionProvider {
             }
             java.util.logging.Logger.getLogger("main").info("...element type kind: " + element.asType().getKind());
             if (element.asType().getKind() == TypeKind.ERROR) {
+                if (NavigationHelper.isLocal(element)) {
+                    return findDefinitions(task, element);
+                }
                 java.util.logging.Logger.getLogger("main").info("...element has ERROR type, calling findError");
                 task.close();
                 return findError(element);

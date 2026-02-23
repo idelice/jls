@@ -10,10 +10,18 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeKind;
+import javax.lang.model.type.TypeMirror;
 import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.FileStore;
+import org.javacs.FindHelper;
 import org.javacs.LombokMetadataCache;
 import org.javacs.LombokHandler;
 import org.javacs.lsp.*;
@@ -62,6 +70,7 @@ public class ErrorProvider {
             result[i].diagnostics.addAll(compilerErrors(root));
             result[i].diagnostics.addAll(LombokHandler.constructorDiagnostics(task, lombokCache, root));
             result[i].diagnostics.addAll(LombokHandler.builderConstructorDiagnostics(task, root));
+            result[i].diagnostics.addAll(arrayLengthMethodInvocationErrors(root, result[i].diagnostics));
             var compilerElapsedMs = (System.nanoTime() - compilerStart) / 1_000_000;
 
             // Skip warning scans when hard errors already exist; warning results are low-value and expensive while code is broken.
@@ -221,6 +230,154 @@ public class ErrorProvider {
      * - "cannot find symbol\n  symbol:   method getOne()\n  location: variable foo of type Foo"
      * - "cannot find symbol\n  symbol:   method setAge(int)\n  location: class Foo"
      */
+    private List<org.javacs.lsp.Diagnostic> arrayLengthMethodInvocationErrors(
+            CompilationUnitTree root, List<org.javacs.lsp.Diagnostic> existingDiagnostics) {
+        var existingErrorLines = new HashSet<Integer>();
+        for (var diagnostic : existingDiagnostics) {
+            if (diagnostic.severity == DiagnosticSeverity.Error) {
+                existingErrorLines.add(diagnostic.range.start.line);
+            }
+        }
+
+        var trees = Trees.instance(task.task);
+        var source = root.getSourceFile() != null ? Paths.get(root.getSourceFile().toUri()) : null;
+        var contents = source != null ? FileStore.contents(source) : null;
+        var generated = new ArrayList<org.javacs.lsp.Diagnostic>();
+
+        class Scanner extends TreePathScanner<Void, HashMap<String, TypeMirror>> {
+            @Override
+            public Void visitMethod(MethodTree methodTree, HashMap<String, TypeMirror> scope) {
+                return super.visitMethod(methodTree, new HashMap<>());
+            }
+
+            @Override
+            public Void visitBlock(BlockTree block, HashMap<String, TypeMirror> scope) {
+                return super.visitBlock(block, new HashMap<>(scope));
+            }
+
+            @Override
+            public Void visitVariable(VariableTree variable, HashMap<String, TypeMirror> scope) {
+                var type = inferVariableType(variable, scope);
+                if (type != null) {
+                    scope.put(variable.getName().toString(), type);
+                }
+                return super.visitVariable(variable, scope);
+            }
+
+            @Override
+            public Void visitMethodInvocation(MethodInvocationTree invocation, HashMap<String, TypeMirror> scope) {
+                if (invocation.getMethodSelect() instanceof MemberSelectTree) {
+                    var memberSelect = (MemberSelectTree) invocation.getMethodSelect();
+                    if (memberSelect.getIdentifier().contentEquals("length")
+                            && invocation.getArguments().isEmpty()) {
+                        var expressionPath = new TreePath(new TreePath(getCurrentPath(), memberSelect), memberSelect.getExpression());
+                        var expressionType = inferExpressionType(expressionPath, scope);
+                        if (expressionType != null && expressionType.getKind() == TypeKind.ARRAY) {
+                            var start = trees.getSourcePositions().getStartPosition(root, memberSelect);
+                            var end = trees.getSourcePositions().getEndPosition(root, memberSelect);
+                            if (start != Diagnostic.NOPOS && end != Diagnostic.NOPOS) {
+                                if (contents != null) {
+                                    var startInt = (int) start;
+                                    var endInt = (int) end;
+                                    var nameStart = FindHelper.findNameIn(root, "length", startInt, endInt);
+                                    if (nameStart >= 0) {
+                                        start = nameStart;
+                                        end = nameStart + "length".length();
+                                    }
+                                }
+                                var line = (int) root.getLineMap().getLineNumber(start) - 1;
+                                if (!existingErrorLines.contains(line)) {
+                                    var diagnostic = new org.javacs.lsp.Diagnostic();
+                                    diagnostic.severity = DiagnosticSeverity.Error;
+                                    diagnostic.code = "compiler.err.cant.resolve.location.args";
+                                    diagnostic.message = "cannot find symbol: method length()";
+                                    diagnostic.range = RangeHelper.range(root, start, end);
+                                    generated.add(diagnostic);
+                                    existingErrorLines.add(line);
+                                }
+                            }
+                        }
+                    }
+                }
+                return super.visitMethodInvocation(invocation, scope);
+            }
+
+            private TypeMirror inferVariableType(VariableTree variable, HashMap<String, TypeMirror> scope) {
+                if (variable.getInitializer() == null) {
+                    return null;
+                }
+                var declarationPath = getCurrentPath();
+                var initializerPath = new TreePath(declarationPath, variable.getInitializer());
+                var type = inferExpressionType(initializerPath, scope);
+                if (type != null && type.getKind() != TypeKind.ERROR) {
+                    return type;
+                }
+                return null;
+            }
+
+            private TypeMirror inferExpressionType(TreePath expressionPath, HashMap<String, TypeMirror> scope) {
+                var type = trees.getTypeMirror(expressionPath);
+                if (type != null && type.getKind() != TypeKind.ERROR && type.getKind() != TypeKind.NONE) {
+                    return type;
+                }
+                var leaf = expressionPath.getLeaf();
+                if (leaf instanceof IdentifierTree) {
+                    return scope.get(((IdentifierTree) leaf).getName().toString());
+                }
+                if (leaf instanceof MethodInvocationTree) {
+                    var invocation = (MethodInvocationTree) leaf;
+                    var lombokResolved =
+                            LombokHandler.resolveMethodInvocationReturnType(task, invocation, expressionPath, lombokCache);
+                    if (lombokResolved != null && lombokResolved.getKind() != TypeKind.ERROR) {
+                        return lombokResolved;
+                    }
+                    var scopeResolved = resolveFromInferredReceiver(invocation, scope);
+                    if (scopeResolved != null && scopeResolved.getKind() != TypeKind.ERROR) {
+                        return scopeResolved;
+                    }
+                }
+                return type;
+            }
+
+            private TypeMirror resolveFromInferredReceiver(MethodInvocationTree invocation, HashMap<String, TypeMirror> scope) {
+                if (!(invocation.getMethodSelect() instanceof MemberSelectTree)) {
+                    return null;
+                }
+                var memberSelect = (MemberSelectTree) invocation.getMethodSelect();
+                if (!(memberSelect.getExpression() instanceof IdentifierTree)) {
+                    return null;
+                }
+                var receiverName = ((IdentifierTree) memberSelect.getExpression()).getName().toString();
+                var receiverType = scope.get(receiverName);
+                if (!(receiverType instanceof DeclaredType)) {
+                    return null;
+                }
+                var receiverElement = (TypeElement) ((DeclaredType) receiverType).asElement();
+                var methodName = memberSelect.getIdentifier().toString();
+                var argumentCount = invocation.getArguments().size();
+                for (var member : task.task.getElements().getAllMembers(receiverElement)) {
+                    if (member.getKind() != ElementKind.METHOD) {
+                        continue;
+                    }
+                    var method = (ExecutableElement) member;
+                    if (!method.getSimpleName().contentEquals(methodName)) {
+                        continue;
+                    }
+                    if (method.getModifiers().contains(Modifier.STATIC)) {
+                        continue;
+                    }
+                    if (method.getParameters().size() != argumentCount) {
+                        continue;
+                    }
+                    return method.getReturnType();
+                }
+                return null;
+            }
+        }
+
+        new Scanner().scan(root, new HashMap<>());
+        return generated;
+    }
 
     private List<org.javacs.lsp.Diagnostic> unusedWarnings(CompilationUnitTree root) {
         var result = new ArrayList<org.javacs.lsp.Diagnostic>();

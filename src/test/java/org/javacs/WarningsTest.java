@@ -209,6 +209,18 @@ public class WarningsTest {
     }
 
     @Test
+    public void invalidArrayLengthMethodAfterLombokGetterStillReportsCompilerError() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokVarSplitFlow.java")));
+        assertThat(
+                errors,
+                hasItem(
+                        anyOf(
+                                startsWith("compiler.err.cant.resolve.location.args(15)"),
+                                startsWith("compiler.err.cant.resolve.location(15)"),
+                                startsWith("compiler.err.cant.resolve.args(15)"))));
+    }
+
+    @Test
     public void eofDiagnosticsStillReportedAfterManyEarlierErrors() {
         server.lint(List.of(FindResource.path("org/javacs/err/ErrorAtEofAfterManyErrors.java")));
         assertThat(
