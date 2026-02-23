@@ -12,6 +12,9 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Find references** - Find all usages of symbols
 - **Diagnostics** - Debounced linting with fast-on-type + full-on-save/idle reporting
 - **Signature help** - Parameter information for method calls
+- **Inlay hints**
+  - `var` inferred type hints
+  - Literal argument type hints in calls/constructors (e.g. `String:`, `int:`)
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
   - Nested Lombok type completion (e.g., `obj.getLombokField().get` shows all members)
   - **Note**: Lombok support covers standard use cases but cannot handle all edge cases due to Lombok's advanced metaprogramming features
@@ -166,6 +169,16 @@ Private Maven repositories are currently not supported. Go-to-definition on depe
 
 JLS currently provides CodeLens entries for test classes and methods (JUnit 4/5 and TestNG annotations). Non-test CodeLens are not yet implemented.
 
+## Inlay Hints
+
+JLS supports `textDocument/inlayHint`
+
+To reduce noise, JLS intentionally suppresses redundant `var` hints when the initializer already makes the type explicit:
+
+- Constructor creation: `var x = new Bar();`
+- Array creation: `var xs = new String[] {"x"};`
+- Type cast: `var o = (Object) value;`
+- Class literal: `var c = String.class;`
 
 ## Usage
 

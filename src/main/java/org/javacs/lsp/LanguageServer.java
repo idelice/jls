@@ -112,6 +112,10 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public List<InlayHint> inlayHint(InlayHintParams params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
     public List<DocumentLink> documentLink(DocumentLinkParams params) {
         throw new RuntimeException("Unimplemented");
     }

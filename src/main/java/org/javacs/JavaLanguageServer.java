@@ -16,6 +16,7 @@ import org.javacs.action.CodeActionProvider;
 import org.javacs.completion.CompletionProvider;
 import org.javacs.completion.SignatureProvider;
 import org.javacs.fold.FoldProvider;
+import org.javacs.hint.InlayHintProvider;
 import org.javacs.hover.HoverProvider;
 import org.javacs.index.SymbolProvider;
 import org.javacs.lens.CodeLensProvider;
@@ -45,6 +46,7 @@ class JavaLanguageServer extends LanguageServer {
     private long nextFullLintAtNanos = 0;
     private long changeSequence = 0;
     private long suppressFullLintUntilNanos = 0;
+    private final InlayHintProvider inlayHintProvider = new InlayHintProvider();
     private static final long FAST_EDIT_LINT_DEBOUNCE_MS = 220;
     private static final long FULL_LINT_IDLE_MS = 900;
     private static final long FULL_LINT_SUPPRESS_AFTER_INTERACTIVE_MS = 1000;
@@ -280,6 +282,7 @@ class JavaLanguageServer extends LanguageServer {
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
+        c.addProperty("inlayHintProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
@@ -507,6 +510,16 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
         return new FoldProvider(compiler()).foldingRanges(file);
+    }
+
+    @Override
+    public List<InlayHint> inlayHint(InlayHintParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
+        markInteractiveRequest("inlayHint");
+        var file = Paths.get(params.textDocument.uri);
+        var hints = inlayHintProvider.inlayHints(compiler(), file, params.range);
+        LOG.fine("[inlay-hints] computed file=" + file.getFileName() + " hints=" + hints.size());
+        return hints;
     }
 
     @Override
