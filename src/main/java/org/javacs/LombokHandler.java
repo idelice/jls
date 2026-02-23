@@ -2,8 +2,6 @@ package org.javacs;
 
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
-import com.sun.source.tree.ConditionalExpressionTree;
-import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
@@ -1194,10 +1192,6 @@ public final class LombokHandler {
 
             var expectedType = field.getType().toString();
             var actualType = paramTypes.get(0);
-            if (isLikelyExpressionToken(actualType)) {
-                // javac sometimes reports argument expressions here instead of types (e.g. ternaries).
-                return true;
-            }
             return typesMatch(expectedType, actualType);
         }
 
@@ -1331,10 +1325,6 @@ public final class LombokHandler {
         if (code == null) {
             return false;
         }
-        if ("compiler.err.cant.resolve.location.args".equals(code)
-                && shouldFilterNullableTernarySetterDiagnostic(task, cache, d, requestCache)) {
-            return true;
-        }
         // Handle "cannot apply symbol" errors for enum constructors with Lombok
         if (code.equals("compiler.err.cant.apply.symbol")) {
             return shouldFilterEnumConstructorError(task, cache, d) ||
@@ -1382,61 +1372,6 @@ public final class LombokHandler {
         }
 
         return false;
-    }
-
-    private static boolean shouldFilterNullableTernarySetterDiagnostic(
-            CompileTask task,
-            LombokMetadataCache cache,
-            javax.tools.Diagnostic<? extends JavaFileObject> d,
-            RequestCache requestCache) {
-        if (cache == null) return false;
-        var path = findDiagnosticPath(task, d);
-        if (path == null) return false;
-        TreePath invocationPath = null;
-        for (var current = path; current != null; current = current.getParentPath()) {
-            if (current.getLeaf() instanceof MethodInvocationTree) {
-                invocationPath = current;
-                break;
-            }
-        }
-        if (invocationPath == null) return false;
-        var invocation = (MethodInvocationTree) invocationPath.getLeaf();
-        if (invocation.getArguments().size() != 1) return false;
-        if (!(invocation.getMethodSelect() instanceof MemberSelectTree)) return false;
-
-        var select = (MemberSelectTree) invocation.getMethodSelect();
-        var methodName = select.getIdentifier().toString();
-        var trees = Trees.instance(task.task);
-        var receiverType = trees.getTypeMirror(new TreePath(invocationPath, select.getExpression()));
-        if (!(receiverType instanceof DeclaredType)) return false;
-        var receiverElement = ((DeclaredType) receiverType).asElement();
-        if (!(receiverElement instanceof TypeElement)) return false;
-        var className = ((TypeElement) receiverElement).getQualifiedName().toString();
-
-        var metadata = metadataForClassName(cache, className, task.roots, requestCache);
-        if (metadata == null) return false;
-        var field = metadata.fieldForSetter(methodName);
-        if (field == null) return false;
-
-        var arg = invocation.getArguments().get(0);
-        if (!(arg instanceof ConditionalExpressionTree)) return false;
-        var conditional = (ConditionalExpressionTree) arg;
-        var trueExpr = conditional.getTrueExpression();
-        var falseExpr = conditional.getFalseExpression();
-        var trueNull = trueExpr.getKind() == Tree.Kind.NULL_LITERAL;
-        var falseNull = falseExpr.getKind() == Tree.Kind.NULL_LITERAL;
-        if (trueNull == falseNull) return false;
-        var nonNullBranch = trueNull ? falseExpr : trueExpr;
-
-        var expectedType = fieldTypeMirror(task, field);
-        if (expectedType == null) {
-            expectedType = resolveTypeMirror(task, field.getType().toString(), className, requestCache);
-        }
-        if (expectedType == null) return false;
-
-        var branchType = trees.getTypeMirror(new TreePath(invocationPath, nonNullBranch));
-        if (branchType == null || branchType.getKind() == TypeKind.ERROR) return false;
-        return task.task.getTypes().isAssignable(branchType, expectedType);
     }
 
     public static final class DiagnosticFilterContext {
@@ -1581,7 +1516,6 @@ public final class LombokHandler {
                 var field = metadata.fieldForSetter(memberName);
                 if (field != null
                         && (typesMatch(field.getType().toString(), paramTypes.get(0))
-                                || isLikelyExpressionToken(paramTypes.get(0))
                                 || isAssignableToField(task, className, field, paramTypes.get(0), requestCache))) {
                     return true;
                 }
@@ -1647,152 +1581,13 @@ public final class LombokHandler {
         if (methodMatcher.find()) {
             var methodName = methodMatcher.group(1);
             var params = methodMatcher.group(2);
-            var parsedParamTypes = parseMethodParamTypes(params);
-            if (hasNonTypeParameterTokens(parsedParamTypes)) {
-                var inferred = inferMethodCallFromDiagnostic(task, d, methodName);
-                if (inferred != null) {
-                    var effectiveClassName = inferred.className != null ? inferred.className : className;
-                    return new ParsedDiagnostic(effectiveClassName, methodName, inferred.paramTypes, null);
-                }
-            }
-            return new ParsedDiagnostic(className, methodName, parsedParamTypes, null);
-        }
-        var inferredMethod = inferMethodCallFromDiagnostic(task, d, null);
-        if (inferredMethod != null) {
-            var effectiveClassName = inferredMethod.className != null ? inferredMethod.className : className;
-            return new ParsedDiagnostic(effectiveClassName, inferredMethod.methodName, inferredMethod.paramTypes, null);
+            return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
         }
         var variableMatcher = VARIABLE_PATTERN.matcher(message);
         if (variableMatcher.find()) {
             return new ParsedDiagnostic(className, null, null, variableMatcher.group(1));
         }
         return new ParsedDiagnostic(className, null, null, null);
-    }
-
-    private static final class InferredMethodCall {
-        private final String className;
-        private final String methodName;
-        private final List<String> paramTypes;
-
-        private InferredMethodCall(String className, String methodName, List<String> paramTypes) {
-            this.className = className;
-            this.methodName = methodName;
-            this.paramTypes = paramTypes;
-        }
-    }
-
-    private static boolean hasNonTypeParameterTokens(List<String> params) {
-        if (params == null || params.isEmpty()) return false;
-        for (var param : params) {
-            if (param == null || param.isBlank()) continue;
-            if (isLikelyExpressionToken(param)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isLikelyExpressionToken(String token) {
-        if (token == null || token.isBlank()) return false;
-        // Heuristic: diagnostics may include expression text, not type names.
-        return token.indexOf(' ') >= 0
-                || token.contains("?")
-                || token.contains(":")
-                || token.contains("==")
-                || token.contains("!=")
-                || token.contains("\"")
-                || token.contains("'")
-                || token.contains("(")
-                || token.contains(")");
-    }
-
-    private static InferredMethodCall inferMethodCallFromDiagnostic(
-            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> d, String methodName) {
-        var path = findDiagnosticPath(task, d);
-        if (path == null) return null;
-        TreePath invocationPath = null;
-        for (var current = path; current != null; current = current.getParentPath()) {
-            if (current.getLeaf() instanceof MethodInvocationTree) {
-                invocationPath = current;
-                break;
-            }
-        }
-        if (invocationPath == null) return null;
-
-        var invocation = (MethodInvocationTree) invocationPath.getLeaf();
-        var select = invocation.getMethodSelect();
-        String invokedName = null;
-        if (select instanceof MemberSelectTree) {
-            invokedName = ((MemberSelectTree) select).getIdentifier().toString();
-        } else if (select instanceof IdentifierTree) {
-            invokedName = ((IdentifierTree) select).getName().toString();
-        }
-        if (invokedName == null) {
-            return null;
-        }
-        if (methodName != null && !invokedName.equals(methodName)) {
-            return null;
-        }
-
-        var trees = Trees.instance(task.task);
-        String className = null;
-        if (select instanceof MemberSelectTree) {
-            var receiver = ((MemberSelectTree) select).getExpression();
-            var receiverType = trees.getTypeMirror(new TreePath(invocationPath, receiver));
-            if (receiverType instanceof DeclaredType) {
-                var receiverElement = ((DeclaredType) receiverType).asElement();
-                if (receiverElement instanceof TypeElement) {
-                    className = ((TypeElement) receiverElement).getQualifiedName().toString();
-                }
-            }
-        }
-        if (className == null) {
-            var enclosing = enclosingClassNameAtDiagnostic(task, d);
-            if (enclosing != null) {
-                className = resolveDiagnosticClassName(task, d, enclosing);
-            }
-        }
-
-        var paramTypes = new ArrayList<String>();
-        for (ExpressionTree arg : invocation.getArguments()) {
-            paramTypes.add(inferArgumentType(trees, invocationPath, arg));
-        }
-        return new InferredMethodCall(className, invokedName, paramTypes);
-    }
-
-    private static String inferArgumentType(Trees trees, TreePath invocationPath, ExpressionTree arg) {
-        var argType = trees.getTypeMirror(new TreePath(invocationPath, arg));
-        if (argType != null && argType.getKind() != TypeKind.ERROR) {
-            return argType.toString();
-        }
-        if (arg.getKind() == Tree.Kind.NULL_LITERAL) {
-            return "<nulltype>";
-        }
-        if (arg instanceof ConditionalExpressionTree) {
-            var conditional = (ConditionalExpressionTree) arg;
-            var trueType = inferBranchType(trees, invocationPath, conditional.getTrueExpression());
-            var falseType = inferBranchType(trees, invocationPath, conditional.getFalseExpression());
-            if (isNullType(trueType) && !isNullType(falseType)) return falseType;
-            if (isNullType(falseType) && !isNullType(trueType)) return trueType;
-            if (trueType != null && !trueType.isBlank()) return trueType;
-            if (falseType != null && !falseType.isBlank()) return falseType;
-        }
-        return arg.toString();
-    }
-
-    private static String inferBranchType(Trees trees, TreePath invocationPath, ExpressionTree branch) {
-        var branchType = trees.getTypeMirror(new TreePath(invocationPath, branch));
-        if (branchType != null && branchType.getKind() != TypeKind.ERROR) {
-            return branchType.toString();
-        }
-        if (branch.getKind() == Tree.Kind.NULL_LITERAL) {
-            return "<nulltype>";
-        }
-        return null;
-    }
-
-    private static boolean isNullType(String typeName) {
-        return "<nulltype>".equals(typeName);
     }
 
     private static DiagnosticDecision quickDiagnosticFilterDecision(
