@@ -1855,30 +1855,44 @@ public final class LombokHandler {
             var leaf = parent.getLeaf();
             if (leaf instanceof com.sun.source.tree.IfTree) {
                 var condition = ((com.sun.source.tree.IfTree) leaf).getCondition();
-                if (isInsideSubtree(current, condition)) return true;
+                if (isInsideSubtree(current, condition) && isBareBooleanCondition(condition)) return true;
                 continue;
             }
             if (leaf instanceof com.sun.source.tree.WhileLoopTree) {
                 var condition = ((com.sun.source.tree.WhileLoopTree) leaf).getCondition();
-                if (isInsideSubtree(current, condition)) return true;
+                if (isInsideSubtree(current, condition) && isBareBooleanCondition(condition)) return true;
                 continue;
             }
             if (leaf instanceof com.sun.source.tree.DoWhileLoopTree) {
                 var condition = ((com.sun.source.tree.DoWhileLoopTree) leaf).getCondition();
-                if (isInsideSubtree(current, condition)) return true;
+                if (isInsideSubtree(current, condition) && isBareBooleanCondition(condition)) return true;
                 continue;
             }
             if (leaf instanceof com.sun.source.tree.ForLoopTree) {
                 var condition = ((com.sun.source.tree.ForLoopTree) leaf).getCondition();
-                if (condition != null && isInsideSubtree(current, condition)) return true;
+                if (condition != null && isInsideSubtree(current, condition) && isBareBooleanCondition(condition)) return true;
                 continue;
             }
             if (leaf instanceof com.sun.source.tree.ConditionalExpressionTree) {
                 var condition = ((com.sun.source.tree.ConditionalExpressionTree) leaf).getCondition();
-                if (isInsideSubtree(current, condition)) return true;
+                if (isInsideSubtree(current, condition) && isBareBooleanCondition(condition)) return true;
             }
         }
         return false;
+    }
+
+    private static boolean isBareBooleanCondition(Tree condition) {
+        if (condition == null) return false;
+        if (condition instanceof com.sun.source.tree.ParenthesizedTree) {
+            return isBareBooleanCondition(((com.sun.source.tree.ParenthesizedTree) condition).getExpression());
+        }
+        if (condition instanceof com.sun.source.tree.UnaryTree
+                && condition.getKind() == Tree.Kind.LOGICAL_COMPLEMENT) {
+            return isBareBooleanCondition(((com.sun.source.tree.UnaryTree) condition).getExpression());
+        }
+        return condition instanceof com.sun.source.tree.MethodInvocationTree
+                || condition instanceof com.sun.source.tree.IdentifierTree
+                || condition instanceof com.sun.source.tree.MemberSelectTree;
     }
 
     private static boolean isInsideSubtree(TreePath path, Tree subtreeRoot) {

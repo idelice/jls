@@ -178,6 +178,13 @@ public class WarningsTest {
     }
 
     @Test
+    public void lombokEnumGetterInsideValuesLoopDoesNotReportMissingSymbol() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokEnumGetterValuesLoop.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location("))));
+    }
+
+    @Test
     public void wrongArityMethodOnLombokClassStillReportsCompilerError() {
         server.lint(List.of(FindResource.path("org/javacs/example/LombokWrongArityHover.java")));
         assertThat(
