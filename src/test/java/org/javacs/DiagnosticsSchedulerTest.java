@@ -6,6 +6,8 @@ import static org.hamcrest.Matchers.is;
 
 import com.google.gson.JsonElement;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.javacs.lsp.*;
 import org.junit.Before;
@@ -15,6 +17,7 @@ public class DiagnosticsSchedulerTest {
     private final AtomicInteger publishedForFile = new AtomicInteger();
     private final AtomicInteger publishedForSecondFile = new AtomicInteger();
     private final AtomicInteger totalPublished = new AtomicInteger();
+    private final List<String> publishedCodesForFile = new ArrayList<>();
     private JavaLanguageServer server;
     private Path file;
     private Path secondFile;
@@ -26,6 +29,7 @@ public class DiagnosticsSchedulerTest {
         publishedForFile.set(0);
         publishedForSecondFile.set(0);
         totalPublished.set(0);
+        publishedCodesForFile.clear();
         server =
                 LanguageServerFixture.getJavaLanguageServer(
                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT,
@@ -35,6 +39,11 @@ public class DiagnosticsSchedulerTest {
                                 totalPublished.incrementAndGet();
                                 if (params.uri.equals(file.toUri())) {
                                     publishedForFile.incrementAndGet();
+                                    for (var diagnostic : params.diagnostics) {
+                                        if (diagnostic.code != null) {
+                                            publishedCodesForFile.add(diagnostic.code);
+                                        }
+                                    }
                                 }
                                 if (params.uri.equals(secondFile.toUri())) {
                                     publishedForSecondFile.incrementAndGet();
@@ -110,6 +119,23 @@ public class DiagnosticsSchedulerTest {
 
         assertThat(publishedForFile.get(), is(1));
         assertThat(totalPublished.get(), greaterThanOrEqualTo(2));
+    }
+
+    @Test
+    public void fastLintStillPublishesWrongArityCompilerError() throws Exception {
+        file = FindResource.path("org/javacs/example/LombokWrongArityHover.java");
+        open(file);
+
+        Thread.sleep(260);
+        server.doAsyncWork();
+
+        var hasWrongArityError =
+                publishedCodesForFile.stream()
+                        .anyMatch(
+                                code ->
+                                        code.equals("compiler.err.cant.apply.symbol")
+                                                || code.startsWith("compiler.err.cant.resolve.location"));
+        assertThat(hasWrongArityError, is(true));
     }
 
     private static int editVersion = 1;

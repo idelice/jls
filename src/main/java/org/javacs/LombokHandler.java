@@ -1181,6 +1181,7 @@ public final class LombokHandler {
 
         var metadata = cache.get(className, task.roots);
         if (metadata == null) return false;
+        if (!hasMethodGeneratingLombokAnnotations(metadata)) return false;
 
         // Handle getters: 0 parameters - filter if Lombok would generate a getter
         if (paramTypes.isEmpty()) {
@@ -1552,6 +1553,20 @@ public final class LombokHandler {
                                 || metadata.isGeneratedBuilderMethod(memberName)));
     }
 
+    private static boolean hasMethodGeneratingLombokAnnotations(LombokMetadata metadata) {
+        if (metadata == null) return false;
+        return metadata.hasGetter
+                || metadata.hasSetter
+                || metadata.hasData
+                || metadata.hasValue
+                || metadata.hasBuilder
+                || metadata.hasToString
+                || metadata.hasEqualsAndHashCode
+                || metadata.hasAllArgsConstructor
+                || metadata.hasRequiredArgsConstructor
+                || metadata.hasNoArgsConstructor;
+    }
+
     private static LombokMetadata metadataForClassName(
             LombokMetadataCache cache, String className, List<CompilationUnitTree> roots) {
         return metadataForClassName(cache, className, roots, null);
@@ -1617,6 +1632,7 @@ public final class LombokHandler {
             if (className == null) return DiagnosticDecision.UNKNOWN;
             var metadata = metadataForClassName(cache, className, task.roots, requestCache);
             if (metadata == null) return DiagnosticDecision.UNKNOWN;
+            if (!hasMethodGeneratingLombokAnnotations(metadata)) return DiagnosticDecision.KEEP;
             List<String> paramTypes = parsed.paramTypes != null ? parsed.paramTypes : List.of();
             if (paramTypes.isEmpty()) {
                 if (isDiagnosticInBooleanCondition(task, d)) {
