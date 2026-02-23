@@ -47,6 +47,8 @@ public final class LombokHandler {
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
     private static final java.util.regex.Pattern METHOD_WITH_PARAMS_PATTERN =
             java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
+    private static final java.util.regex.Pattern METHOD_NO_PARAMS_PATTERN =
+            java.util.regex.Pattern.compile("method\\s+(\\w+)\\b(?!\\s*\\()");
     private static final java.util.regex.Pattern METHOD_IN_CLASS_PATTERN =
             java.util.regex.Pattern.compile("method\\s+(\\w+)\\s+in\\s+(?:class|enum)\\s+([\\w.]+)");
     private static final java.util.regex.Pattern FOUND_ARGUMENTS_PATTERN =
@@ -1182,11 +1184,17 @@ public final class LombokHandler {
 
         // Handle getters: 0 parameters - filter if Lombok would generate a getter
         if (paramTypes.isEmpty()) {
+            if (!(methodName.startsWith("get") || methodName.startsWith("is"))) {
+                return false;
+            }
             return metadata.isGeneratedGetter(methodName);
         }
 
         // Handle setters: 1 parameter - filter if types match
         if (paramTypes.size() == 1) {
+            if (!methodName.startsWith("set")) {
+                return false;
+            }
             var field = metadata.fieldForSetter(methodName);
             if (field == null) return false;
 
@@ -1582,6 +1590,10 @@ public final class LombokHandler {
             var methodName = methodMatcher.group(1);
             var params = methodMatcher.group(2);
             return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
+        }
+        var methodNoParamsMatcher = METHOD_NO_PARAMS_PATTERN.matcher(message);
+        if (methodNoParamsMatcher.find()) {
+            return new ParsedDiagnostic(className, methodNoParamsMatcher.group(1), List.of(), null);
         }
         var variableMatcher = VARIABLE_PATTERN.matcher(message);
         if (variableMatcher.find()) {

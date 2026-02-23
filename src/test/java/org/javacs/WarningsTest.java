@@ -171,6 +171,25 @@ public class WarningsTest {
     }
 
     @Test
+    public void lombokEnumGetterUsageDoesNotReportMissingSymbol() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokEnumGetterUsage.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location("))));
+    }
+
+    @Test
+    public void wrongArityMethodOnLombokClassStillReportsCompilerError() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokWrongArityHover.java")));
+        assertThat(
+                errors,
+                hasItem(
+                        anyOf(
+                                startsWith("compiler.err.cant.apply.symbol("),
+                                startsWith("compiler.err.cant.resolve.location.args("),
+                                startsWith("compiler.err.cant.resolve.location("))));
+    }
+
+    @Test
     public void lombokSetterCallOnThisDoesNotReportMissingSymbol() {
         server.lint(List.of(FindResource.path("org/javacs/example/LombokThisSetterAndCondition.java")));
         assertThat(errors, not(hasItem("compiler.err.cant.resolve.location.args(10)")));
