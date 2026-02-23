@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
@@ -61,6 +62,10 @@ public class ReferenceProvider {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
+                String[] erasedParameterTypes = null;
+                if (element instanceof ExecutableElement method) {
+                    erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
+                }
 
                 // For constructors, find constructor calls (which are type references)
                 if (memberName.equals("<init>")) {
@@ -91,11 +96,11 @@ public class ReferenceProvider {
                                               parentClass.getKind() == javax.lang.model.element.ElementKind.RECORD;
 
                     if (isRecordComponent || isFieldInRecord) {
-                        references.addAll(findMemberReferences(requestId, className, memberName));
+                        references.addAll(findMemberReferences(requestId, className, memberName, null));
                     }
                     return references;
                 }
-                return findMemberReferences(requestId, className, memberName);
+                return findMemberReferences(requestId, className, memberName, erasedParameterTypes);
             }
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(requestId, task);
@@ -127,6 +132,11 @@ public class ReferenceProvider {
     }
 
     private List<Location> findMemberReferences(long requestId, String className, String memberName) {
+        return findMemberReferences(requestId, className, memberName, null);
+    }
+
+    private List<Location> findMemberReferences(
+            long requestId, String className, String memberName, String[] erasedParameterTypes) {
         var findCandidatesStarted = System.nanoTime();
         var files = compiler.findMemberReferences(className, memberName);
         logFine(
@@ -142,7 +152,7 @@ public class ReferenceProvider {
                     "compileMemberReferenceCandidates",
                     elapsedMs(compileStarted),
                     "className=" + className + ", memberName=" + memberName + ", files=" + files.length);
-            return findReferencesForMember(requestId, task, className, memberName);
+            return findReferencesForMember(requestId, task, className, memberName, erasedParameterTypes);
         }
     }
 
@@ -209,7 +219,11 @@ public class ReferenceProvider {
     }
 
     private List<Location> findReferencesForMember(
-            long requestId, CompileTask task, String className, String memberName) {
+            long requestId,
+            CompileTask task,
+            String className,
+            String memberName,
+            String[] erasedParameterTypes) {
         logFine(
                 requestId,
                 "resolveMemberTarget",
@@ -228,44 +242,66 @@ public class ReferenceProvider {
                 elapsedMs(classLookupStarted),
                 "className=" + className);
 
-        // Find the member (method or field) with the given name
-        // For record accessors, prefer METHOD over FIELD (both have same name)
         javax.lang.model.element.Element targetElement = null;
         javax.lang.model.element.Element fallbackElement = null;
-
         var memberLookupStarted = System.nanoTime();
-        for (var member : task.task.getElements().getAllMembers(classElement)) {
-            if (member.getSimpleName().toString().equals(memberName)) {
-                // Prefer METHOD (record accessor) over FIELD
-                if (member.getKind() == javax.lang.model.element.ElementKind.METHOD) {
-                    targetElement = member;
-                    logFine(
-                            requestId,
-                            "resolveMemberTargetMethod",
-                            elapsedMs(memberLookupStarted),
-                            targetElement.toString());
-                    break;  // METHOD takes priority, stop searching
-                }
-                // Remember FIELD as fallback
-                if (fallbackElement == null && member.getKind() == javax.lang.model.element.ElementKind.FIELD) {
-                    fallbackElement = member;
-                }
-            }
-        }
 
-        // Use fallback if no method found
-        if (targetElement == null) {
-            targetElement = fallbackElement;
+        if (erasedParameterTypes != null) {
+            targetElement = FindHelper.findMethod(task, className, memberName, erasedParameterTypes);
             if (targetElement != null) {
                 logFine(
                         requestId,
-                        "resolveMemberTargetFieldFallback",
+                        "resolveMemberTargetSignature",
                         elapsedMs(memberLookupStarted),
                         targetElement.toString());
             }
         }
 
         if (targetElement == null) {
+            for (var member : classElement.getEnclosedElements()) {
+                if (!member.getSimpleName().toString().equals(memberName)) {
+                    continue;
+                }
+                if (member.getKind() == javax.lang.model.element.ElementKind.METHOD) {
+                    targetElement = member;
+                    break;
+                }
+                if (fallbackElement == null
+                        && (member.getKind() == javax.lang.model.element.ElementKind.FIELD
+                                || member.getKind() == javax.lang.model.element.ElementKind.RECORD_COMPONENT)) {
+                    fallbackElement = member;
+                }
+            }
+        }
+
+        if (targetElement == null && fallbackElement == null) {
+            for (var member : task.task.getElements().getAllMembers(classElement)) {
+                if (!member.getSimpleName().toString().equals(memberName)) {
+                    continue;
+                }
+                if (member.getKind() == javax.lang.model.element.ElementKind.METHOD) {
+                    targetElement = member;
+                    break;
+                }
+                if (fallbackElement == null
+                        && (member.getKind() == javax.lang.model.element.ElementKind.FIELD
+                                || member.getKind() == javax.lang.model.element.ElementKind.RECORD_COMPONENT)) {
+                    fallbackElement = member;
+                }
+            }
+        }
+
+        if (targetElement == null) {
+            targetElement = fallbackElement;
+        }
+
+        if (targetElement != null) {
+            logFine(
+                    requestId,
+                    "resolveMemberTargetSelected",
+                    elapsedMs(memberLookupStarted),
+                    targetElement.toString());
+        } else {
             logFine(
                     requestId,
                     "resolveMemberTargetMiss",

@@ -34,11 +34,19 @@ public class WarningsTest {
     }
 
     @Test
+    public void skipWarningsWhenHardErrorsExist() {
+        var file = FindResource.path("org/javacs/err/SkipWarningsOnErrors.java");
+        server.lint(List.of(file));
+        assertThat(errors, hasItem(startsWith("compiler.err.")));
+        assertThat(errors, not(hasItem("unused_local(5)")));
+    }
+
+    @Test
     public void clearErrorIncrementally() {
         var file = FindResource.path("org/javacs/err/ClearErrorIncrementally.java");
         open(file);
         server.lint(List.of(file));
-        assertThat(errors, containsInAnyOrder("compiler.err.prob.found.req(5)", "unused_local(5)"));
+        assertThat(errors, contains("compiler.err.prob.found.req(5)"));
         // Change 1 to "1"
         var newContents =
                 "package org.javacs.err;\n\npublic class ClearErrorIncrementally {\n    void test() {\n        String x = \"1\";\n    }\n}";
@@ -154,6 +162,36 @@ public class WarningsTest {
     public void lombokInheritedGetterOnPatternVariable() {
         server.lint(List.of(FindResource.path("org/javacs/example/LombokPatternInheritedGetter.java")));
         assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+    }
+
+    @Test
+    public void lombokSetterCallOnThisDoesNotReportMissingSymbol() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokThisSetterAndCondition.java")));
+        assertThat(errors, not(hasItem("compiler.err.cant.resolve.location.args(10)")));
+        assertThat(errors, not(hasItem("compiler.err.cant.resolve.args(10)")));
+    }
+
+    @Test
+    public void nonBooleanLombokGetterConditionReportsError() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokThisSetterAndCondition.java")));
+        assertThat(
+                errors,
+                hasItem(
+                        anyOf(
+                                startsWith("compiler.err.prob.found.req(18)"),
+                                startsWith("compiler.err.incompatible.types(18)"),
+                                startsWith("compiler.err.cant.resolve.location.args(18)"))));
+    }
+
+    @Test
+    public void eofDiagnosticsStillReportedAfterManyEarlierErrors() {
+        server.lint(List.of(FindResource.path("org/javacs/err/ErrorAtEofAfterManyErrors.java")));
+        assertThat(
+                errors,
+                hasItem(
+                        anyOf(
+                                equalTo("compiler.err.prob.found.req(135)"),
+                                equalTo("compiler.err.incompatible.types(135)"))));
     }
 
     @Test

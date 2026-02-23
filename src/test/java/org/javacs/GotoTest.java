@@ -158,6 +158,12 @@ public class GotoTest {
     }
 
     @Test
+    public void gotoJdkListType() {
+        var file = "/org/javacs/example/GotoJdkList.java";
+        assertThat(doGoto(file, 3, 19), hasItem(startsWith("List.java:")));
+    }
+
+    @Test
     public void gotoError() {
         var file = "/org/javacs/example/GotoError.java";
         assertThat(doGoto(file, 5, 22), empty());

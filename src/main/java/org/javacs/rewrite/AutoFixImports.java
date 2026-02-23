@@ -4,6 +4,7 @@ import com.sun.source.util.Trees;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -29,14 +30,14 @@ public class AutoFixImports implements Rewrite {
         try (var task = compiler.compile(file)) {
             var used = usedImports(task);
             var unresolved = unresolvedNames(task);
-            var resolved = resolveNames(compiler, unresolved);
+            var resolved = resolveNames(compiler, task, unresolved);
             var all = new ArrayList<String>();
             all.addAll(used);
             all.addAll(resolved.values());
+            all = new ArrayList<>(new LinkedHashSet<>(all));
             all.sort(String::compareTo); // TODO this is not always a good order
             var edits = new ArrayList<TextEdit>();
-            edits.addAll(deleteImports(task));
-            edits.add(insertImports(task, all));
+            edits.add(replaceImports(task, all));
             return Map.of(file, edits.toArray(new TextEdit[edits.size()]));
         }
     }
@@ -67,70 +68,82 @@ public class AutoFixImports implements Rewrite {
         return names;
     }
 
-    private Map<String, String> resolveNames(CompilerProvider compiler, Set<String> unresolved) {
+    private Map<String, String> resolveNames(CompilerProvider compiler, CompileTask task, Set<String> unresolved) {
         var resolved = new HashMap<String, String>();
-        var alreadyImported = compiler.imports();
+        var importedTypes = new LinkedHashSet<>(compiler.imports());
+        var allTopLevelTypes = new LinkedHashSet<>(compiler.publicTopLevelTypes());
+        var thisPackage = packageName(task);
         for (var className : unresolved) {
-            var candidates = new ArrayList<String>();
-            for (var i : alreadyImported) {
-                if (i.endsWith("." + className)) {
-                    candidates.add(i);
-                }
+            var candidates = matchingCandidates(importedTypes, className, thisPackage);
+            if (candidates.isEmpty()) {
+                candidates = matchingCandidates(allTopLevelTypes, className, thisPackage);
             }
             if (candidates.isEmpty()) continue;
             if (candidates.size() > 1) {
                 LOG.warning("..." + className + " is ambiguous between " + String.join(", ", candidates));
                 continue;
             }
-            LOG.info("...resolve " + className + " to " + candidates.get(0));
-            resolved.put(className, candidates.get(0));
+            var resolvedType = candidates.iterator().next();
+            LOG.info("...resolve " + className + " to " + resolvedType);
+            resolved.put(className, resolvedType);
         }
-        // TODO import my own classes
         return resolved;
     }
 
-    private List<TextEdit> deleteImports(CompileTask task) {
-        var edits = new ArrayList<TextEdit>();
+    private LinkedHashSet<String> matchingCandidates(
+            Set<String> candidateTypes, String className, String thisPackage) {
+        var candidates = new LinkedHashSet<String>();
+        for (var i : candidateTypes) {
+            if (!i.endsWith("." + className)) continue;
+            if (i.startsWith("java.lang.")) continue;
+            if (packageName(i).equals(thisPackage)) continue;
+            candidates.add(i);
+        }
+        return candidates;
+    }
+
+    private String packageName(CompileTask task) {
+        var root = task.root();
+        if (root.getPackageName() == null) return "";
+        return root.getPackageName().toString();
+    }
+
+    private String packageName(String qualifiedName) {
+        var lastDot = qualifiedName.lastIndexOf('.');
+        if (lastDot <= 0) return "";
+        return qualifiedName.substring(0, lastDot);
+    }
+
+    private TextEdit replaceImports(CompileTask task, List<String> qualifiedNames) {
         var pos = Trees.instance(task.task).getSourcePositions();
         var root = task.root();
+        var firstNonStatic = -1;
+        var lastNonStatic = -1;
         for (var i : root.getImports()) {
             if (i.isStatic()) continue;
-            var start = pos.getStartPosition(root, i);
-            var line = (int) root.getLineMap().getLineNumber(start);
-            var delete = new TextEdit(new Range(new Position(line - 1, 0), new Position(line, 0)), "");
-            edits.add(delete);
-        }
-        return edits;
-    }
-
-    private TextEdit insertImports(CompileTask task, List<String> qualifiedNames) {
-        var pos = insertPosition(task);
-        var text = new StringBuilder();
-        for (var i : qualifiedNames) {
-            text.append("import ").append(i).append(";\n");
-        }
-        return new TextEdit(new Range(pos, pos), text.toString());
-    }
-
-    private Position insertPosition(CompileTask task) {
-        var pos = Trees.instance(task.task).getSourcePositions();
-        var root = task.root();
-        // If there are imports, use the start of the first import as the insert position
-        for (var i : root.getImports()) {
-            if (!i.isStatic()) {
+            if (firstNonStatic == -1) {
                 var start = pos.getStartPosition(root, i);
-                var line = (int) root.getLineMap().getLineNumber(start);
-                return new Position(line - 1, 0);
+                firstNonStatic = (int) root.getLineMap().getLineNumber(start) - 1;
             }
+            var end = pos.getEndPosition(root, i);
+            lastNonStatic = (int) root.getLineMap().getLineNumber(end);
         }
-        // If there are no imports, insert after the package declaration
+
+        var text = new StringBuilder();
+        for (var qn : qualifiedNames) {
+            text.append("import ").append(qn).append(";\n");
+        }
+
+        if (firstNonStatic != -1) {
+            return new TextEdit(new Range(new Position(firstNonStatic, 0), new Position(lastNonStatic, 0)), text.toString());
+        }
+
+        var insertLine = 0;
         if (root.getPackage() != null) {
             var end = pos.getEndPosition(root, root.getPackage());
-            var line = (int) root.getLineMap().getLineNumber(end) + 1;
-            return new Position(line - 1, 0);
+            insertLine = (int) root.getLineMap().getLineNumber(end);
         }
-        // If there are no imports and no package, insert at the top of the file
-        return new Position(0, 0);
+        return new TextEdit(new Range(new Position(insertLine, 0), new Position(insertLine, 0)), text.toString());
     }
 
     private static final Logger LOG = Logger.getLogger("main");

@@ -35,6 +35,8 @@ import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.InsertTextFormat;
 import org.javacs.lsp.Location;
+import org.javacs.lsp.MarkupContent;
+import org.javacs.lsp.MarkupKind;
 import org.javacs.lsp.ParameterInformation;
 import org.javacs.lsp.SignatureHelp;
 import org.javacs.lsp.SignatureInformation;
@@ -43,6 +45,20 @@ import org.javacs.lsp.Range;
 
 public final class LombokHandler {
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final java.util.regex.Pattern METHOD_WITH_PARAMS_PATTERN =
+            java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
+    private static final java.util.regex.Pattern METHOD_IN_CLASS_PATTERN =
+            java.util.regex.Pattern.compile("method\\s+(\\w+)\\s+in\\s+(?:class|enum)\\s+([\\w.]+)");
+    private static final java.util.regex.Pattern FOUND_ARGUMENTS_PATTERN =
+            java.util.regex.Pattern.compile("found:\\s*(.+?)(?:\\s+reason:|$)");
+    private static final java.util.regex.Pattern LOCATION_CLASS_PATTERN =
+            java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
+    private static final java.util.regex.Pattern ENUM_CONSTRUCTOR_PATTERN =
+            java.util.regex.Pattern.compile("constructor\\s+(\\w+)\\s+in enum\\s+([\\w.]+)");
+    private static final java.util.regex.Pattern CLASS_CONSTRUCTOR_PATTERN =
+            java.util.regex.Pattern.compile("constructor\\s+(\\w+)\\s+in class\\s+([\\w.]+)");
+    private static final java.util.regex.Pattern VARIABLE_PATTERN =
+            java.util.regex.Pattern.compile("variable\\s+(\\w+)");
 
     private LombokHandler() {}
 
@@ -73,7 +89,7 @@ public final class LombokHandler {
             }
         }
 
-        var classTree = findClassTree(task.roots, qualifiedName);
+        var classTree = findClassTreeCached(task.roots, qualifiedName, requestCache);
         if (classTree != null) {
             var metadata = LombokSupport.analyze(classTree);
             if (!LombokSupport.hasLombokAnnotations(metadata)) {
@@ -275,6 +291,34 @@ public final class LombokHandler {
         return resolveMethodInvocationReturnType(task, invocation, invocationPath, cache, requestCache);
     }
 
+    public static CompletionList completeSlf4jLogMemberSelect(
+            CompileTask task,
+            TreePath memberSelectPath,
+            String partial,
+            LombokMetadataCache cache,
+            CompletionContext context) {
+        if (memberSelectPath == null || !(memberSelectPath.getLeaf() instanceof MemberSelectTree)) {
+            return null;
+        }
+        var requestCache =
+                context != null
+                        ? context.requestCache
+                        : new RequestCache("completeSlf4jLogMemberSelect");
+        var select = (MemberSelectTree) memberSelectPath.getLeaf();
+        var expression = select.getExpression();
+
+        if (!(expression instanceof IdentifierTree)
+                || !"log".contentEquals(((IdentifierTree) expression).getName())) return null;
+
+        var enclosingType = enclosingTypeElement(task, memberSelectPath);
+        if (enclosingType == null) return null;
+
+        var list = new ArrayList<CompletionItem>();
+        addSlf4jLogMethodCompletions(task, enclosingType, partial, list, cache, requestCache);
+        if (list.isEmpty()) return null;
+        return new CompletionList(false, list);
+    }
+
     private static javax.lang.model.type.TypeMirror resolveMethodInvocationReturnType(
             CompileTask task,
             MethodInvocationTree invocation,
@@ -299,6 +343,10 @@ public final class LombokHandler {
         // Get the receiver (expression being called on)
         var receiverPath = new TreePath(invocationPath, memberSelect.getExpression());
         var receiverType = trees.getTypeMirror(receiverPath);
+        if (receiverType == null) {
+            LOG.fine("...receiver type is null");
+            return null;
+        }
         LOG.fine("...receiver type: " + receiverType + ", kind: " + receiverType.getKind());
 
         // If receiver type is ERROR, try to resolve it recursively
@@ -385,6 +433,21 @@ public final class LombokHandler {
         return null;
     }
 
+    private static TypeElement enclosingTypeElement(CompileTask task, TreePath path) {
+        var trees = Trees.instance(task.task);
+        for (var current = path; current != null; current = current.getParentPath()) {
+            var kind = current.getLeaf().getKind();
+            if (kind != Tree.Kind.CLASS && kind != Tree.Kind.RECORD && kind != Tree.Kind.ENUM) {
+                continue;
+            }
+            var element = trees.getElement(current);
+            if (element instanceof TypeElement) {
+                return (TypeElement) element;
+            }
+        }
+        return null;
+    }
+
     public static void addCompletions(
             CompileTask task,
             TypeElement typeElement,
@@ -392,6 +455,29 @@ public final class LombokHandler {
             List<CompletionItem> list,
             LombokMetadataCache cache) {
         var requestCache = new RequestCache("addCompletions:" + typeElement.getQualifiedName());
+        addCompletions(task, typeElement, partial, list, cache, requestCache);
+    }
+
+    public static final class CompletionContext {
+        private final RequestCache requestCache;
+
+        private CompletionContext(RequestCache requestCache) {
+            this.requestCache = requestCache;
+        }
+    }
+
+    public static CompletionContext newCompletionContext(String scope) {
+        return new CompletionContext(new RequestCache("completion:" + scope));
+    }
+
+    public static void addCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            CompletionContext context) {
+        var requestCache = context != null ? context.requestCache : new RequestCache("addCompletions:" + typeElement.getQualifiedName());
         addCompletions(task, typeElement, partial, list, cache, requestCache);
     }
 
@@ -420,7 +506,7 @@ public final class LombokHandler {
                     item.kind = CompletionItemKind.Method;
                     item.insertText = getterName + "()";
                     item.insertTextFormat = InsertTextFormat.PlainText;
-                    item.detail = "(generated by Lombok)";
+                    item.documentation = generatedGetterDocumentation(getterName, metadata.fieldForGetter(getterName));
                     list.add(item);
                 }
             }
@@ -435,7 +521,7 @@ public final class LombokHandler {
                     item.kind = CompletionItemKind.Method;
                     item.insertText = setterName + "($1)";
                     item.insertTextFormat = InsertTextFormat.Snippet;
-                    item.detail = "(generated by Lombok)";
+                    item.documentation = generatedSetterDocumentation(setterName, metadata.fieldForSetter(setterName));
                     list.add(item);
                 }
             }
@@ -448,7 +534,10 @@ public final class LombokHandler {
             item.kind = CompletionItemKind.Method;
             item.insertText = "toString()";
             item.insertTextFormat = InsertTextFormat.PlainText;
-            item.detail = "(generated by Lombok)";
+            item.documentation =
+                    new MarkupContent(
+                            MarkupKind.Markdown,
+                            "```java\npublic String toString()\n```");
             list.add(item);
         }
 
@@ -459,7 +548,10 @@ public final class LombokHandler {
             item.kind = CompletionItemKind.Method;
             item.insertText = "equals($1)";
             item.insertTextFormat = InsertTextFormat.Snippet;
-            item.detail = "(generated by Lombok)";
+            item.documentation =
+                    new MarkupContent(
+                            MarkupKind.Markdown,
+                            "```java\npublic boolean equals(Object o)\n```");
             list.add(item);
         }
 
@@ -470,7 +562,10 @@ public final class LombokHandler {
             item.kind = CompletionItemKind.Method;
             item.insertText = "hashCode()";
             item.insertTextFormat = InsertTextFormat.PlainText;
-            item.detail = "(generated by Lombok)";
+            item.documentation =
+                    new MarkupContent(
+                            MarkupKind.Markdown,
+                            "```java\npublic int hashCode()\n```");
             list.add(item);
         }
         var added = list.size() - sizeBefore;
@@ -521,6 +616,20 @@ public final class LombokHandler {
         addSlf4jLogMethodCompletions(task, typeElement, partial, list, cache, requestCache);
     }
 
+    public static void addSlf4jLogMethodCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            CompletionContext context) {
+        var requestCache =
+                context != null
+                        ? context.requestCache
+                        : new RequestCache("addSlf4jLogMethodCompletions:" + typeElement.getQualifiedName());
+        addSlf4jLogMethodCompletions(task, typeElement, partial, list, cache, requestCache);
+    }
+
     private static void addSlf4jLogMethodCompletions(
             CompileTask task,
             TypeElement typeElement,
@@ -547,7 +656,10 @@ public final class LombokHandler {
             item.kind = CompletionItemKind.Method;
             item.insertText = method + "($1)";
             item.insertTextFormat = InsertTextFormat.Snippet;
-            item.detail = "(generated by Slf4j)";
+            item.documentation =
+                    new MarkupContent(
+                            MarkupKind.Markdown,
+                            "```java\npublic void " + method + "(String msg, Object... args)\n```");
             list.add(item);
         }
         var added = list.size() - sizeBefore;
@@ -570,6 +682,20 @@ public final class LombokHandler {
             List<CompletionItem> list,
             LombokMetadataCache cache) {
         var requestCache = new RequestCache("addStaticCompletions:" + typeElement.getQualifiedName());
+        addStaticCompletions(task, typeElement, partial, list, cache, requestCache);
+    }
+
+    public static void addStaticCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokMetadataCache cache,
+            CompletionContext context) {
+        var requestCache =
+                context != null
+                        ? context.requestCache
+                        : new RequestCache("addStaticCompletions:" + typeElement.getQualifiedName());
         addStaticCompletions(task, typeElement, partial, list, cache, requestCache);
     }
 
@@ -597,7 +723,6 @@ public final class LombokHandler {
                 item.kind = CompletionItemKind.Method;
                 item.insertText = metadata.builderMethodName + "()";
                 item.insertTextFormat = InsertTextFormat.PlainText;
-                item.detail = "(generated by Lombok builder)";
                 list.add(item);
             }
         }
@@ -661,7 +786,6 @@ public final class LombokHandler {
             item.kind = CompletionItemKind.Method;
             item.insertText = builderSetter + "($1)";
             item.insertTextFormat = InsertTextFormat.Snippet;
-            item.detail = "(generated by Lombok builder)";
             list.add(item);
         }
         if (!metadata.explicitBuilderMethodNames.contains(metadata.buildMethodName)
@@ -671,10 +795,40 @@ public final class LombokHandler {
             item.kind = CompletionItemKind.Method;
             item.insertText = metadata.buildMethodName + "()";
             item.insertTextFormat = InsertTextFormat.PlainText;
-            item.detail = "(generated by Lombok builder)";
             list.add(item);
         }
         return new CompletionList(false, list);
+    }
+
+    private static MarkupContent generatedGetterDocumentation(String getterName, VariableTree field) {
+        var returnType = field != null && field.getType() != null ? field.getType().toString() : "Object";
+        var signature = "public " + returnType + " " + getterName + "()";
+        var markdown = new StringBuilder("```java\n").append(signature).append("\n```");
+        appendFieldContext(markdown, field);
+        return new MarkupContent(MarkupKind.Markdown, markdown.toString());
+    }
+
+    private static MarkupContent generatedSetterDocumentation(String setterName, VariableTree field) {
+        var paramType = field != null && field.getType() != null ? field.getType().toString() : "Object";
+        var paramName = field != null ? field.getName().toString() : "value";
+        var signature = "public void " + setterName + "(" + paramType + " " + paramName + ")";
+        var markdown = new StringBuilder("```java\n").append(signature).append("\n```");
+        appendFieldContext(markdown, field);
+        return new MarkupContent(MarkupKind.Markdown, markdown.toString());
+    }
+
+    private static void appendFieldContext(StringBuilder markdown, VariableTree field) {
+        if (field == null) {
+            return;
+        }
+        markdown.append("\n\nField: `").append(field.getName()).append("`");
+        var annotations = field.getModifiers().getAnnotations();
+        if (!annotations.isEmpty()) {
+            markdown.append("\n\nField annotations:");
+            for (var annotation : annotations) {
+                markdown.append("\n- `").append(annotation.toString()).append("`");
+            }
+        }
     }
 
     private static String resolveTypeName(
@@ -983,22 +1137,19 @@ public final class LombokHandler {
         List<String> paramTypes = null;
 
         // Try pattern 1: "method foo(...)" - when signature is shown
-        var methodWithParamPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
-        var methodWithParamMatcher = methodWithParamPattern.matcher(message);
+        var methodWithParamMatcher = METHOD_WITH_PARAMS_PATTERN.matcher(message);
         if (methodWithParamMatcher.find()) {
             methodName = methodWithParamMatcher.group(1);
             var params = methodWithParamMatcher.group(2);
             paramTypes = parseMethodParamTypes(params);
         } else {
             // Try pattern 2: "method foo in class Bar" - when signature not fully resolved
-            var methodInClassPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s+in\\s+(?:class|enum)\\s+([\\w.]+)");
-            var methodInClassMatcher = methodInClassPattern.matcher(message);
+            var methodInClassMatcher = METHOD_IN_CLASS_PATTERN.matcher(message);
             if (methodInClassMatcher.find()) {
                 methodName = methodInClassMatcher.group(1);
                 className = methodInClassMatcher.group(2);
                 // When params aren't in signature, check "found:" clause
-                var foundPattern = java.util.regex.Pattern.compile("found:\\s*(.+?)(?:\\s+reason:|$)");
-                var foundMatcher = foundPattern.matcher(message);
+                var foundMatcher = FOUND_ARGUMENTS_PATTERN.matcher(message);
                 if (foundMatcher.find()) {
                     var found = foundMatcher.group(1).trim();
                     if (found.equals("no arguments")) {
@@ -1016,11 +1167,15 @@ public final class LombokHandler {
 
         // Extract class name if not already found
         if (className == null) {
-            var classPattern = java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
-            var classMatcher = classPattern.matcher(message);
-            if (!classMatcher.find()) return false;
-            className = classMatcher.group(1);
+            var classMatcher = LOCATION_CLASS_PATTERN.matcher(message);
+            if (classMatcher.find()) {
+                className = classMatcher.group(1);
+            } else {
+                className = enclosingClassNameAtDiagnostic(task, d);
+                if (className == null) return false;
+            }
         }
+        className = resolveDiagnosticClassName(task, d, className);
 
         var metadata = cache.get(className, task.roots);
         if (metadata == null) return false;
@@ -1049,8 +1204,7 @@ public final class LombokHandler {
         if (message == null) return false;
 
         // Pattern 1: "constructor EnumName in enum com.example.EnumName cannot be applied"
-        var enumPattern = java.util.regex.Pattern.compile("constructor\\s+(\\w+)\\s+in enum\\s+([\\w.]+)");
-        var enumMatcher = enumPattern.matcher(message);
+        var enumMatcher = ENUM_CONSTRUCTOR_PATTERN.matcher(message);
         if (enumMatcher.find()) {
             var enumClassName = enumMatcher.group(2);
             var metadata = cache.get(enumClassName, task.roots);
@@ -1066,8 +1220,7 @@ public final class LombokHandler {
 
         // Pattern 2: "constructor ClassName in class com.example.ClassName cannot be applied"
         // This handles @AllArgsConstructor, @RequiredArgsConstructor, @NoArgsConstructor on regular classes
-        var classPattern = java.util.regex.Pattern.compile("constructor\\s+(\\w+)\\s+in class\\s+([\\w.]+)");
-        var classMatcher = classPattern.matcher(message);
+        var classMatcher = CLASS_CONSTRUCTOR_PATTERN.matcher(message);
         if (classMatcher.find()) {
             var className = classMatcher.group(2);
             var metadata = cache.get(className, task.roots);
@@ -1094,31 +1247,21 @@ public final class LombokHandler {
         if (code == null || !code.startsWith("compiler.err.cant.resolve")) {
             return null;
         }
-        var message = d.getMessage(null);
-        if (message == null) return null;
+        var parsed = parseDiagnostic(task, d, d.getMessage(null));
+        if (parsed == null || parsed.methodName == null || parsed.paramTypes == null || parsed.paramTypes.size() != 1) {
+            return null;
+        }
+        if (parsed.className == null) return null;
 
-        var methodPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
-        var methodMatcher = methodPattern.matcher(message);
-        if (!methodMatcher.find()) return null;
-
-        var methodName = methodMatcher.group(1);
-        var params = methodMatcher.group(2);
-        var paramTypes = parseMethodParamTypes(params);
-        if (paramTypes.size() != 1) return null;
-
-        var classPattern = java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
-        var classMatcher = classPattern.matcher(message);
-        if (!classMatcher.find()) return null;
-
-        var className = classMatcher.group(1);
+        var className = parsed.className;
         var metadata = cache.get(className, task.roots);
         if (metadata == null) return null;
 
-        var field = metadata.fieldForSetter(methodName);
+        var field = metadata.fieldForSetter(parsed.methodName);
         if (field == null) return null;
 
         var expectedType = field.getType().toString();
-        var actualType = paramTypes.get(0);
+        var actualType = parsed.paramTypes.get(0);
         if (typesMatch(expectedType, actualType)) {
             return null;
         }
@@ -1138,6 +1281,33 @@ public final class LombokHandler {
     public static DiagnosticFilterContext newDiagnosticFilterContext(String code) {
         var effectiveCode = code != null ? code : "<null>";
         return new DiagnosticFilterContext(new RequestCache("shouldFilterDiagnostic:" + effectiveCode));
+    }
+
+    public static void prefetchDiagnosticClassMetadata(
+            CompileTask task,
+            LombokMetadataCache cache,
+            DiagnosticFilterContext context,
+            java.util.Collection<String> classNames,
+            CompilationUnitTree root) {
+        if (cache == null || context == null || classNames == null || classNames.isEmpty()) return;
+        var started = System.nanoTime();
+        var prefetched = 0;
+        for (var className : classNames) {
+            if (className == null || className.isBlank()) continue;
+            var resolved = normalizeDiagnosticClassName(task, root, className);
+            metadataForClassName(cache, resolved, task.roots, context.requestCache);
+            prefetched++;
+        }
+        var elapsedMs = (System.nanoTime() - started) / 1_000_000;
+        var prefetchedCount = prefetched;
+        LOG.fine(
+                () ->
+                        "[lombok-prefetch] scope="
+                                + context.requestCache.scope
+                                + " classes="
+                                + prefetchedCount
+                                + " ms="
+                                + elapsedMs);
     }
 
     public static boolean shouldFilterDiagnostic(
@@ -1166,39 +1336,39 @@ public final class LombokHandler {
         }
         var message = d.getMessage(null);
         if (message == null) return false;
+        var parsed = parseDiagnostic(task, d, message);
+        if (parsed == null) return false;
 
-        var methodPattern = java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
-        var methodMatcher = methodPattern.matcher(message);
-        if (methodMatcher.find()) {
-            var methodName = methodMatcher.group(1);
-            var params = methodMatcher.group(2);
-            var paramTypes = parseMethodParamTypes(params);
-
-            var classPattern = java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
-            var classMatcher = classPattern.matcher(message);
-            if (classMatcher.find()) {
-                var className = classMatcher.group(1);
-                return isGeneratedMemberOfClass(task, cache, className, methodName, paramTypes, requestCache);
-            }
+        var quickDecision = quickDiagnosticFilterDecision(task, cache, d, requestCache, message);
+        if (quickDecision == DiagnosticDecision.FILTER) {
+            return true;
+        }
+        if (quickDecision == DiagnosticDecision.KEEP) {
+            return false;
         }
 
-        var variablePattern = java.util.regex.Pattern.compile("variable\\s+(\\w+)");
-        var variableMatcher = variablePattern.matcher(message);
-        if (variableMatcher.find()) {
-            var variableName = variableMatcher.group(1);
-            var classPattern = java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
-            var classMatcher = classPattern.matcher(message);
-            if (classMatcher.find()) {
-                var className = classMatcher.group(1);
-                // Check for Slf4j log variable
-                if ("log".equals(variableName)) {
-                    var metadata = cache.get(className, task.roots);
-                    if (metadata != null && metadata.hasSlf4j) {
-                        return true;
-                    }
-                }
-                return isGeneratedMemberOfClass(task, cache, className, variableName, null, requestCache);
+        if (parsed.methodName != null && parsed.className != null) {
+            if (parsed.paramTypes != null && parsed.paramTypes.isEmpty() && isDiagnosticInBooleanCondition(task, d)) {
+                LOG.fine(
+                        () ->
+                                "[lombok-cache] keeping diagnostic in boolean condition class="
+                                        + parsed.className
+                                        + " method="
+                                        + parsed.methodName);
+                return false;
             }
+            return isGeneratedMemberOfClass(
+                    task, cache, parsed.className, parsed.methodName, parsed.paramTypes, requestCache);
+        }
+
+        if (parsed.variableName != null && parsed.className != null) {
+            if ("log".equals(parsed.variableName)) {
+                var metadata = cache.get(parsed.className, task.roots);
+                if (metadata != null && metadata.hasSlf4j) {
+                    return true;
+                }
+            }
+            return isGeneratedMemberOfClass(task, cache, parsed.className, parsed.variableName, null, requestCache);
         }
 
         return false;
@@ -1379,6 +1549,152 @@ public final class LombokHandler {
         return metadataForClassName(cache, className, roots, null);
     }
 
+    private static final class ParsedDiagnostic {
+        private final String className;
+        private final String methodName;
+        private final List<String> paramTypes;
+        private final String variableName;
+
+        private ParsedDiagnostic(String className, String methodName, List<String> paramTypes, String variableName) {
+            this.className = className;
+            this.methodName = methodName;
+            this.paramTypes = paramTypes;
+            this.variableName = variableName;
+        }
+    }
+
+    private enum DiagnosticDecision {
+        FILTER,
+        KEEP,
+        UNKNOWN
+    }
+
+    private static ParsedDiagnostic parseDiagnostic(
+            CompileTask task,
+            javax.tools.Diagnostic<? extends JavaFileObject> d,
+            String message) {
+        if (message == null) {
+            return null;
+        }
+        var className = classNameFromMessage(task, d, message);
+        var methodMatcher = METHOD_WITH_PARAMS_PATTERN.matcher(message);
+        if (methodMatcher.find()) {
+            var methodName = methodMatcher.group(1);
+            var params = methodMatcher.group(2);
+            return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
+        }
+        var variableMatcher = VARIABLE_PATTERN.matcher(message);
+        if (variableMatcher.find()) {
+            return new ParsedDiagnostic(className, null, null, variableMatcher.group(1));
+        }
+        return new ParsedDiagnostic(className, null, null, null);
+    }
+
+    private static DiagnosticDecision quickDiagnosticFilterDecision(
+            CompileTask task,
+            LombokMetadataCache cache,
+            javax.tools.Diagnostic<? extends JavaFileObject> d,
+            RequestCache requestCache,
+            String message) {
+        var parsed = parseDiagnostic(task, d, message);
+        if (parsed == null) {
+            return DiagnosticDecision.UNKNOWN;
+        }
+        if (parsed.methodName != null) {
+            var className = parsed.className;
+            if (className == null) return DiagnosticDecision.UNKNOWN;
+            var metadata = metadataForClassName(cache, className, task.roots, requestCache);
+            if (metadata == null) return DiagnosticDecision.UNKNOWN;
+            List<String> paramTypes = parsed.paramTypes != null ? parsed.paramTypes : List.of();
+            if (paramTypes.isEmpty()) {
+                if (isDiagnosticInBooleanCondition(task, d)) {
+                    return DiagnosticDecision.KEEP;
+                }
+                return generatedMemberMatchesQuick(metadata, parsed.methodName, paramTypes);
+            }
+            if (paramTypes.size() == 1) {
+                var field = metadata.fieldForSetter(parsed.methodName);
+                if (field != null && typesMatch(field.getType().toString(), paramTypes.get(0))) {
+                    return DiagnosticDecision.FILTER;
+                }
+                if (field != null) {
+                    return DiagnosticDecision.UNKNOWN;
+                }
+            }
+            return DiagnosticDecision.UNKNOWN;
+        }
+        if (parsed.variableName != null) {
+            var className = parsed.className;
+            if (className == null) return DiagnosticDecision.UNKNOWN;
+            var metadata = metadataForClassName(cache, className, task.roots, requestCache);
+            if (metadata == null) return DiagnosticDecision.UNKNOWN;
+            if ("log".equals(parsed.variableName) && metadata.hasSlf4j) {
+                return DiagnosticDecision.FILTER;
+            }
+            if (generatedMemberMatchesQuick(metadata, parsed.variableName, null) == DiagnosticDecision.FILTER) {
+                return DiagnosticDecision.FILTER;
+            }
+        }
+        return DiagnosticDecision.UNKNOWN;
+    }
+
+    private static DiagnosticDecision generatedMemberMatchesQuick(
+            LombokMetadata metadata, String memberName, List<String> paramTypes) {
+        if (paramTypes != null) {
+            if (paramTypes.isEmpty()) {
+                if (metadata.isGeneratedGetter(memberName) || metadata.isGeneratedSpecialMethod(memberName)) {
+                    return DiagnosticDecision.FILTER;
+                }
+                if (metadata.hasBuilder
+                        && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)
+                        && (memberName.equals(metadata.builderMethodName)
+                                || memberName.equals(metadata.buildMethodName))) {
+                    return DiagnosticDecision.FILTER;
+                }
+                return DiagnosticDecision.UNKNOWN;
+            }
+            if (paramTypes.size() == 1) {
+                if (metadata.hasEqualsAndHashCode
+                        && memberName.equals("equals")
+                        && isObjectType(paramTypes.get(0))) {
+                    return DiagnosticDecision.FILTER;
+                }
+                if (metadata.hasBuilder
+                        && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)
+                        && metadata.isGeneratedBuilderMethod(memberName)) {
+                    var builderField = metadata.builderParamForName(memberName);
+                    if (builderField != null
+                            && typesMatch(builderField.getType().toString(), paramTypes.get(0))) {
+                        return DiagnosticDecision.FILTER;
+                    }
+                }
+                return DiagnosticDecision.UNKNOWN;
+            }
+            return DiagnosticDecision.UNKNOWN;
+        }
+        return (metadata.isGeneratedGetter(memberName)
+                        || metadata.isGeneratedSetter(memberName)
+                        || metadata.isGeneratedSpecialMethod(memberName)
+                        || (metadata.hasBuilder
+                                && !metadata.explicitInnerTypeNames.contains(metadata.builderClassName)
+                                && (memberName.equals(metadata.builderMethodName)
+                                        || metadata.isGeneratedBuilderMethod(memberName))))
+                ? DiagnosticDecision.FILTER
+                : DiagnosticDecision.KEEP;
+    }
+
+    private static String classNameFromMessage(
+            CompileTask task,
+            javax.tools.Diagnostic<? extends JavaFileObject> d,
+            String message) {
+        var classMatcher = LOCATION_CLASS_PATTERN.matcher(message);
+        if (classMatcher.find()) {
+            return resolveDiagnosticClassName(task, d, classMatcher.group(1));
+        }
+        var enclosing = enclosingClassNameAtDiagnostic(task, d);
+        return enclosing != null ? resolveDiagnosticClassName(task, d, enclosing) : null;
+    }
+
     private static LombokMetadata metadataForClassName(
             LombokMetadataCache cache,
             String className,
@@ -1436,6 +1752,157 @@ public final class LombokHandler {
         return metadata;
     }
 
+    private static String resolveDiagnosticClassName(
+            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic, String rawClassName) {
+        if (rawClassName == null || rawClassName.isBlank()) {
+            return rawClassName;
+        }
+        if (rawClassName.contains(".")) {
+            return rawClassName;
+        }
+        var elements = task.task.getElements();
+        var direct = elements.getTypeElement(rawClassName);
+        if (direct != null) {
+            return direct.getQualifiedName().toString();
+        }
+
+        var path = findDiagnosticPath(task, diagnostic);
+        if (path != null) {
+            for (var current = path; current != null; current = current.getParentPath()) {
+                if (!(current.getLeaf() instanceof ClassTree)) {
+                    continue;
+                }
+                var classElement = Trees.instance(task.task).getElement(current);
+                if (!(classElement instanceof TypeElement)) {
+                    continue;
+                }
+                var type = (TypeElement) classElement;
+                if (type.getSimpleName().contentEquals(rawClassName)) {
+                    return type.getQualifiedName().toString();
+                }
+            }
+        }
+
+        var root = diagnosticRoot(task, diagnostic);
+        if (root != null) {
+            var rootPackage = root.getPackage();
+            var packageName = rootPackage == null ? "" : rootPackage.getPackageName().toString();
+            if (!packageName.isEmpty()) {
+                var samePackageCandidate = packageName + "." + rawClassName;
+                if (elements.getTypeElement(samePackageCandidate) != null) {
+                    return samePackageCandidate;
+                }
+            }
+        }
+        return rawClassName;
+    }
+
+    private static String normalizeDiagnosticClassName(
+            CompileTask task, CompilationUnitTree root, String className) {
+        if (className == null || className.isBlank() || className.contains(".")) {
+            return className;
+        }
+        var elements = task.task.getElements();
+        var direct = elements.getTypeElement(className);
+        if (direct != null) {
+            return direct.getQualifiedName().toString();
+        }
+        var rootPackage = root.getPackage();
+        var packageName = rootPackage == null ? "" : rootPackage.getPackageName().toString();
+        if (packageName.isEmpty()) {
+            return className;
+        }
+        var samePackage = packageName + "." + className;
+        return elements.getTypeElement(samePackage) != null ? samePackage : className;
+    }
+
+    private static boolean isDiagnosticInBooleanCondition(
+            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic) {
+        var path = findDiagnosticPath(task, diagnostic);
+        if (path == null) {
+            return false;
+        }
+        for (var current = path; current != null; current = current.getParentPath()) {
+            var parent = current.getParentPath();
+            if (parent == null) {
+                continue;
+            }
+            var leaf = parent.getLeaf();
+            if (leaf instanceof com.sun.source.tree.IfTree) {
+                var condition = ((com.sun.source.tree.IfTree) leaf).getCondition();
+                if (isInsideSubtree(current, condition)) return true;
+                continue;
+            }
+            if (leaf instanceof com.sun.source.tree.WhileLoopTree) {
+                var condition = ((com.sun.source.tree.WhileLoopTree) leaf).getCondition();
+                if (isInsideSubtree(current, condition)) return true;
+                continue;
+            }
+            if (leaf instanceof com.sun.source.tree.DoWhileLoopTree) {
+                var condition = ((com.sun.source.tree.DoWhileLoopTree) leaf).getCondition();
+                if (isInsideSubtree(current, condition)) return true;
+                continue;
+            }
+            if (leaf instanceof com.sun.source.tree.ForLoopTree) {
+                var condition = ((com.sun.source.tree.ForLoopTree) leaf).getCondition();
+                if (condition != null && isInsideSubtree(current, condition)) return true;
+                continue;
+            }
+            if (leaf instanceof com.sun.source.tree.ConditionalExpressionTree) {
+                var condition = ((com.sun.source.tree.ConditionalExpressionTree) leaf).getCondition();
+                if (isInsideSubtree(current, condition)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isInsideSubtree(TreePath path, Tree subtreeRoot) {
+        for (var current = path; current != null; current = current.getParentPath()) {
+            if (current.getLeaf() == subtreeRoot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static TreePath findDiagnosticPath(
+            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic) {
+        var root = diagnosticRoot(task, diagnostic);
+        if (root == null || diagnostic.getStartPosition() < 0) {
+            return null;
+        }
+        return new FindNameAt(task).scan(root, diagnostic.getStartPosition());
+    }
+
+    private static CompilationUnitTree diagnosticRoot(
+            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic) {
+        if (diagnostic == null || diagnostic.getSource() == null) {
+            return null;
+        }
+        var sourceUri = diagnostic.getSource().toUri();
+        for (var root : task.roots) {
+            if (root.getSourceFile().toUri().equals(sourceUri)) {
+                return root;
+            }
+        }
+        return null;
+    }
+
+    private static String enclosingClassNameAtDiagnostic(
+            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic) {
+        var path = findDiagnosticPath(task, diagnostic);
+        if (path == null) return null;
+        var trees = Trees.instance(task.task);
+        for (var current = path; current != null; current = current.getParentPath()) {
+            if (!(current.getLeaf() instanceof ClassTree)) continue;
+            var element = trees.getElement(current);
+            if (element instanceof TypeElement) {
+                return ((TypeElement) element).getQualifiedName().toString();
+            }
+        }
+        return null;
+    }
+
     private static void addSlf4jLogVariableCompletion(
             CompileTask task,
             TypeElement typeElement,
@@ -1470,7 +1937,6 @@ public final class LombokHandler {
         item.kind = CompletionItemKind.Variable;
         item.insertText = "log";
         item.insertTextFormat = InsertTextFormat.PlainText;
-        item.detail = "(generated by Slf4j)";
         list.add(item);
         if (requestCache != null) {
             LOG.fine(
@@ -1551,6 +2017,19 @@ public final class LombokHandler {
 
         LOG.fine(() -> "...class not found: " + qualifiedName);
         return null;
+    }
+
+    private static ClassTree findClassTreeCached(
+            List<CompilationUnitTree> roots, String qualifiedName, RequestCache requestCache) {
+        if (requestCache == null) {
+            return findClassTree(roots, qualifiedName);
+        }
+        if (requestCache.classTreeByQualifiedName.containsKey(qualifiedName)) {
+            return requestCache.classTreeByQualifiedName.get(qualifiedName);
+        }
+        var found = findClassTree(roots, qualifiedName);
+        requestCache.classTreeByQualifiedName.put(qualifiedName, found);
+        return found;
     }
 
     private static ClassTree findNestedClass(ClassTree outerClass, String[] classPath, int index) {
@@ -1778,6 +2257,7 @@ public final class LombokHandler {
         private final String scope;
         private final Map<String, List<? extends Element>> allMembersByClassName = new HashMap<>();
         private final Map<String, LombokMetadata> metadataByClassName = new HashMap<>();
+        private final Map<String, ClassTree> classTreeByQualifiedName = new HashMap<>();
         private final Map<String, TypeMirror> resolvedTypeByName = new HashMap<>();
         private final Map<String, Boolean> assignableBySignature = new HashMap<>();
         private final Set<String> inheritedFieldsEnriched = new HashSet<>();

@@ -77,4 +77,22 @@ public class FindReferencesTest {
         // Should find both usages of rec.name()
         assertThat(refs, hasSize(greaterThan(0)));
     }
+
+    @Test
+    public void findOverloadedIntMethodReferences() {
+        var refs = items("/org/javacs/example/GotoOverload.java", 12, 17);  // on overloaded(int)
+        assertThat(refs, hasItem("GotoOverload.java(8)"));
+        assertThat(refs, hasItem("GotoOverloadInOtherFile.java(6)"));
+        assertThat(refs, not(hasItem("GotoOverload.java(9)")));
+        assertThat(refs, not(hasItem("GotoOverloadInOtherFile.java(7)")));
+    }
+
+    @Test
+    public void findOverloadedStringMethodReferences() {
+        var refs = items("/org/javacs/example/GotoOverload.java", 16, 17);  // on overloaded(String)
+        assertThat(refs, hasItem("GotoOverload.java(9)"));
+        assertThat(refs, hasItem("GotoOverloadInOtherFile.java(7)"));
+        assertThat(refs, not(hasItem("GotoOverload.java(8)")));
+        assertThat(refs, not(hasItem("GotoOverloadInOtherFile.java(6)")));
+    }
 }

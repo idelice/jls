@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
@@ -354,17 +355,18 @@ public class CompletionProvider {
 
     private void addClassNames(
             CompilationUnitTree root, SourcePositions sourcePositions, String partial, CompletionList list) {
+        var importFacts = ImportFacts.create(root);
         var packageName = Objects.toString(root.getPackageName(), "");
         var uniques = new HashSet<String>();
         var previousSize = list.items.size();
         for (var className : compiler.packagePrivateTopLevelTypes(packageName)) {
             if (!StringSearch.matchesPartialName(className, partial)) continue;
             var item = classItem(className, Priority.IMPORTED_CLASS);
-            if (hasImportConflict(root, className)) {
+            if (hasImportConflict(importFacts, className)) {
                 item.insertText = className;
                 item.insertTextFormat = InsertTextFormat.PlainText;
             } else {
-                var edits = autoImportEdits(className, root, sourcePositions);
+                var edits = autoImportEdits(className, importFacts, sourcePositions);
                 if (!edits.isEmpty()) {
                     item.additionalTextEdits = edits;
                 }
@@ -381,11 +383,11 @@ public class CompletionProvider {
                 break;
             }
             var item = classItem(className, Priority.NOT_IMPORTED_CLASS);
-            if (hasImportConflict(root, className)) {
+            if (hasImportConflict(importFacts, className)) {
                 item.insertText = className;
                 item.insertTextFormat = InsertTextFormat.PlainText;
             } else {
-                var edits = autoImportEdits(className, root, sourcePositions);
+                var edits = autoImportEdits(className, importFacts, sourcePositions);
                 if (!edits.isEmpty()) {
                     item.additionalTextEdits = edits;
                 }
@@ -398,82 +400,94 @@ public class CompletionProvider {
     }
 
     private List<TextEdit> autoImportEdits(
-            String className, CompilationUnitTree root, SourcePositions sourcePositions) {
+            String className, ImportFacts importFacts, SourcePositions sourcePositions) {
         if (className.indexOf('.') < 0) {
             return List.of();
         }
         if (className.startsWith("java.lang.")) {
             return List.of();
         }
-        var packageTree = root.getPackage();
-        if (packageTree != null) {
-            var packageName = packageTree.getPackageName().toString();
-            if (className.startsWith(packageName + ".")
-                    && !className.substring(packageName.length() + 1).contains(".")) {
-                return List.of();
-            }
+        if (!importFacts.packageName.isEmpty()
+                && className.startsWith(importFacts.packageName + ".")
+                && !className.substring(importFacts.packageName.length() + 1).contains(".")) {
+            return List.of();
         }
-        for (var i : root.getImports()) {
-            var imported = i.getQualifiedIdentifier().toString();
-            if (imported.equals(className)) {
-                return List.of();
-            }
-            if (imported.endsWith(".*")) {
-                var importedPackage = imported.substring(0, imported.length() - 1);
-                if (className.startsWith(importedPackage)) {
-                    return List.of();
-                }
-            }
+        if (importFacts.explicitImports.contains(className)) {
+            return List.of();
+        }
+        if (importFacts.starImports.contains(packageName(className))) {
+            return List.of();
         }
 
-        var edits = AddImport.createTextEdits(className, root, sourcePositions);
+        var edits = AddImport.createTextEdits(className, importFacts.root, sourcePositions);
         return List.of(edits[0]);
     }
 
-    private boolean hasImportConflict(CompilationUnitTree root, String className) {
+    private boolean hasImportConflict(ImportFacts importFacts, String className) {
         if (className.indexOf('.') < 0) {
             return false;
         }
         var targetSimple = simpleName(className).toString();
-        for (var i : root.getImports()) {
-            if (i.isStatic()) continue;
-            var imported = i.getQualifiedIdentifier().toString();
-            if (imported.endsWith(".*")) continue;
-            if (imported.equals(className)) continue;
-            var importedSimple = simpleName(imported).toString();
-            if (importedSimple.equals(targetSimple)) {
-                return true;
-            }
+        var existingImport = importFacts.simpleToExplicitImport.get(targetSimple);
+        return existingImport != null && !existingImport.equals(className);
+    }
+
+    private static final class ImportFacts {
+        private final CompilationUnitTree root;
+        private final String packageName;
+        private final Set<String> explicitImports;
+        private final Set<String> starImports;
+        private final Map<String, String> simpleToExplicitImport;
+
+        private ImportFacts(
+                CompilationUnitTree root,
+                String packageName,
+                Set<String> explicitImports,
+                Set<String> starImports,
+                Map<String, String> simpleToExplicitImport) {
+            this.root = root;
+            this.packageName = packageName;
+            this.explicitImports = explicitImports;
+            this.starImports = starImports;
+            this.simpleToExplicitImport = simpleToExplicitImport;
         }
-        return false;
+
+        private static ImportFacts create(CompilationUnitTree root) {
+            var packageName = Objects.toString(root.getPackageName(), "");
+            var explicitImports = new HashSet<String>();
+            var starImports = new HashSet<String>();
+            var simpleToExplicitImport = new HashMap<String, String>();
+            for (var i : root.getImports()) {
+                if (i.isStatic()) continue;
+                var imported = i.getQualifiedIdentifier().toString();
+                if (imported.endsWith(".*")) {
+                    starImports.add(imported.substring(0, imported.length() - 2));
+                    continue;
+                }
+                explicitImports.add(imported);
+                var dot = imported.lastIndexOf('.');
+                var simpleImportedName = dot == -1 ? imported : imported.substring(dot + 1);
+                simpleToExplicitImport.putIfAbsent(simpleImportedName, imported);
+            }
+            return new ImportFacts(root, packageName, explicitImports, starImports, simpleToExplicitImport);
+        }
     }
 
     private CompletionList completeMemberSelect(
             CompileTask task, TreePath path, String partial, boolean endsWithParen) {
         var trees = Trees.instance(task.task);
         var select = (MemberSelectTree) path.getLeaf();
+        LombokHandler.CompletionContext lombokContext = null;
         LOG.info("...complete members of " + select.getExpression());
 
-        // Special handling for Slf4j log variable (log.info, log.debug, etc.)
-        if (select.getExpression() instanceof IdentifierTree) {
-            var ident = (IdentifierTree) select.getExpression();
-            if ("log".equals(ident.getName().toString())) {
-                var enclosingPath = path;
-                while (enclosingPath != null) {
-                    var kind = enclosingPath.getLeaf().getKind();
-                    if (kind == Tree.Kind.CLASS || kind == Tree.Kind.RECORD) {
-                        var enclosingElement = trees.getElement(enclosingPath);
-                        if (enclosingElement instanceof TypeElement) {
-                            var list = new ArrayList<CompletionItem>();
-                            LombokHandler.addSlf4jLogMethodCompletions(task, (TypeElement) enclosingElement, partial, list, lombokCache);
-                            if (!list.isEmpty()) {
-                                return new CompletionList(false, list);
-                            }
-                        }
-                        break;
-                    }
-                    enclosingPath = enclosingPath.getParentPath();
-                }
+        // Fast-path for Lombok @Slf4j generated `log` receiver.
+        if (select.getExpression() instanceof IdentifierTree
+                && "log".contentEquals(((IdentifierTree) select.getExpression()).getName())) {
+            lombokContext = LombokHandler.newCompletionContext("memberSelect:" + select.getExpression());
+            var slf4jCompletions =
+                    LombokHandler.completeSlf4jLogMemberSelect(task, path, partial, lombokCache, lombokContext);
+            if (slf4jCompletions != null) {
+                return slf4jCompletions;
             }
         }
 
@@ -487,24 +501,27 @@ public class CompletionProvider {
                 return builderList;
             }
 
-            // Try to resolve Lombok-generated method return type for nested chaining
+            // Resolve Lombok-generated getter chains like obj.getA().getB().
             var invocationPath = new TreePath(path, select.getExpression());
             var lombokType = LombokHandler.resolveMethodInvocationReturnType(
                     task, (MethodInvocationTree) select.getExpression(), invocationPath, lombokCache);
-            LOG.info("...Lombok type resolved: " + lombokType);
-            if (lombokType != null && lombokType instanceof DeclaredType) {
-                LOG.info("...returning completions for resolved Lombok type: " + lombokType);
+            LOG.info("...Lombok invocation type resolved: " + lombokType);
+            if (lombokType instanceof DeclaredType) {
+                if (lombokContext == null) {
+                    lombokContext = LombokHandler.newCompletionContext("memberSelect:" + select.getExpression());
+                }
                 var scope = trees.getScope(invocationPath);
-                // Method invocations are always instance access (not static)
-                return completeDeclaredTypeMemberSelect(task, scope, (DeclaredType) lombokType, false, partial, endsWithParen);
-            } else {
-                LOG.info("...Lombok type resolution failed or not DeclaredType");
+                return completeDeclaredTypeMemberSelect(
+                        task, scope, (DeclaredType) lombokType, false, partial, endsWithParen, lombokContext);
             }
         }
         path = new TreePath(path, select.getExpression());
         var isStatic = trees.getElement(path) instanceof TypeElement;
         var scope = trees.getScope(path);
         var type = trees.getTypeMirror(path);
+        if (type == null) {
+            return NOT_SUPPORTED;
+        }
 
         // Handle ERROR types from unresolved Lombok-generated methods (recursive support)
         if (type.getKind() == TypeKind.ERROR) {
@@ -514,12 +531,20 @@ public class CompletionProvider {
             if (resolvedType != null && resolvedType instanceof DeclaredType) {
                 var resolvedDeclaredType = (DeclaredType) resolvedType;
                 // ERROR types from method calls are always instance access, not static
-                return completeDeclaredTypeMemberSelect(task, scope, resolvedDeclaredType, false, partial, endsWithParen);
+                if (lombokContext == null) {
+                    lombokContext = LombokHandler.newCompletionContext("memberSelect:" + select.getExpression());
+                }
+                return completeDeclaredTypeMemberSelect(
+                        task, scope, resolvedDeclaredType, false, partial, endsWithParen, lombokContext);
             }
             var varInferred = inferVarDeclaredType(task, path);
             if (varInferred != null) {
                 LOG.fine("...resolved var type for completion: " + varInferred);
-                return completeDeclaredTypeMemberSelect(task, scope, varInferred, false, partial, endsWithParen);
+                if (lombokContext == null) {
+                    lombokContext = LombokHandler.newCompletionContext("memberSelect:" + select.getExpression());
+                }
+                return completeDeclaredTypeMemberSelect(
+                        task, scope, varInferred, false, partial, endsWithParen, lombokContext);
             }
             return NOT_SUPPORTED;
         }
@@ -530,7 +555,11 @@ public class CompletionProvider {
             return completeTypeVariableMemberSelect(task, scope, (TypeVariable) type, isStatic, partial, endsWithParen);
         } else if (type instanceof DeclaredType) {
             var declaredType = (DeclaredType) type;
-            return completeDeclaredTypeMemberSelect(task, scope, declaredType, isStatic, partial, endsWithParen);
+            if (lombokContext == null) {
+                lombokContext = LombokHandler.newCompletionContext("memberSelect:" + select.getExpression());
+            }
+            return completeDeclaredTypeMemberSelect(
+                    task, scope, declaredType, isStatic, partial, endsWithParen, lombokContext);
         } else {
             return NOT_SUPPORTED;
         }
@@ -568,6 +597,10 @@ public class CompletionProvider {
         if (!(element instanceof VariableElement)) {
             return null;
         }
+        var variable = (VariableElement) element;
+        if (variable.asType() instanceof DeclaredType) {
+            return (DeclaredType) variable.asType();
+        }
         var declarationPath = trees.getPath(element);
         if (declarationPath == null || !(declarationPath.getLeaf() instanceof VariableTree)) {
             return null;
@@ -588,11 +621,29 @@ public class CompletionProvider {
         if (initType instanceof DeclaredType) {
             return (DeclaredType) initType;
         }
+        if (declaration.getType() != null) {
+            var declaredTypePath = new TreePath(declarationPath, declaration.getType());
+            var declaredType = trees.getTypeMirror(declaredTypePath);
+            if (declaredType instanceof DeclaredType) {
+                return (DeclaredType) declaredType;
+            }
+        }
         return null;
     }
 
     private CompletionList completeDeclaredTypeMemberSelect(
             CompileTask task, Scope scope, DeclaredType type, boolean isStatic, String partial, boolean endsWithParen) {
+        return completeDeclaredTypeMemberSelect(task, scope, type, isStatic, partial, endsWithParen, null);
+    }
+
+    private CompletionList completeDeclaredTypeMemberSelect(
+            CompileTask task,
+            Scope scope,
+            DeclaredType type,
+            boolean isStatic,
+            String partial,
+            boolean endsWithParen,
+            LombokHandler.CompletionContext lombokContext) {
         var typeElement = (TypeElement) type.asElement();
         var collected =
                 collectTypeMembers(
@@ -607,9 +658,9 @@ public class CompletionProvider {
 
         // Add Lombok-generated members
         if (!isStatic) {
-            addLombokCompletions(task, typeElement, partial, list);
+            addLombokCompletions(task, typeElement, partial, list, lombokContext);
         } else {
-            LombokHandler.addStaticCompletions(task, typeElement, partial, list, lombokCache);
+            LombokHandler.addStaticCompletions(task, typeElement, partial, list, lombokCache, lombokContext);
         }
 
         if (isStatic) {
@@ -628,8 +679,13 @@ public class CompletionProvider {
      * Searches the compilation task for the ClassTree of the given TypeElement and synthesizes
      * completions for generated getters, setters, toString, equals, hashCode, and constructors.
      */
-    private void addLombokCompletions(CompileTask task, TypeElement typeElement, String partial, List<CompletionItem> list) {
-        LombokHandler.addCompletions(task, typeElement, partial, list, lombokCache);
+    private void addLombokCompletions(
+            CompileTask task,
+            TypeElement typeElement,
+            String partial,
+            List<CompletionItem> list,
+            LombokHandler.CompletionContext lombokContext) {
+        LombokHandler.addCompletions(task, typeElement, partial, list, lombokCache, lombokContext);
     }
 
     private boolean isEnclosingClass(DeclaredType type, Scope start) {
@@ -937,6 +993,12 @@ public class CompletionProvider {
         var dot = className.lastIndexOf('.');
         if (dot == -1) return className;
         return className.subSequence(dot + 1, className.length());
+    }
+
+    private String packageName(String className) {
+        var dot = className.lastIndexOf('.');
+        if (dot <= 0) return "";
+        return className.substring(0, dot);
     }
 
     private int priorityForScopedMember(ScopeHelper.ScopedMember scoped) {

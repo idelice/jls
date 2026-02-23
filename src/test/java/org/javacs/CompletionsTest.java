@@ -813,6 +813,20 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void lombokThisPojoCompletionContainsGetterAndSetter() {
+        var labels = label("/org/javacs/example/LombokThisSetterAndCondition.java", 17, 13);
+        assertThat(labels, hasItems("getFoo", "setFoo"));
+    }
+
+    @Test
+    public void lombokGeneratedCompletionIncludesFieldAnnotationContext() {
+        var docs = documentation("/org/javacs/example/LombokCompletionDocs.java", 14, 15);
+        assertThat(docs, hasItem(org.hamcrest.Matchers.containsString("public String getFoo()")));
+        assertThat(docs, hasItem(org.hamcrest.Matchers.containsString("Field: `foo`")));
+        assertThat(docs, hasItem(org.hamcrest.Matchers.containsString("@Deprecated")));
+    }
+
+    @Test
     public void lombokFieldRenameRefreshesCompletionItems() {
         var file = FindResource.path("/org/javacs/example/LombokCompletionFieldChange.java");
         open(file);

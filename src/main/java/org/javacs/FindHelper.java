@@ -193,6 +193,43 @@ public class FindHelper {
         return new Location(uri, range);
     }
 
+    public static Location location(ParseTask task, TreePath path) {
+        return location(task, path, "");
+    }
+
+    public static Location location(ParseTask task, TreePath path, CharSequence name) {
+        var lines = path.getCompilationUnit().getLineMap();
+        var pos = Trees.instance(task.task).getSourcePositions();
+        var start = (int) pos.getStartPosition(path.getCompilationUnit(), path.getLeaf());
+        var end = (int) pos.getEndPosition(path.getCompilationUnit(), path.getLeaf());
+        if (start == Diagnostic.NOPOS || end == Diagnostic.NOPOS) {
+            try {
+                var contents = path.getCompilationUnit().getSourceFile().getCharContent(true);
+                if (start == Diagnostic.NOPOS) {
+                    start = 0;
+                }
+                if (end == Diagnostic.NOPOS) {
+                    end = contents.length();
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        if (name.length() > 0) {
+            start = FindHelper.findNameIn(path.getCompilationUnit(), name, start, end);
+            end = start + name.length();
+        }
+        var startLine = (int) lines.getLineNumber(start);
+        var startColumn = (int) lines.getColumnNumber(start);
+        var startPos = new Position(startLine - 1, startColumn - 1);
+        var endLine = (int) lines.getLineNumber(end);
+        var endColumn = (int) lines.getColumnNumber(end);
+        var endPos = new Position(endLine - 1, endColumn - 1);
+        var range = new Range(startPos, endPos);
+        var uri = normalizeUri(path.getCompilationUnit().getSourceFile().toUri());
+        return new Location(uri, range);
+    }
+
     private static URI normalizeUri(URI uri) {
         if (uri == null) return null;
         if (!"jar".equals(uri.getScheme())) return uri;

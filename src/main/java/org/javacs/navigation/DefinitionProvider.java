@@ -289,37 +289,47 @@ public class DefinitionProvider {
     }
 
     private List<Location> findRemoteDefinitions(JavaFileObject otherFile, String className, Element element) {
-        try (var task = compiler.compile(List.of(otherFile))) {
-            var elements = task.task.getElements();
-            var typeElement = elements.getTypeElement(className);
-            if (typeElement == null) {
-                return List.of();
-            }
-            var trees = com.sun.source.util.Trees.instance(task.task);
+        // For JDK/JAR sources, avoid full analyze() and use parse-only lookup to keep
+        // navigation resilient to javac assertion failures in remote source attribution.
+        var parse = compiler.parse(otherFile);
+        var classTree = FindHelper.findType(parse, className);
+        if (classTree == null) {
+            return List.of();
+        }
+        var trees = com.sun.source.util.Trees.instance(parse.task);
 
-            // Try to find a matching member if the element is a member
-            if (element instanceof ExecutableElement || element instanceof VariableElement) {
-                for (var member : typeElement.getEnclosedElements()) {
-                    if (member.getSimpleName().contentEquals(element.getSimpleName())) {
-                        var memberPath = trees.getPath(member);
+        // Try to find a matching member if the element is a member
+        if (element instanceof ExecutableElement || element instanceof VariableElement) {
+            var isConstructor = "<init>".equals(element.getSimpleName().toString());
+            var parseMemberName =
+                    isConstructor ? classTree.getSimpleName().toString() : element.getSimpleName().toString();
+            for (var member : classTree.getMembers()) {
+                if (member instanceof com.sun.source.tree.MethodTree) {
+                    var method = (com.sun.source.tree.MethodTree) member;
+                    if (method.getName().contentEquals(parseMemberName)) {
+                        var memberPath = trees.getPath(parse.root, member);
                         if (memberPath != null) {
-                            // For constructors, use the class name instead of <init>
-                            var displayName = "<init>".equals(element.getSimpleName().toString())
-                                ? typeElement.getSimpleName()
-                                : element.getSimpleName();
-                            return List.of(FindHelper.location(task, memberPath, displayName));
+                            return List.of(FindHelper.location(parse, memberPath, parseMemberName));
+                        }
+                    }
+                } else if (!isConstructor && member instanceof com.sun.source.tree.VariableTree) {
+                    var field = (com.sun.source.tree.VariableTree) member;
+                    if (field.getName().contentEquals(parseMemberName)) {
+                        var memberPath = trees.getPath(parse.root, member);
+                        if (memberPath != null) {
+                            return List.of(FindHelper.location(parse, memberPath, parseMemberName));
                         }
                     }
                 }
             }
-
-            // Fall back to type definition
-            var path = trees.getPath(typeElement);
-            if (path == null) {
-                return List.of();
-            }
-            return List.of(FindHelper.location(task, path, typeElement.getSimpleName()));
         }
+
+        // Fall back to type definition
+        var path = trees.getPath(parse.root, classTree);
+        if (path == null) {
+            return List.of();
+        }
+        return List.of(FindHelper.location(parse, path, classTree.getSimpleName()));
     }
 
     private List<Location> findConstructorForContext(CompileTask task, TypeElement typeElement) {

@@ -23,6 +23,10 @@ public class ErrorProvider {
     private final LombokMetadataCache lombokCache;
     private final boolean includeWarnings;
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final java.util.regex.Pattern LOCATION_CLASS_PATTERN =
+            java.util.regex.Pattern.compile("location:.*(?:of type|class)\\s+([\\w.]+)");
+    private static final java.util.regex.Pattern IN_CLASS_PATTERN =
+            java.util.regex.Pattern.compile("in\\s+(?:class|enum)\\s+([\\w.]+)");
 
     public ErrorProvider(CompileTask task, LombokMetadataCache lombokCache) {
         this(task, lombokCache, true);
@@ -44,6 +48,7 @@ public class ErrorProvider {
     public PublishDiagnosticsParams[] errors() {
         var result = new PublishDiagnosticsParams[task.roots.size()];
         for (var i = 0; i < task.roots.size(); i++) {
+            var rootStart = System.nanoTime();
             var root = task.roots.get(i);
             var uri = root.getSourceFile().toUri();
             result[i] = new PublishDiagnosticsParams();
@@ -53,15 +58,38 @@ public class ErrorProvider {
                 LOG.fine("Skipping diagnostics for JAR source: " + uri);
                 continue;
             }
+            var compilerStart = System.nanoTime();
             result[i].diagnostics.addAll(compilerErrors(root));
             result[i].diagnostics.addAll(LombokHandler.constructorDiagnostics(task, lombokCache, root));
             result[i].diagnostics.addAll(LombokHandler.builderConstructorDiagnostics(task, root));
+            var compilerElapsedMs = (System.nanoTime() - compilerStart) / 1_000_000;
 
-            // Skip expensive warning scans if not needed (e.g., for navigation-only requests)
-            if (includeWarnings) {
+            // Skip warning scans when hard errors already exist; warning results are low-value and expensive while code is broken.
+            var hasHardErrors =
+                    result[i].diagnostics.stream().anyMatch(d -> d.severity == DiagnosticSeverity.Error);
+            var warningStart = System.nanoTime();
+            if (includeWarnings && !hasHardErrors) {
                 result[i].diagnostics.addAll(unusedWarnings(root));
                 result[i].diagnostics.addAll(notThrownWarnings(root));
             }
+            var warningElapsedMs = (System.nanoTime() - warningStart) / 1_000_000;
+            var totalElapsedMs = (System.nanoTime() - rootStart) / 1_000_000;
+            var diagnosticCount = result[i].diagnostics.size();
+            var warningsSkipped = includeWarnings && hasHardErrors;
+            LOG.fine(
+                    () ->
+                            "[diag-timing] uri="
+                                    + uri
+                                    + " compiler_ms="
+                                    + compilerElapsedMs
+                                    + " warnings_ms="
+                                    + warningElapsedMs
+                                    + " warnings_skipped="
+                                    + warningsSkipped
+                                    + " total_ms="
+                                    + totalElapsedMs
+                                    + " diagnostics="
+                                    + diagnosticCount);
         }
         // TODO hint fields that could be final
 
@@ -84,6 +112,8 @@ public class ErrorProvider {
         // Create a copy to avoid ConcurrentModificationException during cache compilation
         var diagnosticsCopy = new ArrayList<>(task.diagnostics);
         var filterContext = LombokHandler.newDiagnosticFilterContext("batch:" + root.getSourceFile().toUri());
+        var prefetchClassNames = collectLikelyLombokClassNames(diagnosticsCopy, root);
+        LombokHandler.prefetchDiagnosticClassMetadata(task, lombokCache, filterContext, prefetchClassNames, root);
         LOG.fine(
                 () ->
                         "[lombok-cache] diagnostics batch start uri="
@@ -91,6 +121,8 @@ public class ErrorProvider {
                                 + " diagnostics="
                                 + diagnosticsCopy.size());
         int filteredByLombok = 0;
+        int lombokChecks = 0;
+        int lombokSkippedByPrecheck = 0;
 
         for (var d : diagnosticsCopy) {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
@@ -102,24 +134,85 @@ public class ErrorProvider {
                 result.add(lombokAdjusted);
                 continue;
             }
-            if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d, filterContext)) {
-                filteredByLombok++;
-                continue;  // Skip this error
+            if (shouldAttemptLombokFilter(d)) {
+                lombokChecks++;
+                if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d, filterContext)) {
+                    filteredByLombok++;
+                    continue; // Skip this error
+                }
+            } else {
+                lombokSkippedByPrecheck++;
             }
 
             result.add(lspDiagnostic(d, root.getLineMap()));
         }
         var kept = result.size();
         var filteredCount = filteredByLombok;
+        var checks = lombokChecks;
+        var precheckSkipped = lombokSkippedByPrecheck;
         LOG.fine(
                 () ->
                         "[lombok-cache] diagnostics batch end uri="
                                 + root.getSourceFile().toUri()
                                 + " filtered="
                                 + filteredCount
+                                + " lombok_checks="
+                                + checks
+                                + " precheck_skipped="
+                                + precheckSkipped
                                 + " kept="
                                 + kept);
         return result;
+    }
+
+    private boolean shouldAttemptLombokFilter(Diagnostic<? extends JavaFileObject> d) {
+        var code = d.getCode();
+        if (code == null) return false;
+        if ("compiler.err.cant.apply.symbol".equals(code)) {
+            return true;
+        }
+        if (!code.startsWith("compiler.err.cant.resolve")) {
+            return false;
+        }
+        var message = d.getMessage(null);
+        if (message == null) {
+            return false;
+        }
+        // Generated Lombok members are surfaced as unresolved methods, or as slf4j `log`.
+        if (message.contains("method ")) {
+            return true;
+        }
+        return message.contains("variable log");
+    }
+
+    private Set<String> collectLikelyLombokClassNames(
+            List<Diagnostic<? extends JavaFileObject>> diagnosticsCopy, CompilationUnitTree root) {
+        var classes = new HashSet<String>();
+        var packageName = root.getPackage() != null ? root.getPackage().getPackageName().toString() : "";
+        var sourceName = root.getSourceFile().getName();
+        if (sourceName != null && sourceName.endsWith(".java")) {
+            var separator = Math.max(sourceName.lastIndexOf('/'), sourceName.lastIndexOf('\\'));
+            var fileName = sourceName.substring(separator + 1, sourceName.length() - 5);
+            classes.add(packageName.isEmpty() ? fileName : packageName + "." + fileName);
+        }
+        for (var d : diagnosticsCopy) {
+            if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
+            var code = d.getCode();
+            if (code == null || (!code.startsWith("compiler.err.cant.resolve") && !code.equals("compiler.err.cant.apply.symbol"))) {
+                continue;
+            }
+            var message = d.getMessage(null);
+            if (message == null) continue;
+            var locationMatcher = LOCATION_CLASS_PATTERN.matcher(message);
+            if (locationMatcher.find()) {
+                classes.add(locationMatcher.group(1));
+            }
+            var inClassMatcher = IN_CLASS_PATTERN.matcher(message);
+            if (inClassMatcher.find()) {
+                classes.add(inClassMatcher.group(1));
+            }
+        }
+        return classes;
     }
 
     /**

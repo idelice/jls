@@ -9,6 +9,7 @@ import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
 import org.javacs.action.CodeActionProvider;
@@ -17,7 +18,6 @@ import org.javacs.completion.SignatureProvider;
 import org.javacs.fold.FoldProvider;
 import org.javacs.hover.HoverProvider;
 import org.javacs.index.SymbolProvider;
-import org.javacs.inlay.InlayHintProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ColorProvider;
@@ -37,6 +37,17 @@ class JavaLanguageServer extends LanguageServer {
     private boolean modifiedBuild = true;
     private CacheManager cacheManager;
     private String progressToken;
+    private final LinkedHashSet<Path> pendingFastLintFiles = new LinkedHashSet<>();
+    private final LinkedHashSet<Path> pendingFullLintFiles = new LinkedHashSet<>();
+    private long pendingFastLintSeq = 0;
+    private long pendingFullLintSeq = 0;
+    private long nextFastLintAtNanos = 0;
+    private long nextFullLintAtNanos = 0;
+    private long changeSequence = 0;
+    private long suppressFullLintUntilNanos = 0;
+    private static final long FAST_EDIT_LINT_DEBOUNCE_MS = 220;
+    private static final long FULL_LINT_IDLE_MS = 900;
+    private static final long FULL_LINT_SUPPRESS_AFTER_INTERACTIVE_MS = 1000;
 
     JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -62,13 +73,17 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     void lint(Collection<Path> files) {
+        lint(files, true, "full");
+    }
+
+    void lint(Collection<Path> files, boolean includeWarnings, String phase) {
         if (files.isEmpty()) return;
         LOG.info("Lint " + files.size() + " files...");
         var started = Instant.now();
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
             var compiled = Instant.now();
             LOG.info("...compiled in " + Duration.between(started, compiled).toMillis() + " ms");
-            publishDiagnosticsAndColors(task, started);
+            publishDiagnosticsAndColors(task, started, includeWarnings, phase);
         }
     }
 
@@ -77,14 +92,26 @@ class JavaLanguageServer extends LanguageServer {
      * This is separated from compilation so navigation can compile without this overhead.
      */
     void publishDiagnosticsAndColors(CompileTask task, Instant started) {
-        for (var errs : new ErrorProvider(task, lombokCache).errors()) {
+        publishDiagnosticsAndColors(task, started, true, "full");
+    }
+
+    void publishDiagnosticsAndColors(CompileTask task, Instant started, boolean includeWarnings, String phase) {
+        for (var errs : new ErrorProvider(task, lombokCache, includeWarnings).errors()) {
             client.publishDiagnostics(errs);
         }
         // for (var colors : new ColorProvider(task).colors()) {
         //     client.customNotification("java/colors", GSON.toJsonTree(colors));
         // }
         var published = Instant.now();
-        LOG.info("...published in " + Duration.between(started, published).toMillis() + " ms");
+        LOG.info(
+                "...published in "
+                        + Duration.between(started, published).toMillis()
+                        + " ms"
+                        + " [phase="
+                        + phase
+                        + ", includeWarnings="
+                        + includeWarnings
+                        + "]");
     }
 
     /**
@@ -252,9 +279,6 @@ class JavaLanguageServer extends LanguageServer {
         c.addProperty("documentFormattingProvider", true);
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
-        var inlayHintOptions = new JsonObject();
-        inlayHintOptions.addProperty("resolveProvider", false);
-        c.add("inlayHintProvider", inlayHintOptions);
         c.addProperty("foldingRangeProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
@@ -375,6 +399,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<CompletionList> completion(TextDocumentPositionParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
+        markInteractiveRequest("completion");
         var file = Paths.get(params.textDocument.uri);
         var provider = new CompletionProvider(compiler(), lombokCache);
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
@@ -390,6 +415,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public Optional<Hover> hover(TextDocumentPositionParams position) {
+        markInteractiveRequest("hover");
         var uri = position.textDocument.uri;
         var line = position.position.line + 1;
         var column = position.position.character + 1;
@@ -406,6 +432,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<SignatureHelp> signatureHelp(TextDocumentPositionParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
+        markInteractiveRequest("signature");
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
@@ -417,6 +444,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<List<Location>> gotoDefinition(TextDocumentPositionParams position) {
         if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        markInteractiveRequest("definition");
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
@@ -430,6 +458,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<List<Location>> findReferences(ReferenceParams position) {
         if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        markInteractiveRequest("references");
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
@@ -455,20 +484,6 @@ class JavaLanguageServer extends LanguageServer {
         var lenses = CodeLensProvider.find(task);
         LOG.fine("CodeLens: " + lenses.size() + " items for " + file.getFileName());
         return lenses;
-    }
-
-    @Override
-    public List<InlayHint> inlayHint(InlayHintParams params) {
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
-        if (!inlayHintsEnabled()) return List.of();
-        var file = Paths.get(params.textDocument.uri);
-        var provider =
-                new InlayHintProvider(
-                        compiler(),
-                        Duration.ofMillis(inlayHintsDebounceMs()),
-                        Duration.ofMillis(inlayHintsCacheIdleMs()),
-                        inlayHintsCacheMaxEntries());
-        return provider.inlayHints(file, params.range, inlayHintsParameterNames());
     }
 
     @Override
@@ -615,67 +630,13 @@ class JavaLanguageServer extends LanguageServer {
     private boolean uncheckedChanges = false;
     private Path lastEdited = Paths.get("");
 
-    private boolean inlayHintsEnabled() {
-        if (!settings.has("inlayHints")) return false;
-        var hints = settings.get("inlayHints");
-        if (hints.isJsonPrimitive() && hints.getAsJsonPrimitive().isBoolean()) {
-            return hints.getAsBoolean();
-        }
-        if (hints.isJsonObject()) {
-            var obj = hints.getAsJsonObject();
-            if (obj.has("enabled")) {
-                return obj.get("enabled").getAsBoolean();
-            }
-        }
-        return false;
-    }
-
-    private boolean inlayHintsParameterNames() {
-        if (!settings.has("inlayHints")) return true;
-        var hints = settings.get("inlayHints");
-        if (hints.isJsonObject()) {
-            var obj = hints.getAsJsonObject();
-            if (obj.has("parameterNames")) {
-                return obj.get("parameterNames").getAsBoolean();
-            }
-        }
-        return true;
-    }
-
-    private int inlayHintsDebounceMs() {
-        return readInlayHintsIntSetting("debounceMs", 250, 0, 2000);
-    }
-
-    private int inlayHintsCacheIdleMs() {
-        return readInlayHintsIntSetting("cacheIdleMs", 120000, 5000, 1800000);
-    }
-
-    private int inlayHintsCacheMaxEntries() {
-        return readInlayHintsIntSetting("cacheMaxEntries", 256, 16, 4096);
-    }
-
-    private int readInlayHintsIntSetting(String key, int fallback, int min, int max) {
-        if (!settings.has("inlayHints")) return fallback;
-        var hints = settings.get("inlayHints");
-        if (!hints.isJsonObject()) return fallback;
-        var obj = hints.getAsJsonObject();
-        if (!obj.has(key)) return fallback;
-        try {
-            var value = obj.get(key).getAsInt();
-            if (value < min) return min;
-            if (value > max) return max;
-            return value;
-        } catch (Exception ignored) {
-            return fallback;
-        }
-    }
-
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isJavaFile(params.textDocument.uri)) return;
         lastEdited = Paths.get(params.textDocument.uri);
         uncheckedChanges = true;
+        scheduleDebouncedLint(lastEdited, "open");
     }
 
     @Override
@@ -683,6 +644,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.change(params);
         lastEdited = Paths.get(params.textDocument.uri);
         uncheckedChanges = true;
+        scheduleDebouncedLint(lastEdited, "change");
     }
 
     @Override
@@ -690,7 +652,9 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.close(params);
 
         if (FileStore.isJavaFile(params.textDocument.uri)) {
-            InlayHintProvider.invalidate(Paths.get(params.textDocument.uri));
+            var closed = Paths.get(params.textDocument.uri);
+            pendingFastLintFiles.remove(closed);
+            pendingFullLintFiles.remove(closed);
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }
@@ -709,23 +673,178 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
+            pendingFastLintFiles.clear();
+            pendingFullLintFiles.clear();
             // Re-lint all active documents
-            lint(FileStore.activeDocuments());
+            lint(FileStore.activeDocuments(), true, "full-save");
         }
     }
 
     @Override
     public void doAsyncWork() {
-        if (uncheckedChanges && FileStore.activeDocuments().contains(lastEdited)) {
+        var now = System.nanoTime();
+        if (!uncheckedChanges) {
+            return;
+        }
+
+        if (!pendingFastLintFiles.isEmpty()
+                && now >= nextFastLintAtNanos) {
             try {
-                lint(List.of(lastEdited));
+                var files = activeOnly(pendingFastLintFiles);
+                var seq = pendingFastLintSeq;
+                pendingFastLintFiles.clear();
+                if (!files.isEmpty()) {
+                    LOG.fine(
+                            "[lint-scheduler] run fast lint files="
+                                    + files.size()
+                                    + " seq="
+                                    + seq
+                                    + " debounce_ms="
+                                    + fastEditLintDebounceMs());
+                    lint(files, false, "fast");
+                }
             } catch (Exception e) {
                 // Log but don't crash server. Lint failures should not terminate the language server.
-                LOG.warning("Async lint failed for " + lastEdited + ": " + e.getMessage());
+                LOG.warning("Async lint failed: " + e.getMessage());
                 LOG.log(java.util.logging.Level.FINE, "", e);
-            } finally {
-                uncheckedChanges = false;
             }
+        }
+
+        if (!warningsOnSaveOnly()
+                && !pendingFullLintFiles.isEmpty()
+                && now >= nextFullLintAtNanos
+                && now >= suppressFullLintUntilNanos) {
+            try {
+                var files = activeOnly(pendingFullLintFiles);
+                var seq = pendingFullLintSeq;
+                pendingFullLintFiles.clear();
+                if (!files.isEmpty()) {
+                    LOG.fine(
+                            "[lint-scheduler] run full lint files="
+                                    + files.size()
+                                    + " seq="
+                                    + seq
+                                    + " idle_ms="
+                                    + fullLintIdleMs());
+                    lint(files, true, "full-idle");
+                }
+            } catch (Exception e) {
+                LOG.warning("Async full lint failed: " + e.getMessage());
+                LOG.log(java.util.logging.Level.FINE, "", e);
+            }
+        }
+
+        if (pendingFastLintFiles.isEmpty() && (warningsOnSaveOnly() || pendingFullLintFiles.isEmpty())) {
+            uncheckedChanges = false;
+        }
+    }
+
+    private List<Path> activeOnly(LinkedHashSet<Path> files) {
+        var active = FileStore.activeDocuments();
+        var result = new ArrayList<Path>();
+        for (var file : files) {
+            if (active.contains(file)) {
+                result.add(file);
+            }
+        }
+        return result;
+    }
+
+    private void scheduleDebouncedLint(Path file, String reason) {
+        if (!FileStore.activeDocuments().contains(file)) {
+            return;
+        }
+        if (isCachedJarSource(file)) {
+            LOG.fine("[lint-scheduler] skip cached jar source file=" + file + " reason=" + reason);
+            return;
+        }
+        pendingFastLintFiles.add(file);
+        changeSequence++;
+        pendingFastLintSeq = changeSequence;
+        var now = System.nanoTime();
+        nextFastLintAtNanos = now + TimeUnit.MILLISECONDS.toNanos(fastEditLintDebounceMs());
+        if (!warningsOnSaveOnly()) {
+            pendingFullLintFiles.add(file);
+            pendingFullLintSeq = changeSequence;
+            nextFullLintAtNanos = now + TimeUnit.MILLISECONDS.toNanos(fullLintIdleMs());
+        }
+        LOG.fine(
+                "[lint-scheduler] queued "
+                        + reason
+                        + " file="
+                        + file
+                        + " pending_fast="
+                        + pendingFastLintFiles.size()
+                        + " pending_full="
+                        + pendingFullLintFiles.size()
+                        + " seq="
+                        + pendingFastLintSeq
+                        + " fast_due_ms="
+                        + fastEditLintDebounceMs()
+                        + " full_due_ms="
+                        + (warningsOnSaveOnly() ? 0 : fullLintIdleMs())
+                        + " warnings_on_save_only="
+                        + warningsOnSaveOnly());
+    }
+
+    private boolean isCachedJarSource(Path file) {
+        var path = file.toString();
+        return path.contains("jls-jar-sources");
+    }
+
+    private void markInteractiveRequest(String source) {
+        suppressFullLintUntilNanos =
+                System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fullLintSuppressAfterInteractiveMs());
+        LOG.fine(
+                "[lint-scheduler] suppress full lint source="
+                        + source
+                        + " for_ms="
+                        + fullLintSuppressAfterInteractiveMs());
+    }
+
+    private boolean warningsOnSaveOnly() {
+        return readDiagnosticsBooleanSetting("warningsOnSaveOnly", true);
+    }
+
+    private int fastEditLintDebounceMs() {
+        return readDiagnosticsIntSetting("fastDebounceMs", (int) FAST_EDIT_LINT_DEBOUNCE_MS, 50, 1000);
+    }
+
+    private int fullLintIdleMs() {
+        return readDiagnosticsIntSetting("fullIdleMs", (int) FULL_LINT_IDLE_MS, 200, 5000);
+    }
+
+    private int fullLintSuppressAfterInteractiveMs() {
+        return readDiagnosticsIntSetting(
+                "interactiveSuppressMs", (int) FULL_LINT_SUPPRESS_AFTER_INTERACTIVE_MS, 100, 5000);
+    }
+
+    private boolean readDiagnosticsBooleanSetting(String key, boolean fallback) {
+        if (!settings.has("diagnostics")) return fallback;
+        var diagnostics = settings.get("diagnostics");
+        if (!diagnostics.isJsonObject()) return fallback;
+        var obj = diagnostics.getAsJsonObject();
+        if (!obj.has(key)) return fallback;
+        try {
+            return obj.get(key).getAsBoolean();
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
+    private int readDiagnosticsIntSetting(String key, int fallback, int min, int max) {
+        if (!settings.has("diagnostics")) return fallback;
+        var diagnostics = settings.get("diagnostics");
+        if (!diagnostics.isJsonObject()) return fallback;
+        var obj = diagnostics.getAsJsonObject();
+        if (!obj.has(key)) return fallback;
+        try {
+            var value = obj.get(key).getAsInt();
+            if (value < min) return min;
+            if (value > max) return max;
+            return value;
+        } catch (Exception ignored) {
+            return fallback;
         }
     }
 

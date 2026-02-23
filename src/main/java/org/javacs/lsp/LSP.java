@@ -243,10 +243,8 @@ public class LSP {
             }
             // If poll(_) failed, loop again
             if (r == null) {
-                if (hasAsyncWork) {
-                    server.doAsyncWork();
-                    hasAsyncWork = false;
-                }
+                server.doAsyncWork();
+                hasAsyncWork = false;
                 continue;
             }
             // Otherwise, process the new message
@@ -409,13 +407,6 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, CodeLensParams.class);
                             var response = server.codeLens(params);
-                            respond(send, r.id, response);
-                            break;
-                        }
-                    case "textDocument/inlayHint":
-                        {
-                            var params = gson.fromJson(r.params, InlayHintParams.class);
-                            var response = server.inlayHint(params);
                             respond(send, r.id, response);
                             break;
                         }

@@ -270,6 +270,7 @@ class CompileBatch implements AutoCloseable {
         Collections.addAll(list, "-proc:none");
 
         Collections.addAll(list, "-g");
+        Collections.addAll(list, "-Xmaxerrs", "5000");
         // You would think we could do -Xlint:all,
         // but some lints trigger fatal errors in the presence of parse errors
         Collections.addAll(
@@ -302,6 +303,7 @@ class CompileBatch implements AutoCloseable {
         Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         Collections.addAll(list, "-proc:none");
         Collections.addAll(list, "-g");
+        Collections.addAll(list, "-Xmaxerrs", "5000");
 
         Collections.addAll(
                 list,
@@ -314,12 +316,44 @@ class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        list.addAll(extraArgs);
+        list.addAll(filterApOptions(extraArgs));
         for (var export : addExports) {
             list.add("--add-exports");
             list.add(export + "=ALL-UNNAMED");
         }
         return list;
+    }
+
+    private static List<String> filterApOptions(Set<String> extraArgs) {
+        var filtered = new ArrayList<String>();
+        var skipNextValue = false;
+        for (var arg : extraArgs) {
+            if (skipNextValue) {
+                skipNextValue = false;
+                continue;
+            }
+            if (arg == null || arg.isBlank()) continue;
+            if (arg.equals("-processor")) {
+                skipNextValue = true;
+                continue;
+            }
+            if (arg.startsWith("-processor=")) continue;
+            if (arg.equals("-processorpath")) {
+                skipNextValue = true;
+                continue;
+            }
+            if (arg.startsWith("-processorpath=")) continue;
+            if (arg.equals("--processor-path")) {
+                skipNextValue = true;
+                continue;
+            }
+            if (arg.startsWith("--processor-path=")) continue;
+            if (arg.startsWith("-proc:")) continue;
+            if (arg.equals("-XprintProcessorInfo")) continue;
+            if (arg.equals("-XprintRounds")) continue;
+            filtered.add(arg);
+        }
+        return filtered;
     }
 
     private boolean isValidFileRange(javax.tools.Diagnostic<? extends JavaFileObject> d) {

@@ -67,10 +67,17 @@ class JavaCompilerService implements CompilerProvider {
             cachedCompile.borrow.close();
         }
         cachedCompile = null;
-        cachedCompile = doCompile(sources);
-        cachedModified.clear();
-        for (var f : sources) {
-            cachedModified.put(f, f.getLastModified());
+        try {
+            cachedCompile = doCompile(sources);
+            cachedModified.clear();
+            for (var f : sources) {
+                cachedModified.put(f, f.getLastModified());
+            }
+        } catch (RuntimeException e) {
+            // If compilation fails, force a fresh compile on next request instead of
+            // reusing stale source timestamps with a null cachedCompile.
+            cachedModified.clear();
+            throw e;
         }
     }
 
@@ -81,12 +88,8 @@ class JavaCompilerService implements CompilerProvider {
         try {
             firstAttempt = new CompileBatch(this, sources);
         } catch (CompileBatch.APFailureException e) {
-            // AP failed - retry without AP if Lombok is present
-            if (isLombokPresentOnClasspath()) {
-                LOG.warning("Annotation processing failed: " + e.getMessage() + ", retrying without AP");
-                return doCompileWithoutAP(sources);
-            }
-            throw e;
+            LOG.warning("Compilation analyze failed with AP enabled: " + e.getMessage() + ", retrying without AP");
+            return doCompileWithoutAP(sources);
         } catch (RuntimeException e) {
             // Other compilation errors
             throw e;
@@ -118,12 +121,8 @@ class JavaCompilerService implements CompilerProvider {
         try {
             secondAttempt = new CompileBatch(this, moreSources);
         } catch (CompileBatch.APFailureException e) {
-            // AP failed on second attempt too - retry without AP
-            if (isLombokPresentOnClasspath()) {
-                LOG.warning("Annotation processing failed on retry: " + e.getMessage() + ", using non-AP compilation");
-                return doCompileWithoutAP(moreSources);
-            }
-            throw e;
+            LOG.warning("Compilation analyze failed on retry with AP enabled: " + e.getMessage() + ", using non-AP compilation");
+            return doCompileWithoutAP(moreSources);
         } catch (RuntimeException e) {
             // Other compilation errors
             throw e;
@@ -133,7 +132,7 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
-        if (needsCompile(sources)) {
+        if (cachedCompile == null || needsCompile(sources)) {
             loadCompile(sources);
         } else {
             LOG.info("...using cached compile");
@@ -401,18 +400,6 @@ class JavaCompilerService implements CompilerProvider {
      */
     private CompileBatch doCompileWithoutAP(Collection<? extends JavaFileObject> sources) {
         return new CompileBatch(this, sources, false);  // false = no AP
-    }
-
-    /**
-     * Check if Lombok is present on the classpath.
-     */
-    private boolean isLombokPresentOnClasspath() {
-        return classPath.stream()
-                .anyMatch(
-                        p -> {
-                            var name = p.getFileName().toString().toLowerCase();
-                            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
-                        });
     }
 
     private static final Logger LOG = Logger.getLogger("main");

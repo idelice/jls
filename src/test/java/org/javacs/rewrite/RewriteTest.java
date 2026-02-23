@@ -62,6 +62,27 @@ public class RewriteTest {
     }
 
     @Test
+    public void fixImportsProjectType() {
+        var file = file("FixImportsProjectType.java");
+        var edits = new AutoFixImports(file).rewrite(compiler);
+        assertThat(edits, hasKey(file));
+        for (var edit : edits.get(file)) {
+            if (edit.newText.contains("org.javacs.other.Admin")) {
+                return;
+            }
+        }
+        fail("didn't re-create import org.javacs.other.Admin");
+    }
+
+    @Test
+    public void fixImportsProducesSingleImportEdit() {
+        var file = file("FixImportsProjectType.java");
+        var edits = new AutoFixImports(file).rewrite(compiler);
+        assertThat(edits, hasKey(file));
+        assertThat(edits.get(file).length, is(1));
+    }
+
+    @Test
     public void ignoreStaticImport() {
         var file = file("StaticImport.java");
         var edits = new AutoFixImports(file).rewrite(compiler);

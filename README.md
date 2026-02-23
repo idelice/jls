@@ -10,9 +10,8 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Go-to-definition** - Navigate to class definitions in workspace and JARs (including private repositories)
 - **Hover information** - Type information and Javadoc documentation with proper formatting
 - **Find references** - Find all usages of symbols
-- **Diagnostics** - Real-time linting and error reporting
+- **Diagnostics** - Debounced linting with fast-on-type + full-on-save/idle reporting
 - **Signature help** - Parameter information for method calls
-- **Inlay hints** - Parameter names and `var` type hints
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
   - Nested Lombok type completion (e.g., `obj.getLombokField().get` shows all members)
   - **Note**: Lombok support covers standard use cases but cannot handle all edge cases due to Lombok's advanced metaprogramming features
@@ -91,6 +90,29 @@ The language server will automatically detect dependencies from:
 - Gradle (`build.gradle`)
 - Bazel (`BUILD` files)
 
+### Diagnostics Settings
+
+Diagnostics behavior is configured from your client via `java.diagnostics`:
+
+```json
+{
+    "java": {
+        "diagnostics": {
+            "warningsOnSaveOnly": true,
+            "fastDebounceMs": 220,
+            "fullIdleMs": 900,
+            "interactiveSuppressMs": 1000
+        }
+    }
+}
+```
+
+Options:
+- `warningsOnSaveOnly` (default `true`): while typing, publish fast diagnostics without warning scans; publish full diagnostics on save.
+- `fastDebounceMs` (default `220`, range `50..1000`): debounce for fast diagnostics after edits.
+- `fullIdleMs` (default `900`, range `200..5000`): idle delay before full diagnostics when `warningsOnSaveOnly` is `false`.
+- `interactiveSuppressMs` (default `1000`, range `100..5000`): suppress full diagnostics briefly after interactive requests (completion/hover/signature/definition/references).
+
 ### Manual dependency specification
 
 If automatic detection doesn't work, you can specify dependencies in your project root in a `.java-language-server.json` file:
@@ -138,50 +160,6 @@ Private Maven repositories are currently not supported. Go-to-definition on depe
         "/path/to/private-dep-sources.jar"
     ]
 }
-```
-
-## Inlay Hints
-
-JLS supports LSP inlay hints for:
-- parameter names
-- `var` type hints (always on when inlay hints are enabled)
-
-These are controlled by the `java.inlayHints` settings block sent by your client:
-
-```json
-{
-    "java": {
-        "inlayHints": {
-            "enabled": true,
-            "parameterNames": true,
-            "debounceMs": 250,
-            "cacheIdleMs": 120000,
-            "cacheMaxEntries": 256
-        }
-    }
-}
-```
-
-Options:
-- `enabled`: master switch for inlay hints.
-- `parameterNames`: show/hide parameter name hints.
-- `debounceMs`: delay window to reuse previous hints while typing (reduces flicker).
-- `cacheIdleMs`: remove idle cached hint snapshots after this time.
-- `cacheMaxEntries`: maximum number of cached files before oldest entries are evicted.
-
-Behavior details:
-- If `inlayHints` is boolean `true`, all inlay hints are enabled.
-- If `inlayHints` is boolean `false`, all inlay hints are disabled.
-- `var` type hints are no longer configurable separately.
-
-Examples:
-
-```json
-{ "java": { "inlayHints": true } }
-```
-
-```json
-{ "java": { "inlayHints": { "enabled": true, "parameterNames": false, "debounceMs": 200 } } }
 ```
 
 ## CodeLens
@@ -246,10 +224,6 @@ container.getItem().get
 ```
 
 This works through semantic type resolution using the Java compiler API's type system, ensuring 100% accuracy with zero performance impact.
-
-### Inlay Hints
-
-Inlay hints are now available for parameter names and `var` types. When enabled, hints are derived from source when possible and avoid displaying synthetic `argN` names.
 
 ### Limitations of Lombok Support
 
