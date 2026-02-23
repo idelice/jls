@@ -171,6 +171,9 @@ public class ErrorProvider {
         if ("compiler.err.cant.apply.symbol".equals(code)) {
             return true;
         }
+        if ("compiler.err.cant.resolve.location.args".equals(code) || "compiler.err.cant.resolve.args".equals(code)) {
+            return true;
+        }
         if (!code.startsWith("compiler.err.cant.resolve")) {
             return false;
         }
