@@ -819,6 +819,12 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void instanceofPatternVariableAppearsInIdentifierCompletion() {
+        var labels = label("/org/javacs/example/LombokPatternCompletion.java", 8, 20);
+        assertThat(labels, hasItem("somepojo"));
+    }
+
+    @Test
     public void lombokGeneratedCompletionIncludesFieldAnnotationContext() {
         var docs = documentation("/org/javacs/example/LombokCompletionDocs.java", 14, 15);
         assertThat(docs, hasItem(org.hamcrest.Matchers.containsString("public String getFoo()")));

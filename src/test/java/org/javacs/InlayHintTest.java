@@ -32,13 +32,27 @@ public class InlayHintTest {
     }
 
     @Test
-    public void parameterLiteralTypeHintsAreReturned() {
+    public void parameterNameHintsAreReturned() {
         var uri = FindResource.uri("/org/javacs/example/InlayHintsExample.java");
         var hints = server.inlayHint(new InlayHintParams(new TextDocumentIdentifier(uri), fullRange()));
         var labels = hints.stream().map(h -> h.label).collect(Collectors.toList());
 
-        assertThat("labels=" + labels, labels.contains("String:"), equalTo(true));
-        assertThat("labels=" + labels, labels.contains("int:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("label:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("count:"), equalTo(true));
+    }
+
+    @Test
+    public void parameterNameHintsCoverConstructorsMethodsAndNullWithoutNullType() {
+        var uri = FindResource.uri("/org/javacs/example/ParameterNameHintsExample.java");
+        var hints = server.inlayHint(new InlayHintParams(new TextDocumentIdentifier(uri), fullRange()));
+        var labels = hints.stream().map(h -> h.label).collect(Collectors.toList());
+
+        assertThat("labels=" + labels, labels.contains("capacity:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("bound:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("text:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("value:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("maybe:"), equalTo(true));
+        assertThat("labels=" + labels, labels.contains("<nulltype>:"), equalTo(false));
     }
 
     @Test

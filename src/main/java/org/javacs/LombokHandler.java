@@ -1757,9 +1757,6 @@ public final class LombokHandler {
         if (rawClassName == null || rawClassName.isBlank()) {
             return rawClassName;
         }
-        if (rawClassName.contains(".")) {
-            return rawClassName;
-        }
         var elements = task.task.getElements();
         var direct = elements.getTypeElement(rawClassName);
         if (direct != null) {
@@ -1799,7 +1796,7 @@ public final class LombokHandler {
 
     private static String normalizeDiagnosticClassName(
             CompileTask task, CompilationUnitTree root, String className) {
-        if (className == null || className.isBlank() || className.contains(".")) {
+        if (className == null || className.isBlank()) {
             return className;
         }
         var elements = task.task.getElements();

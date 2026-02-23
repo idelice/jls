@@ -165,6 +165,12 @@ public class WarningsTest {
     }
 
     @Test
+    public void lombokGetterChainOnPatternVariableDoesNotReportMissingSymbol() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokPatternGetterChain.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+    }
+
+    @Test
     public void lombokSetterCallOnThisDoesNotReportMissingSymbol() {
         server.lint(List.of(FindResource.path("org/javacs/example/LombokThisSetterAndCondition.java")));
         assertThat(errors, not(hasItem("compiler.err.cant.resolve.location.args(10)")));

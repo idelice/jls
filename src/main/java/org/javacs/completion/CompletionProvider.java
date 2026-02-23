@@ -939,6 +939,7 @@ public class CompletionProvider {
             case INTERFACE:
                 return CompletionItemKind.Interface;
             case LOCAL_VARIABLE:
+            case BINDING_VARIABLE:
                 return CompletionItemKind.Variable;
             case METHOD:
                 return CompletionItemKind.Method;

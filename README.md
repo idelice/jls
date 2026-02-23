@@ -14,7 +14,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Signature help** - Parameter information for method calls
 - **Inlay hints**
   - `var` inferred type hints
-  - Literal argument type hints in calls/constructors (e.g. `String:`, `int:`)
+  - Parameter name hints in calls/constructors (e.g. `text:`, `bound:`)
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
   - Nested Lombok type completion (e.g., `obj.getLombokField().get` shows all members)
   - **Note**: Lombok support covers standard use cases but cannot handle all edge cases due to Lombok's advanced metaprogramming features
@@ -172,6 +172,8 @@ JLS currently provides CodeLens entries for test classes and methods (JUnit 4/5 
 ## Inlay Hints
 
 JLS supports `textDocument/inlayHint`
+
+Parameter hints use argument names where available (including `null` arguments as parameter-name hints, not `<nulltype>` type hints).
 
 To reduce noise, JLS intentionally suppresses redundant `var` hints when the initializer already makes the type explicit:
 
