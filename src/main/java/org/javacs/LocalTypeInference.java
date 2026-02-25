@@ -19,10 +19,14 @@ import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 
 public final class LocalTypeInference {
+    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final String DEBUG_COMPLETION_RESOLUTION_PROP = "jls.debug.completion.resolution";
+
     private LocalTypeInference() {}
 
     public static DeclaredType inferDeclaredTypeOfVarIdentifier(
             CompileTask task, TreePath identifierPath, LombokMetadataCache cache) {
+        var debugResolution = Boolean.getBoolean(DEBUG_COMPLETION_RESOLUTION_PROP);
         if (identifierPath == null || !(identifierPath.getLeaf() instanceof IdentifierTree)) {
             return null;
         }
@@ -32,7 +36,15 @@ public final class LocalTypeInference {
             return null;
         }
         var variable = (VariableElement) element;
-        if (variable.asType() instanceof DeclaredType) {
+        if (variable.asType() instanceof DeclaredType && isResolvedType(variable.asType())) {
+            if (debugResolution) {
+                LOG.info(
+                        "[local-type-infer] var="
+                                + variable.getSimpleName()
+                                + " declared_type="
+                                + variable.asType()
+                                + " source=element");
+            }
             return (DeclaredType) variable.asType();
         }
         var declarationPath = trees.getPath(element);
@@ -55,8 +67,24 @@ public final class LocalTypeInference {
         }
         var initializerPath = new TreePath(declarationPath, declaration.getInitializer());
         var inferred = inferExpressionType(task, initializerPath, cache, Map.of());
-        if (inferred instanceof DeclaredType) {
+        if (inferred instanceof DeclaredType && isResolvedType(inferred)) {
+            if (debugResolution) {
+                LOG.info(
+                        "[local-type-infer] var="
+                                + variable.getSimpleName()
+                                + " inferred_type="
+                                + inferred
+                                + " source=initializer");
+            }
             return (DeclaredType) inferred;
+        }
+        if (debugResolution) {
+            LOG.info(
+                    "[local-type-infer] var="
+                            + variable.getSimpleName()
+                            + " inferred_type="
+                            + inferred
+                            + " source=initializer_unresolved");
         }
         return null;
     }

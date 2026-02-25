@@ -282,6 +282,89 @@ public final class LombokHandler {
         return null;
     }
 
+    public static javax.lang.model.type.TypeMirror resolveLombokChainedErrorType(
+            CompileTask task, String errorTypeName, LombokMetadataCache cache) {
+        var requestCache = new RequestCache("resolveLombokChainedErrorType:" + errorTypeName);
+        return resolveLombokChainedErrorType(task, errorTypeName, cache, requestCache);
+    }
+
+    private static javax.lang.model.type.TypeMirror resolveLombokChainedErrorType(
+            CompileTask task, String errorTypeName, LombokMetadataCache cache, RequestCache requestCache) {
+        if (errorTypeName == null || errorTypeName.isBlank()) {
+            return null;
+        }
+        var parts = errorTypeName.split("\\.");
+        if (parts.length < 2) {
+            return null;
+        }
+        var elements = task.task.getElements();
+        TypeElement owner = null;
+        int methodStart = -1;
+        for (int i = parts.length - 1; i >= 1; i--) {
+            var candidate = String.join(".", java.util.Arrays.copyOfRange(parts, 0, i));
+            owner = elements.getTypeElement(candidate);
+            if (owner != null) {
+                methodStart = i;
+                break;
+            }
+        }
+        if (owner == null || methodStart < 0 || methodStart >= parts.length) {
+            return null;
+        }
+
+        var currentType = (javax.lang.model.type.TypeMirror) owner.asType();
+        for (int i = methodStart; i < parts.length; i++) {
+            var methodName = parts[i];
+            var nextType = resolveZeroArgMemberReturnType(task, cache, currentType, methodName, requestCache);
+            if (nextType == null || nextType.getKind() == TypeKind.ERROR || nextType.getKind() == TypeKind.NONE) {
+                return null;
+            }
+            currentType = nextType;
+        }
+        return currentType;
+    }
+
+    private static javax.lang.model.type.TypeMirror resolveZeroArgMemberReturnType(
+            CompileTask task,
+            LombokMetadataCache cache,
+            javax.lang.model.type.TypeMirror ownerType,
+            String methodName,
+            RequestCache requestCache) {
+        if (!(ownerType instanceof DeclaredType)) {
+            return null;
+        }
+        var ownerElement = ((DeclaredType) ownerType).asElement();
+        if (!(ownerElement instanceof TypeElement)) {
+            return null;
+        }
+        var typeElement = (TypeElement) ownerElement;
+        var ownerClassName = typeElement.getQualifiedName().toString();
+
+        var metadata = metadataForClass(task, ownerClassName, cache, requestCache);
+        if (metadata != null && metadata.isGeneratedGetter(methodName)) {
+            var field = metadata.fieldForGetter(methodName);
+            if (field != null) {
+                for (var member : allMembers(task, typeElement, requestCache)) {
+                    if (member.getKind() == ElementKind.FIELD && member.getSimpleName().contentEquals(field.getName())) {
+                        return ((VariableElement) member).asType();
+                    }
+                }
+            }
+        }
+
+        for (var member : allMembers(task, typeElement, requestCache)) {
+            if (member.getKind() != ElementKind.METHOD || !member.getSimpleName().contentEquals(methodName)) {
+                continue;
+            }
+            var method = (ExecutableElement) member;
+            if (!method.getParameters().isEmpty()) {
+                continue;
+            }
+            return method.getReturnType();
+        }
+        return null;
+    }
+
     /**
      * Resolve the return type of a MethodInvocationTree that may call a Lombok-generated method.
      * This handles nested method chaining like: obj.getField1().getField2().getField3()
@@ -369,6 +452,15 @@ public final class LombokHandler {
                     return null;
                 }
                 LOG.fine("...recursive resolution succeeded: " + receiverType);
+            } else if (memberSelect.getExpression() instanceof IdentifierTree) {
+                // Support var chains where the receiver local was initialized from another Lombok getter.
+                var inferredReceiver = LocalTypeInference.inferDeclaredTypeOfVarIdentifier(task, receiverPath, cache);
+                if (inferredReceiver == null || inferredReceiver.getKind() == TypeKind.ERROR) {
+                    LOG.fine("...identifier receiver type inference failed");
+                    return null;
+                }
+                receiverType = inferredReceiver;
+                LOG.fine("...identifier receiver type inferred: " + receiverType);
             } else {
                 LOG.fine("...receiver is not MethodInvocationTree, cannot resolve ERROR type");
                 return null;

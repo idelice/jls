@@ -19,6 +19,7 @@ public class DiagnosticsSchedulerTest {
     private final AtomicInteger totalPublished = new AtomicInteger();
     private final List<String> publishedCodesForFile = new ArrayList<>();
     private final List<String> publishedCodesWithLineForFile = new ArrayList<>();
+    private final List<List<String>> publishEventsForFile = new ArrayList<>();
     private JavaLanguageServer server;
     private Path file;
     private Path secondFile;
@@ -32,6 +33,7 @@ public class DiagnosticsSchedulerTest {
         totalPublished.set(0);
         publishedCodesForFile.clear();
         publishedCodesWithLineForFile.clear();
+        publishEventsForFile.clear();
         server =
                 LanguageServerFixture.getJavaLanguageServer(
                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT,
@@ -41,9 +43,11 @@ public class DiagnosticsSchedulerTest {
                                 totalPublished.incrementAndGet();
                                 if (params.uri.equals(file.toUri())) {
                                     publishedForFile.incrementAndGet();
+                                    var eventCodes = new ArrayList<String>();
                                     for (var diagnostic : params.diagnostics) {
                                         if (diagnostic.code != null) {
                                             publishedCodesForFile.add(diagnostic.code);
+                                            eventCodes.add(diagnostic.code);
                                             publishedCodesWithLineForFile.add(
                                                     String.format(
                                                             "%s(%d)",
@@ -51,6 +55,7 @@ public class DiagnosticsSchedulerTest {
                                                             diagnostic.range.start.line + 1));
                                         }
                                     }
+                                    publishEventsForFile.add(eventCodes);
                                 }
                                 if (params.uri.equals(secondFile.toUri())) {
                                     publishedForSecondFile.incrementAndGet();
@@ -94,7 +99,33 @@ public class DiagnosticsSchedulerTest {
         var save = new DidSaveTextDocumentParams();
         save.textDocument = new TextDocumentIdentifier(file.toUri());
         server.didSaveTextDocument(save);
+        Thread.sleep(220);
+        server.doAsyncWork();
         assertThat(publishedForFile.get(), greaterThanOrEqualTo(2));
+    }
+
+    @Test
+    public void savePublishesErrorsFirstThenDeferredWarnings() throws Exception {
+        file = FindResource.path("org/javacs/warn/UnusedAfterTyping.java");
+        open(file);
+
+        publishEventsForFile.clear();
+        publishedCodesWithLineForFile.clear();
+
+        var save = new DidSaveTextDocumentParams();
+        save.textDocument = new TextDocumentIdentifier(file.toUri());
+        server.didSaveTextDocument(save);
+
+        assertThat(publishEventsForFile.size(), is(1));
+        var firstHasUnusedWarning =
+                publishEventsForFile.get(0).stream().anyMatch(code -> code.startsWith("unused_local"));
+        assertThat(firstHasUnusedWarning, is(false));
+
+        Thread.sleep(220);
+        server.doAsyncWork();
+        var hasUnusedAfterDeferredPhase =
+                publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("unused_local("));
+        assertThat(hasUnusedAfterDeferredPhase, is(true));
     }
 
     @Test
@@ -206,6 +237,7 @@ public class DiagnosticsSchedulerTest {
         var save = new DidSaveTextDocumentParams();
         save.textDocument = new TextDocumentIdentifier(file.toUri());
         server.didSaveTextDocument(save);
+        Thread.sleep(220);
         server.doAsyncWork();
 
         var hasUnusedAfterSave =
@@ -224,11 +256,49 @@ public class DiagnosticsSchedulerTest {
 
         publishedCodesWithLineForFile.clear();
         server.didSaveTextDocument(save);
+        Thread.sleep(220);
         server.doAsyncWork();
 
         var hasUnusedAfterSecondSave =
                 publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("unused_local("));
         assertThat(hasUnusedAfterSecondSave, is(true));
+    }
+
+    @Test
+    public void stressTypingBurstPublishesTwoPhaseDiagnosticsForManyWarnings() throws Exception {
+        file = FindResource.path("org/javacs/warn/DiagnosticsStress.java");
+        open(file);
+
+        publishEventsForFile.clear();
+        publishedCodesWithLineForFile.clear();
+        var base = FileStore.contents(file);
+
+        // Simulate rapid typing bursts (multiple didChange events before debounce fires).
+        for (int i = 0; i < 40; i++) {
+            var edited = (i % 2 == 0) ? base + "\n" : base;
+            edit(file, edited);
+        }
+
+        Thread.sleep(260);
+        server.doAsyncWork();
+        assertThat("fast phase should publish once", publishEventsForFile.size(), is(1));
+        var firstHasWarnings =
+                publishEventsForFile.get(0).stream().anyMatch(code -> code.startsWith("unused_local"));
+        assertThat("fast phase should not include warnings", firstHasWarnings, is(false));
+
+        var beforeSaveEvents = publishEventsForFile.size();
+        var save = new DidSaveTextDocumentParams();
+        save.textDocument = new TextDocumentIdentifier(file.toUri());
+        server.didSaveTextDocument(save);
+
+        Thread.sleep(220);
+        server.doAsyncWork();
+        var eventsAfterSave = publishEventsForFile.size() - beforeSaveEvents;
+        assertThat("save path should produce bounded diagnostics publishes", eventsAfterSave >= 1 && eventsAfterSave <= 2, is(true));
+
+        var hasWarningsAfterSave =
+                publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("unused_local("));
+        assertThat("save/deferred path should contain warning diagnostics", hasWarningsAfterSave, is(true));
     }
 
     private static int editVersion = 1;

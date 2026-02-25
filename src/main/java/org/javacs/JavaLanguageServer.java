@@ -39,16 +39,20 @@ class JavaLanguageServer extends LanguageServer {
     private String progressToken;
     private final LinkedHashSet<Path> pendingFastLintFiles = new LinkedHashSet<>();
     private final LinkedHashSet<Path> pendingFullLintFiles = new LinkedHashSet<>();
+    private final LinkedHashSet<Path> pendingWarningLintFiles = new LinkedHashSet<>();
     private long pendingFastLintSeq = 0;
     private long pendingFullLintSeq = 0;
+    private long pendingWarningLintSeq = 0;
     private long nextFastLintAtNanos = 0;
     private long nextFullLintAtNanos = 0;
+    private long nextWarningLintAtNanos = 0;
     private long changeSequence = 0;
     private long suppressFullLintUntilNanos = 0;
     private final Map<java.net.URI, Integer> diagnosticsFingerprintByUri = new HashMap<>();
     private final InlayHintProvider inlayHintProvider = new InlayHintProvider();
     private static final long FAST_EDIT_LINT_DEBOUNCE_MS = 220;
     private static final long FULL_LINT_IDLE_MS = 900;
+    private static final long DEFERRED_WARNING_LINT_MS = 160;
     private static final long FULL_LINT_SUPPRESS_AFTER_INTERACTIVE_MS = 1000;
 
     JavaCompilerService compiler() {
@@ -80,21 +84,34 @@ class JavaLanguageServer extends LanguageServer {
 
     void lint(Collection<Path> files, boolean includeWarnings, String phase) {
         if (files.isEmpty()) return;
+        if (includeWarnings && shouldUseTwoPhaseDiagnostics(phase)) {
+            lint(files, false, phase + "-errors");
+            scheduleDeferredWarningLint(files, phase);
+            return;
+        }
+        runLint(files, includeWarnings, phase);
+    }
+
+    private void runLint(Collection<Path> files, boolean includeWarnings, String phase) {
+        if (files.isEmpty()) return;
         LOG.info("Lint " + files.size() + " files...");
         var startedNanos = System.nanoTime();
-        try (var task = compiler().compile(files.toArray(Path[]::new))) {
-            var compileElapsedMs = (System.nanoTime() - startedNanos) / 1_000_000;
-            LOG.info(
-                    "[perf][diagnostics] phase="
-                            + phase
-                            + " includeWarnings="
-                            + includeWarnings
-                            + " compile_ms="
-                            + compileElapsedMs
-                            + " files="
-                            + files.size());
-            publishDiagnosticsAndColors(task, startedNanos, includeWarnings, phase);
-        }
+        JavaCompilerService.runInDiagnosticsCriticalPath(
+                () -> {
+                    try (var task = compiler().compile(files.toArray(Path[]::new))) {
+                        var compileElapsedMs = (System.nanoTime() - startedNanos) / 1_000_000;
+                        LOG.info(
+                                "[perf][diagnostics] phase="
+                                        + phase
+                                        + " includeWarnings="
+                                        + includeWarnings
+                                        + " compile_ms="
+                                        + compileElapsedMs
+                                        + " files="
+                                        + files.size());
+                        publishDiagnosticsAndColors(task, startedNanos, includeWarnings, phase);
+                    }
+                });
     }
 
     /**
@@ -729,6 +746,7 @@ class JavaLanguageServer extends LanguageServer {
             var closed = Paths.get(params.textDocument.uri);
             pendingFastLintFiles.remove(closed);
             pendingFullLintFiles.remove(closed);
+            pendingWarningLintFiles.remove(closed);
             diagnosticsFingerprintByUri.remove(params.textDocument.uri);
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
@@ -750,6 +768,7 @@ class JavaLanguageServer extends LanguageServer {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             pendingFastLintFiles.clear();
             pendingFullLintFiles.clear();
+            pendingWarningLintFiles.clear();
             // Re-lint all active documents
             lint(FileStore.activeDocuments(), true, "full-save");
         }
@@ -809,7 +828,32 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
 
-        if (pendingFastLintFiles.isEmpty() && (warningsOnSaveOnly() || pendingFullLintFiles.isEmpty())) {
+        if (!pendingWarningLintFiles.isEmpty()
+                && now >= nextWarningLintAtNanos
+                && now >= suppressFullLintUntilNanos) {
+            try {
+                var files = activeOnly(pendingWarningLintFiles);
+                var seq = pendingWarningLintSeq;
+                pendingWarningLintFiles.clear();
+                if (!files.isEmpty()) {
+                    LOG.fine(
+                            "[lint-scheduler] run deferred warning lint files="
+                                    + files.size()
+                                    + " seq="
+                                    + seq
+                                    + " defer_ms="
+                                    + deferredWarningLintMs());
+                    runLint(files, true, "warnings-deferred");
+                }
+            } catch (Exception e) {
+                LOG.warning("Async deferred warning lint failed: " + e.getMessage());
+                LOG.log(java.util.logging.Level.FINE, "", e);
+            }
+        }
+
+        if (pendingFastLintFiles.isEmpty()
+                && (warningsOnSaveOnly() || pendingFullLintFiles.isEmpty())
+                && pendingWarningLintFiles.isEmpty()) {
             uncheckedChanges = false;
         }
     }
@@ -834,6 +878,7 @@ class JavaLanguageServer extends LanguageServer {
             return;
         }
         pendingFastLintFiles.add(file);
+        pendingWarningLintFiles.remove(file);
         changeSequence++;
         pendingFastLintSeq = changeSequence;
         var now = System.nanoTime();
@@ -860,6 +905,35 @@ class JavaLanguageServer extends LanguageServer {
                         + (warningsOnSaveOnly() ? 0 : fullLintIdleMs())
                         + " warnings_on_save_only="
                         + warningsOnSaveOnly());
+    }
+
+    private boolean shouldUseTwoPhaseDiagnostics(String phase) {
+        if (phase == null) return false;
+        if (phase.contains("warnings-deferred")) return false;
+        return readDiagnosticsBooleanSetting("twoPhasePublish", true);
+    }
+
+    private void scheduleDeferredWarningLint(Collection<Path> files, String phase) {
+        if (files.isEmpty()) return;
+        var now = System.nanoTime();
+        changeSequence++;
+        pendingWarningLintSeq = changeSequence;
+        for (var file : files) {
+            if (!FileStore.activeDocuments().contains(file)) continue;
+            if (isCachedJarSource(file)) continue;
+            pendingWarningLintFiles.add(file);
+        }
+        nextWarningLintAtNanos = now + TimeUnit.MILLISECONDS.toNanos(deferredWarningLintMs());
+        uncheckedChanges = true;
+        LOG.fine(
+                "[lint-scheduler] queued deferred warning lint phase="
+                        + phase
+                        + " files="
+                        + pendingWarningLintFiles.size()
+                        + " seq="
+                        + pendingWarningLintSeq
+                        + " due_ms="
+                        + deferredWarningLintMs());
     }
 
     private boolean isCachedJarSource(Path file) {
@@ -892,6 +966,10 @@ class JavaLanguageServer extends LanguageServer {
     private int fullLintSuppressAfterInteractiveMs() {
         return readDiagnosticsIntSetting(
                 "interactiveSuppressMs", (int) FULL_LINT_SUPPRESS_AFTER_INTERACTIVE_MS, 100, 5000);
+    }
+
+    private int deferredWarningLintMs() {
+        return readDiagnosticsIntSetting("deferredWarningMs", (int) DEFERRED_WARNING_LINT_MS, 20, 2000);
     }
 
     private boolean readDiagnosticsBooleanSetting(String key, boolean fallback) {

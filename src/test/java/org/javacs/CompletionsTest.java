@@ -845,6 +845,18 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void lombokNestedPojoCompletionIncludesStringGetter() {
+        var labels = label("/org/javacs/example/LombokNestedGetterCompletion.java", 35, 13);
+        assertThat(labels, hasItem("getA"));
+    }
+
+    @Test
+    public void lombokGetterAssignedToVarHasStringCompletions() {
+        var labels = label("/org/javacs/example/LombokNestedStringFieldCompletion.java", 37, 11);
+        assertThat(labels, hasItem("split"));
+    }
+
+    @Test
     public void fluentInterfaceChainCompletionIncludesNextFluentMethods() {
         var labels = label("/org/javacs/example/FluentInterfaceChainCompletion.java", 19, 18);
         assertThat(labels, hasItems("prep2", "prep3"));

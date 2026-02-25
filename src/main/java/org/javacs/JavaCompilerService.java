@@ -3,6 +3,7 @@ package org.javacs;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -14,6 +15,8 @@ class JavaCompilerService implements CompilerProvider {
     final Set<String> addExports;
     final Set<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
+    private static final ThreadLocal<Integer> DIAGNOSTICS_CRITICAL_DEPTH = ThreadLocal.withInitial(() -> 0);
+    private static final AtomicLong JDK_LOOKUP_CALLS = new AtomicLong();
     final Docs docs;
     final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
     // Diagnostics from the last compilation task
@@ -269,6 +272,23 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public Optional<JavaFileObject> findAnywhere(String className) {
         var startedNanos = System.nanoTime();
+        if (isInDiagnosticsCriticalPath()) {
+            var fromSource = findTypeDeclaration(className);
+            if (fromSource != NOT_FOUND) {
+                LOG.fine(
+                        "[perf][lookup] class="
+                                + className
+                                + " source=workspace-only elapsed_ms="
+                                + ((System.nanoTime() - startedNanos) / 1_000_000));
+                return Optional.of(new SourceFileObject(fromSource));
+            }
+            LOG.fine(
+                    "[perf][lookup] class="
+                            + className
+                            + " source=none(workspace-only) elapsed_ms="
+                            + ((System.nanoTime() - startedNanos) / 1_000_000));
+            return Optional.empty();
+        }
         var fromDocs = findPublicTypeDeclarationInDocPath(className);
         if (fromDocs.isPresent()) {
             LOG.fine(
@@ -316,6 +336,7 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private Optional<JavaFileObject> findPublicTypeDeclarationInJdk(String className) {
+        JDK_LOOKUP_CALLS.incrementAndGet();
         if (jdkSourceByType.containsKey(className)) {
             return jdkSourceByType.get(className);
         }
@@ -444,4 +465,30 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private static final Logger LOG = Logger.getLogger("main");
+
+    static void runInDiagnosticsCriticalPath(Runnable action) {
+        var previous = DIAGNOSTICS_CRITICAL_DEPTH.get();
+        DIAGNOSTICS_CRITICAL_DEPTH.set(previous + 1);
+        try {
+            action.run();
+        } finally {
+            if (previous == 0) {
+                DIAGNOSTICS_CRITICAL_DEPTH.remove();
+            } else {
+                DIAGNOSTICS_CRITICAL_DEPTH.set(previous);
+            }
+        }
+    }
+
+    static boolean isInDiagnosticsCriticalPath() {
+        return DIAGNOSTICS_CRITICAL_DEPTH.get() > 0;
+    }
+
+    static void resetJdkLookupCallsForTests() {
+        JDK_LOOKUP_CALLS.set(0);
+    }
+
+    static long jdkLookupCallsForTests() {
+        return JDK_LOOKUP_CALLS.get();
+    }
 }

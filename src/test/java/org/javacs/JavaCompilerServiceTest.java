@@ -48,6 +48,21 @@ public class JavaCompilerServiceTest {
         }
     }
 
+    @Test
+    public void diagnosticsCriticalPathSkipsJdkSourceLookup() {
+        JavaCompilerService.resetJdkLookupCallsForTests();
+        compiler.findAnywhere("java.lang.String");
+        var baselineLookups = JavaCompilerService.jdkLookupCallsForTests();
+        assertThat("baseline lookup should probe JDK/doc sources", baselineLookups, greaterThan(0L));
+
+        JavaCompilerService.resetJdkLookupCallsForTests();
+        JavaCompilerService.runInDiagnosticsCriticalPath(() -> compiler.findAnywhere("java.lang.String"));
+        assertThat(
+                "diagnostics critical path must avoid JDK/doc lookups",
+                JavaCompilerService.jdkLookupCallsForTests(),
+                is(0L));
+    }
+
     private static Set<Path> testRuntimeClassPath() {
         var result = new HashSet<Path>();
         var entries = System.getProperty("java.class.path", "").split(java.io.File.pathSeparator);

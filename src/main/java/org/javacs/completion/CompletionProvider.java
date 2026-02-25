@@ -490,6 +490,7 @@ public class CompletionProvider {
             CompileTask task, TreePath path, String partial, boolean endsWithParen) {
         var trees = Trees.instance(task.task);
         var select = (MemberSelectTree) path.getLeaf();
+        var debugResolution = Boolean.getBoolean(DEBUG_COMPLETION_RESOLUTION_PROP);
         LombokHandler.CompletionContext lombokContext = null;
         LOG.fine("...complete members of " + select.getExpression());
 
@@ -533,13 +534,43 @@ public class CompletionProvider {
         var scope = trees.getScope(path);
         var type = trees.getTypeMirror(path);
         if (type == null) {
+            if (debugResolution) {
+                LOG.info(
+                        "[completion-resolve] expr="
+                                + select.getExpression()
+                                + " type=<null> partial="
+                                + partial);
+            }
             return NOT_SUPPORTED;
+        }
+        if (debugResolution) {
+            LOG.info(
+                    "[completion-resolve] expr="
+                            + select.getExpression()
+                            + " type="
+                            + type
+                            + " kind="
+                            + type.getKind()
+                            + " is_static="
+                            + isStatic
+                            + " partial="
+                            + partial);
         }
 
         // Handle ERROR types from unresolved Lombok-generated methods (recursive support)
         if (type.getKind() == TypeKind.ERROR) {
             var errorTypeName = type.toString();
             var resolvedType = LombokHandler.resolveLombokGeneratedMethodType(task, errorTypeName, lombokCache);
+            if (resolvedType == null) {
+                resolvedType = LombokHandler.resolveLombokChainedErrorType(task, errorTypeName, lombokCache);
+            }
+            if (debugResolution) {
+                LOG.info(
+                        "[completion-resolve] error_type="
+                                + errorTypeName
+                                + " lombok_resolved="
+                                + resolvedType);
+            }
 
             if (resolvedType != null && resolvedType instanceof DeclaredType) {
                 var resolvedDeclaredType = (DeclaredType) resolvedType;
@@ -551,6 +582,9 @@ public class CompletionProvider {
                         task, scope, resolvedDeclaredType, false, partial, endsWithParen, lombokContext);
             }
             var varInferred = inferVarDeclaredType(task, path);
+            if (debugResolution) {
+                LOG.info("[completion-resolve] var_inferred=" + varInferred + " expr=" + select.getExpression());
+            }
             if (varInferred != null) {
                 LOG.fine("...resolved var type for completion: " + varInferred);
                 if (lombokContext == null) {
@@ -1137,5 +1171,6 @@ public class CompletionProvider {
         final Map<String, Integer> methodPriority = new HashMap<>();
     }
 
+    private static final String DEBUG_COMPLETION_RESOLUTION_PROP = "jls.debug.completion.resolution";
     private static final Logger LOG = Logger.getLogger("main");
 }
