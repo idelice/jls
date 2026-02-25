@@ -33,19 +33,20 @@ public class DefinitionProvider {
     }
 
     public List<Location> find() {
+        var startedNanos = System.nanoTime();
         try (var task = compiler.compile(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
-            java.util.logging.Logger.getLogger("main").info("...DefinitionProvider element: " + element);
+            LOG.fine("...DefinitionProvider element: " + element);
             if (element == null) {
-                java.util.logging.Logger.getLogger("main").info("...element is null");
+                LOG.fine("...element is null");
                 return NOT_SUPPORTED;
             }
-            java.util.logging.Logger.getLogger("main").info("...element type kind: " + element.asType().getKind());
+            LOG.fine("...element type kind: " + element.asType().getKind());
             if (element.asType().getKind() == TypeKind.ERROR) {
                 if (NavigationHelper.isLocal(element)) {
                     return findDefinitions(task, element);
                 }
-                java.util.logging.Logger.getLogger("main").info("...element has ERROR type, calling findError");
+                LOG.fine("...element has ERROR type, calling findError");
                 task.close();
                 return findError(element);
             }
@@ -97,36 +98,46 @@ public class DefinitionProvider {
 
             // For workspace files, use original logic that better handles overloading
             return findRemoteDefinitionsLocal(otherFile.get(), element);
+        } finally {
+            LOG.info(
+                    "[perf][definition] file="
+                            + file.getFileName()
+                            + " line="
+                            + line
+                            + " col="
+                            + column
+                            + " elapsed_ms="
+                            + ((System.nanoTime() - startedNanos) / 1_000_000));
         }
     }
 
     private List<Location> findError(Element element) {
         var name = element.getSimpleName();
-        java.util.logging.Logger.getLogger("main").info("...findError element name: " + name);
+        LOG.fine("...findError element name: " + name);
         if (name == null) return NOT_SUPPORTED;
         var parent = element.getEnclosingElement();
-        java.util.logging.Logger.getLogger("main").info("...findError parent: " + parent);
+        LOG.fine("...findError parent: " + parent);
         if (!(parent instanceof TypeElement)) {
-            java.util.logging.Logger.getLogger("main").info("...parent is not TypeElement, returning NOT_SUPPORTED");
+            LOG.fine("...parent is not TypeElement, returning NOT_SUPPORTED");
             return NOT_SUPPORTED;
         }
         var type = (TypeElement) parent;
         var className = type.getQualifiedName().toString();
         var memberName = name.toString();
-        java.util.logging.Logger.getLogger("main").info("...findError className: " + className);
+        LOG.fine("...findError className: " + className);
 
         // Check if className looks like a method chain (e.g., "Foo.getBar" instead of just "Bar")
         // This happens with nested Lombok getter calls where javac can't resolve the type
         if (isMethodChain(className)) {
-            java.util.logging.Logger.getLogger("main").info("...detected method chain, attempting to resolve return type");
+            LOG.fine("...detected method chain, attempting to resolve return type");
             var resolvedClassName = resolveMethodChainReturnType(className);
             if (resolvedClassName != null) {
                 className = resolvedClassName;
-                java.util.logging.Logger.getLogger("main").info("...resolved to class: " + className);
+                LOG.fine("...resolved to class: " + className);
             }
         }
 
-        java.util.logging.Logger.getLogger("main").info("...findError searching for member: " + memberName + " in class: " + className);
+        LOG.fine("...findError searching for member: " + memberName + " in class: " + className);
         return findAllMembers(className, memberName);
     }
 
@@ -153,23 +164,23 @@ public class DefinitionProvider {
         var className = methodChain.substring(0, lastDot);
         var methodName = methodChain.substring(lastDot + 1);
 
-        java.util.logging.Logger.getLogger("main").info("...resolving method: " + methodName + " on class: " + className);
+        LOG.fine("...resolving method: " + methodName + " on class: " + className);
 
         // Check if className is itself a method chain (recursive case)
         if (isMethodChain(className)) {
-            java.util.logging.Logger.getLogger("main").info("...className is also a method chain, resolving recursively");
+            LOG.fine("...className is also a method chain, resolving recursively");
             className = resolveMethodChainReturnType(className);
             if (className == null) {
-                java.util.logging.Logger.getLogger("main").info("...recursive resolution failed");
+                LOG.fine("...recursive resolution failed");
                 return null;
             }
-            java.util.logging.Logger.getLogger("main").info("...recursive resolution succeeded: " + className);
+            LOG.fine("...recursive resolution succeeded: " + className);
         }
 
         // Find the class
         var classFile = compiler.findAnywhere(className);
         if (classFile.isEmpty()) {
-            java.util.logging.Logger.getLogger("main").info("...class file not found: " + className);
+            LOG.fine("...class file not found: " + className);
             return null;
         }
 
@@ -177,7 +188,7 @@ public class DefinitionProvider {
             var elements = task.task.getElements();
             var typeElement = elements.getTypeElement(className);
             if (typeElement == null) {
-                java.util.logging.Logger.getLogger("main").info("...type element not found: " + className);
+                LOG.fine("...type element not found: " + className);
                 return null;
             }
 
@@ -190,11 +201,11 @@ public class DefinitionProvider {
             }
 
             if (fieldName == null) {
-                java.util.logging.Logger.getLogger("main").info("...not a getter pattern: " + methodName);
+                LOG.fine("...not a getter pattern: " + methodName);
                 return null;
             }
 
-            java.util.logging.Logger.getLogger("main").info("...looking for field: " + fieldName);
+            LOG.fine("...looking for field: " + fieldName);
 
             // Find the field and get its type
             for (var member : elements.getAllMembers(typeElement)) {
@@ -204,14 +215,14 @@ public class DefinitionProvider {
                     if (fieldType instanceof javax.lang.model.type.DeclaredType) {
                         var returnTypeElement = (TypeElement) ((javax.lang.model.type.DeclaredType) fieldType).asElement();
                         var returnClassName = returnTypeElement.getQualifiedName().toString();
-                        java.util.logging.Logger.getLogger("main").info("...found return type: " + returnClassName);
+                        LOG.fine("...found return type: " + returnClassName);
                         return returnClassName;
                     }
                 }
             }
         }
 
-        java.util.logging.Logger.getLogger("main").info("...could not resolve return type");
+        LOG.fine("...could not resolve return type");
         return null;
     }
 
@@ -315,7 +326,8 @@ public class DefinitionProvider {
                             return List.of(FindHelper.location(parse, memberPath, parseMemberName));
                         }
                     }
-                } else if (!isConstructor && member instanceof com.sun.source.tree.VariableTree) {
+                }
+                else if (!isConstructor && member instanceof com.sun.source.tree.VariableTree) {
                     var field = (com.sun.source.tree.VariableTree) member;
                     if (field.getName().contentEquals(parseMemberName)) {
                         var memberPath = trees.getPath(parse.root, member);
@@ -466,4 +478,5 @@ public class DefinitionProvider {
         return List.of(FindHelper.location(task, path, name));
     }
 
+    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
 }

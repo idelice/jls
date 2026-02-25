@@ -839,6 +839,18 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void lombokDataMapCompletionIncludesGetterChainMembers() {
+        var labels = label("/org/javacs/example/LombokDataMapHoverCompletion.java", 16, 27);
+        assertThat(labels, hasItem("get"));
+    }
+
+    @Test
+    public void fluentInterfaceChainCompletionIncludesNextFluentMethods() {
+        var labels = label("/org/javacs/example/FluentInterfaceChainCompletion.java", 19, 18);
+        assertThat(labels, hasItems("prep2", "prep3"));
+    }
+
+    @Test
     public void lombokFieldRenameRefreshesCompletionItems() {
         var file = FindResource.path("/org/javacs/example/LombokCompletionFieldChange.java");
         open(file);

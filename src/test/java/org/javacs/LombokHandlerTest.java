@@ -19,4 +19,14 @@ public class LombokHandlerTest {
         assertFalse(LombokHandler.shouldSkipLombokLookup("com.example.demo.models.Foo"));
         assertFalse(LombokHandler.shouldSkipLombokLookup("org.javacs.example.Slf4jRecord"));
     }
+
+    @Test
+    public void shortCircuitsNonProjectClassTreeLookup() {
+        assertTrue(LombokHandler.shouldShortCircuitClassTreeLookup("java.util.Map"));
+        assertTrue(LombokHandler.shouldShortCircuitClassTreeLookup("javax.validation.Valid"));
+        assertTrue(LombokHandler.shouldShortCircuitClassTreeLookup("jdk.internal.misc.Unsafe"));
+        assertTrue(LombokHandler.shouldShortCircuitClassTreeLookup("sun.misc.Unsafe"));
+        assertFalse(LombokHandler.shouldShortCircuitClassTreeLookup("com.example.demo.models.ThisPoj"));
+        assertFalse(LombokHandler.shouldShortCircuitClassTreeLookup("org.javacs.example.Slf4jRecord"));
+    }
 }

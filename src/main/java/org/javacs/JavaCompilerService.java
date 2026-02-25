@@ -21,6 +21,7 @@ class JavaCompilerService implements CompilerProvider {
     // Use the same file manager for multiple tasks, so we don't repeatedly re-compile the same files
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
+    private final Map<String, Optional<JavaFileObject>> jdkSourceByType = new HashMap<>();
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
         System.err.println("Class path:");
@@ -267,18 +268,39 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Optional<JavaFileObject> findAnywhere(String className) {
+        var startedNanos = System.nanoTime();
         var fromDocs = findPublicTypeDeclarationInDocPath(className);
         if (fromDocs.isPresent()) {
+            LOG.fine(
+                    "[perf][lookup] class="
+                            + className
+                            + " source=docPath elapsed_ms="
+                            + ((System.nanoTime() - startedNanos) / 1_000_000));
             return fromDocs;
         }
         var fromJdk = findPublicTypeDeclarationInJdk(className);
         if (fromJdk.isPresent()) {
+            LOG.fine(
+                    "[perf][lookup] class="
+                            + className
+                            + " source=jdk elapsed_ms="
+                            + ((System.nanoTime() - startedNanos) / 1_000_000));
             return fromJdk;
         }
         var fromSource = findTypeDeclaration(className);
         if (fromSource != NOT_FOUND) {
+            LOG.fine(
+                    "[perf][lookup] class="
+                            + className
+                            + " source=workspace elapsed_ms="
+                            + ((System.nanoTime() - startedNanos) / 1_000_000));
             return Optional.of(new SourceFileObject(fromSource));
         }
+        LOG.fine(
+                "[perf][lookup] class="
+                        + className
+                        + " source=none elapsed_ms="
+                        + ((System.nanoTime() - startedNanos) / 1_000_000));
         return Optional.empty();
     }
 
@@ -294,6 +316,10 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private Optional<JavaFileObject> findPublicTypeDeclarationInJdk(String className) {
+        if (jdkSourceByType.containsKey(className)) {
+            return jdkSourceByType.get(className);
+        }
+        var startedNanos = System.nanoTime();
         try {
             for (var module : ScanClassPath.JDK_MODULES) {
                 var moduleLocation = docs.fileManager.getLocationForModule(StandardLocation.MODULE_SOURCE_PATH, module);
@@ -301,14 +327,29 @@ class JavaCompilerService implements CompilerProvider {
                 var fromModuleSourcePath =
                         docs.fileManager.getJavaFileForInput(moduleLocation, className, JavaFileObject.Kind.SOURCE);
                 if (fromModuleSourcePath != null) {
-                    LOG.info(String.format("...found %s in module %s of jdk", fromModuleSourcePath.toUri(), module));
-                    return Optional.of(fromModuleSourcePath);
+                    var result = Optional.of(fromModuleSourcePath);
+                    jdkSourceByType.put(className, result);
+                    LOG.info(
+                            "[perf][jdk-lookup] class="
+                                    + className
+                                    + " hit=true module="
+                                    + module
+                                    + " elapsed_ms="
+                                    + ((System.nanoTime() - startedNanos) / 1_000_000));
+                    return result;
                 }
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        return Optional.empty();
+        var empty = Optional.<JavaFileObject>empty();
+        jdkSourceByType.put(className, empty);
+        LOG.fine(
+                "[perf][jdk-lookup] class="
+                        + className
+                        + " hit=false elapsed_ms="
+                        + ((System.nanoTime() - startedNanos) / 1_000_000));
+        return empty;
     }
 
     @Override

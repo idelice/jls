@@ -18,6 +18,7 @@ public class DiagnosticsSchedulerTest {
     private final AtomicInteger publishedForSecondFile = new AtomicInteger();
     private final AtomicInteger totalPublished = new AtomicInteger();
     private final List<String> publishedCodesForFile = new ArrayList<>();
+    private final List<String> publishedCodesWithLineForFile = new ArrayList<>();
     private JavaLanguageServer server;
     private Path file;
     private Path secondFile;
@@ -30,6 +31,7 @@ public class DiagnosticsSchedulerTest {
         publishedForSecondFile.set(0);
         totalPublished.set(0);
         publishedCodesForFile.clear();
+        publishedCodesWithLineForFile.clear();
         server =
                 LanguageServerFixture.getJavaLanguageServer(
                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT,
@@ -42,6 +44,11 @@ public class DiagnosticsSchedulerTest {
                                     for (var diagnostic : params.diagnostics) {
                                         if (diagnostic.code != null) {
                                             publishedCodesForFile.add(diagnostic.code);
+                                            publishedCodesWithLineForFile.add(
+                                                    String.format(
+                                                            "%s(%d)",
+                                                            diagnostic.code,
+                                                            diagnostic.range.start.line + 1));
                                         }
                                     }
                                 }
@@ -138,6 +145,92 @@ public class DiagnosticsSchedulerTest {
         assertThat(hasWrongArityError, is(true));
     }
 
+    @Test
+    public void fastLintDoesNotReportMissingLombokGetterInsideSpringStringUtilsCall() throws Exception {
+        file = FindResource.path("com/example/demo/models/ThisPojIfUsage.java");
+        open(file);
+
+        Thread.sleep(260);
+        server.doAsyncWork();
+
+        var hasMissingGetter =
+                publishedCodesWithLineForFile.stream()
+                        .anyMatch(code -> code.startsWith("compiler.err.cant.resolve.location.args(7)"));
+        assertThat(hasMissingGetter, is(false));
+    }
+
+    @Test
+    public void fastLintDoesNotReportMissingLombokGetterInsideSpringStringUtilsServiceCondition() throws Exception {
+        file = FindResource.path("com/example/demo/service/ServiceTwo.java");
+        open(file);
+
+        Thread.sleep(260);
+        server.doAsyncWork();
+
+        var hasMissingGetter =
+                publishedCodesWithLineForFile.stream()
+                        .anyMatch(code -> code.startsWith("compiler.err.cant.resolve.location.args(13)"));
+        assertThat(hasMissingGetter, is(false));
+    }
+
+    @Test
+    public void fastLintMalformedStringUtilsConditionDoesNotReportMissingLombokGetter() throws Exception {
+        file = FindResource.path("com/example/demo/service/ServiceTwo.java");
+        open(file);
+
+        var broken =
+                FileStore.contents(file)
+                        .replace(
+                                "if (StringUtils.isEmpty(ksk.getFoo())) {",
+                                "if (StringUtils.isEmpty(ksk.getFoo()) {");
+        edit(file, broken);
+
+        Thread.sleep(260);
+        server.doAsyncWork();
+
+        var hasExpectedSyntaxError =
+                publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("compiler.err.expected(14)"));
+        assertThat(hasExpectedSyntaxError, is(true));
+
+        var hasMissingGetter =
+                publishedCodesWithLineForFile.stream()
+                        .anyMatch(code -> code.startsWith("compiler.err.cant.resolve.location.args(14)"));
+        assertThat(hasMissingGetter, is(false));
+    }
+
+    @Test
+    public void unusedLocalWarningReturnsOnlyOnSaveAfterTyping() throws Exception {
+        file = FindResource.path("org/javacs/warn/UnusedAfterTyping.java");
+        open(file);
+
+        var save = new DidSaveTextDocumentParams();
+        save.textDocument = new TextDocumentIdentifier(file.toUri());
+        server.didSaveTextDocument(save);
+        server.doAsyncWork();
+
+        var hasUnusedAfterSave =
+                publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("unused_local("));
+        assertThat(hasUnusedAfterSave, is(true));
+
+        publishedCodesWithLineForFile.clear();
+        var edited = FileStore.contents(file).replace("var asdw1 = spl[0];", "var asdw1 = spl[0]; ");
+        edit(file, edited);
+        Thread.sleep(260);
+        server.doAsyncWork();
+
+        var hasUnusedDuringTyping =
+                publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("unused_local("));
+        assertThat(hasUnusedDuringTyping, is(false));
+
+        publishedCodesWithLineForFile.clear();
+        server.didSaveTextDocument(save);
+        server.doAsyncWork();
+
+        var hasUnusedAfterSecondSave =
+                publishedCodesWithLineForFile.stream().anyMatch(code -> code.startsWith("unused_local("));
+        assertThat(hasUnusedAfterSecondSave, is(true));
+    }
+
     private static int editVersion = 1;
 
     private void open(Path javaFile) {
@@ -153,5 +246,15 @@ public class DiagnosticsSchedulerTest {
         var close = new DidCloseTextDocumentParams();
         close.textDocument.uri = javaFile.toUri();
         server.didCloseTextDocument(close);
+    }
+
+    private void edit(Path javaFile, String contents) {
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = javaFile.toUri();
+        change.textDocument.version = editVersion++;
+        var evt = new TextDocumentContentChangeEvent();
+        evt.text = contents;
+        change.contentChanges.add(evt);
+        server.didChangeTextDocument(change);
     }
 }

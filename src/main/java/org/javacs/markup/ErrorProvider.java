@@ -179,15 +179,9 @@ public class ErrorProvider {
         if (!code.startsWith("compiler.err.cant.resolve")) {
             return false;
         }
-        var message = d.getMessage(null);
-        if (message == null) {
-            return false;
-        }
-        // Generated Lombok members are surfaced as unresolved methods, or as slf4j `log`.
-        if (message.contains("method ")) {
-            return true;
-        }
-        return message.contains("variable log");
+        // Allow full Lombok filtering for all unresolved symbols; final filtering still validates
+        // member generation against class metadata and returns false for non-Lombok cases.
+        return true;
     }
 
     private Set<String> collectLikelyLombokClassNames(

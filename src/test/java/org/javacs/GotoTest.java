@@ -235,6 +235,12 @@ public class GotoTest {
         assertThat(suggestions, hasItem("LombokVarSplitFlow.java:14"));
     }
 
+    @Test
+    public void gotoLombokSetterResolvesToField() {
+        var suggestions = doGoto("/org/javacs/example/LombokSetterBooleanScopeExample.java", 24, 18);
+        assertThat(suggestions, hasItem("LombokSetterBooleanScopeExample.java:7"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

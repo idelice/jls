@@ -32,56 +32,57 @@ public class HoverProvider {
     }
 
     public MarkupContent hover(Path file, int line, int column) {
+        var startedNanos = System.nanoTime();
         try (var task = compiler.compile(file)) {
             var position = task.root().getLineMap().getPosition(line, column);
             var element = new FindHoverElement(task.task).scan(task.root(), position);
-            LOG.info("...HoverProvider element: " + element);
+            LOG.fine("...HoverProvider element: " + element);
             if (element == null) return null;
-            LOG.info("...element kind: " + element.getKind());
-            LOG.info("...element class: " + element.getClass().getName());
+            LOG.fine("...element kind: " + element.getKind());
+            LOG.fine("...element class: " + element.getClass().getName());
 
             // Handle case where javac returns CLASS for Lombok methods
             if (element.getKind() == ElementKind.CLASS) {
                 var elementName = element.toString();
-                LOG.info("...element name: " + elementName);
+                LOG.fine("...element name: " + elementName);
                 // Check if this looks like a Lombok method (e.g., "com.example.Foo.getBar")
                 if (elementName.contains(".")) {
                     var lastDot = elementName.lastIndexOf('.');
                     var className = elementName.substring(0, lastDot);
                     var methodName = elementName.substring(lastDot + 1);
-                    LOG.info("...possible Lombok method: class=" + className + ", method=" + methodName);
+                    LOG.fine("...possible Lombok method: class=" + className + ", method=" + methodName);
 
                     var resolvedChainType = resolveMethodChainReturnType(task, elementName);
                     if (resolvedChainType != null) {
-                        var signature = "public " + displayTypeName(resolvedChainType.toString()) + " " + methodName + "()";
-                        LOG.info("...resolved method-chain signature: " + signature);
+                        var signature = "public " + renderSimpleType(resolvedChainType) + " " + methodName + "()";
+                        LOG.fine("...resolved method-chain signature: " + signature);
                         return new MarkupContent(MarkupKind.Markdown, "```java\n" + signature + "\n```");
                     }
 
                     // Try to get Lombok metadata for this class
                     var metadata = org.javacs.LombokHandler.metadataForClass(task, className, this.lombokCache);
                     if (metadata != null) {
-                        LOG.info("...found Lombok metadata");
+                        LOG.fine("...found Lombok metadata");
                         // Check if it's a generated getter
                         if (metadata.isGeneratedGetter(methodName)) {
-                            LOG.info("...it's a generated getter");
+                            LOG.fine("...it's a generated getter");
                             var field = metadata.fieldForGetter(methodName);
                             if (field != null) {
                                 var fieldType = field.getType().toString();
                                 var signature = "public " + fieldType + " " + methodName + "()";
-                                LOG.info("...generated signature: " + signature);
+                                LOG.fine("...generated signature: " + signature);
                                 return new MarkupContent(MarkupKind.Markdown, "```java\n" + signature + "\n```");
                             }
                         }
                         // Check if it's a generated setter
                         else if (metadata.isGeneratedSetter(methodName)) {
-                            LOG.info("...it's a generated setter");
+                            LOG.fine("...it's a generated setter");
                             var field = metadata.fieldForSetter(methodName);
                             if (field != null) {
                                 var fieldType = field.getType().toString();
                                 var fieldName = field.getName().toString();
                                 var signature = "public void " + methodName + "(" + fieldType + " " + fieldName + ")";
-                                LOG.info("...generated signature: " + signature);
+                                LOG.fine("...generated signature: " + signature);
                                 return new MarkupContent(MarkupKind.Markdown, "```java\n" + signature + "\n```");
                             }
                         }
@@ -91,9 +92,9 @@ public class HoverProvider {
 
             if (element instanceof ExecutableElement) {
                 var exec = (ExecutableElement) element;
-                LOG.info("...method name: " + exec.getSimpleName());
-                LOG.info("...return type: " + exec.getReturnType());
-                LOG.info("...enclosing element: " + exec.getEnclosingElement());
+                LOG.fine("...method name: " + exec.getSimpleName());
+                LOG.fine("...return type: " + exec.getReturnType());
+                LOG.fine("...enclosing element: " + exec.getEnclosingElement());
             }
             var docs = docs(task, element);
             var markdown = new StringBuilder();
@@ -101,17 +102,27 @@ public class HoverProvider {
                 markdown.append(renderTypeHeader((TypeElement) element));
             } else {
                 var code = printType(element);
-                LOG.info("...printType result: " + code);
+                LOG.fine("...printType result: " + code);
                 markdown.append("```java\n").append(code).append("\n```");
             }
             if (!docs.isEmpty()) {
                 markdown.append("\n\n---\n\n").append(docs);
             }
+            LOG.info(
+                    "[perf][hover] file="
+                            + file.getFileName()
+                            + " line="
+                            + line
+                            + " col="
+                            + column
+                            + " elapsed_ms="
+                            + ((System.nanoTime() - startedNanos) / 1_000_000));
             return new MarkupContent(MarkupKind.Markdown, markdown.toString());
         }
     }
 
     public void resolveCompletionItem(CompletionItem item) {
+        var startedNanos = System.nanoTime();
         if (item.data == null || item.data == JsonNull.INSTANCE) return;
         var data = JsonHelper.GSON.fromJson(item.data, CompletionData.class);
         var source = compiler.findAnywhere(data.className);
@@ -132,6 +143,13 @@ public class HoverProvider {
         var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
         if (docTree == null) return;
         item.documentation = MarkdownHelper.asMarkupContent(docTree);
+        LOG.info(
+                "[perf][completion-resolve] class="
+                        + data.className
+                        + " member="
+                        + data.memberName
+                        + " elapsed_ms="
+                        + ((System.nanoTime() - startedNanos) / 1_000_000));
     }
 
     // TODO consider showing actual source code instead of just types and names
@@ -272,11 +290,6 @@ public class HoverProvider {
         return Character.isLowerCase(segment.charAt(0));
     }
 
-    private String displayTypeName(String fullName) {
-        var dot = fullName.lastIndexOf('.');
-        return dot >= 0 ? fullName.substring(dot + 1) : fullName;
-    }
-
     private String docs(ParseTask task, Tree tree) {
         var path = Trees.instance(task.task).getPath(task.root, tree);
         var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
@@ -284,17 +297,24 @@ public class HoverProvider {
         return MarkdownHelper.asMarkdown(docTree);
     }
 
+    private String renderSimpleType(TypeMirror type) {
+        var raw = type.toString();
+        var withoutPackages = raw.replaceAll("(?:(?:[a-z_][\\w$]*\\.)+)([A-Z][\\w$]*(?:\\.[A-Z][\\w$]*)*)", "$1");
+        var withoutOuterClasses = withoutPackages.replaceAll("([A-Z][\\w$]*)\\.", "");
+        return withoutOuterClasses.replaceAll(",\\s*", ", ");
+    }
+
     // TODO this should be merged with logic in CompletionProvider
     // TODO this should parameterize the type
     // TODO show more information about declarations---was this a parameter, a field? What were the modifiers?
     private String printType(Element e) {
-        LOG.info("...printType called for element: " + e);
-        LOG.info("...printType element kind: " + e.getKind());
+        LOG.fine("...printType called for element: " + e);
+        LOG.fine("...printType element kind: " + e.getKind());
         if (e instanceof ExecutableElement) {
             var m = (ExecutableElement) e;
-            LOG.info("...printType using ShortTypePrinter.printMethod");
+            LOG.fine("...printType using ShortTypePrinter.printMethod");
             var result = ShortTypePrinter.DEFAULT.printMethod(m);
-            LOG.info("...printMethod result: " + result);
+            LOG.fine("...printMethod result: " + result);
             return result;
         } else if (e instanceof VariableElement) {
             var v = (VariableElement) e;

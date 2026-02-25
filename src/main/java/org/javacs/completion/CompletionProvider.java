@@ -15,7 +15,6 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -133,16 +132,30 @@ public class CompletionProvider {
     }
 
     public CompletionList complete(Path file, int line, int column) {
-        LOG.info("Complete at " + file.getFileName() + "(" + line + "," + column + ")...");
-        var started = Instant.now();
+        var startedNanos = System.nanoTime();
+        var parseStarted = System.nanoTime();
         var task = compiler.parse(file);
+        var parseElapsedMs = (System.nanoTime() - parseStarted) / 1_000_000;
         var cursor = task.root.getLineMap().getPosition(line, column);
+        var pruneStarted = System.nanoTime();
         var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
         var endOfLine = endOfLine(contents, (int) cursor);
         contents.insert(endOfLine, ';');
+        var pruneElapsedMs = (System.nanoTime() - pruneStarted) / 1_000_000;
+        var resolveStarted = System.nanoTime();
         var list = compileAndComplete(file, contents.toString(), cursor);
+        var resolveElapsedMs = (System.nanoTime() - resolveStarted) / 1_000_000;
         addTopLevelSnippets(task, list);
-        logCompletionTiming(started, list.items, list.isIncomplete);
+        logCompletionTiming(
+                startedNanos,
+                parseElapsedMs,
+                pruneElapsedMs,
+                resolveElapsedMs,
+                list.items,
+                list.isIncomplete,
+                file,
+                line,
+                column);
         return list;
     }
 
@@ -156,12 +169,12 @@ public class CompletionProvider {
     }
 
     private CompletionList compileAndComplete(Path file, String contents, long cursor) {
-        var started = Instant.now();
+        var started = System.nanoTime();
         var source = new SourceFileObject(file, contents, Instant.now());
         var partial = partialIdentifier(contents, (int) cursor);
         var endsWithParen = endsWithParen(contents, (int) cursor);
         try (var task = compiler.compile(List.of(source))) {
-            LOG.info("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
+            LOG.fine("...compiled in " + ((System.nanoTime() - started) / 1_000_000) + "ms");
             var path = new FindCompletionsAt(task.task).scan(task.root(), cursor);
             switch (path.getLeaf().getKind()) {
                 case IDENTIFIER:
@@ -242,7 +255,7 @@ public class CompletionProvider {
     }
 
     private CompletionList completeIdentifier(CompileTask task, TreePath path, String partial, boolean endsWithParen) {
-        LOG.info("...complete identifiers");
+        LOG.fine("...complete identifiers");
         var list = new CompletionList();
         list.items = completeUsingScope(task, path, partial, endsWithParen);
         LombokHandler.addScopeCompletions(task, path, partial, list.items, lombokCache);
@@ -305,7 +318,7 @@ public class CompletionProvider {
             var priority = methodPriority.getOrDefault(entry.getKey(), Priority.METHOD);
             list.add(method(task, overloads, !endsWithParen, priority));
         }
-        LOG.info("...found " + list.size() + " scope members");
+        LOG.fine("...found " + list.size() + " scope members");
         return list;
     }
 
@@ -342,7 +355,7 @@ public class CompletionProvider {
             var priority = methodPriority.getOrDefault(entry.getKey(), Priority.METHOD);
             list.items.add(method(task, overloads, !endsWithParen, priority));
         }
-        LOG.info("...found " + (list.items.size() - previousSize) + " static imports");
+        LOG.fine("...found " + (list.items.size() - previousSize) + " static imports");
     }
 
     private boolean importMatchesPartial(Name staticImport, String partial) {
@@ -396,7 +409,7 @@ public class CompletionProvider {
             list.items.add(item);
             uniques.add(className);
         }
-        LOG.info("...found " + (list.items.size() - previousSize) + " class names");
+        LOG.fine("...found " + (list.items.size() - previousSize) + " class names");
     }
 
     private List<TextEdit> autoImportEdits(
@@ -478,7 +491,7 @@ public class CompletionProvider {
         var trees = Trees.instance(task.task);
         var select = (MemberSelectTree) path.getLeaf();
         LombokHandler.CompletionContext lombokContext = null;
-        LOG.info("...complete members of " + select.getExpression());
+        LOG.fine("...complete members of " + select.getExpression());
 
         // Fast-path for Lombok @Slf4j generated `log` receiver.
         if (select.getExpression() instanceof IdentifierTree
@@ -492,12 +505,12 @@ public class CompletionProvider {
         }
 
         if (select.getExpression() instanceof MethodInvocationTree) {
-            LOG.info("...expression is MethodInvocationTree, attempting Lombok resolution");
+            LOG.fine("...expression is MethodInvocationTree, attempting Lombok resolution");
             var builderList =
                     LombokHandler.builderCompletionsForInvocation(
                             task, (MethodInvocationTree) select.getExpression(), partial, lombokCache, compiler);
             if (builderList != null) {
-                LOG.info("...builder pattern detected, returning builder completions");
+                LOG.fine("...builder pattern detected, returning builder completions");
                 return builderList;
             }
 
@@ -505,7 +518,7 @@ public class CompletionProvider {
             var invocationPath = new TreePath(path, select.getExpression());
             var lombokType = LombokHandler.resolveMethodInvocationReturnType(
                     task, (MethodInvocationTree) select.getExpression(), invocationPath, lombokCache);
-            LOG.info("...Lombok invocation type resolved: " + lombokType);
+            LOG.fine("...Lombok invocation type resolved: " + lombokType);
             if (lombokType instanceof DeclaredType) {
                 if (lombokContext == null) {
                     lombokContext = LombokHandler.newCompletionContext("memberSelect:" + select.getExpression());
@@ -672,7 +685,7 @@ public class CompletionProvider {
     private CompletionList completeMemberReference(CompileTask task, TreePath path, String partial) {
         var trees = Trees.instance(task.task);
         var select = (MemberReferenceTree) path.getLeaf();
-        LOG.info("...complete methods of " + select.getQualifierExpression());
+        LOG.fine("...complete methods of " + select.getQualifierExpression());
         path = new TreePath(path, select.getQualifierExpression());
         var element = trees.getElement(path);
         var isStatic = element instanceof TypeElement;
@@ -737,7 +750,7 @@ public class CompletionProvider {
         var switchTree = (SwitchTree) path.getLeaf();
         path = new TreePath(path, switchTree.getExpression());
         var type = Trees.instance(task.task).getTypeMirror(path);
-        LOG.info("...complete constants of type " + type);
+        LOG.fine("...complete constants of type " + type);
         if (!(type instanceof DeclaredType)) {
             return NOT_SUPPORTED;
         }
@@ -753,7 +766,7 @@ public class CompletionProvider {
     }
 
     private CompletionList completeImport(String path) {
-        LOG.info("...complete import");
+        LOG.fine("...complete import");
         var names = new HashSet<String>();
         var list = new CompletionList();
         for (var className : compiler.publicTopLevelTypes()) {
@@ -945,10 +958,36 @@ public class CompletionProvider {
         static final int CASE_LABEL = iota++;
     }
 
-    private void logCompletionTiming(Instant started, List<?> list, boolean isIncomplete) {
-        var elapsedMs = Duration.between(started, Instant.now()).toMillis();
-        if (isIncomplete) LOG.info(String.format("Found %d items (incomplete) in %,d ms", list.size(), elapsedMs));
-        else LOG.info(String.format("...found %d items in %,d ms", list.size(), elapsedMs));
+    private void logCompletionTiming(
+            long startedNanos,
+            long parseElapsedMs,
+            long pruneElapsedMs,
+            long resolveElapsedMs,
+            List<?> list,
+            boolean isIncomplete,
+            Path file,
+            int line,
+            int column) {
+        var elapsedMs = (System.nanoTime() - startedNanos) / 1_000_000;
+        LOG.info(
+                "[perf][completion] file="
+                        + file.getFileName()
+                        + " line="
+                        + line
+                        + " col="
+                        + column
+                        + " parse_ms="
+                        + parseElapsedMs
+                        + " prune_ms="
+                        + pruneElapsedMs
+                        + " resolve_ms="
+                        + resolveElapsedMs
+                        + " total_ms="
+                        + elapsedMs
+                        + " items="
+                        + list.size()
+                        + " incomplete="
+                        + isIncomplete);
     }
 
     private CharSequence simpleName(String className) {

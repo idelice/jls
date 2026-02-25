@@ -205,14 +205,26 @@ public class WarningsTest {
 
     @Test
     public void nonBooleanLombokGetterConditionReportsError() {
-        server.lint(List.of(FindResource.path("org/javacs/example/LombokThisSetterAndCondition.java")));
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokNonBooleanGetterCondition.java")));
         assertThat(
                 errors,
                 hasItem(
                         anyOf(
-                                startsWith("compiler.err.prob.found.req(18)"),
-                                startsWith("compiler.err.incompatible.types(18)"),
-                                startsWith("compiler.err.cant.resolve.location.args(18)"))));
+                                startsWith("compiler.err.prob.found.req(13)"),
+                                startsWith("compiler.err.incompatible.types(13)"),
+                                startsWith("compiler.err.cant.resolve.location.args(13)"))));
+    }
+
+    @Test
+    public void lombokGetterInsideStringUtilsCallDoesNotReportMissingSymbol() {
+        server.lint(List.of(FindResource.path("com/example/demo/models/ThisPojIfUsage.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args(7)"))));
+    }
+
+    @Test
+    public void lombokGetterInsideSpringStringUtilsServiceConditionDoesNotReportMissingSymbol() {
+        server.lint(List.of(FindResource.path("com/example/demo/service/ServiceTwo.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args(13)"))));
     }
 
     @Test
@@ -263,6 +275,55 @@ public class WarningsTest {
                         + "    }\n"
                         + "}\n";
         edit(file, newContents);
+        errors.clear();
+
+        server.lint(List.of(file));
+        assertThat(errors, hasItem(startsWith("compiler.err.")));
+    }
+
+    @Test
+    public void lombokSetterBooleanAndCatchScopeDoNotReportMissingMembers() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokSetterBooleanScopeExample.java")));
+        assertThat(errors, not(hasItem("compiler.err.cant.resolve.location.args(24)")));
+        assertThat(errors, not(hasItem("compiler.err.cant.resolve.location.args(29)")));
+        assertThat(errors, not(hasItem("compiler.err.cant.resolve.location(24)")));
+        assertThat(errors, not(hasItem("compiler.err.cant.resolve.location(29)")));
+    }
+
+    @Test
+    public void checkedExceptionMustProduceDiagnostic() {
+        server.lint(List.of(FindResource.path("org/javacs/err/CheckedExceptionDiagnostic.java")));
+        assertThat(errors, hasItem(startsWith("compiler.err.unreported.exception")));
+    }
+
+    @Test
+    public void stringLengthFieldAccessMustProduceDiagnostic() {
+        server.lint(List.of(FindResource.path("org/javacs/err/StringLengthFieldDiagnostic.java")));
+        assertThat(errors, hasItem(startsWith("compiler.err.cant.resolve.location")));
+    }
+
+    @Test
+    public void returnTypeChangeInvalidatesIncrementalDiagnostics() {
+        var file = FindResource.path("org/javacs/err/ReturnTypeChangeIncremental.java");
+        open(file);
+
+        server.lint(List.of(file));
+        assertThat(errors, empty());
+
+        var edited =
+                "package org.javacs.err;\n"
+                        + "\n"
+                        + "interface ReturnTypeContract {\n"
+                        + "    void compute();\n"
+                        + "}\n"
+                        + "\n"
+                        + "public class ReturnTypeChangeIncremental implements ReturnTypeContract {\n"
+                        + "    @Override\n"
+                        + "    public Object compute() {\n"
+                        + "        return new Object();\n"
+                        + "    }\n"
+                        + "}\n";
+        edit(file, edited);
         errors.clear();
 
         server.lint(List.of(file));

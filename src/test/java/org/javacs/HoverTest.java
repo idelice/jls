@@ -91,6 +91,12 @@ public class HoverTest {
         assertThat(hover, not(containsString("public static class foo")));
     }
 
+    @Test
+    public void lombokDataMapGetterHoverShowsGenericSignature() {
+        var hover = symbolAt("/org/javacs/example/LombokDataMapHoverCompletion.java", 15, 16);
+        assertThat(hover, containsString("Map<String, String> getDataMap()"));
+    }
+
     // Re-using the language server makes these tests go a lot faster, but it will potentially produce surprising output
     // if things go wrong
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();

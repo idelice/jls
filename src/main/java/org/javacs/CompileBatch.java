@@ -58,12 +58,25 @@ class CompileBatch implements AutoCloseable {
         this.roots = new ArrayList<>();
 
         try {
+            var parseStarted = System.nanoTime();
             for (var t : borrow.task.parse()) {
                 roots.add(t);
             }
+            var parseElapsedMs = (System.nanoTime() - parseStarted) / 1_000_000;
             // The results of borrow.task.analyze() are unreliable when errors are present
             // You can get at `Element` values using `Trees`
+            var analyzeStarted = System.nanoTime();
             borrow.task.analyze();
+            var analyzeElapsedMs = (System.nanoTime() - analyzeStarted) / 1_000_000;
+            LOG.info(
+                    "[perf][compile-batch] roots="
+                            + roots.size()
+                            + " parse_ms="
+                            + parseElapsedMs
+                            + " analyze_ms="
+                            + analyzeElapsedMs
+                            + " ap_enabled="
+                            + allowAP);
         } catch (IOException e) {
             try {
                 borrow.close();

@@ -6,7 +6,6 @@ import com.google.gson.*;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
@@ -46,6 +45,7 @@ class JavaLanguageServer extends LanguageServer {
     private long nextFullLintAtNanos = 0;
     private long changeSequence = 0;
     private long suppressFullLintUntilNanos = 0;
+    private final Map<java.net.URI, Integer> diagnosticsFingerprintByUri = new HashMap<>();
     private final InlayHintProvider inlayHintProvider = new InlayHintProvider();
     private static final long FAST_EDIT_LINT_DEBOUNCE_MS = 220;
     private static final long FULL_LINT_IDLE_MS = 900;
@@ -81,11 +81,19 @@ class JavaLanguageServer extends LanguageServer {
     void lint(Collection<Path> files, boolean includeWarnings, String phase) {
         if (files.isEmpty()) return;
         LOG.info("Lint " + files.size() + " files...");
-        var started = Instant.now();
+        var startedNanos = System.nanoTime();
         try (var task = compiler().compile(files.toArray(Path[]::new))) {
-            var compiled = Instant.now();
-            LOG.info("...compiled in " + Duration.between(started, compiled).toMillis() + " ms");
-            publishDiagnosticsAndColors(task, started, includeWarnings, phase);
+            var compileElapsedMs = (System.nanoTime() - startedNanos) / 1_000_000;
+            LOG.info(
+                    "[perf][diagnostics] phase="
+                            + phase
+                            + " includeWarnings="
+                            + includeWarnings
+                            + " compile_ms="
+                            + compileElapsedMs
+                            + " files="
+                            + files.size());
+            publishDiagnosticsAndColors(task, startedNanos, includeWarnings, phase);
         }
     }
 
@@ -98,22 +106,61 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     void publishDiagnosticsAndColors(CompileTask task, Instant started, boolean includeWarnings, String phase) {
-        for (var errs : new ErrorProvider(task, lombokCache, includeWarnings).errors()) {
+        publishDiagnosticsAndColors(task, System.nanoTime(), includeWarnings, phase);
+    }
+
+    void publishDiagnosticsAndColors(CompileTask task, long startedNanos, boolean includeWarnings, String phase) {
+        var collectStarted = System.nanoTime();
+        var payloads = new ErrorProvider(task, lombokCache, includeWarnings).errors();
+        var collectElapsedMs = (System.nanoTime() - collectStarted) / 1_000_000;
+        var publishStarted = System.nanoTime();
+        var publishedCount = 0;
+        var skippedUnchanged = 0;
+        for (var errs : payloads) {
+            var fingerprint = diagnosticsFingerprint(errs);
+            var previous = diagnosticsFingerprintByUri.get(errs.uri);
+            if (previous != null && previous == fingerprint) {
+                skippedUnchanged++;
+                continue;
+            }
+            diagnosticsFingerprintByUri.put(errs.uri, fingerprint);
             client.publishDiagnostics(errs);
+            publishedCount++;
         }
         // for (var colors : new ColorProvider(task).colors()) {
         //     client.customNotification("java/colors", GSON.toJsonTree(colors));
         // }
-        var published = Instant.now();
+        var publishElapsedMs = (System.nanoTime() - publishStarted) / 1_000_000;
+        var totalElapsedMs = (System.nanoTime() - startedNanos) / 1_000_000;
         LOG.info(
-                "...published in "
-                        + Duration.between(started, published).toMillis()
-                        + " ms"
-                        + " [phase="
+                "[perf][diagnostics] phase="
                         + phase
-                        + ", includeWarnings="
+                        + " includeWarnings="
                         + includeWarnings
-                        + "]");
+                        + " collect_ms="
+                        + collectElapsedMs
+                        + " publish_ms="
+                        + publishElapsedMs
+                        + " total_ms="
+                        + totalElapsedMs
+                        + " published_files="
+                        + publishedCount
+                        + " skipped_unchanged="
+                        + skippedUnchanged);
+    }
+
+    private int diagnosticsFingerprint(PublishDiagnosticsParams params) {
+        var hash = 1;
+        for (var d : params.diagnostics) {
+            hash = 31 * hash + Objects.hashCode(d.code);
+            hash = 31 * hash + Objects.hashCode(d.message);
+            hash = 31 * hash + Objects.hashCode(d.severity);
+            hash = 31 * hash + d.range.start.line;
+            hash = 31 * hash + d.range.start.character;
+            hash = 31 * hash + d.range.end.line;
+            hash = 31 * hash + d.range.end.character;
+        }
+        return hash;
     }
 
     /**
@@ -404,15 +451,23 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         markInteractiveRequest("completion");
         var file = Paths.get(params.textDocument.uri);
+        var startedNanos = System.nanoTime();
         var provider = new CompletionProvider(compiler(), lombokCache);
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
+        LOG.info(
+                "[perf][completion-request] file="
+                        + file.getFileName()
+                        + " elapsed_ms="
+                        + ((System.nanoTime() - startedNanos) / 1_000_000));
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(list);
     }
 
     @Override
     public CompletionItem resolveCompletionItem(CompletionItem unresolved) {
+        var startedNanos = System.nanoTime();
         new HoverProvider(compiler(), lombokCache).resolveCompletionItem(unresolved);
+        LOG.info("[perf][completion-resolve-request] elapsed_ms=" + ((System.nanoTime() - startedNanos) / 1_000_000));
         return unresolved;
     }
 
@@ -424,7 +479,13 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
+        var startedNanos = System.nanoTime();
         var content = new HoverProvider(compiler(), lombokCache).hover(file, line, column);
+        LOG.info(
+                "[perf][hover-request] file="
+                        + file.getFileName()
+                        + " elapsed_ms="
+                        + ((System.nanoTime() - startedNanos) / 1_000_000));
         if (content == null) {
             return Optional.empty();
         }
@@ -668,6 +729,7 @@ class JavaLanguageServer extends LanguageServer {
             var closed = Paths.get(params.textDocument.uri);
             pendingFastLintFiles.remove(closed);
             pendingFullLintFiles.remove(closed);
+            diagnosticsFingerprintByUri.remove(params.textDocument.uri);
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }

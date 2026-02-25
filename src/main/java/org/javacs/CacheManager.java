@@ -17,16 +17,32 @@ import java.util.logging.Logger;
  */
 class CacheManager {
     private static final Logger LOG = Logger.getLogger("main");
-    private static final Path CACHE_ROOT = Paths.get(System.getProperty("user.home"), ".cache", "jls");
+    private static final Path DEFAULT_CACHE_ROOT = Paths.get(System.getProperty("user.home"), ".cache", "jls");
     private static final String CLASSPATH_CACHE = "classpath.cache";
     private static final String DOCPATH_CACHE = "docpath.cache";
     private static final String METADATA_FILE = "metadata.json";
+    private final Path cacheRoot;
+    private final Map<String, InMemoryCacheEntry> inMemoryCache = new HashMap<>();
+
+    CacheManager() {
+        this(DEFAULT_CACHE_ROOT);
+    }
+
+    CacheManager(Path cacheRoot) {
+        this.cacheRoot = cacheRoot;
+    }
 
     /** Load cached classpath and docpath if valid */
     Optional<CachedPaths> loadCache(Path workspaceRoot, Collection<String> externalDependencies) {
         try {
             var workspaceDirName = getWorkspaceCacheDirName(workspaceRoot);
-            var cacheDir = CACHE_ROOT.resolve(workspaceDirName);
+            var memoryEntry = inMemoryCache.get(workspaceDirName);
+            if (memoryEntry != null && isCacheValid(workspaceRoot, memoryEntry.metadata, externalDependencies)) {
+                LOG.info("In-memory cache hit for workspace " + workspaceRoot + " (" + workspaceDirName + ")");
+                return Optional.of(memoryEntry.paths);
+            }
+
+            var cacheDir = cacheRoot.resolve(workspaceDirName);
 
             if (!Files.exists(cacheDir)) {
                 return Optional.empty();
@@ -56,9 +72,11 @@ class CacheManager {
 
             var classPath = readPathsFromFile(classPathFile);
             var docPath = readPathsFromFile(docPathFile);
+            var cachedPaths = new CachedPaths(classPath, docPath);
+            inMemoryCache.put(workspaceDirName, new InMemoryCacheEntry(cachedPaths, metadata));
 
             LOG.info("Cache hit for workspace " + workspaceRoot + " (" + workspaceDirName + ")");
-            return Optional.of(new CachedPaths(classPath, docPath));
+            return Optional.of(cachedPaths);
 
         } catch (Exception e) {
             LOG.warning("Failed to load cache: " + e.getMessage());
@@ -71,7 +89,13 @@ class CacheManager {
             Set<Path> docPath) {
         try {
             var workspaceDirName = getWorkspaceCacheDirName(workspaceRoot);
-            var cacheDir = CACHE_ROOT.resolve(workspaceDirName);
+            var metadata = new CacheMetadata(workspaceRoot, externalDependencies);
+            var cachedPaths = new CachedPaths(classPath, docPath);
+
+            // Always keep the current process fast even if filesystem cache is unavailable.
+            inMemoryCache.put(workspaceDirName, new InMemoryCacheEntry(cachedPaths, metadata));
+
+            var cacheDir = cacheRoot.resolve(workspaceDirName);
 
             // Create cache directory if it doesn't exist
             Files.createDirectories(cacheDir);
@@ -84,7 +108,6 @@ class CacheManager {
             writePathsToFile(docPathFile, docPath);
 
             // Write metadata
-            var metadata = new CacheMetadata(workspaceRoot, externalDependencies);
             writeMetadata(cacheDir.resolve(METADATA_FILE), metadata);
 
             LOG.info("Cached dependencies for workspace " + workspaceRoot + " (" + workspaceDirName + ")");
@@ -99,7 +122,8 @@ class CacheManager {
     void clearCache(Path workspaceRoot) {
         try {
             var workspaceDirName = getWorkspaceCacheDirName(workspaceRoot);
-            var cacheDir = CACHE_ROOT.resolve(workspaceDirName);
+            inMemoryCache.remove(workspaceDirName);
+            var cacheDir = cacheRoot.resolve(workspaceDirName);
 
             if (Files.exists(cacheDir)) {
                 deleteDirectory(cacheDir);
@@ -267,6 +291,16 @@ class CacheManager {
         CachedPaths(Set<Path> classPath, Set<Path> docPath) {
             this.classPath = classPath;
             this.docPath = docPath;
+        }
+    }
+
+    private static class InMemoryCacheEntry {
+        final CachedPaths paths;
+        final CacheMetadata metadata;
+
+        InMemoryCacheEntry(CachedPaths paths, CacheMetadata metadata) {
+            this.paths = paths;
+            this.metadata = metadata;
         }
     }
 
