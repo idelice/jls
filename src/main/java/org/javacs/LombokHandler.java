@@ -45,8 +45,13 @@ import org.javacs.lsp.Range;
 
 public final class LombokHandler {
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final String DEBUG_RESOLUTION_PROP = "jls.debug.lombok.resolution";
     private static final java.util.regex.Pattern METHOD_WITH_PARAMS_PATTERN =
             java.util.regex.Pattern.compile("method\\s+(\\w+)\\s*\\(([^)]*)\\)");
+    private static final java.util.regex.Pattern NO_SUITABLE_METHOD_PATTERN =
+            java.util.regex.Pattern.compile("no suitable method found for\\s+(\\w+)\\s*\\(([^)]*)\\)");
+    private static final java.util.regex.Pattern APPLICABLE_METHOD_OWNER_PATTERN =
+            java.util.regex.Pattern.compile("method\\s+([\\w.$]+)\\.(\\w+)\\s*\\(");
     private static final java.util.regex.Pattern METHOD_NO_PARAMS_PATTERN =
             java.util.regex.Pattern.compile("method\\s+(\\w+)\\b(?!\\s*\\()");
     private static final java.util.regex.Pattern METHOD_IN_CLASS_PATTERN =
@@ -1133,15 +1138,17 @@ public final class LombokHandler {
             CompileTask task, LombokMetadataCache cache, javax.tools.Diagnostic<? extends JavaFileObject> d) {
         var message = d.getMessage(null);
         if (message == null) return false;
-        var parsed = parseDiagnostic(task, d, message);
-        if (parsed == null || parsed.methodName == null || parsed.paramTypes == null || parsed.className == null) {
+        var astContext = new DiagnosticAstContext(task, d);
+        var parsed = parseDiagnostic(task, d, message, astContext);
+        if (parsed == null || parsed.methodName == null || parsed.paramTypes == null) {
             return false;
         }
         var methodName = parsed.methodName;
         var paramTypes = parsed.paramTypes;
-        var className = parsed.className;
+        var className = parsed.className != null ? parsed.className : astContext.receiverClassName();
+        if (className == null) return false;
 
-        var metadata = cache.get(className, task.roots);
+        var metadata = metadataForClassName(cache, className, task.roots, null);
         if (metadata == null) return false;
         if (!hasMethodGeneratingLombokAnnotations(metadata)) return false;
 
@@ -1284,10 +1291,79 @@ public final class LombokHandler {
         if (code == null) {
             return false;
         }
+        var traceEnabled = Boolean.getBoolean(DEBUG_RESOLUTION_PROP);
+        var traceStartNanos = traceEnabled ? System.nanoTime() : 0L;
+        if (traceEnabled && (code.startsWith("compiler.err.cant.apply") || code.startsWith("compiler.err.cant.resolve.location.args"))) {
+            LOG.info(
+                    "[lombok-resolve-trace] code="
+                            + code
+                            + " line="
+                            + (d.getLineNumber() > 0 ? d.getLineNumber() : -1)
+                            + " message="
+                            + d.getMessage(null));
+        }
         // Handle "cannot apply symbol" errors for enum constructors with Lombok
-        if (code.equals("compiler.err.cant.apply.symbol")) {
-            return shouldFilterEnumConstructorError(task, cache, d) ||
-                   shouldFilterLombokSetterWithMatchingTypes(task, cache, d);
+        if (code.equals("compiler.err.cant.apply.symbol") || code.equals("compiler.err.cant.apply.symbols")) {
+            var message = d.getMessage(null);
+            var parsed = parseCantApplyDiagnosticFast(task, d, message);
+            var parsedClassMetadata =
+                    parsed != null && parsed.className != null
+                            ? metadataForClassName(cache, parsed.className, task.roots, requestCache)
+                            : null;
+            var quickDecision =
+                    parsed != null
+                            ? quickDiagnosticFilterDecision(parsedClassMetadata, parsed, null)
+                            : DiagnosticDecision.UNKNOWN;
+            if (Boolean.getBoolean("jls.debug.diag.timings") && parsed != null) {
+                var sampleKey =
+                        code
+                                + "|"
+                                + parsed.className
+                                + "|"
+                                + parsed.methodName
+                                + "|"
+                                + parsed.paramTypes;
+                if (requestCache.loggedCantApplySamples.add(sampleKey)) {
+                    LOG.info(
+                            "[diag-filter-cant-apply] code="
+                                    + code
+                                    + " class="
+                                    + parsed.className
+                                    + " method="
+                                    + parsed.methodName
+                                    + " params="
+                                    + parsed.paramTypes
+                                    + " quick_decision="
+                                    + quickDecision
+                                    + " has_metadata="
+                                    + (parsedClassMetadata != null));
+                }
+            }
+            if (quickDecision == DiagnosticDecision.FILTER) {
+                if (traceEnabled && code.startsWith("compiler.err.cant.apply")) {
+                    LOG.info(
+                            "[lombok-resolve-trace] code="
+                                    + code
+                                    + " filtered=true reason=quick-match total_ms="
+                                    + ((System.nanoTime() - traceStartNanos) / 1_000_000));
+                }
+                return true;
+            }
+            var astContext = new DiagnosticAstContext(task, d, requestCache);
+            var filtered =
+                    shouldFilterEnumConstructorError(task, cache, d)
+                            || shouldFilterLombokSetterWithMatchingTypes(task, cache, d)
+                            || shouldFilterInvocationFromAst(task, cache, astContext, requestCache, traceEnabled);
+            if (traceEnabled && code.startsWith("compiler.err.cant.apply")) {
+                LOG.info(
+                        "[lombok-resolve-trace] code="
+                                + code
+                                + " filtered="
+                                + filtered
+                                + " total_ms="
+                                + ((System.nanoTime() - traceStartNanos) / 1_000_000));
+            }
+            return filtered;
         }
         // Handle "cannot resolve symbol" errors for Lombok-generated members
         if (!code.startsWith("compiler.err.cant.resolve")) {
@@ -1295,9 +1371,21 @@ public final class LombokHandler {
         }
         var message = d.getMessage(null);
         if (message == null) return false;
-        var astContext = new DiagnosticAstContext(task, d);
+        var astContext = new DiagnosticAstContext(task, d, requestCache);
         var parsed = parseDiagnostic(task, d, message, astContext);
         if (parsed == null) return false;
+        if (traceEnabled && code.startsWith("compiler.err.cant.resolve.location.args")) {
+            LOG.info(
+                    "[lombok-resolve-trace] parsed method="
+                            + parsed.methodName
+                            + " class="
+                            + parsed.className
+                            + " params="
+                            + parsed.paramTypes
+                            + " variable="
+                            + parsed.variableName);
+            logConditionalResolutionTrace(task, astContext);
+        }
         var directConditionMethodName = astContext.directConditionMethodName();
         var parsedClassMetadata =
                 parsed.className != null ? metadataForClassName(cache, parsed.className, task.roots, requestCache) : null;
@@ -1325,6 +1413,18 @@ public final class LombokHandler {
         }
 
         if (parsed.methodName != null && parsed.className != null) {
+            if (code.startsWith("compiler.err.cant.resolve.location.args")
+                    && shouldFilterSetterInvocationWithConditional(
+                            task, cache, parsed, astContext, requestCache, traceEnabled)) {
+                if (traceEnabled) {
+                    LOG.info(
+                            "[lombok-resolve-trace] code="
+                                    + code
+                                    + " filtered=true reason=setter-conditional-ast total_ms="
+                                    + ((System.nanoTime() - traceStartNanos) / 1_000_000));
+                }
+                return true;
+            }
             if (parsed.paramTypes != null
                     && parsed.paramTypes.isEmpty()
                     && parsed.methodName.equals(directConditionMethodName)) {
@@ -1374,6 +1474,13 @@ public final class LombokHandler {
             }
         }
 
+        if (traceEnabled && (code.startsWith("compiler.err.cant.apply") || code.startsWith("compiler.err.cant.resolve.location.args"))) {
+            LOG.info(
+                    "[lombok-resolve-trace] code="
+                            + code
+                            + " filtered=false total_ms="
+                            + ((System.nanoTime() - traceStartNanos) / 1_000_000));
+        }
         return false;
     }
 
@@ -1590,9 +1697,33 @@ public final class LombokHandler {
         if (message == null) {
             return null;
         }
-        var className = classNameFromMessage(task, d, message, astContext);
+        String className = null;
+        boolean classNameResolved = false;
+        var noSuitableMethodMatcher = NO_SUITABLE_METHOD_PATTERN.matcher(message);
+        if (noSuitableMethodMatcher.find()) {
+            var methodName = noSuitableMethodMatcher.group(1);
+            var params = noSuitableMethodMatcher.group(2);
+            var ownerMatcher = APPLICABLE_METHOD_OWNER_PATTERN.matcher(message);
+            while (ownerMatcher.find()) {
+                var ownerMethod = ownerMatcher.group(2);
+                if (!methodName.equals(ownerMethod)) {
+                    continue;
+                }
+                className = resolveDiagnosticClassName(task, d, ownerMatcher.group(1), astContext);
+                classNameResolved = true;
+                break;
+            }
+            if (!classNameResolved) {
+                className = classNameFromMessage(task, d, message, astContext);
+            }
+            return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
+        }
         var methodMatcher = METHOD_WITH_PARAMS_PATTERN.matcher(message);
         if (methodMatcher.find()) {
+            if (!classNameResolved) {
+                className = classNameFromMessage(task, d, message, astContext);
+                classNameResolved = true;
+            }
             var methodName = methodMatcher.group(1);
             var params = methodMatcher.group(2);
             return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
@@ -1612,13 +1743,60 @@ public final class LombokHandler {
         }
         var methodNoParamsMatcher = METHOD_NO_PARAMS_PATTERN.matcher(message);
         if (methodNoParamsMatcher.find()) {
+            if (!classNameResolved) {
+                className = classNameFromMessage(task, d, message, astContext);
+                classNameResolved = true;
+            }
             return new ParsedDiagnostic(className, methodNoParamsMatcher.group(1), List.of(), null);
         }
         var variableMatcher = VARIABLE_PATTERN.matcher(message);
         if (variableMatcher.find()) {
+            if (!classNameResolved) {
+                className = classNameFromMessage(task, d, message, astContext);
+                classNameResolved = true;
+            }
             return new ParsedDiagnostic(className, null, null, variableMatcher.group(1));
         }
+        if (!classNameResolved) {
+            className = classNameFromMessage(task, d, message, astContext);
+        }
         return new ParsedDiagnostic(className, null, null, null);
+    }
+
+    private static ParsedDiagnostic parseCantApplyDiagnosticFast(
+            CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> d, String message) {
+        if (message == null) {
+            return null;
+        }
+        var noSuitableMethodMatcher = NO_SUITABLE_METHOD_PATTERN.matcher(message);
+        if (noSuitableMethodMatcher.find()) {
+            var methodName = noSuitableMethodMatcher.group(1);
+            var params = noSuitableMethodMatcher.group(2);
+            String className = null;
+            var ownerMatcher = APPLICABLE_METHOD_OWNER_PATTERN.matcher(message);
+            while (ownerMatcher.find()) {
+                var ownerMethod = ownerMatcher.group(2);
+                if (!methodName.equals(ownerMethod)) {
+                    continue;
+                }
+                className = resolveDiagnosticClassName(task, d, ownerMatcher.group(1));
+                break;
+            }
+            return new ParsedDiagnostic(className, methodName, parseMethodParamTypes(params), null);
+        }
+        var methodInClassMatcher = METHOD_IN_CLASS_PATTERN.matcher(message);
+        if (methodInClassMatcher.find()) {
+            var methodName = methodInClassMatcher.group(1);
+            var className = resolveDiagnosticClassName(task, d, methodInClassMatcher.group(2));
+            var foundMatcher = FOUND_ARGUMENTS_PATTERN.matcher(message);
+            if (foundMatcher.find()) {
+                var found = foundMatcher.group(1).trim();
+                var params = found.equals("no arguments") ? List.<String>of() : parseMethodParamTypes(found);
+                return new ParsedDiagnostic(className, methodName, params, null);
+            }
+            return new ParsedDiagnostic(className, methodName, null, null);
+        }
+        return null;
     }
 
     private static DiagnosticDecision quickDiagnosticFilterDecision(
@@ -2011,6 +2189,220 @@ public final class LombokHandler {
         return null;
     }
 
+    private static void logConditionalResolutionTrace(CompileTask task, DiagnosticAstContext astContext) {
+        var path = astContext.path();
+        if (path == null) {
+            LOG.info("[lombok-resolve-trace] ast path=<null>");
+            return;
+        }
+        TreePath invocationPath = null;
+        for (var current = path; current != null; current = current.getParentPath()) {
+            if (current.getLeaf() instanceof MethodInvocationTree) {
+                invocationPath = current;
+                break;
+            }
+        }
+        if (invocationPath == null) {
+            LOG.info("[lombok-resolve-trace] invocation=<null>");
+            return;
+        }
+        var invocation = (MethodInvocationTree) invocationPath.getLeaf();
+        var trees = Trees.instance(task.task);
+        var index = 0;
+        for (var arg : invocation.getArguments()) {
+            var argPath = new TreePath(invocationPath, arg);
+            var argType = trees.getTypeMirror(argPath);
+            LOG.info(
+                    "[lombok-resolve-trace] arg_index="
+                            + index
+                            + " kind="
+                            + arg.getKind()
+                            + " type="
+                            + argType);
+            if (arg.getKind() == Tree.Kind.CONDITIONAL_EXPRESSION) {
+                var conditional = (com.sun.source.tree.ConditionalExpressionTree) arg;
+                var trueType = trees.getTypeMirror(new TreePath(argPath, conditional.getTrueExpression()));
+                var falseType = trees.getTypeMirror(new TreePath(argPath, conditional.getFalseExpression()));
+                LOG.info(
+                        "[lombok-resolve-trace] conditional true_type="
+                                + trueType
+                                + " false_type="
+                                + falseType
+                                + " merged_type="
+                                + argType);
+            }
+            index++;
+        }
+    }
+
+    private static boolean shouldFilterSetterInvocationWithConditional(
+            CompileTask task,
+            LombokMetadataCache cache,
+            ParsedDiagnostic parsed,
+            DiagnosticAstContext astContext,
+            RequestCache requestCache,
+            boolean traceEnabled) {
+        var started = traceEnabled ? System.nanoTime() : 0L;
+        if (parsed == null || parsed.methodName == null || parsed.className == null) return false;
+        if (!parsed.methodName.startsWith("set")) return false;
+        var metadata = metadataForClassName(cache, parsed.className, task.roots, requestCache);
+        if (metadata == null) return false;
+        var setterField = metadata.fieldForSetter(parsed.methodName);
+        if (setterField == null) return false;
+
+        var invocationPath = nearestMethodInvocationPath(astContext.path());
+        if (invocationPath == null || !(invocationPath.getLeaf() instanceof MethodInvocationTree)) return false;
+        var invocation = (MethodInvocationTree) invocationPath.getLeaf();
+        var methodName = invocationMethodName(invocation);
+        if (!parsed.methodName.equals(methodName)) return false;
+        if (invocation.getArguments().size() != 1) return false;
+
+        var arg = invocation.getArguments().get(0);
+        var matched =
+                argumentMatchesSetterType(task, parsed.className, metadata, setterField, invocationPath, arg, requestCache);
+        if (traceEnabled) {
+            LOG.info(
+                    "[lombok-resolve-trace] setter-conditional-check method="
+                            + parsed.methodName
+                            + " class="
+                            + parsed.className
+                            + " matched="
+                            + matched
+                            + " ms="
+                            + ((System.nanoTime() - started) / 1_000_000));
+        }
+        return matched;
+    }
+
+    private static boolean shouldFilterInvocationFromAst(
+            CompileTask task,
+            LombokMetadataCache cache,
+            DiagnosticAstContext astContext,
+            RequestCache requestCache,
+            boolean traceEnabled) {
+        var started = traceEnabled ? System.nanoTime() : 0L;
+        var invocationPath = nearestMethodInvocationPath(astContext.path());
+        if (invocationPath == null || !(invocationPath.getLeaf() instanceof MethodInvocationTree)) return false;
+        var invocation = (MethodInvocationTree) invocationPath.getLeaf();
+        var methodName = invocationMethodName(invocation);
+        if (methodName == null) return false;
+        if (!(invocation.getMethodSelect() instanceof MemberSelectTree)) return false;
+
+        var memberSelect = (MemberSelectTree) invocation.getMethodSelect();
+        var trees = Trees.instance(task.task);
+        var receiverPath = new TreePath(invocationPath, memberSelect.getExpression());
+        var receiverElement = trees.getElement(receiverPath);
+        // Do not suppress static-call overload diagnostics.
+        if (receiverElement instanceof TypeElement) return false;
+
+        var receiverType = trees.getTypeMirror(receiverPath);
+        if (!(receiverType instanceof DeclaredType)) return false;
+        var receiverClassName = ((TypeElement) ((DeclaredType) receiverType).asElement()).getQualifiedName().toString();
+        var metadata = metadataForClassName(cache, receiverClassName, task.roots, requestCache);
+        if (metadata == null) return false;
+
+        var matched = false;
+        if (invocation.getArguments().isEmpty()) {
+            matched = metadata.isGeneratedGetter(methodName);
+        } else if (invocation.getArguments().size() == 1) {
+            var setterField = metadata.fieldForSetter(methodName);
+            if (setterField != null) {
+                matched =
+                        argumentMatchesSetterType(
+                                task,
+                                receiverClassName,
+                                metadata,
+                                setterField,
+                                invocationPath,
+                                invocation.getArguments().get(0),
+                                requestCache);
+            }
+        }
+        if (traceEnabled) {
+            LOG.info(
+                    "[lombok-resolve-trace] ast-invocation-check class="
+                            + receiverClassName
+                            + " method="
+                            + methodName
+                            + " arg_count="
+                            + invocation.getArguments().size()
+                            + " matched="
+                            + matched
+                            + " ms="
+                            + ((System.nanoTime() - started) / 1_000_000));
+        }
+        return matched;
+    }
+
+    private static boolean argumentMatchesSetterType(
+            CompileTask task,
+            String ownerClassName,
+            LombokMetadata metadata,
+            VariableTree setterField,
+            TreePath parentPath,
+            Tree argument,
+            RequestCache requestCache) {
+        if (argument == null) return false;
+        var argumentPath = new TreePath(parentPath, argument);
+        if (argument.getKind() == Tree.Kind.CONDITIONAL_EXPRESSION) {
+            var conditional = (com.sun.source.tree.ConditionalExpressionTree) argument;
+            return argumentMatchesSetterType(
+                            task,
+                            ownerClassName,
+                            metadata,
+                            setterField,
+                            argumentPath,
+                            conditional.getTrueExpression(),
+                            requestCache)
+                    && argumentMatchesSetterType(
+                            task,
+                            ownerClassName,
+                            metadata,
+                            setterField,
+                            argumentPath,
+                            conditional.getFalseExpression(),
+                            requestCache);
+        }
+        var expectedType = setterField.getType().toString();
+        if (argument instanceof MethodInvocationTree) {
+            var called = invocationMethodName((MethodInvocationTree) argument);
+            if (called != null && metadata.isGeneratedGetter(called)) {
+                var getterField = metadata.fieldForGetter(called);
+                if (getterField != null && typesMatch(expectedType, getterField.getType().toString())) {
+                    return true;
+                }
+            }
+        }
+        var trees = Trees.instance(task.task);
+        var argType = trees.getTypeMirror(argumentPath);
+        if (argType == null || argType.getKind() == TypeKind.ERROR) {
+            return false;
+        }
+        return isAssignableToField(task, ownerClassName, setterField, argType.toString(), requestCache)
+                || typesMatch(expectedType, argType.toString());
+    }
+
+    private static String invocationMethodName(MethodInvocationTree invocation) {
+        if (invocation == null) return null;
+        var select = invocation.getMethodSelect();
+        if (select instanceof MemberSelectTree) {
+            return ((MemberSelectTree) select).getIdentifier().toString();
+        }
+        if (select instanceof IdentifierTree) {
+            return ((IdentifierTree) select).getName().toString();
+        }
+        return null;
+    }
+
+    private static TreePath nearestMethodInvocationPath(TreePath path) {
+        for (var current = path; current != null; current = current.getParentPath()) {
+            if (current.getLeaf() instanceof MethodInvocationTree) {
+                return current;
+            }
+        }
+        return null;
+    }
+
     private static CompilationUnitTree diagnosticRoot(
             CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic) {
         if (diagnostic == null || diagnostic.getSource() == null) {
@@ -2111,6 +2503,7 @@ public final class LombokHandler {
     private static final class DiagnosticAstContext {
         private final CompileTask task;
         private final javax.tools.Diagnostic<? extends JavaFileObject> diagnostic;
+        private final RequestCache requestCache;
         private CompilationUnitTree root;
         private boolean rootResolved;
         private TreePath path;
@@ -2125,14 +2518,33 @@ public final class LombokHandler {
         private boolean enclosingResolved;
 
         private DiagnosticAstContext(CompileTask task, javax.tools.Diagnostic<? extends JavaFileObject> diagnostic) {
+            this(task, diagnostic, null);
+        }
+
+        private DiagnosticAstContext(
+                CompileTask task,
+                javax.tools.Diagnostic<? extends JavaFileObject> diagnostic,
+                RequestCache requestCache) {
             this.task = task;
             this.diagnostic = diagnostic;
+            this.requestCache = requestCache;
         }
 
         private CompilationUnitTree root() {
             if (!rootResolved) {
-                if (diagnostic != null) {
-                    root = diagnosticRoot(task, diagnostic);
+                if (diagnostic != null && diagnostic.getSource() != null) {
+                    var sourceUri = diagnostic.getSource().toUri();
+                    if (requestCache != null) {
+                        root = requestCache.rootByUri.get(sourceUri);
+                        if (root == null) {
+                            root = diagnosticRoot(task, diagnostic);
+                            if (root != null) {
+                                requestCache.rootByUri.put(sourceUri, root);
+                            }
+                        }
+                    } else {
+                        root = diagnosticRoot(task, diagnostic);
+                    }
                 }
                 rootResolved = true;
             }
@@ -2143,7 +2555,18 @@ public final class LombokHandler {
             if (!pathResolved) {
                 var resolvedRoot = root();
                 if (resolvedRoot != null && diagnostic != null && diagnostic.getStartPosition() >= 0) {
-                    path = new FindNameAt(task).scan(resolvedRoot, diagnostic.getStartPosition());
+                    if (requestCache != null && diagnostic.getSource() != null) {
+                        var key = diagnostic.getSource().toUri() + "#" + diagnostic.getStartPosition();
+                        path = requestCache.pathBySourceAndStart.get(key);
+                        if (path == null) {
+                            path = new FindNameAt(task).scan(resolvedRoot, diagnostic.getStartPosition());
+                            if (path != null) {
+                                requestCache.pathBySourceAndStart.put(key, path);
+                            }
+                        }
+                    } else {
+                        path = new FindNameAt(task).scan(resolvedRoot, diagnostic.getStartPosition());
+                    }
                 }
                 pathResolved = true;
             }
@@ -2341,6 +2764,7 @@ public final class LombokHandler {
         if (params == null) return List.of();
         var trimmed = params.trim();
         if (trimmed.isEmpty()) return List.of();
+        if ("no arguments".equals(trimmed)) return List.of();
         var parts = trimmed.split(",");
         var result = new ArrayList<String>();
         for (var part : parts) {
@@ -2551,6 +2975,9 @@ public final class LombokHandler {
         private final Set<String> loggedMetadataMisses = new HashSet<>();
         private final Set<String> loggedMetadataStores = new HashSet<>();
         private final Set<String> loggedMetadataHits = new HashSet<>();
+        private final Set<String> loggedCantApplySamples = new HashSet<>();
+        private final Map<java.net.URI, CompilationUnitTree> rootByUri = new HashMap<>();
+        private final Map<String, TreePath> pathBySourceAndStart = new HashMap<>();
 
         private RequestCache(String scope) {
             this.scope = scope;

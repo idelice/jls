@@ -185,6 +185,14 @@ public class WarningsTest {
     }
 
     @Test
+    public void lombokEnumGetterWithOverloadedStaticsStillResolvesZeroArgInstanceGetter() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokEnumSetterOverload.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.apply.symbols("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.apply.symbol("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+    }
+
+    @Test
     public void wrongArityMethodOnLombokClassStillReportsCompilerError() {
         server.lint(List.of(FindResource.path("org/javacs/example/LombokWrongArityHover.java")));
         assertThat(
@@ -201,6 +209,30 @@ public class WarningsTest {
         server.lint(List.of(FindResource.path("org/javacs/example/LombokThisSetterAndCondition.java")));
         assertThat(errors, not(hasItem("compiler.err.cant.resolve.location.args(10)")));
         assertThat(errors, not(hasItem("compiler.err.cant.resolve.args(10)")));
+    }
+
+    @Test
+    public void ternaryInsideLombokSetterCallDoesNotReportMissingSetter() {
+        server.lint(List.of(FindResource.path("org/javacs/example/LombokTernarySetterUsage.java")));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location.args("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.resolve.location("))));
+    }
+
+    @Test
+    public void lombokEnumOverloadStormFiltersQuickly() {
+        var file = FindResource.path("org/javacs/example/LombokEnumOverloadStorm.java");
+        // Warm up project/dependency/classpath initialization so this test measures diagnostics responsiveness.
+        server.lint(List.of(file));
+        errors.clear();
+
+        var started = System.nanoTime();
+        server.lint(List.of(file));
+        var elapsedMs = (System.nanoTime() - started) / 1_000_000;
+        System.err.println("[test-timing] lombokEnumOverloadStormFiltersQuickly lint_ms=" + elapsedMs);
+
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.apply.symbols("))));
+        assertThat(errors, not(hasItem(startsWith("compiler.err.cant.apply.symbol("))));
+        assertThat(elapsedMs, lessThan(700L));
     }
 
     @Test

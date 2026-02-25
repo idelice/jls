@@ -113,6 +113,7 @@ public class ErrorProvider {
 
     private List<org.javacs.lsp.Diagnostic> compilerErrors(CompilationUnitTree root) {
         var result = new ArrayList<org.javacs.lsp.Diagnostic>();
+        var debugTimings = Boolean.getBoolean("jls.debug.diag.timings");
 
         // Create a copy to avoid ConcurrentModificationException during cache compilation
         var diagnosticsCopy = new ArrayList<>(task.diagnostics);
@@ -128,20 +129,40 @@ public class ErrorProvider {
         int filteredByLombok = 0;
         int lombokChecks = 0;
         int lombokSkippedByPrecheck = 0;
+        long adjustMs = 0;
+        long filterMs = 0;
+        long convertMs = 0;
+        var perCodeFilterMs = new HashMap<String, Long>();
+        var perCodeFilterCount = new HashMap<String, Integer>();
+        var perCodeSampleMessage = new HashMap<String, String>();
 
         for (var d : diagnosticsCopy) {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
             if (d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
 
             // Replace or filter out errors for Lombok-generated members
+            var adjustStart = debugTimings ? System.nanoTime() : 0L;
             var lombokAdjusted = LombokHandler.adjustDiagnostic(task, lombokCache, d, root);
+            if (debugTimings) {
+                adjustMs += (System.nanoTime() - adjustStart) / 1_000_000;
+            }
             if (lombokAdjusted != null) {
                 result.add(lombokAdjusted);
                 continue;
             }
             if (shouldAttemptLombokFilter(d)) {
                 lombokChecks++;
-                if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d, filterContext)) {
+                var filterStart = debugTimings ? System.nanoTime() : 0L;
+                var shouldFilter = LombokHandler.shouldFilterDiagnostic(task, lombokCache, d, filterContext);
+                if (debugTimings) {
+                    var elapsed = (System.nanoTime() - filterStart) / 1_000_000;
+                    filterMs += elapsed;
+                    var code = d.getCode() != null ? d.getCode() : "<null>";
+                    perCodeFilterMs.merge(code, elapsed, Long::sum);
+                    perCodeFilterCount.merge(code, 1, Integer::sum);
+                    perCodeSampleMessage.putIfAbsent(code, d.getMessage(null));
+                }
+                if (shouldFilter) {
                     filteredByLombok++;
                     continue; // Skip this error
                 }
@@ -149,7 +170,11 @@ public class ErrorProvider {
                 lombokSkippedByPrecheck++;
             }
 
+            var convertStart = debugTimings ? System.nanoTime() : 0L;
             result.add(lspDiagnostic(d, root.getLineMap()));
+            if (debugTimings) {
+                convertMs += (System.nanoTime() - convertStart) / 1_000_000;
+            }
         }
         var kept = result.size();
         var filteredCount = filteredByLombok;
@@ -167,14 +192,52 @@ public class ErrorProvider {
                                 + precheckSkipped
                                 + " kept="
                                 + kept);
+        if (debugTimings) {
+            LOG.info(
+                    "[diag-filter-timing] uri="
+                            + root.getSourceFile().toUri()
+                            + " diagnostics="
+                            + diagnosticsCopy.size()
+                            + " adjust_ms="
+                            + adjustMs
+                            + " filter_ms="
+                            + filterMs
+                            + " lsp_convert_ms="
+                            + convertMs);
+            for (var entry : perCodeFilterCount.entrySet()) {
+                var code = entry.getKey();
+                var count = entry.getValue();
+                var elapsed = perCodeFilterMs.getOrDefault(code, 0L);
+                LOG.info(
+                        "[diag-filter-timing] uri="
+                                + root.getSourceFile().toUri()
+                                + " code="
+                                + code
+                                + " count="
+                                + count
+                                + " total_filter_ms="
+                                + elapsed
+                                + " sample_message="
+                                + perCodeSampleMessage.getOrDefault(code, "<none>"));
+            }
+        }
         return result;
     }
 
     private boolean shouldAttemptLombokFilter(Diagnostic<? extends JavaFileObject> d) {
         var code = d.getCode();
         if (code == null) return false;
-        if ("compiler.err.cant.apply.symbol".equals(code)) {
+        if ("compiler.err.cant.apply.symbol".equals(code)
+                || "compiler.err.cant.apply.symbols".equals(code)) {
             return true;
+        }
+        if (code.startsWith("compiler.err.cant.apply")
+                && Boolean.getBoolean("jls.debug.lombok.resolution")) {
+            LOG.info(
+                    "[diag-filter-trace] skip_lombok_filter code="
+                            + code
+                            + " line="
+                            + (d.getLineNumber() > 0 ? d.getLineNumber() : -1));
         }
         if (!code.startsWith("compiler.err.cant.resolve")) {
             return false;
@@ -197,7 +260,10 @@ public class ErrorProvider {
         for (var d : diagnosticsCopy) {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
             var code = d.getCode();
-            if (code == null || (!code.startsWith("compiler.err.cant.resolve") && !code.equals("compiler.err.cant.apply.symbol"))) {
+            if (code == null
+                    || (!code.startsWith("compiler.err.cant.resolve")
+                            && !code.equals("compiler.err.cant.apply.symbol")
+                            && !code.equals("compiler.err.cant.apply.symbols"))) {
                 continue;
             }
             var message = d.getMessage(null);
