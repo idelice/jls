@@ -8,22 +8,17 @@ import javax.lang.model.element.TypeElement;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
-import org.javacs.LombokHandler;
-import org.javacs.LombokMetadataCache;
 import org.javacs.lsp.Location;
 
 public class ReferenceProvider {
     private final CompilerProvider compiler;
-    private final LombokMetadataCache lombokCache;
     private final Path file;
     private final int line, column;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
-    public ReferenceProvider(
-            CompilerProvider compiler, LombokMetadataCache lombokCache, Path file, int line, int column) {
+    public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
         this.compiler = compiler;
-        this.lombokCache = lombokCache;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -48,12 +43,7 @@ public class ReferenceProvider {
                 }
                 task.close();
                 if (element.getKind() == javax.lang.model.element.ElementKind.FIELD) {
-                    var references = new ArrayList<Location>();
-                    references.addAll(findFieldReferencesScoped(className, memberName));
-                    references.addAll(
-                            LombokHandler.findAccessorReferences(
-                                    compiler, className, memberName, lombokCache));
-                    return references;
+                    return findFieldReferencesScoped(className, memberName);
                 }
                 return findMemberReferences(className, memberName);
             }

@@ -5,27 +5,21 @@ import com.sun.source.util.*;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.FileStore;
-import org.javacs.LombokMetadataCache;
-import org.javacs.LombokHandler;
 import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
-    private final LombokMetadataCache lombokCache;
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
 
-    public ErrorProvider(CompileTask task, LombokMetadataCache lombokCache) {
+    public ErrorProvider(CompileTask task) {
         this.task = task;
-        this.lombokCache = lombokCache;
     }
 
     public PublishDiagnosticsParams[] errors() {
@@ -41,8 +35,6 @@ public class ErrorProvider {
                 continue;
             }
             result[i].diagnostics.addAll(compilerErrors(root));
-            result[i].diagnostics.addAll(LombokHandler.constructorDiagnostics(task, lombokCache, root));
-            result[i].diagnostics.addAll(LombokHandler.builderConstructorDiagnostics(task, root));
             result[i].diagnostics.addAll(unusedWarnings(root));
             result[i].diagnostics.addAll(notThrownWarnings(root));
         }
@@ -71,36 +63,17 @@ public class ErrorProvider {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
             if (d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
 
-            // Replace or filter out errors for Lombok-generated members
-            var lombokAdjusted = LombokHandler.adjustDiagnostic(task, lombokCache, d, root);
-            if (lombokAdjusted != null) {
-                result.add(lombokAdjusted);
-                continue;
-            }
-            if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d)) {
-                continue;  // Skip this error
-            }
-
             result.add(lspDiagnostic(d, root.getLineMap()));
         }
         return result;
     }
-
-    /**
-     * Check if a diagnostic is about a Lombok-generated member.
-     * Examples of such errors:
-     * - "cannot find symbol\n  symbol:   method getOne()\n  location: variable foo of type Foo"
-     * - "cannot find symbol\n  symbol:   method setAge(int)\n  location: class Foo"
-     */
 
     private List<org.javacs.lsp.Diagnostic> unusedWarnings(CompilationUnitTree root) {
         var result = new ArrayList<org.javacs.lsp.Diagnostic>();
         var warnUnused = new WarnUnused(task.task);
         warnUnused.scan(root, null);
         for (var unusedEl : warnUnused.notUsed()) {
-            if (!LombokHandler.shouldSuppressUnusedField(unusedEl, task, lombokCache)) {
-                result.add(warnUnused(unusedEl));
-            }
+            result.add(warnUnused(unusedEl));
         }
         return result;
     }

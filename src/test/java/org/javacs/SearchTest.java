@@ -91,4 +91,12 @@ public class SearchTest {
 
         assertThat("includes explicit constructor", all, hasItem("ReferenceConstructor"));
     }
+
+    @Test
+    public void symbolsInRecordFile() {
+        var path = "/org/javacs/example/RecordSymbols.java";
+        var all = searchFile(FindResource.uri(path));
+
+        assertThat(all, hasItems("RecordSymbols", "format"));
+    }
 }

@@ -29,8 +29,12 @@ public class HoverProvider {
 
     public MarkupContent hover(Path file, int line, int column) {
         try (var task = compiler.compile(file)) {
-            var position = task.root().getLineMap().getPosition(line, column);
-            var element = new FindHoverElement(task.task).scan(task.root(), position);
+            var root = task.root(file);
+            if (task.roots.size() > 1) {
+                LOG.fine(String.format("[perf] hover_root_select file=%s roots=%d", file, task.roots.size()));
+            }
+            var position = root.getLineMap().getPosition(line, column);
+            var element = new FindHoverElement(task.task).scan(root, position);
             if (element == null) return null;
             var docs = docs(task, element);
             var markdown = new StringBuilder();
@@ -53,9 +57,19 @@ public class HoverProvider {
         var source = compiler.findAnywhere(data.className);
         if (source.isEmpty()) return;
         var task = compiler.parse(source.get());
-        var tree = findItem(task, data);
+        Tree tree;
+        try {
+            tree = findItem(task, data);
+        } catch (RuntimeException missingGeneratedItem) {
+            LOG.fine(
+                    String.format(
+                            "Skip completion item resolve for unresolved member %s#%s",
+                            data.className, data.memberName));
+            return;
+        }
         resolveDetail(item, data, tree);
         var path = Trees.instance(task.task).getPath(task.root, tree);
+        if (path == null) return;
         var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
         if (docTree == null) return;
         item.documentation = MarkdownHelper.asMarkupContent(docTree);
@@ -112,8 +126,13 @@ public class HoverProvider {
             var file = compiler.findAnywhere(className);
             if (file.isEmpty()) return "";
             var parse = compiler.parse(file.get());
-            var tree = FindHelper.findField(parse, className, field.getSimpleName().toString());
-            return docs(parse, tree);
+            try {
+                var tree = FindHelper.findField(parse, className, field.getSimpleName().toString());
+                return docs(parse, tree);
+            } catch (RuntimeException e) {
+                LOG.fine(String.format("Skip hover docs for unresolved field %s#%s", className, field.getSimpleName()));
+                return "";
+            }
         } else if (element instanceof ExecutableElement) {
             var method = (ExecutableElement) element;
             var type = (TypeElement) method.getEnclosingElement();
@@ -123,8 +142,13 @@ public class HoverProvider {
             var file = compiler.findAnywhere(className);
             if (file.isEmpty()) return "";
             var parse = compiler.parse(file.get());
-            var tree = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-            return docs(parse, tree);
+            try {
+                var tree = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
+                return docs(parse, tree);
+            } catch (RuntimeException e) {
+                LOG.fine(String.format("Skip hover docs for unresolved method %s#%s", className, methodName));
+                return "";
+            }
         } else {
             return "";
         }

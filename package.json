@@ -116,6 +116,11 @@
                     },
                     "description": "List of modules to allow access to, for example [\"jdk.compiler/com.sun.tools.javac.api\"]"
                 },
+                "java.lombok.enabled": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Enable Lombok annotation processing in diagnostics. Disable to avoid Lombok processing overhead and run without Lombok-generated diagnostics."
+                },
                 "java.trace.server": {
                     "scope": "window",
                     "type": "string",

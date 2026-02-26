@@ -105,6 +105,7 @@ public class CompletionsBase {
 
     protected List<? extends CompletionItem> items(String file, int row, int column) {
         var uri = FindResource.uri(file);
+        server.lint(List.of(java.nio.file.Paths.get(uri)));
         var position =
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(row - 1, column - 1));
         var maybe = server.completion(position);

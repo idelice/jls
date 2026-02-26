@@ -7,6 +7,9 @@ import java.nio.file.*;
 import java.nio.file.attribute.*;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.logging.Logger;
 import javax.lang.model.element.TypeElement;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -16,13 +19,14 @@ import org.javacs.lsp.TextDocumentContentChangeEvent;
 
 public class FileStore {
 
-    private static final Set<Path> workspaceRoots = new HashSet<>();
+    private static final Set<Path> workspaceRoots = ConcurrentHashMap.newKeySet();
 
-    private static final Map<Path, VersionedContent> activeDocuments = new HashMap<>();
+    private static final Map<Path, VersionedContent> activeDocuments = new ConcurrentHashMap<>();
+    private static final AtomicLong contentRevision = new AtomicLong();
 
     /** javaSources[file] is the javaSources time of a .java source file. */
     // TODO organize by package name for speed of list(...)
-    private static final TreeMap<Path, Info> javaSources = new TreeMap<>();
+    private static final ConcurrentSkipListMap<Path, Info> javaSources = new ConcurrentSkipListMap<>();
 
     private static class Info {
         final Instant modified;
@@ -48,6 +52,7 @@ public class FileStore {
         }
         workspaceRoots.clear();
         workspaceRoots.addAll(newRoots);
+        bumpContentRevision();
     }
 
     private static Set<Path> normalize(Set<Path> newRoots) {
@@ -93,6 +98,7 @@ public class FileStore {
         activeDocuments.clear();
         workspaceRoots.clear();
         javaSources.clear();
+        bumpContentRevision();
     }
 
     static List<Path> list(String packageName) {
@@ -196,14 +202,17 @@ public class FileStore {
 
     static void externalCreate(Path file) {
         readInfoFromDisk(file);
+        bumpContentRevision();
     }
 
     static void externalChange(Path file) {
         readInfoFromDisk(file);
+        bumpContentRevision();
     }
 
     static void externalDelete(Path file) {
         javaSources.remove(file);
+        bumpContentRevision();
     }
 
     private static void readInfoFromDisk(Path file) {
@@ -224,6 +233,7 @@ public class FileStore {
         var document = params.textDocument;
         var file = Paths.get(document.uri);
         activeDocuments.put(file, new VersionedContent(document.text, document.version));
+        bumpContentRevision();
     }
 
     static void change(DidChangeTextDocumentParams params) {
@@ -241,16 +251,36 @@ public class FileStore {
             else newText = patch(newText, change);
         }
         activeDocuments.put(file, new VersionedContent(newText, document.version));
+        bumpContentRevision();
     }
 
     static void close(DidCloseTextDocumentParams params) {
         if (!isJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         activeDocuments.remove(file);
+        bumpContentRevision();
     }
 
     static Set<Path> activeDocuments() {
         return activeDocuments.keySet();
+    }
+
+    static long contentRevision() {
+        return contentRevision.get();
+    }
+
+    private static void bumpContentRevision() {
+        contentRevision.incrementAndGet();
+    }
+
+    static VersionedContent activeDocument(Path file) {
+        return activeDocuments.get(file);
+    }
+
+    static int version(Path file) {
+        var active = activeDocuments.get(file);
+        if (active == null) return -1;
+        return active.version;
     }
 
     public static String contents(Path file) {
@@ -271,9 +301,8 @@ public class FileStore {
     }
 
     static InputStream inputStream(Path file) {
-        var uri = file.toUri();
-        if (activeDocuments.containsKey(uri)) {
-            var string = activeDocuments.get(uri).content;
+        if (activeDocuments.containsKey(file)) {
+            var string = activeDocuments.get(file).content;
             var bytes = string.getBytes();
             return new ByteArrayInputStream(bytes);
         }
@@ -289,9 +318,8 @@ public class FileStore {
     }
 
     static BufferedReader bufferedReader(Path file) {
-        var uri = file.toUri();
-        if (activeDocuments.containsKey(uri)) {
-            var string = activeDocuments.get(uri).content;
+        if (activeDocuments.containsKey(file)) {
+            var string = activeDocuments.get(file).content;
             return new BufferedReader(new StringReader(string));
         }
         try {
@@ -323,50 +351,50 @@ public class FileStore {
     }
 
     private static String patch(String sourceText, TextDocumentContentChangeEvent change) {
-        try {
-            var range = change.range;
-            var reader = new BufferedReader(new StringReader(sourceText));
-            var writer = new StringWriter();
+        var range = change.range;
+        if (range == null) return change.text;
 
-            // Skip unchanged lines
-            int line = 0;
+        var start = offsetAt(sourceText, range.start.line, range.start.character);
+        var end = offsetAt(sourceText, range.end.line, range.end.character);
+        if (end < start) {
+            LOG.fine(
+                    String.format(
+                            "Invalid change range start=%d end=%d for %s; clamping end to start",
+                            start, end, range));
+            end = start;
+        }
+        return sourceText.substring(0, start) + change.text + sourceText.substring(end);
+    }
 
-            while (line < range.start.line) {
-                writer.write(reader.readLine() + '\n');
+    private static int offsetAt(String sourceText, int targetLine, int targetCharacter) {
+        if (targetLine < 0) targetLine = 0;
+        if (targetCharacter < 0) targetCharacter = 0;
+
+        var line = 0;
+        var i = 0;
+        while (line < targetLine && i < sourceText.length()) {
+            var c = sourceText.charAt(i++);
+            if (c == '\n') {
+                line++;
+            } else if (c == '\r') {
+                if (i < sourceText.length() && sourceText.charAt(i) == '\n') {
+                    i++;
+                }
                 line++;
             }
-
-            // Skip unchanged chars
-            for (int character = 0; character < range.start.character; character++) {
-                writer.write(reader.read());
-            }
-
-            // Write replacement text
-            writer.write(change.text);
-
-            // Skip replaced text
-            if (change.range.start.line == change.range.end.line) {
-                int chars = change.range.end.character - change.range.start.character;
-                reader.skip(chars);
-            } else {
-                int lines = change.range.end.line - change.range.start.line;
-                int chars = change.range.end.character;
-                for (int lineSkip = 0; lineSkip < lines; lineSkip++) {
-                    reader.readLine();
-                }
-                reader.skip(chars);
-            }
-
-            // Write remaining text
-            while (true) {
-                int next = reader.read();
-
-                if (next == -1) return writer.toString();
-                else writer.write(next);
-            }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
+        if (line < targetLine) {
+            return sourceText.length();
+        }
+
+        var character = 0;
+        while (character < targetCharacter && i < sourceText.length()) {
+            var c = sourceText.charAt(i);
+            if (c == '\n' || c == '\r') break;
+            i++;
+            character++;
+        }
+        return i;
     }
 
     static boolean isJavaFile(Path file) {

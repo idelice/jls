@@ -40,9 +40,18 @@ class FindCompletionsAt extends TreePathScanner<TreePath, Long> {
     @Override
     public TreePath visitMemberSelect(MemberSelectTree t, Long find) {
         var pos = Trees.instance(task).getSourcePositions();
-        var start = pos.getEndPosition(root, t.getExpression()) + 1;
+        var expressionEnd = pos.getEndPosition(root, t.getExpression());
+        if (expressionEnd < 0) {
+            return super.visitMemberSelect(t, find);
+        }
+        var start = expressionEnd + 1; // dot position
         var end = pos.getEndPosition(root, t);
-        if (start <= find && find <= end) {
+        if (end < start) {
+            // In erroneous trees (eg `foo.`), javac can report the member-select end before the dot.
+            end = start;
+        }
+        // Allow one character beyond the reported end so completion works at cursor-after-dot.
+        if (start <= find && find <= end + 1) {
             return getCurrentPath();
         }
         return super.visitMemberSelect(t, find);

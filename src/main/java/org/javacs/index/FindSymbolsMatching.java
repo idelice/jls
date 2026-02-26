@@ -83,11 +83,13 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
         return null;
     }
 
-    private static Integer asSymbolKind(Tree.Kind k) {
+    private static int asSymbolKind(Tree.Kind k) {
         switch (k) {
             case ANNOTATION_TYPE:
             case CLASS:
                 return SymbolKind.Class;
+            case RECORD:
+                return SymbolKind.Struct;
             case ENUM:
                 return SymbolKind.Enum;
             case INTERFACE:
@@ -101,7 +103,7 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
                 // where we only return fields, not local variables
                 return SymbolKind.Field;
             default:
-                return null;
+                return SymbolKind.Class;
         }
     }
 

@@ -13,7 +13,6 @@ import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
-import org.javacs.LombokHandler;
 import org.javacs.SourceFileObject;
 import org.javacs.lsp.Location;
 
@@ -97,10 +96,6 @@ public class DefinitionProvider {
                 locations.add(location);
             }
 
-            // If not found, check if it's a Lombok-generated member
-            if (locations.isEmpty()) {
-                locations.addAll(LombokHandler.findGeneratedMemberLocations(task, className, memberName));
-            }
         }
         return locations;
     }

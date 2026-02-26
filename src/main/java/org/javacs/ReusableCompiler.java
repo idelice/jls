@@ -44,6 +44,7 @@ import com.sun.tools.javac.util.DefinedBy;
 import com.sun.tools.javac.util.DefinedBy.Api;
 import com.sun.tools.javac.util.Log;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Logger;
@@ -184,10 +185,14 @@ class ReusableCompiler {
             drop(DiagnosticListener.class);
             drop(Log.outKey);
             drop(Log.errKey);
+            drop(javax.annotation.processing.Processor.class);
             drop(JavaFileManager.class);
             drop(JavacTask.class);
             drop(JavacTrees.class);
             drop(JavacElements.class);
+            // Lombok/AP state must not leak between tasks in a reusable context.
+            dropByClassName("com.sun.tools.javac.processing.JavacProcessingEnvironment");
+            dropByClassName("com.sun.tools.javac.processing.JavacProcessingEnvironment$DiscoveredProcessors");
 
             if (ht.get(Log.logKey) instanceof ReusableLog) {
                 // log already inited - not first round
@@ -200,6 +205,16 @@ class ReusableCompiler {
                 Annotate.instance(this).newRound();
                 CompileStates.instance(this).clear();
                 MultiTaskListener.instance(this).clear();
+            }
+        }
+
+        private void dropByClassName(String className) {
+            try {
+                @SuppressWarnings("unchecked")
+                var cls = (Class<Object>) Class.forName(className);
+                drop(cls);
+            } catch (ClassNotFoundException ignored) {
+                // No-op: class name is JDK-internal and may vary by version.
             }
         }
 
@@ -241,12 +256,66 @@ class ReusableCompiler {
             }
 
             void clear() {
+                resetAnnotationProcessingState();
                 newRound();
             }
 
             @Override
             protected void checkReusable() {
                 // do nothing - it's ok to reuse the compiler
+            }
+
+            private void resetAnnotationProcessingState() {
+                try {
+                    // AP state from the previous task must be reset, otherwise javac can keep
+                    // processAnnotations=true with a null deferredDiagnosticHandler in the next task.
+                    setBooleanField("processAnnotations", false);
+                    setObjectField("deferredDiagnosticHandler", null);
+                    closeAndClearProcessingEnvironment();
+                    setBooleanFieldIfPresent("annotationProcessingOccurred", false);
+                    setBooleanFieldIfPresent("explicitAnnotationProcessingRequested", false);
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    ReusableCompiler.LOG.warning(
+                            "Failed to reset javac annotation-processing state; compiler reuse may be unstable: "
+                                    + e.getMessage());
+                }
+            }
+
+            private void closeAndClearProcessingEnvironment() throws ReflectiveOperationException {
+                var field = JavaCompiler.class.getDeclaredField("procEnvImpl");
+                field.setAccessible(true);
+                var procEnv = field.get(this);
+                if (procEnv != null) {
+                    try {
+                        Method close = procEnv.getClass().getMethod("close");
+                        close.invoke(procEnv);
+                    } catch (NoSuchMethodException ignored) {
+                        // Keep going; we'll still clear the field.
+                    } catch (IllegalAccessException | InvocationTargetException e) {
+                        ReusableCompiler.LOG.fine("Failed to close stale procEnvImpl: " + e.getMessage());
+                    }
+                }
+                field.set(this, null);
+            }
+
+            private void setBooleanField(String fieldName, boolean value) throws ReflectiveOperationException {
+                var field = JavaCompiler.class.getDeclaredField(fieldName);
+                field.setAccessible(true);
+                field.setBoolean(this, value);
+            }
+
+            private void setBooleanFieldIfPresent(String fieldName, boolean value) throws ReflectiveOperationException {
+                try {
+                    setBooleanField(fieldName, value);
+                } catch (NoSuchFieldException ignored) {
+                    // Field name differs across JDKs; safe to ignore.
+                }
+            }
+
+            private void setObjectField(String fieldName, Object value) throws ReflectiveOperationException {
+                var field = JavaCompiler.class.getDeclaredField(fieldName);
+                field.setAccessible(true);
+                field.set(this, value);
             }
         }
 

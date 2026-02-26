@@ -2,27 +2,45 @@ package org.javacs.completion;
 
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.ExpressionTree;
+import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.IdentifierTree;
+import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.NewArrayTree;
+import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.Scope;
 import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TypeCastTree;
+import com.sun.source.tree.VariableTree;
+import com.sun.source.tree.ArrayAccessTree;
+import com.sun.source.tree.ArrayTypeTree;
+import com.sun.source.tree.ParameterizedTypeTree;
+import com.sun.source.tree.AnnotatedTypeTree;
 import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
@@ -34,16 +52,15 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeMirror;
 import javax.lang.model.type.TypeVariable;
+import org.javacs.CompileBatch;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FileStore;
 import org.javacs.JsonHelper;
-import org.javacs.LombokHandler;
-import org.javacs.LombokMetadataCache;
 import org.javacs.ParseTask;
-import org.javacs.SourceFileObject;
 import org.javacs.StringSearch;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
@@ -55,7 +72,8 @@ import org.javacs.rewrite.AddImport;
 
 public class CompletionProvider {
     private final CompilerProvider compiler;
-    private final LombokMetadataCache lombokCache;
+    private final CompletionSnapshotProvider snapshotProvider;
+    private final IndexSnapshot indexSnapshot;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
@@ -123,23 +141,94 @@ public class CompletionProvider {
         "float",
         "double",
     };
+    private static final Set<String> OBJECT_MEMBER_LABELS =
+            Set.of("equals", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait");
 
-    public CompletionProvider(CompilerProvider compiler, LombokMetadataCache lombokCache) {
+    public CompletionProvider(
+            CompilerProvider compiler,
+            CompletionSnapshotProvider snapshotProvider,
+            IndexSnapshot indexSnapshot) {
         this.compiler = compiler;
-        this.lombokCache = lombokCache;
+        this.snapshotProvider = snapshotProvider;
+        this.indexSnapshot = indexSnapshot == null ? IndexSnapshot.EMPTY : indexSnapshot;
     }
 
     public CompletionList complete(Path file, int line, int column) {
+        return complete(file, line, column, -1);
+    }
+
+    public CompletionList complete(Path file, int line, int column, int fileVersionSeen) {
         LOG.info("Complete at " + file.getFileName() + "(" + line + "," + column + ")...");
+        assertIndexSnapshotVersion(file, fileVersionSeen);
+        var snapshotVersion = indexSnapshot.version;
+        var snapshotTypeCount = indexSnapshot.types.size();
         var started = Instant.now();
+        var countersBefore = CompileBatch.perfCounters();
+        var parseStarted = Instant.now();
         var task = compiler.parse(file);
+        LOG.info("[perf] completion_parse file=" + file.getFileName() + " took=" + Duration.between(parseStarted, Instant.now()).toMillis() + "ms");
         var cursor = task.root.getLineMap().getPosition(line, column);
         var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
         var endOfLine = endOfLine(contents, (int) cursor);
         contents.insert(endOfLine, ';');
-        var list = compileAndComplete(file, contents.toString(), cursor);
+        var pruned = contents.toString();
+        var memberAccess = memberAccessContext(pruned, (int) cursor);
+        var parsePath = new FindCompletionsAt(task.task).scan(task.root, cursor);
+        CompletionOutcome outcome;
+        if (memberAccess != null && isImportOrPackageContext(parsePath)) {
+            // `import foo.bar.` should stay on the import completion path.
+            var list = completeParseOnly(task, pruned, cursor, memberAccess.partial);
+            outcome = new CompletionOutcome(list, false);
+        } else if (memberAccess != null) {
+            var list =
+                    completeParseAndIndex(
+                            task,
+                            parsePath,
+                            cursor,
+                            memberAccess,
+                            endsWithParen(pruned, (int) cursor));
+            LOG.info("[perf] completion_member_path mode=index_only snapshot=false");
+            outcome = new CompletionOutcome(list, false);
+        } else {
+            outcome = completeReadOnly(file, task, line, column, pruned, cursor);
+        }
+        var list = outcome.list;
+        if (list == NOT_SUPPORTED) {
+            return NOT_SUPPORTED;
+        }
+        // Some sentinel paths use immutable lists (List.of()).
+        // Completion post-processing mutates/sorts the list, so ensure mutability.
+        if (!(list.items instanceof ArrayList)) {
+            list.items = new ArrayList<>(list.items);
+        }
         addTopLevelSnippets(task, list);
+        sortCompletionItems(list.items);
         logCompletionTiming(started, list.items, list.isIncomplete);
+        var countersAfter = CompileBatch.perfCounters();
+        var enterDelta = countersAfter.enterOnlyBatches - countersBefore.enterOnlyBatches;
+        var analyzeDelta = countersAfter.analyzeInvocations - countersBefore.analyzeInvocations;
+        var apDelta = countersAfter.apEnabledBatches - countersBefore.apEnabledBatches;
+        LOG.info(
+                String.format(
+                        "[perf] completion_read_only file=%s snapshot=%s sources=1 enter=%d analyze=%d ap=%d took=%dms",
+                        file.getFileName(),
+                        outcome.usedSnapshot,
+                        enterDelta,
+                        analyzeDelta,
+                        apDelta,
+                        Duration.between(started, Instant.now()).toMillis()));
+        if (snapshotVersion != indexSnapshot.version || snapshotTypeCount != indexSnapshot.types.size()) {
+            LOG.warning(
+                    String.format(
+                            "[completion] snapshot changed during completion file=%s start_version=%d end_version=%d start_types=%d end_types=%d",
+                            file.getFileName(),
+                            snapshotVersion,
+                            indexSnapshot.version,
+                            snapshotTypeCount,
+                            indexSnapshot.types.size()));
+        }
+        assert snapshotVersion == indexSnapshot.version;
+        assert snapshotTypeCount == indexSnapshot.types.size();
         return list;
     }
 
@@ -152,30 +241,1162 @@ public class CompletionProvider {
         return cursor;
     }
 
-    private CompletionList compileAndComplete(Path file, String contents, long cursor) {
+    private CompletionList completeParseAndIndex(
+            ParseTask parseTask,
+            TreePath parsePath,
+            long cursor,
+            MemberAccessContext memberAccess,
+            boolean endsWithParen) {
+        return completeMembersUsingIndex(parseTask, parsePath, cursor, memberAccess, endsWithParen);
+    }
+
+    private CompletionList completeMembersUsingIndex(
+            ParseTask parseTask,
+            TreePath parsePath,
+            long cursor,
+            MemberAccessContext memberAccess,
+            boolean endsWithParen) {
+        if (indexSnapshot == null || indexSnapshot.isEmpty()) {
+            LOG.info("[perf] completion_member_index state=miss reason=index_empty receiver=" + memberAccess.receiver);
+            return EMPTY;
+        }
+        var index = indexSnapshot.index();
         var started = Instant.now();
-        var source = new SourceFileObject(file, contents, Instant.now());
-        var partial = partialIdentifier(contents, (int) cursor);
-        var endsWithParen = endsWithParen(contents, (int) cursor);
-        try (var task = compiler.compile(List.of(source))) {
-            LOG.info("...compiled in " + Duration.between(started, Instant.now()).toMillis() + "ms");
-            var path = new FindCompletionsAt(task.task).scan(task.root(), cursor);
-            switch (path.getLeaf().getKind()) {
-                case IDENTIFIER:
-                    return completeIdentifier(task, path, partial, endsWithParen);
-                case MEMBER_SELECT:
-                    return completeMemberSelect(task, path, partial, endsWithParen);
-                case MEMBER_REFERENCE:
-                    return completeMemberReference(task, path, partial);
-                case SWITCH:
-                    return completeSwitchConstant(task, path, partial);
-                case IMPORT:
-                    return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
-                default:
-                    var list = new CompletionList();
-                    addKeywords(path, partial, list);
-                    return list;
+        var resolver = new ParseTypeResolver(parseTask, index, cursor);
+        var expression = memberReceiverExpression(parsePath);
+        var resolved = resolver.resolve(expression, memberAccess.receiver);
+        if (resolved.isEmpty()) {
+            LOG.info("[completion] unresolved receiver at position " + cursor + ", no fallback used");
+            LOG.info(
+                    "[perf] completion_member_index state=miss receiver="
+                            + memberAccess.receiver
+                            + " reason=unresolved_type");
+            return EMPTY;
+        }
+        var target = resolved.get();
+        if (!target.arrayType && !isQualifiedTypeName(target.qualifiedType)) {
+            LOG.info("[completion] unresolved receiver at position " + cursor + ", no fallback used");
+            LOG.info(
+                    "[perf] completion_member_index state=miss receiver="
+                            + memberAccess.receiver
+                            + " reason=non_fqn_type type="
+                            + target.qualifiedType);
+            return EMPTY;
+        }
+        var currentType = resolver.currentEnclosingTypeName();
+        if (target.arrayType) {
+            return completeArrayMemberSelect(target.staticContext);
+        }
+        var members = index.members(target.qualifiedType, target.staticContext);
+        if (members.isEmpty()) {
+            LOG.info(
+                    "[perf] completion_member_index state=miss receiver="
+                            + memberAccess.receiver
+                            + " type="
+                            + target.qualifiedType
+                            + " reason=no_members");
+            return EMPTY;
+        }
+
+        var list = new ArrayList<CompletionItem>();
+        var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();
+        var methodPriority = new HashMap<String, Integer>();
+        for (var member : members) {
+            if (!isIndexMemberVisible(member, target.qualifiedType, currentType)) continue;
+            if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
+            if (member.kind == CompletionItemKind.Method) {
+                methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
+                methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
+            } else {
+                var item = indexedMember(member);
+                item.sortText = sortKey(indexMemberPriority(member), item.label);
+                list.add(item);
             }
+        }
+        for (var entry : methods.entrySet()) {
+            var method = indexedMethod(entry.getValue(), !endsWithParen);
+            method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
+            list.add(method);
+        }
+        if (target.staticContext) {
+            list.add(keyword("class"));
+            if (resolver.isEnclosingInstanceType(target.qualifiedType)) {
+                list.add(keyword("this"));
+                list.add(keyword("super"));
+            }
+        }
+        sortCompletionItems(list);
+        LOG.info(
+                String.format(
+                        "[perf] completion_member_index state=hit receiver=%s type=%s items=%d took=%dms",
+                        memberAccess.receiver,
+                        target.qualifiedType,
+                        list.size(),
+                        Duration.between(started, Instant.now()).toMillis()));
+        return new CompletionList(false, list);
+    }
+
+    private void assertIndexSnapshotVersion(Path file, int fileVersionSeen) {
+        if (fileVersionSeen < 0) {
+            return;
+        }
+        if (indexSnapshot == null) {
+            return;
+        }
+        if (indexSnapshot.version > fileVersionSeen) {
+            LOG.warning(
+                    String.format(
+                            "[perf] completion_index_snapshot state=version_mismatch file=%s snapshot=%d file_version=%d",
+                            file.getFileName(), indexSnapshot.version, fileVersionSeen));
+        }
+    }
+
+    private boolean isIndexMemberVisible(
+            TypeMemberIndex.Member member, String targetType, Optional<String> currentEnclosingType) {
+        if (!member.isPrivate) {
+            return true;
+        }
+        if (!Objects.equals(member.ownerType, targetType)) {
+            return false;
+        }
+        return currentEnclosingType.isPresent() && Objects.equals(currentEnclosingType.get(), targetType);
+    }
+
+    private Tree memberReceiverExpression(TreePath parsePath) {
+        for (var cursor = parsePath; cursor != null; cursor = cursor.getParentPath()) {
+            if (cursor.getLeaf() instanceof MemberSelectTree select) {
+                return select.getExpression();
+            }
+        }
+        return null;
+    }
+
+    private boolean isQualifiedTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return false;
+        }
+        return typeName.contains(".") || TypeMemberIndex.isPrimitiveTypeName(typeName);
+    }
+
+    private int indexMemberPriority(TypeMemberIndex.Member member) {
+        if (member.kind == CompletionItemKind.Method) {
+            if (member.priority == 0) return Priority.METHOD;
+            if (member.priority == 2) return Priority.OBJECT_METHOD;
+            return Priority.INHERITED_METHOD;
+        }
+        if (member.kind == CompletionItemKind.Field) {
+            if (member.priority == 0) return Priority.FIELD;
+            return Priority.INHERITED_FIELD;
+        }
+        if (member.kind == CompletionItemKind.Class
+                || member.kind == CompletionItemKind.Interface
+                || member.kind == CompletionItemKind.Enum) {
+            return Priority.FIELD;
+        }
+        return Priority.PACKAGE_MEMBER;
+    }
+
+    private CompletionItem indexedMember(TypeMemberIndex.Member member) {
+        var item = new CompletionItem();
+        item.label = member.name;
+        item.kind = member.kind;
+        item.detail = member.detail;
+        item.insertText = member.name;
+        item.insertTextFormat = InsertTextFormat.PlainText;
+        var data = new CompletionData();
+        data.className = member.ownerType;
+        data.memberName = member.name;
+        item.data = JsonHelper.GSON.toJsonTree(data);
+        return item;
+    }
+
+    private CompletionItem indexedMethod(List<TypeMemberIndex.Member> overloads, boolean addParens) {
+        var first = overloads.get(0);
+        var item = new CompletionItem();
+        item.label = first.name;
+        item.kind = CompletionItemKind.Method;
+        item.detail = first.detail;
+        if (addParens) {
+            if (overloads.size() == 1 && (first.erasedParameterTypes == null || first.erasedParameterTypes.length == 0)) {
+                item.insertText = first.name + "()$0";
+            } else {
+                item.insertText = first.name + "($0)";
+                item.command = new Command();
+                item.command.command = "editor.action.triggerParameterHints";
+                item.command.title = "Trigger Parameter Hints";
+            }
+            item.insertTextFormat = InsertTextFormat.Snippet;
+        }
+        var data = new CompletionData();
+        data.className = first.ownerType;
+        data.memberName = first.name;
+        data.erasedParameterTypes = first.erasedParameterTypes == null ? new String[0] : first.erasedParameterTypes;
+        data.plusOverloads = Math.max(0, overloads.size() - 1);
+        item.data = JsonHelper.GSON.toJsonTree(data);
+        return item;
+    }
+
+    private static class TypeResolution {
+        final String qualifiedType;
+        final boolean staticContext;
+        final boolean arrayType;
+
+        TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType) {
+            this.qualifiedType = qualifiedType;
+            this.staticContext = staticContext;
+            this.arrayType = arrayType;
+        }
+    }
+
+    private static class CandidateType {
+        final TypeResolution resolution;
+        final int depth;
+        final long start;
+
+        CandidateType(TypeResolution resolution, int depth, long start) {
+            this.resolution = resolution;
+            this.depth = depth;
+            this.start = start;
+        }
+    }
+
+    private static class ParseTypeResolver {
+        private static final int MAX_RESOLVE_DEPTH = 24;
+        private final ParseTask parseTask;
+        private final CompilationUnitTree root;
+        private final SourcePositions positions;
+        private final TypeMemberIndex index;
+        private final long cursor;
+        private final TreePath cursorPath;
+        private TypeResolution thisType;
+        private TypeResolution superType;
+
+        ParseTypeResolver(ParseTask parseTask, TypeMemberIndex index, long cursor) {
+            this.parseTask = parseTask;
+            this.root = parseTask.root;
+            this.positions = Trees.instance(parseTask.task).getSourcePositions();
+            this.index = index;
+            this.cursor = cursor;
+            this.cursorPath = new FindCompletionsAt(parseTask.task).scan(parseTask.root, cursor);
+        }
+
+        Optional<TypeResolution> resolve(Tree expression, String fallbackIdentifier) {
+            if (expression != null) {
+                var direct = resolveExpression(expression, 0);
+                if (direct.isPresent()) {
+                    return direct;
+                }
+            }
+            if (fallbackIdentifier == null || fallbackIdentifier.isBlank()) {
+                return Optional.empty();
+            }
+            return resolveIdentifier(fallbackIdentifier, 0);
+        }
+
+        private Optional<TypeResolution> resolveExpression(Tree expression, int depth) {
+            if (expression == null || depth > MAX_RESOLVE_DEPTH) {
+                return Optional.empty();
+            }
+            if (expression instanceof ParenthesizedTree parenthesized) {
+                return resolveExpression(parenthesized.getExpression(), depth + 1);
+            }
+            if (expression instanceof IdentifierTree identifier) {
+                return resolveIdentifier(identifier.getName().toString(), depth + 1);
+            }
+            if (expression instanceof NewClassTree newClassTree) {
+                return resolveTypeTree(newClassTree.getIdentifier(), false);
+            }
+            if (expression instanceof NewArrayTree newArrayTree) {
+                if (newArrayTree.getType() == null) {
+                    return Optional.empty();
+                }
+                var component = resolveTypeTree(newArrayTree.getType(), false);
+                if (component.isEmpty()) {
+                    return Optional.empty();
+                }
+                return Optional.of(new TypeResolution(component.get().qualifiedType, false, true));
+            }
+            if (expression instanceof MethodInvocationTree invocationTree) {
+                return resolveMethodInvocation(invocationTree, depth + 1);
+            }
+            if (expression instanceof MemberSelectTree memberSelectTree) {
+                return resolveMemberSelect(memberSelectTree, depth + 1);
+            }
+            if (expression instanceof TypeCastTree castTree) {
+                return resolveTypeTree(castTree.getType(), false);
+            }
+            if (expression instanceof ArrayAccessTree arrayAccessTree) {
+                var array = resolveExpression(arrayAccessTree.getExpression(), depth + 1);
+                if (array.isEmpty()) return Optional.empty();
+                var type = array.get();
+                if (!type.arrayType || type.qualifiedType == null || type.qualifiedType.isBlank()) {
+                    return Optional.empty();
+                }
+                return Optional.of(new TypeResolution(type.qualifiedType, false, false));
+            }
+            if (expression instanceof LiteralTree literal) {
+                return literalType(literal);
+            }
+            return Optional.empty();
+        }
+
+        private Optional<TypeResolution> resolveMethodInvocation(MethodInvocationTree invocationTree, int depth) {
+            var select = invocationTree.getMethodSelect();
+            if (select instanceof IdentifierTree identifier) {
+                var current = resolveThisType();
+                if (current.isEmpty()) return Optional.empty();
+                var method = index.member(current.get().qualifiedType, identifier.getName().toString(), false);
+                if (method.isEmpty()) return Optional.empty();
+                return returnTypeOf(method.get());
+            }
+            if (select instanceof MemberSelectTree memberSelectTree) {
+                var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
+                if (receiver.isEmpty()) return Optional.empty();
+                var method =
+                        index.member(
+                                receiver.get().qualifiedType,
+                                memberSelectTree.getIdentifier().toString(),
+                                receiver.get().staticContext);
+                if (method.isEmpty()) return Optional.empty();
+                return returnTypeOf(method.get());
+            }
+            return Optional.empty();
+        }
+
+        private Optional<TypeResolution> resolveMemberSelect(MemberSelectTree memberSelectTree, int depth) {
+            var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
+            if (receiver.isEmpty()) {
+                return resolveTypeTree(memberSelectTree, true);
+            }
+            if (receiver.get().arrayType && "length".equals(memberSelectTree.getIdentifier().toString())) {
+                return Optional.of(new TypeResolution("int", false, false));
+            }
+            if (receiver.get().staticContext
+                    && "class".equals(memberSelectTree.getIdentifier().toString())) {
+                return Optional.of(new TypeResolution("java.lang.Class", false, false));
+            }
+            var member =
+                    index.member(
+                            receiver.get().qualifiedType,
+                            memberSelectTree.getIdentifier().toString(),
+                            receiver.get().staticContext);
+            if (member.isEmpty()) {
+                return Optional.empty();
+            }
+            return returnTypeOf(member.get());
+        }
+
+        private Optional<TypeResolution> resolveIdentifier(String identifier, int depth) {
+            if ("this".equals(identifier)) {
+                return resolveThisType();
+            }
+            if ("super".equals(identifier)) {
+                return resolveSuperType();
+            }
+            var variable = resolveVisibleVariable(identifier, depth + 1);
+            if (variable.isPresent()) {
+                return variable;
+            }
+            var nested = resolveNestedTypeInEnclosingScopes(identifier);
+            if (nested.isPresent()) {
+                return Optional.of(new TypeResolution(nested.get(), true, false));
+            }
+            var type = index.resolveTypeName(identifier, root);
+            if (type.isPresent()) {
+                return Optional.of(new TypeResolution(type.get(), true, false));
+            }
+            return Optional.empty();
+        }
+
+        private Optional<String> resolveNestedTypeInEnclosingScopes(String simpleName) {
+            for (var classPath = enclosingClassPath(); classPath != null; classPath = parentClassPath(classPath.getParentPath())) {
+                var owner = qualifiedClassName(classPath);
+                var candidate = owner + "." + simpleName;
+                if (index.types().containsKey(candidate)) {
+                    return Optional.of(candidate);
+                }
+            }
+            return Optional.empty();
+        }
+
+        private TreePath parentClassPath(TreePath from) {
+            for (var cursor = from; cursor != null; cursor = cursor.getParentPath()) {
+                if (cursor.getLeaf() instanceof ClassTree) {
+                    return cursor;
+                }
+            }
+            return null;
+        }
+
+        private Optional<TypeResolution> resolveVisibleVariable(String targetName, int depth) {
+            final CandidateType[] best = new CandidateType[1];
+            new TreePathScanner<Void, Void>() {
+                @Override
+                public Void visitClass(ClassTree classTree, Void p) {
+                    if (!containsCursor(classTree)) return null;
+                    for (var member : classTree.getMembers()) {
+                        if (member instanceof VariableTree) {
+                            scan(member, p);
+                        } else if (containsCursor(member)) {
+                            scan(member, p);
+                        }
+                    }
+                    return null;
+                }
+
+                @Override
+                public Void visitMethod(MethodTree methodTree, Void p) {
+                    if (!containsCursor(methodTree)) return null;
+                    for (var parameter : methodTree.getParameters()) {
+                        consider(parameter, getCurrentPath(), depth + 1);
+                    }
+                    if (methodTree.getBody() != null) {
+                        scan(methodTree.getBody(), p);
+                    }
+                    return null;
+                }
+
+                @Override
+                public Void visitBlock(BlockTree blockTree, Void p) {
+                    if (!containsCursor(blockTree)) return null;
+                    for (var statement : blockTree.getStatements()) {
+                        var start = startOf(statement);
+                        if (start >= 0 && start >= cursor) {
+                            break;
+                        }
+                        scan(statement, p);
+                    }
+                    return null;
+                }
+
+                @Override
+                public Void visitVariable(VariableTree variableTree, Void p) {
+                    consider(variableTree, getCurrentPath(), depth + 1);
+                    return null;
+                }
+
+                private void consider(VariableTree variableTree, TreePath path, int nextDepth) {
+                    if (!variableTree.getName().contentEquals(targetName)) return;
+                    var start = startOf(variableTree);
+                    if (start < 0 || start >= cursor) return;
+                    var resolved = resolveVariableType(variableTree, path, nextDepth);
+                    if (resolved.isEmpty()) return;
+                    var candidate = new CandidateType(resolved.get(), depth(path), start);
+                    if (best[0] == null
+                            || candidate.depth > best[0].depth
+                            || (candidate.depth == best[0].depth && candidate.start > best[0].start)) {
+                        best[0] = candidate;
+                    }
+                }
+            }.scan(root, null);
+
+            if (best[0] == null) return Optional.empty();
+            return Optional.of(best[0].resolution);
+        }
+
+        private Optional<TypeResolution> resolveVariableType(VariableTree variableTree, TreePath path, int depth) {
+            if (variableTree.getType() != null && !"var".equals(variableTree.getType().toString())) {
+                return resolveTypeTree(variableTree.getType(), false);
+            }
+            if (variableTree.getInitializer() != null) {
+                return resolveExpression(variableTree.getInitializer(), depth + 1);
+            }
+            return Optional.empty();
+        }
+
+        private Optional<TypeResolution> resolveTypeTree(Tree tree, boolean staticContext) {
+            if (tree == null) return Optional.empty();
+            if (tree instanceof AnnotatedTypeTree annotatedTypeTree) {
+                return resolveTypeTree(annotatedTypeTree.getUnderlyingType(), staticContext);
+            }
+            if (tree instanceof ParameterizedTypeTree parameterizedTypeTree) {
+                return resolveTypeTree(parameterizedTypeTree.getType(), staticContext);
+            }
+            if (tree instanceof ArrayTypeTree arrayTypeTree) {
+                var component = resolveTypeTree(arrayTypeTree.getType(), staticContext);
+                if (component.isEmpty()) return Optional.empty();
+                return Optional.of(new TypeResolution(component.get().qualifiedType, staticContext, true));
+            }
+            var typeName = tree.toString();
+            var resolved = index.resolveTypeName(typeName, root);
+            return resolved.map(type -> new TypeResolution(type, staticContext, false));
+        }
+
+        private Optional<TypeResolution> resolveThisType() {
+            if (thisType != null) {
+                return Optional.of(thisType);
+            }
+            var classPath = enclosingClassPath();
+            if (classPath == null) return Optional.empty();
+            var qualified = qualifiedClassName(classPath);
+            if (!index.types().containsKey(qualified)) {
+                return Optional.empty();
+            }
+            thisType = new TypeResolution(qualified, false, false);
+            return Optional.of(thisType);
+        }
+
+        Optional<String> currentEnclosingTypeName() {
+            return resolveThisType().map(type -> type.qualifiedType);
+        }
+
+        boolean isEnclosingInstanceType(String qualifiedType) {
+            if (qualifiedType == null || qualifiedType.isBlank()) {
+                return false;
+            }
+            if (cursorPath == null) {
+                return false;
+            }
+            var blockedByStaticContext = false;
+            for (var path = cursorPath; path != null; path = path.getParentPath()) {
+                var leaf = path.getLeaf();
+                if (leaf instanceof MethodTree methodTree
+                        && methodTree.getModifiers() != null
+                        && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                    blockedByStaticContext = true;
+                    continue;
+                }
+                if (leaf instanceof BlockTree blockTree) {
+                    var parent = path.getParentPath();
+                    if (parent != null
+                            && parent.getLeaf() instanceof ClassTree
+                            && blockTree.isStatic()) {
+                        blockedByStaticContext = true;
+                    }
+                    continue;
+                }
+                if (!(leaf instanceof ClassTree classTree)) {
+                    continue;
+                }
+                var className = qualifiedClassName(path);
+                if (qualifiedType.equals(className)) {
+                    return !blockedByStaticContext;
+                }
+                if (classTree.getModifiers() != null
+                        && classTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                    blockedByStaticContext = true;
+                }
+            }
+            return false;
+        }
+
+        private Optional<TypeResolution> resolveSuperType() {
+            if (superType != null) {
+                return Optional.of(superType);
+            }
+            var classPath = enclosingClassPath();
+            if (classPath == null) return Optional.empty();
+            var classTree = (ClassTree) classPath.getLeaf();
+            if (classTree.getExtendsClause() == null) {
+                superType = new TypeResolution("java.lang.Object", false, false);
+                return Optional.of(superType);
+            }
+            var resolved = resolveTypeTree(classTree.getExtendsClause(), false);
+            if (resolved.isPresent()) {
+                superType = resolved.get();
+                return resolved;
+            }
+            return Optional.empty();
+        }
+
+        private Optional<TypeResolution> returnTypeOf(TypeMemberIndex.Member member) {
+            if (member.returnType == null || member.returnType.isBlank()) {
+                return Optional.empty();
+            }
+            var type = member.returnType;
+            var isArray = type.endsWith("[]");
+            if (isArray) {
+                type = type.substring(0, type.length() - 2);
+            }
+            var resolved = index.resolveTypeName(type, root);
+            return resolved.map(next -> new TypeResolution(next, false, isArray));
+        }
+
+        private Optional<TypeResolution> literalType(LiteralTree literal) {
+            var value = literal.getValue();
+            if (value == null) return Optional.empty();
+            if (value instanceof String) return Optional.of(new TypeResolution("java.lang.String", false, false));
+            if (value instanceof Integer) return Optional.of(new TypeResolution("java.lang.Integer", false, false));
+            if (value instanceof Long) return Optional.of(new TypeResolution("java.lang.Long", false, false));
+            if (value instanceof Float) return Optional.of(new TypeResolution("java.lang.Float", false, false));
+            if (value instanceof Double) return Optional.of(new TypeResolution("java.lang.Double", false, false));
+            if (value instanceof Boolean) return Optional.of(new TypeResolution("java.lang.Boolean", false, false));
+            if (value instanceof Character) return Optional.of(new TypeResolution("java.lang.Character", false, false));
+            return Optional.empty();
+        }
+
+        private TreePath enclosingClassPath() {
+            final TreePath[] best = new TreePath[1];
+            final int[] bestDepth = {-1};
+            new TreePathScanner<Void, Void>() {
+                @Override
+                public Void visitClass(ClassTree classTree, Void p) {
+                    if (!containsCursor(classTree)) return null;
+                    var depth = depth(getCurrentPath());
+                    if (depth > bestDepth[0]) {
+                        bestDepth[0] = depth;
+                        best[0] = getCurrentPath();
+                    }
+                    return super.visitClass(classTree, p);
+                }
+            }.scan(root, null);
+            return best[0];
+        }
+
+        private String qualifiedClassName(TreePath classPath) {
+            var classes = new ArrayList<String>();
+            for (var cursorPath = classPath; cursorPath != null; cursorPath = cursorPath.getParentPath()) {
+                if (cursorPath.getLeaf() instanceof ClassTree classTree) {
+                    classes.add(classTree.getSimpleName().toString());
+                }
+            }
+            Collections.reverse(classes);
+            var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+            if (packageName.isEmpty()) {
+                return String.join(".", classes);
+            }
+            return packageName + "." + String.join(".", classes);
+        }
+
+        private boolean containsCursor(Tree tree) {
+            var start = startOf(tree);
+            var end = endOf(tree);
+            if (start < 0 || end < 0) return false;
+            return start <= cursor && cursor <= end;
+        }
+
+        private long startOf(Tree tree) {
+            return positions.getStartPosition(root, tree);
+        }
+
+        private long endOf(Tree tree) {
+            return positions.getEndPosition(root, tree);
+        }
+
+        private int depth(TreePath path) {
+            var depth = 0;
+            for (var cursorPath = path; cursorPath != null; cursorPath = cursorPath.getParentPath()) {
+                depth++;
+            }
+            return depth;
+        }
+    }
+
+    private CompletionOutcome completeReadOnly(
+            Path file,
+            ParseTask parseTask,
+            int line,
+            int column,
+            String contents,
+            long parseCursor) {
+        var memberAccess = memberAccessContext(contents, (int) parseCursor);
+        var partial = memberAccess == null ? partialIdentifier(contents, (int) parseCursor) : memberAccess.partial;
+        var endsWithParen = endsWithParen(contents, (int) parseCursor);
+        var parsePath = new FindCompletionsAt(parseTask.task).scan(parseTask.root, parseCursor);
+        var memberContext = memberAccess != null && !isImportOrPackageContext(parsePath);
+        var maybeSnapshot = snapshotProvider.acquire(file);
+        if (maybeSnapshot.isEmpty()) {
+            LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=miss");
+            return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
+        }
+        try (var snapshot = maybeSnapshot.get()) {
+            var task = snapshot.task();
+            TreePath path;
+            long cursor;
+            try {
+                var root = task.root(file);
+                cursor = root.getLineMap().getPosition(line, column);
+                path = new FindCompletionsAt(task.task).scan(root, cursor);
+            } catch (RuntimeException noFreshRoot) {
+                LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=stale");
+                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
+            }
+            if (path == null) {
+                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
+            }
+            if (snapshot.stale()) {
+                LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=stale_guard");
+                if (!memberContext) {
+                    return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
+                }
+                var recovered =
+                        recoverMemberCompletionFromSnapshot(
+                                task,
+                                path.getCompilationUnit(),
+                                path,
+                                line,
+                                cursor,
+                                memberAccess,
+                                endsWithParen);
+                if (recovered != null && !recovered.items.isEmpty()) {
+                    LOG.info(
+                            "[perf] completion_snapshot file="
+                                    + file.getFileName()
+                                    + " state=stale_guard_recovered items="
+                                    + recovered.items.size());
+                    return new CompletionOutcome(recovered, true);
+                }
+                LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=stale_guard_parse_only");
+                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
+            }
+            LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=hit");
+            if (memberContext) {
+                var recovered =
+                        recoverMemberCompletionFromSnapshot(
+                                task,
+                                path.getCompilationUnit(),
+                                path,
+                                line,
+                                cursor,
+                                memberAccess,
+                                endsWithParen);
+                if (recovered != null && !recovered.items.isEmpty()) {
+                    return new CompletionOutcome(recovered, true);
+                }
+                // Do not allow stale/member requests to degrade to identifier completion (eg. `txn` for `txn.`).
+                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
+            }
+            var semantic = dispatchCompletion(task, path, contents, cursor, partial, endsWithParen);
+            if (semantic == NOT_SUPPORTED || semantic.items.isEmpty()) {
+                var parseKind = parsePath == null ? "null" : parsePath.getLeaf().getKind().name();
+                var snapshotKind = path.getLeaf().getKind().name();
+                LOG.info(
+                        String.format(
+                                "[perf] completion_empty parse_kind=%s snapshot_kind=%s member=%s partial=%s",
+                                parseKind, snapshotKind, memberContext, partial));
+            }
+            if (shouldFallbackToParse(parsePath, path, semantic, memberContext)) {
+                var fallback = completeParseOnly(parseTask, contents, parseCursor, partial);
+                if (!fallback.items.isEmpty()) {
+                    LOG.info("[perf] completion_snapshot_fallback state=parse_only");
+                    return new CompletionOutcome(fallback, false);
+                }
+            }
+            return new CompletionOutcome(semantic, true);
+        }
+    }
+
+    private boolean isImportOrPackageContext(TreePath path) {
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            var kind = cursor.getLeaf().getKind();
+            if (kind == Tree.Kind.IMPORT || kind == Tree.Kind.PACKAGE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean shouldFallbackToParse(
+            TreePath parsePath, TreePath snapshotPath, CompletionList semantic, boolean memberContext) {
+        if (semantic == NOT_SUPPORTED) {
+            return true;
+        }
+        if (semantic.items.isEmpty()) {
+            return true;
+        }
+        if (memberContext && isKeywordOnly(semantic)) {
+            return true;
+        }
+        if (parsePath == null || snapshotPath == null) {
+            return false;
+        }
+        if (!memberContext
+                && parsePath.getLeaf().getKind() == Tree.Kind.IDENTIFIER
+                && snapshotPath.getLeaf().getKind() != Tree.Kind.IDENTIFIER) {
+            return true;
+        }
+        if (parsePath.getLeaf().getKind() != Tree.Kind.COMPILATION_UNIT
+                && snapshotPath.getLeaf().getKind() == Tree.Kind.COMPILATION_UNIT) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean isKeywordOnly(CompletionList list) {
+        if (list.items.isEmpty()) {
+            return false;
+        }
+        for (var item : list.items) {
+            if (!Objects.equals(item.kind, CompletionItemKind.Keyword)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isDotTrigger(String contents, int cursor) {
+        return cursor > 0 && cursor <= contents.length() && contents.charAt(cursor - 1) == '.';
+    }
+
+    private CompletionList recoverMemberCompletionFromSnapshot(
+            CompileTask task,
+            CompilationUnitTree root,
+            TreePath initialPath,
+            int line,
+            long cursor,
+            MemberAccessContext memberAccess,
+            boolean endsWithParen) {
+        var receiver = memberAccess.receiver;
+        var partial = memberAccess.partial;
+        var expressionPath =
+                receiver.isEmpty() ? expressionPathForMemberAccess(initialPath) : expressionPathForDot(initialPath, receiver);
+        var probeA = Math.max(0, cursor - partial.length() - 1);
+        var probeB = Math.max(0, probeA - 1);
+        var probeC = probeA + 1;
+        var probes = new long[] {probeA, probeB, probeC};
+        for (var probe : probes) {
+            if (expressionPath != null) {
+                break;
+            }
+            if (probe == cursor) {
+                continue;
+            }
+            var shiftedPath = new FindCompletionsAt(task.task).scan(root, probe);
+            expressionPath =
+                    receiver.isEmpty() ? expressionPathForMemberAccess(shiftedPath) : expressionPathForDot(shiftedPath, receiver);
+        }
+        CompletionList primary = null;
+        if (expressionPath != null) {
+            primary = completeMembersForExpression(task, expressionPath, expressionPath.getLeaf(), partial, endsWithParen);
+            if (isUsefulMemberResult(primary, partial, receiver) && !isWeakObjectOnlyResult(primary)) {
+                LOG.info(
+                        "[perf] completion_member_recover state=hit receiver="
+                                + (receiver.isEmpty() ? "<expr>" : receiver)
+                                + " items="
+                                + primary.items.size()
+                                + " quality=strong");
+                return primary;
+            }
+            if (isWeakObjectOnlyResult(primary)) {
+                LOG.info(
+                        "[perf] completion_member_recover state=weak_candidate receiver="
+                                + (receiver.isEmpty() ? "<expr>" : receiver)
+                                + " items="
+                                + primary.items.size());
+            }
+        }
+
+        var fallbackCandidates =
+                receiver.isEmpty() ? List.<TreePath>of() : fallbackExpressionPathsForReceiver(task, root, receiver, line, cursor);
+        var best = isCandidateResult(primary, receiver) ? primary : null;
+        for (var candidate : fallbackCandidates) {
+            if (expressionPath != null && samePath(task, root, expressionPath, candidate)) {
+                continue;
+            }
+            var completed = completeMembersForExpression(task, candidate, candidate.getLeaf(), partial, endsWithParen);
+            if (!isCandidateResult(completed, receiver)) {
+                continue;
+            }
+            if (best == null || shouldPreferMemberCandidate(best, completed)) {
+                if (best != null && isWeakObjectOnlyResult(best) && !isWeakObjectOnlyResult(completed)) {
+                    LOG.info(
+                            "[perf] completion_member_recover state=promote_strong receiver="
+                                    + (receiver.isEmpty() ? "<expr>" : receiver)
+                                    + " weak_items="
+                                    + best.items.size()
+                                    + " strong_items="
+                                    + completed.items.size());
+                }
+                best = completed;
+            }
+            if (isUsefulMemberResult(best, partial, receiver) && !isWeakObjectOnlyResult(best)) {
+                break;
+            }
+        }
+        if (best == null) {
+            LOG.info("[perf] completion_member_recover state=miss receiver=" + (receiver.isEmpty() ? "<expr>" : receiver));
+            return null;
+        }
+        if (best == NOT_SUPPORTED || best.items.isEmpty()) {
+            LOG.info("[perf] completion_member_recover state=empty receiver=" + (receiver.isEmpty() ? "<expr>" : receiver));
+            return null;
+        }
+        var quality = isWeakObjectOnlyResult(best) ? "weak_object_only" : "strong";
+        LOG.info(
+                "[perf] completion_member_recover state=hit receiver="
+                        + (receiver.isEmpty() ? "<expr>" : receiver)
+                        + " items="
+                        + best.items.size()
+                        + " quality="
+                        + quality);
+        return best;
+    }
+
+    private boolean shouldPreferMemberCandidate(CompletionList best, CompletionList candidate) {
+        var bestWeak = isWeakObjectOnlyResult(best);
+        var candidateWeak = isWeakObjectOnlyResult(candidate);
+        if (bestWeak != candidateWeak) {
+            return bestWeak && !candidateWeak;
+        }
+        return candidate.items.size() > best.items.size();
+    }
+
+    private boolean isWeakObjectOnlyResult(CompletionList list) {
+        if (list == null || list == NOT_SUPPORTED || list.items.isEmpty()) {
+            return false;
+        }
+        var sawMember = false;
+        for (var item : list.items) {
+            if (item == null || item.label == null) {
+                continue;
+            }
+            if (Objects.equals(item.kind, CompletionItemKind.Keyword)) {
+                continue;
+            }
+            sawMember = true;
+            if (!OBJECT_MEMBER_LABELS.contains(item.label)) {
+                return false;
+            }
+        }
+        return sawMember;
+    }
+
+    private boolean isCandidateResult(CompletionList list, String receiver) {
+        if (list == null || list == NOT_SUPPORTED || list.items.isEmpty()) {
+            return false;
+        }
+        if (hasNonKeywordItems(list)) {
+            return true;
+        }
+        return acceptsKeywordOnlyMembers(receiver, list);
+    }
+
+    private boolean isUsefulMemberResult(CompletionList list, String partial, String receiver) {
+        if (!isCandidateResult(list, receiver)) {
+            return false;
+        }
+        if (!partial.isEmpty()) {
+            return true;
+        }
+        return list.items.size() > 3;
+    }
+
+    private boolean hasNonKeywordItems(CompletionList list) {
+        for (var item : list.items) {
+            if (!Objects.equals(item.kind, CompletionItemKind.Keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean acceptsKeywordOnlyMembers(String receiver, CompletionList list) {
+        if (receiver != null && !receiver.isEmpty() && Character.isUpperCase(receiver.charAt(0))) {
+            return true;
+        }
+        return list.items.size() == 1 && "length".equals(list.items.get(0).label);
+    }
+
+    private boolean samePath(CompileTask task, CompilationUnitTree root, TreePath a, TreePath b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        if (a.getLeaf().getKind() != b.getLeaf().getKind()) {
+            return false;
+        }
+        var positions = Trees.instance(task.task).getSourcePositions();
+        var aStart = positions.getStartPosition(root, a.getLeaf());
+        var bStart = positions.getStartPosition(root, b.getLeaf());
+        return aStart >= 0 && aStart == bStart;
+    }
+
+    private List<TreePath> fallbackExpressionPathsForReceiver(
+            CompileTask task, CompilationUnitTree root, String receiver, int requestedLine, long cursor) {
+        var trees = Trees.instance(task.task);
+        var positions = trees.getSourcePositions();
+        var candidates = new ArrayList<TreePath>();
+        var seen = new HashSet<String>();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitIdentifier(IdentifierTree identifier, Void __) {
+                if (receiver.equals(identifier.getName().toString())) {
+                    var path = getCurrentPath();
+                    if (isReceiverCandidateElement(trees.getElement(path))) {
+                        addCandidate(path);
+                    }
+                }
+                return super.visitIdentifier(identifier, __);
+            }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree member, Void __) {
+                if (receiverNameMatches(member.getExpression(), receiver)) {
+                    var path = new TreePath(getCurrentPath(), member.getExpression());
+                    if (isReceiverCandidateElement(trees.getElement(path))) {
+                        addCandidate(path);
+                    }
+                }
+                return super.visitMemberSelect(member, __);
+            }
+
+            private void addCandidate(TreePath path) {
+                var start = positions.getStartPosition(root, path.getLeaf());
+                var key = path.getLeaf().getKind().name() + ":" + start;
+                if (seen.add(key)) {
+                    candidates.add(path);
+                }
+            }
+        }.scan(root, null);
+
+        if (candidates.isEmpty()) {
+            return List.of();
+        }
+        candidates.sort(
+                Comparator.comparingInt((TreePath candidate) -> lineDistance(root, positions, candidate, requestedLine))
+                        .thenComparingLong(candidate -> offsetDistance(root, positions, candidate, cursor)));
+        LOG.info("[perf] completion_member_recover state=fallback receiver=" + receiver + " candidates=" + candidates.size());
+        return candidates;
+    }
+
+    private int lineDistance(
+            CompilationUnitTree root, SourcePositions positions, TreePath candidate, int requestedLine) {
+        var start = positions.getStartPosition(root, candidate.getLeaf());
+        if (start < 0) {
+            return Integer.MAX_VALUE / 2;
+        }
+        var line = (int) root.getLineMap().getLineNumber(start);
+        return Math.abs(line - requestedLine);
+    }
+
+    private long offsetDistance(
+            CompilationUnitTree root, SourcePositions positions, TreePath candidate, long requestedCursor) {
+        var start = positions.getStartPosition(root, candidate.getLeaf());
+        if (start < 0) {
+            return Long.MAX_VALUE / 2;
+        }
+        return Math.abs(start - requestedCursor);
+    }
+
+    private boolean isReceiverCandidateElement(Element element) {
+        if (element == null) {
+            return false;
+        }
+        if (element instanceof TypeElement) {
+            return true;
+        }
+        var kind = element.getKind();
+        return kind == ElementKind.FIELD
+                || kind == ElementKind.LOCAL_VARIABLE
+                || kind == ElementKind.PARAMETER
+                || kind == ElementKind.RESOURCE_VARIABLE
+                || kind == ElementKind.EXCEPTION_PARAMETER
+                || kind == ElementKind.ENUM_CONSTANT;
+    }
+
+    private TreePath expressionPathForDot(TreePath path, String receiver) {
+        if (path == null) {
+            return null;
+        }
+        TreePath expressionPath;
+        switch (path.getLeaf().getKind()) {
+            case MEMBER_SELECT:
+                var select = (MemberSelectTree) path.getLeaf();
+                expressionPath = new TreePath(path, select.getExpression());
+                break;
+            case IDENTIFIER:
+                expressionPath = path;
+                break;
+            default:
+                return null;
+        }
+        if (!receiverNameMatches(expressionPath.getLeaf(), receiver)) {
+            return null;
+        }
+        return expressionPath;
+    }
+
+    private TreePath expressionPathForMemberAccess(TreePath path) {
+        if (path == null) {
+            return null;
+        }
+        if (path.getLeaf() instanceof MemberSelectTree select) {
+            return new TreePath(path, select.getExpression());
+        }
+        if (path.getLeaf().getKind() == Tree.Kind.IDENTIFIER) {
+            var parent = path.getParentPath();
+            if (parent != null && parent.getLeaf() instanceof MemberSelectTree select) {
+                return new TreePath(parent, select.getExpression());
+            }
+        }
+        return null;
+    }
+
+    private boolean receiverNameMatches(Tree expression, String expectedName) {
+        if (expectedName.isEmpty()) {
+            return false;
+        }
+        if (expression instanceof IdentifierTree identifier) {
+            return expectedName.equals(identifier.getName().toString());
+        }
+        if (expression instanceof MemberSelectTree select) {
+            return expectedName.equals(select.getIdentifier().toString());
+        }
+        return false;
+    }
+
+    private CompletionList completeParseOnly(ParseTask parseTask, String contents, long cursor, String partial) {
+        var path = new FindCompletionsAt(parseTask.task).scan(parseTask.root, cursor);
+        if (path == null) {
+            return new CompletionList();
+        }
+        var memberAccess = memberAccessContext(contents, (int) cursor);
+        if (memberAccess != null && !isImportOrPackageContext(path)) {
+            var list = new CompletionList();
+            addSyntacticMemberUsages(parseTask, cursor, memberAccess.receiver, partial, list);
+            sortCompletionItems(list.items);
+            return list;
+        }
+        switch (path.getLeaf().getKind()) {
+            case IMPORT:
+                return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
+            default:
+                var list = new CompletionList();
+                addKeywords(path, partial, list);
+                addSyntacticLocalVariables(parseTask, cursor, partial, list);
+                addImportedTypeNames(parseTask.root, partial, list);
+                if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
+                    addClassNames(parseTask.root, Trees.instance(parseTask.task).getSourcePositions(), partial, list);
+                }
+                boostExactMatches(parseTask.root, list.items, partial);
+                sortCompletionItems(list.items);
+                return list;
+        }
+    }
+
+    private CompletionList dispatchCompletion(
+            CompileTask task, TreePath path, String contents, long cursor, String partial, boolean endsWithParen) {
+        switch (path.getLeaf().getKind()) {
+            case IDENTIFIER:
+                var parent = path.getParentPath();
+                if (parent != null && parent.getLeaf().getKind() == Tree.Kind.MEMBER_SELECT) {
+                    return completeMemberSelect(task, parent, partial, endsWithParen);
+                } else if (parent != null && parent.getLeaf().getKind() == Tree.Kind.MEMBER_REFERENCE) {
+                    return completeMemberReference(task, parent, partial);
+                } else {
+                    return completeIdentifier(task, path, partial, endsWithParen);
+                }
+            case MEMBER_SELECT:
+                return completeMemberSelect(task, path, partial, endsWithParen);
+            case MEMBER_REFERENCE:
+                return completeMemberReference(task, path, partial);
+            case SWITCH:
+                return completeSwitchConstant(task, path, partial);
+            case IMPORT:
+                return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
+            default:
+                var list = new CompletionList();
+                addKeywords(path, partial, list);
+                return list;
+        }
+    }
+
+    private static class CompletionOutcome {
+        final CompletionList list;
+        final boolean usedSnapshot;
+
+        CompletionOutcome(CompletionList list, boolean usedSnapshot) {
+            this.list = list;
+            this.usedSnapshot = usedSnapshot;
         }
     }
 
@@ -242,13 +1463,95 @@ public class CompletionProvider {
         LOG.info("...complete identifiers");
         var list = new CompletionList();
         list.items = completeUsingScope(task, path, partial, endsWithParen);
-        LombokHandler.addScopeCompletions(task, path, partial, list.items, lombokCache);
         addStaticImports(task, path.getCompilationUnit(), partial, endsWithParen, list);
+        addImportedTypeNames(path.getCompilationUnit(), partial, list);
         if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
             addClassNames(path.getCompilationUnit(), Trees.instance(task.task).getSourcePositions(), partial, list);
         }
         addKeywords(path, partial, list);
+        boostExactMatches(path.getCompilationUnit(), list.items, partial);
+        sortCompletionItems(list.items);
         return list;
+    }
+
+    private void addImportedTypeNames(CompilationUnitTree root, String partial, CompletionList list) {
+        var seen = new HashSet<String>();
+        for (var item : list.items) {
+            if (item.label != null) {
+                seen.add(item.label);
+            }
+        }
+        for (var importTree : root.getImports()) {
+            if (importTree.isStatic()) continue;
+            var qualified = importTree.getQualifiedIdentifier().toString();
+            if (qualified.endsWith(".*")) continue;
+            var simple = simpleName(qualified).toString();
+            if (!matchesCompletionPrefix(simple, partial)) continue;
+            if (!seen.add(simple)) continue;
+            list.items.add(classItem(qualified));
+        }
+    }
+
+    private void boostExactMatches(CompilationUnitTree root, List<CompletionItem> items, String partial) {
+        if (partial == null || partial.isBlank()) {
+            return;
+        }
+        for (var item : items) {
+            if (item.label == null) continue;
+            if (!item.label.equalsIgnoreCase(partial)) continue;
+            var existingPriority = parseSortPriority(item.sortText);
+            var exactPriority = isDirectImportedType(root, item) ? Priority.EXACT_IMPORTED_MATCH : Priority.EXACT_MATCH;
+            item.sortText =
+                    String.format(
+                            "%03d:%03d:%s",
+                            exactPriority, existingPriority, item.label.toLowerCase());
+        }
+    }
+
+    private boolean isDirectImportedType(CompilationUnitTree root, CompletionItem item) {
+        if (root == null || item == null || item.label == null) {
+            return false;
+        }
+        if (!Objects.equals(item.kind, CompletionItemKind.Class)
+                && !Objects.equals(item.kind, CompletionItemKind.Interface)) {
+            return false;
+        }
+        for (var i : root.getImports()) {
+            if (i.isStatic()) continue;
+            var imported = i.getQualifiedIdentifier().toString();
+            if (imported.endsWith(".*")) continue;
+            if (simpleName(imported).toString().equals(item.label)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int parseSortPriority(String sortText) {
+        if (sortText == null) {
+            return Priority.PACKAGE_MEMBER;
+        }
+        var colon = sortText.indexOf(':');
+        if (colon <= 0) {
+            return Priority.PACKAGE_MEMBER;
+        }
+        try {
+            return Integer.parseInt(sortText.substring(0, colon));
+        } catch (NumberFormatException e) {
+            return Priority.PACKAGE_MEMBER;
+        }
+    }
+
+    private boolean matchesCompletionPrefix(CharSequence candidate, String partial) {
+        if (partial == null) return true;
+        if (StringSearch.matchesPartialName(candidate, partial)) return true;
+        if (candidate.length() < partial.length()) return false;
+        for (int i = 0; i < partial.length(); i++) {
+            if (Character.toLowerCase(candidate.charAt(i)) != Character.toLowerCase(partial.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void addKeywords(TreePath path, String partial, CompletionList list) {
@@ -268,6 +1571,95 @@ public class CompletionProvider {
         }
     }
 
+    private void addSyntacticLocalVariables(ParseTask task, long cursor, String partial, CompletionList list) {
+        var trees = Trees.instance(task.task);
+        var positions = trees.getSourcePositions();
+        var seen = new HashSet<String>();
+        for (var item : list.items) {
+            seen.add(item.label);
+        }
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitVariable(VariableTree t, Void __) {
+                var start = positions.getStartPosition(task.root, t);
+                if (start < 0 || start >= cursor) return super.visitVariable(t, null);
+                var name = t.getName().toString();
+                if (name.isEmpty()) return super.visitVariable(t, null);
+                if (!StringSearch.matchesPartialName(name, partial)) return super.visitVariable(t, null);
+                if (seen.add(name)) {
+                    list.items.add(variable(name));
+                }
+                return super.visitVariable(t, null);
+            }
+        }.scan(task.root, null);
+    }
+
+    private void addSyntacticMemberUsages(
+            ParseTask task, long cursor, String receiver, String partial, CompletionList list) {
+        var trees = Trees.instance(task.task);
+        var positions = trees.getSourcePositions();
+        var seen = new HashSet<String>();
+        for (var item : list.items) {
+            seen.add(item.label);
+        }
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitMethodInvocation(MethodInvocationTree invocation, Void __) {
+                var select = invocation.getMethodSelect();
+                if (select instanceof MemberSelectTree member
+                        && receiverMatches(member.getExpression(), receiver)) {
+                    var start = positions.getStartPosition(task.root, invocation);
+                    if (start >= 0 && start < cursor) {
+                        addMethod(member.getIdentifier().toString(), receiver, partial, list, seen);
+                    }
+                }
+                return super.visitMethodInvocation(invocation, __);
+            }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree member, Void __) {
+                if (receiverMatches(member.getExpression(), receiver)) {
+                    var start = positions.getStartPosition(task.root, member);
+                    if (start >= 0 && start < cursor) {
+                        addField(member.getIdentifier().toString(), receiver, partial, list, seen);
+                    }
+                }
+                return super.visitMemberSelect(member, __);
+            }
+
+            private boolean receiverMatches(ExpressionTree expression, String expected) {
+                if (!(expression instanceof IdentifierTree identifier)) return false;
+                return expected.equals(identifier.getName().toString());
+            }
+        }.scan(task.root, null);
+    }
+
+    private void addMethod(String name, String receiver, String partial, CompletionList list, Set<String> seen) {
+        if (name.equals(receiver)) return;
+        if (!StringSearch.matchesPartialName(name, partial)) return;
+        if (!seen.add(name)) return;
+        var method = new CompletionItem();
+        method.label = name;
+        method.kind = CompletionItemKind.Method;
+        method.insertText = name + "($0)";
+        method.insertTextFormat = InsertTextFormat.Snippet;
+        method.sortText = sortKey(Priority.METHOD, method.label);
+        list.items.add(method);
+    }
+
+    private void addField(String name, String receiver, String partial, CompletionList list, Set<String> seen) {
+        if (name.equals(receiver)) return;
+        if (!StringSearch.matchesPartialName(name, partial)) return;
+        if (!seen.add(name)) return;
+        var field = new CompletionItem();
+        field.label = name;
+        field.kind = CompletionItemKind.Field;
+        field.insertText = name;
+        field.insertTextFormat = InsertTextFormat.PlainText;
+        field.sortText = sortKey(Priority.FIELD, field.label);
+        list.items.add(field);
+    }
+
     private Tree findKeywordLevel(TreePath path) {
         while (path != null) {
             if (path.getLeaf() instanceof CompilationUnitTree
@@ -284,9 +1676,9 @@ public class CompletionProvider {
             CompileTask task, TreePath path, String partial, boolean endsWithParen) {
         var trees = Trees.instance(task.task);
         var list = new ArrayList<CompletionItem>();
-        var methods = new HashMap<String, List<ExecutableElement>>();
+        var methods = new TreeMap<String, List<ExecutableElement>>();
         var scope = trees.getScope(path);
-        Predicate<CharSequence> filter = name -> StringSearch.matchesPartialName(name, partial);
+        Predicate<CharSequence> filter = name -> matchesCompletionPrefix(name, partial);
         for (var member : ScopeHelper.scopeMembers(task, scope, filter)) {
             if (member.getKind() == ElementKind.METHOD) {
                 putMethod((ExecutableElement) member, methods);
@@ -304,7 +1696,7 @@ public class CompletionProvider {
     private void addStaticImports(
             CompileTask task, CompilationUnitTree root, String partial, boolean endsWithParen, CompletionList list) {
         var trees = Trees.instance(task.task);
-        var methods = new HashMap<String, List<ExecutableElement>>();
+        var methods = new TreeMap<String, List<ExecutableElement>>();
         var previousSize = list.items.size();
         outer:
         for (var i : root.getImports()) {
@@ -350,6 +1742,7 @@ public class CompletionProvider {
         for (var className : compiler.packagePrivateTopLevelTypes(packageName)) {
             if (!StringSearch.matchesPartialName(className, partial)) continue;
             var item = classItem(className);
+            applyClassSortPriority(root, className, item);
             if (hasImportConflict(root, className)) {
                 item.insertText = className;
                 item.insertTextFormat = InsertTextFormat.PlainText;
@@ -370,6 +1763,7 @@ public class CompletionProvider {
                 break;
             }
             var item = classItem(className);
+            applyClassSortPriority(root, className, item);
             if (hasImportConflict(root, className)) {
                 item.insertText = className;
                 item.insertTextFormat = InsertTextFormat.PlainText;
@@ -383,6 +1777,39 @@ public class CompletionProvider {
             uniques.add(className);
         }
         LOG.info("...found " + (list.items.size() - previousSize) + " class names");
+    }
+
+    private void applyClassSortPriority(CompilationUnitTree root, String className, CompletionItem item) {
+        var imported = isDirectlyImported(root, className);
+        var samePackage = isSamePackageTopLevel(root, className);
+        var javaLang = className.startsWith("java.lang.");
+        var priority = (imported || samePackage || javaLang) ? Priority.IMPORTED_CLASS : Priority.NOT_IMPORTED_CLASS;
+        item.sortText = sortKey(priority, item.label);
+    }
+
+    private boolean isDirectlyImported(CompilationUnitTree root, String className) {
+        for (var i : root.getImports()) {
+            if (i.isStatic()) continue;
+            var imported = i.getQualifiedIdentifier().toString();
+            if (imported.equals(className)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isSamePackageTopLevel(CompilationUnitTree root, String className) {
+        if (className.indexOf('.') < 0) {
+            return true;
+        }
+        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+        if (packageName.isEmpty()) {
+            return className.indexOf('.') < 0;
+        }
+        if (!className.startsWith(packageName + ".")) {
+            return false;
+        }
+        return className.substring(packageName.length() + 1).indexOf('.') < 0;
     }
 
     private List<TextEdit> autoImportEdits(
@@ -438,53 +1865,49 @@ public class CompletionProvider {
 
     private CompletionList completeMemberSelect(
             CompileTask task, TreePath path, String partial, boolean endsWithParen) {
-        var trees = Trees.instance(task.task);
         var select = (MemberSelectTree) path.getLeaf();
         LOG.info("...complete members of " + select.getExpression());
+        var expressionPath = new TreePath(path, select.getExpression());
+        return completeMembersForExpression(task, expressionPath, select.getExpression(), partial, endsWithParen);
+    }
 
-        // Special handling for Slf4j log variable (log.info, log.debug, etc.)
-        if (select.getExpression() instanceof IdentifierTree) {
-            var ident = (IdentifierTree) select.getExpression();
-            if ("log".equals(ident.getName().toString())) {
-                var enclosingPath = path;
-                while (enclosingPath != null) {
-                    if (enclosingPath.getLeaf().getKind() == Tree.Kind.CLASS) {
-                        var enclosingElement = trees.getElement(enclosingPath);
-                        if (enclosingElement instanceof TypeElement) {
-                            var list = new ArrayList<CompletionItem>();
-                            LombokHandler.addSlf4jLogMethodCompletions(task, (TypeElement) enclosingElement, partial, list, lombokCache);
-                            if (!list.isEmpty()) {
-                                return new CompletionList(false, list);
-                            }
-                        }
-                        break;
-                    }
-                    enclosingPath = enclosingPath.getParentPath();
-                }
+    private CompletionList completeMembersForExpression(
+            CompileTask task,
+            TreePath expressionPath,
+            Tree expression,
+            String partial,
+            boolean endsWithParen) {
+        var trees = Trees.instance(task.task);
+        var includePrivate = expression instanceof ExpressionTree && isThisOrSuper((ExpressionTree) expression);
+        var isStatic = trees.getElement(expressionPath) instanceof TypeElement;
+        var scope = trees.getScope(expressionPath);
+        var type = trees.getTypeMirror(expressionPath);
+        if (expression instanceof MethodInvocationTree) {
+            var resolved = resolveInvocationReturnType(task, expressionPath, (MethodInvocationTree) expression);
+            if (resolved != null) {
+                type = resolved;
             }
+            isStatic = false;
         }
-
-        if (select.getExpression() instanceof MethodInvocationTree) {
-            var builderList =
-                    LombokHandler.builderCompletionsForInvocation(
-                            task, (MethodInvocationTree) select.getExpression(), partial, lombokCache, compiler);
-            if (builderList != null) {
-                return builderList;
-            }
-        }
-        path = new TreePath(path, select.getExpression());
-        var isStatic = trees.getElement(path) instanceof TypeElement;
-        var scope = trees.getScope(path);
-        var type = trees.getTypeMirror(path);
         if (type instanceof ArrayType) {
             return completeArrayMemberSelect(isStatic);
         } else if (type instanceof TypeVariable) {
-            return completeTypeVariableMemberSelect(task, scope, (TypeVariable) type, isStatic, partial, endsWithParen);
+            return completeTypeVariableMemberSelect(
+                    task, scope, (TypeVariable) type, isStatic, partial, endsWithParen, includePrivate);
         } else if (type instanceof DeclaredType) {
-            return completeDeclaredTypeMemberSelect(task, scope, (DeclaredType) type, isStatic, partial, endsWithParen);
+            return completeDeclaredTypeMemberSelect(
+                    task, scope, (DeclaredType) type, isStatic, partial, endsWithParen, includePrivate);
         } else {
             return NOT_SUPPORTED;
         }
+    }
+
+    private boolean isThisOrSuper(ExpressionTree expression) {
+        if (!(expression instanceof IdentifierTree identifier)) {
+            return false;
+        }
+        var name = identifier.getName().toString();
+        return "this".equals(name) || "super".equals(name);
     }
 
     private CompletionList completeArrayMemberSelect(boolean isStatic) {
@@ -498,44 +1921,69 @@ public class CompletionProvider {
     }
 
     private CompletionList completeTypeVariableMemberSelect(
-            CompileTask task, Scope scope, TypeVariable type, boolean isStatic, String partial, boolean endsWithParen) {
+            CompileTask task,
+            Scope scope,
+            TypeVariable type,
+            boolean isStatic,
+            String partial,
+            boolean endsWithParen,
+            boolean includePrivate) {
         if (type.getUpperBound() instanceof DeclaredType) {
             return completeDeclaredTypeMemberSelect(
-                    task, scope, (DeclaredType) type.getUpperBound(), isStatic, partial, endsWithParen);
+                    task,
+                    scope,
+                    (DeclaredType) type.getUpperBound(),
+                    isStatic,
+                    partial,
+                    endsWithParen,
+                    includePrivate);
         } else if (type.getUpperBound() instanceof TypeVariable) {
             return completeTypeVariableMemberSelect(
-                    task, scope, (TypeVariable) type.getUpperBound(), isStatic, partial, endsWithParen);
+                    task,
+                    scope,
+                    (TypeVariable) type.getUpperBound(),
+                    isStatic,
+                    partial,
+                    endsWithParen,
+                    includePrivate);
         } else {
             return NOT_SUPPORTED;
         }
     }
 
     private CompletionList completeDeclaredTypeMemberSelect(
-            CompileTask task, Scope scope, DeclaredType type, boolean isStatic, String partial, boolean endsWithParen) {
+            CompileTask task,
+            Scope scope,
+            DeclaredType type,
+            boolean isStatic,
+            String partial,
+            boolean endsWithParen,
+            boolean includePrivate) {
         var trees = Trees.instance(task.task);
         var typeElement = (TypeElement) type.asElement();
         var list = new ArrayList<CompletionItem>();
-        var methods = new HashMap<String, List<ExecutableElement>>();
+        var methods = new TreeMap<String, List<ExecutableElement>>();
+        var methodPriority = new HashMap<String, Integer>();
         for (var member : task.task.getElements().getAllMembers(typeElement)) {
             if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
             if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
-            if (!trees.isAccessible(scope, member, type)) continue;
+            if (!includePrivate && !trees.isAccessible(scope, member, type)) continue;
             if (isStatic != member.getModifiers().contains(Modifier.STATIC)) continue;
             if (member.getKind() == ElementKind.METHOD) {
                 putMethod((ExecutableElement) member, methods);
+                var name = member.getSimpleName().toString();
+                var priority = memberPriority(typeElement, member);
+                methodPriority.merge(name, priority, Math::min);
             } else {
-                list.add(item(task, member));
+                var next = item(task, member);
+                next.sortText = sortKey(memberPriority(typeElement, member), next.label);
+                list.add(next);
             }
         }
-        for (var overloads : methods.values()) {
-            list.add(method(task, overloads, !endsWithParen));
-        }
-
-        // Add Lombok-generated members
-        if (!isStatic) {
-            addLombokCompletions(task, typeElement, partial, list);
-        } else {
-            LombokHandler.addStaticCompletions(task, typeElement, partial, list, lombokCache);
+        for (var entry : methods.entrySet()) {
+            var method = method(task, entry.getValue(), !endsWithParen);
+            method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
+            list.add(method);
         }
 
         if (isStatic) {
@@ -545,16 +1993,8 @@ public class CompletionProvider {
             list.add(keyword("this"));
             list.add(keyword("super"));
         }
+        sortCompletionItems(list);
         return new CompletionList(false, list);
-    }
-
-    /**
-     * Add completion items for Lombok-generated members.
-     * Searches the compilation task for the ClassTree of the given TypeElement and synthesizes
-     * completions for generated getters, setters, toString, equals, hashCode, and constructors.
-     */
-    private void addLombokCompletions(CompileTask task, TypeElement typeElement, String partial, List<CompletionItem> list) {
-        LombokHandler.addCompletions(task, typeElement, partial, list, lombokCache);
     }
 
     private boolean isEnclosingClass(DeclaredType type, Scope start) {
@@ -625,7 +2065,7 @@ public class CompletionProvider {
         var trees = Trees.instance(task.task);
         var typeElement = (TypeElement) type.asElement();
         var list = new ArrayList<CompletionItem>();
-        var methods = new HashMap<String, List<ExecutableElement>>();
+        var methods = new TreeMap<String, List<ExecutableElement>>();
         for (var member : task.task.getElements().getAllMembers(typeElement)) {
             if (!StringSearch.matchesPartialName(member.getSimpleName(), partial)) continue;
             if (member.getKind() != ElementKind.METHOD) continue;
@@ -643,6 +2083,7 @@ public class CompletionProvider {
         if (isStatic) {
             list.add(keyword("new"));
         }
+        sortCompletionItems(list);
         return new CompletionList(false, list);
     }
 
@@ -658,8 +2099,8 @@ public class CompletionProvider {
 
     private CompletionList completeSwitchConstant(CompileTask task, TreePath path, String partial) {
         var switchTree = (SwitchTree) path.getLeaf();
-        path = new TreePath(path, switchTree.getExpression());
-        var type = Trees.instance(task.task).getTypeMirror(path);
+        var expressionPath = new TreePath(path, switchTree.getExpression());
+        var type = resolveSwitchExpressionType(task, expressionPath);
         LOG.info("...complete constants of type " + type);
         if (!(type instanceof DeclaredType)) {
             return NOT_SUPPORTED;
@@ -673,6 +2114,74 @@ public class CompletionProvider {
             list.add(item(task, member));
         }
         return new CompletionList(false, list);
+    }
+
+    private TypeMirror resolveSwitchExpressionType(CompileTask task, TreePath expressionPath) {
+        var trees = Trees.instance(task.task);
+        if (expressionPath.getLeaf() instanceof ParenthesizedTree) {
+            var paren = (ParenthesizedTree) expressionPath.getLeaf();
+            return resolveSwitchExpressionType(task, new TreePath(expressionPath, paren.getExpression()));
+        }
+        var direct = trees.getTypeMirror(expressionPath);
+        if (direct instanceof DeclaredType) {
+            return direct;
+        }
+        var expression = expressionPath.getLeaf();
+        if (expression instanceof MethodInvocationTree) {
+            return resolveInvocationReturnType(task, expressionPath, (MethodInvocationTree) expression);
+        }
+        if (expression instanceof IdentifierTree) {
+            var element = trees.getElement(expressionPath);
+            if (element instanceof VariableElement) {
+                return ((VariableElement) element).asType();
+            }
+        }
+        return direct;
+    }
+
+    private TypeMirror resolveInvocationReturnType(
+            CompileTask task, TreePath invocationPath, MethodInvocationTree invocation) {
+        var trees = Trees.instance(task.task);
+        var selectPath = new TreePath(invocationPath, invocation.getMethodSelect());
+        if (invocation.getMethodSelect() instanceof IdentifierTree) {
+            var id = (IdentifierTree) invocation.getMethodSelect();
+            var scope = trees.getScope(selectPath);
+            Predicate<CharSequence> filter = name -> id.getName().contentEquals(name);
+            for (var member : ScopeHelper.scopeMembers(task, scope, filter)) {
+                if (member.getKind() != ElementKind.METHOD) continue;
+                var method = (ExecutableElement) member;
+                if (!matchesArity(method, invocation.getArguments().size())) continue;
+                return method.getReturnType();
+            }
+            return null;
+        }
+        if (invocation.getMethodSelect() instanceof MemberSelectTree) {
+            var select = (MemberSelectTree) invocation.getMethodSelect();
+            var qualifierPath = new TreePath(selectPath, select.getExpression());
+            var qualifierType = trees.getTypeMirror(qualifierPath);
+            if (!(qualifierType instanceof DeclaredType)) return qualifierType;
+            var qualifierDeclared = (DeclaredType) qualifierType;
+            var qualifierElement = (TypeElement) qualifierDeclared.asElement();
+            var scope = trees.getScope(qualifierPath);
+            var staticCall = trees.getElement(qualifierPath) instanceof TypeElement;
+            for (var member : task.task.getElements().getAllMembers(qualifierElement)) {
+                if (member.getKind() != ElementKind.METHOD) continue;
+                if (!member.getSimpleName().contentEquals(select.getIdentifier())) continue;
+                if (staticCall != member.getModifiers().contains(Modifier.STATIC)) continue;
+                if (!trees.isAccessible(scope, member, qualifierDeclared)) continue;
+                var method = (ExecutableElement) member;
+                if (!matchesArity(method, invocation.getArguments().size())) continue;
+                return method.getReturnType();
+            }
+        }
+        return null;
+    }
+
+    private boolean matchesArity(ExecutableElement method, int args) {
+        if (method.isVarArgs()) {
+            return args >= method.getParameters().size() - 1;
+        }
+        return method.getParameters().size() == args;
     }
 
     private CompletionList completeImport(String path) {
@@ -706,6 +2215,7 @@ public class CompletionProvider {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Module;
+        i.sortText = sortKey(Priority.PACKAGE_MEMBER, i.label);
         return i;
     }
 
@@ -714,6 +2224,7 @@ public class CompletionProvider {
         i.label = simpleName(className).toString();
         i.kind = CompletionItemKind.Class;
         i.detail = className;
+        i.sortText = sortKey(Priority.IMPORTED_CLASS, i.label);
         var data = new CompletionData();
         data.className = className;
         i.data = JsonHelper.GSON.toJsonTree(data);
@@ -726,7 +2237,7 @@ public class CompletionProvider {
         i.kind = CompletionItemKind.Snippet;
         i.insertText = snippet;
         i.insertTextFormat = InsertTextFormat.Snippet;
-        i.sortText = String.format("%02d%s", Priority.SNIPPET, i.label);
+        i.sortText = sortKey(Priority.SNIPPET, i.label);
         return i;
     }
 
@@ -737,6 +2248,7 @@ public class CompletionProvider {
         i.kind = kind(element);
         i.detail = element.toString();
         i.data = JsonHelper.GSON.toJsonTree(data(task, element, 1));
+        i.sortText = sortKey(priorityForItemKind(i.kind), i.label);
         return i;
     }
 
@@ -761,6 +2273,7 @@ public class CompletionProvider {
             }
             i.insertTextFormat = 2; // Snippet
         }
+        i.sortText = sortKey(Priority.METHOD, i.label);
         return i;
     }
 
@@ -836,13 +2349,24 @@ public class CompletionProvider {
         i.label = keyword;
         i.kind = CompletionItemKind.Keyword;
         i.detail = "keyword";
-        i.sortText = String.format("%02d%s", Priority.KEYWORD, i.label);
+        i.sortText = sortKey(Priority.KEYWORD, i.label);
+        return i;
+    }
+
+    private CompletionItem variable(String name) {
+        var i = new CompletionItem();
+        i.label = name;
+        i.kind = CompletionItemKind.Variable;
+        i.detail = "local";
+        i.sortText = sortKey(Priority.LOCAL, i.label);
         return i;
     }
 
     private static class Priority {
+        static final int EXACT_IMPORTED_MATCH = -2;
+        static final int EXACT_MATCH = -1;
         static int iota = 0;
-        static final int SNIPPET = iota;
+        static final int SNIPPET = iota++;
         static final int LOCAL = iota++;
         static final int FIELD = iota++;
         static final int INHERITED_FIELD = iota++;
@@ -858,10 +2382,110 @@ public class CompletionProvider {
         static final int CASE_LABEL = iota++;
     }
 
+    private int memberPriority(TypeElement ownerType, Element member) {
+        var enclosing = member.getEnclosingElement();
+        var declaredInOwner = enclosing != null && enclosing.equals(ownerType);
+        var declaredInObject =
+                enclosing instanceof TypeElement
+                        && ((TypeElement) enclosing).getQualifiedName().contentEquals("java.lang.Object");
+        if (member.getKind() == ElementKind.METHOD) {
+            if (declaredInOwner) {
+                return Priority.METHOD;
+            }
+            if (declaredInObject) {
+                return Priority.OBJECT_METHOD;
+            }
+            return Priority.INHERITED_METHOD;
+        }
+        if (member.getKind() == ElementKind.FIELD || member.getKind() == ElementKind.ENUM_CONSTANT) {
+            if (declaredInOwner) {
+                return Priority.FIELD;
+            }
+            return Priority.INHERITED_FIELD;
+        }
+        return priorityForItemKind(kind(member));
+    }
+
+    private int priorityForItemKind(Integer kind) {
+        if (kind == null) {
+            return Priority.PACKAGE_MEMBER;
+        }
+        if (Objects.equals(kind, CompletionItemKind.Variable)) {
+            return Priority.LOCAL;
+        }
+        if (Objects.equals(kind, CompletionItemKind.Field)) {
+            return Priority.FIELD;
+        }
+        if (Objects.equals(kind, CompletionItemKind.Method)) {
+            return Priority.METHOD;
+        }
+        if (Objects.equals(kind, CompletionItemKind.Keyword)) {
+            return Priority.KEYWORD;
+        }
+        if (Objects.equals(kind, CompletionItemKind.Class) || Objects.equals(kind, CompletionItemKind.Interface)) {
+            return Priority.IMPORTED_CLASS;
+        }
+        if (Objects.equals(kind, CompletionItemKind.Module)) {
+            return Priority.PACKAGE_MEMBER;
+        }
+        return Priority.PACKAGE_MEMBER;
+    }
+
+    private String sortKey(int priority, String label) {
+        var safe = label == null ? "" : label;
+        return String.format("%03d:%s", priority, safe.toLowerCase());
+    }
+
+    private void sortCompletionItems(List<CompletionItem> items) {
+        items.sort(
+                Comparator.comparing((CompletionItem item) -> item.sortText == null ? sortKey(Priority.PACKAGE_MEMBER, item.label) : item.sortText)
+                        .thenComparing(item -> item.label == null ? "" : item.label, String.CASE_INSENSITIVE_ORDER)
+                        .thenComparingInt(item -> item.kind));
+    }
+
+    private MemberAccessContext memberAccessContext(String contents, int cursor) {
+        if (cursor < 0 || cursor > contents.length()) {
+            return null;
+        }
+        var effectiveCursor = cursor;
+        if (effectiveCursor < contents.length() && contents.charAt(effectiveCursor) == '.') {
+            effectiveCursor++;
+        }
+        var partialStart = effectiveCursor;
+        while (partialStart > 0 && Character.isJavaIdentifierPart(contents.charAt(partialStart - 1))) {
+            partialStart--;
+        }
+        var dot = partialStart - 1;
+        if (dot < 0 || contents.charAt(dot) != '.') {
+            return null;
+        }
+        var receiverEnd = dot;
+        var receiverStart = receiverEnd;
+        while (receiverStart > 0 && Character.isJavaIdentifierPart(contents.charAt(receiverStart - 1))) {
+            receiverStart--;
+        }
+        var receiver = receiverStart < receiverEnd ? contents.substring(receiverStart, receiverEnd) : "";
+        var partial = contents.substring(partialStart, effectiveCursor);
+        return new MemberAccessContext(receiver, partial, partial.isEmpty());
+    }
+
+    private static class MemberAccessContext {
+        final String receiver;
+        final String partial;
+        final boolean dotTrigger;
+
+        MemberAccessContext(String receiver, String partial, boolean dotTrigger) {
+            this.receiver = receiver;
+            this.partial = partial;
+            this.dotTrigger = dotTrigger;
+        }
+    }
+
     private void logCompletionTiming(Instant started, List<?> list, boolean isIncomplete) {
         var elapsedMs = Duration.between(started, Instant.now()).toMillis();
-        if (isIncomplete) LOG.info(String.format("Found %d items (incomplete) in %,d ms", list.size(), elapsedMs));
-        else LOG.info(String.format("...found %d items in %,d ms", list.size(), elapsedMs));
+        if (isIncomplete)
+            LOG.info(String.format("[perf] completion_total items=%d incomplete=true took=%dms", list.size(), elapsedMs));
+        else LOG.info(String.format("[perf] completion_total items=%d incomplete=false took=%dms", list.size(), elapsedMs));
     }
 
     private CharSequence simpleName(String className) {

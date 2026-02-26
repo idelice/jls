@@ -50,28 +50,11 @@ class Parser {
         return parseJavaFileObject(new SourceFileObject(file));
     }
 
-    private static Parser cachedParse;
-    private static long cachedModified = -1;
-
-    private static boolean needsParse(JavaFileObject file) {
-        if (cachedParse == null) return true;
-        if (!cachedParse.file.equals(file)) return true;
-        if (file.getLastModified() > cachedModified) return true;
-        return false;
-    }
-
-    private static void loadParse(JavaFileObject file) {
-        cachedParse = new Parser(file);
-        cachedModified = file.getLastModified();
-    }
-
     static Parser parseJavaFileObject(JavaFileObject file) {
-        if (needsParse(file)) {
-            loadParse(file);
-        } else {
-            LOG.info("...using cached parse");
-        }
-        return cachedParse;
+        // Parse directly from the current SourceFileObject snapshot.
+        // This avoids cross-request stale AST races on shared global parse state.
+        LOG.fine("[perf] parser_parse file=" + file.getName());
+        return new Parser(file);
     }
 
     Set<Name> packagePrivateClasses() {

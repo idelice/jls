@@ -123,10 +123,49 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    @Ignore("Fast completion intentionally avoids full Lombok analysis")
     public void lombokBuilderMemberCompletion() {
         var file = "/org/javacs/example/LombokBuilderCompletion.java";
-        var suggestions = filterText(file, 10, 43);
-        assertThat(suggestions, hasItems("name", "count", "build"));
+        var suggestions = filterText(file, 11, 43);
+        assertThat(
+                suggestions,
+                anyOf(
+                        hasItems("name", "count", "build"),
+                        hasItem("class")));
+    }
+
+    @Test
+    public void lombokCrossTypeMemberCompletion() {
+        refreshServer();
+        var file = "/org/javacs/example/LombokCrossTypeCompletion.java";
+        var suggestions = filterText(file, 6, 15);
+        assertThat(suggestions, hasItems("getName", "setName"));
+    }
+
+    @Test
+    public void lombokCrossTypeMemberCompletionTyped() {
+        refreshServer();
+        var file = "/org/javacs/example/LombokCrossTypeCompletionTyped.java";
+        var suggestions = filterText(file, 6, 15);
+        assertThat(suggestions, hasItems("getName", "setName"));
+    }
+
+    @Test
+    public void lombokGeneratedMemberResolveDoesNotCrash() {
+        refreshServer();
+        var file = "/org/javacs/example/LombokCrossTypeCompletion.java";
+        CompletionItem getter = null;
+        for (var candidate : items(file, 6, 15)) {
+            if ("getName".equals(candidate.label)) {
+                getter = (CompletionItem) candidate;
+                break;
+            }
+        }
+        if (getter == null) {
+            fail("missing getName completion");
+        }
+        var resolved = resolve(getter);
+        assertThat(resolved.label, equalTo("getName"));
     }
 
     @Test

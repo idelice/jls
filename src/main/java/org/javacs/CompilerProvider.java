@@ -33,5 +33,21 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
+    default CompileTask compileFast(Path... files) {
+        return compile(files);
+    }
+
+    default CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
+        return compile(sources);
+    }
+
+    default CompileTask compileFastWithProcessors(Path... files) {
+        return compileFast(files);
+    }
+
+    default CompileTask compileFastWithProcessors(Collection<? extends JavaFileObject> sources) {
+        return compileFast(sources);
+    }
+
     Path NOT_FOUND = Paths.get("");
 }
