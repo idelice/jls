@@ -6,8 +6,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.javacs.lsp.DidOpenTextDocumentParams;
+import org.javacs.lsp.DidSaveTextDocumentParams;
+import org.javacs.lsp.Position;
+import org.javacs.lsp.TextDocumentIdentifier;
+import org.javacs.lsp.TextDocumentPositionParams;
 import org.javacs.lsp.TextDocumentItem;
+import org.junit.Assert;
 import org.junit.Test;
 
 public class JavaLanguageServerTest {
@@ -29,5 +38,86 @@ public class JavaLanguageServerTest {
 
         // Should not fail
         server.lint(Collections.singleton(Paths.get(textDocument.uri)));
+    }
+
+    @Test
+    public void lintDoesNotRefreshCompletionIndex() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var hello = FindResource.path("org/javacs/example/HelloWorld.java");
+        var before = completionIndexVersion(server);
+        server.lint(List.of(hello));
+        var after = completionIndexVersion(server);
+        Assert.assertEquals("diagnostics lint should not rebuild completion index", before, after);
+    }
+
+    @Test
+    public void didSaveRefreshesCompletionIndexWithoutDiagnosticsCoupling() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var initial = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = initial;
+        server.didOpenTextDocument(open);
+
+        var before = completionIndexVersion(server);
+        var save = new DidSaveTextDocumentParams();
+        save.textDocument = new TextDocumentIdentifier(file.toUri());
+        server.didSaveTextDocument(save);
+        var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
+        Assert.assertTrue("didSave should trigger completion index refresh", updated);
+    }
+
+    @Test
+    public void completionUsesCurrentIndexEvenAfterUnsavedVersionChange() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var original = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = original;
+        server.didOpenTextDocument(open);
+
+        var broken = original.replace("this.", "this.\n");
+        var change = new org.javacs.lsp.DidChangeTextDocumentParams();
+        change.textDocument.uri = file.toUri();
+        change.textDocument.version = 2;
+        var delta = new org.javacs.lsp.TextDocumentContentChangeEvent();
+        delta.text = broken;
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
+
+        var completion =
+                server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+        Assert.assertTrue(completion.isPresent());
+        Assert.assertTrue(
+                "member completion should keep using index after unsaved change",
+                completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
+    }
+
+    private long completionIndexVersion(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
+        field.setAccessible(true);
+        return ((AtomicLong) field.get(server)).get();
+    }
+
+    private boolean awaitCompletionIndexAdvance(
+            JavaLanguageServer server, long before, long timeout, TimeUnit unit) throws Exception {
+        var deadline = System.nanoTime() + unit.toNanos(timeout);
+        while (System.nanoTime() < deadline) {
+            if (completionIndexVersion(server) > before) {
+                return true;
+            }
+            Thread.sleep(20);
+        }
+        return false;
     }
 }

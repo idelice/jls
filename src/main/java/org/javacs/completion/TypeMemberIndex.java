@@ -12,15 +12,15 @@ import com.sun.source.tree.TreeVisitor;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
+import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
+import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
-import java.util.HashMap;
-import java.util.LinkedHashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -107,7 +107,7 @@ public class TypeMemberIndex {
     private static final Logger LOG = Logger.getLogger("main");
 
     private TypeMemberIndex(Map<String, TypeInfo> typesByQualifiedName) {
-        var verified = new LinkedHashMap<String, TypeInfo>();
+        var verified = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
         for (var entry : typesByQualifiedName.entrySet()) {
             var key = entry.getKey();
             var valid = key != null && (key.contains(".") || isPrimitiveTypeName(key));
@@ -195,7 +195,7 @@ public class TypeMemberIndex {
     }
 
     private Optional<String> resolveSimpleName(String simpleName, CompilationUnitTree root) {
-        var candidates = new LinkedHashSet<String>();
+        var candidates = new ObjectLinkedOpenHashSet<String>();
         var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
         if (!packageName.isEmpty()) {
             var samePackage = packageName + "." + simpleName;
@@ -257,10 +257,10 @@ public class TypeMemberIndex {
         var elements = task.task.getElements();
         var types = task.task.getTypes();
 
-        var rootDeclaredTypeSources = new HashMap<String, Path>();
-        var collectedTypes = new LinkedHashMap<String, TypeElement>();
-        var seenMirrors = new HashSet<String>();
-        var skippedInvalidTypeKeys = new LinkedHashSet<String>();
+        var rootDeclaredTypeSources = new Object2ObjectOpenHashMap<String, Path>();
+        var collectedTypes = new Object2ObjectLinkedOpenHashMap<String, TypeElement>();
+        var seenMirrors = new ObjectOpenHashSet<String>();
+        var skippedInvalidTypeKeys = new ObjectLinkedOpenHashSet<String>();
         for (var root : task.roots) {
             Path sourcePath = null;
             var sourceUri = root.getSourceFile().toUri();
@@ -326,7 +326,7 @@ public class TypeMemberIndex {
             }.scan(root, null);
         }
 
-        var typeEntries = new LinkedHashMap<String, TypeInfo>();
+        var typeEntries = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
         for (var type : collectedTypes.values()) {
             var qualifiedName = type.getQualifiedName().toString();
             if (!isValidIndexKey(qualifiedName)) {
@@ -337,7 +337,7 @@ public class TypeMemberIndex {
             }
 
             var members = new ArrayList<Member>();
-            var seen = new HashMap<String, Member>();
+            var seen = new Object2ObjectOpenHashMap<String, Member>();
             for (var member : elements.getAllMembers(type)) {
                 if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
                 var kind = memberKind(member);

@@ -97,7 +97,7 @@ class JavaCompilerService implements CompilerProvider {
     private SourceFingerprint fingerprint(JavaFileObject file) {
         var version = -1;
         if (file instanceof SourceFileObject sourceFileObject) {
-            version = sourceFileObject.snapshotVersion();
+            version = sourceFileObject.contentVersion();
         }
         return new SourceFingerprint(file.getLastModified(), version);
     }
@@ -370,24 +370,6 @@ class JavaCompilerService implements CompilerProvider {
             cached.borrow.close();
         }
         modifiedCache.clear();
-    }
-
-    void resetIdleCachesForSnapshot(String trigger) {
-        if (cachedCompile != null && !cachedCompile.closed) {
-            LOG.info("[perf] javac_cache_reset trigger=" + trigger + " skipped=full_in_use");
-            return;
-        }
-        if (cachedFastCompile != null && !cachedFastCompile.closed) {
-            LOG.info("[perf] javac_cache_reset trigger=" + trigger + " skipped=fast_in_use");
-            return;
-        }
-        dropCachedCompilation(cachedCompile, cachedModified);
-        cachedCompile = null;
-        cachedCompileContentRevision = -1;
-        dropCachedCompilation(cachedFastCompile, cachedFastModified);
-        cachedFastCompile = null;
-        cachedFastCompileContentRevision = -1;
-        LOG.info("[perf] javac_cache_reset trigger=" + trigger + " applied=true");
     }
 
     private static final Pattern PACKAGE_EXTRACTOR = Pattern.compile("^([a-z][_a-zA-Z0-9]*\\.)*[a-z][_a-zA-Z0-9]*");

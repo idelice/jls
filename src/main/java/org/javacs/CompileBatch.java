@@ -217,7 +217,7 @@ public class CompileBatch implements AutoCloseable {
             }
             var version = -1;
             if (file instanceof SourceFileObject sourceFile) {
-                version = sourceFile.snapshotVersion();
+                version = sourceFile.contentVersion();
             }
             result.put(path, new CompileTask.SourceStamp(file.getLastModified(), version));
         }

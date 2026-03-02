@@ -36,7 +36,7 @@ public class SourceFileObjectTest {
         changed.contentChanges.add(delta);
         FileStore.change(changed);
 
-        assertThat(snapshot.snapshotVersion(), is(1));
+        assertThat(snapshot.contentVersion(), is(1));
         assertThat(snapshot.getLastModified(), is(snapshotModified));
         assertThat(snapshot.getCharContent(true).toString(), is(initial));
         assertThat(FileStore.version(file), is(2));

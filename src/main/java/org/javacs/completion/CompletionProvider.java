@@ -1,5 +1,8 @@
 package org.javacs.completion;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
@@ -10,6 +13,7 @@ import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.ModifiersTree;
 import com.sun.source.tree.NewArrayTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.ParenthesizedTree;
@@ -72,8 +76,8 @@ import org.javacs.rewrite.AddImport;
 
 public class CompletionProvider {
     private final CompilerProvider compiler;
-    private final CompletionSnapshotProvider snapshotProvider;
-    private final IndexSnapshot indexSnapshot;
+    private final TypeMemberIndex completionIndex;
+    private final long completionIndexVersion;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
@@ -143,14 +147,21 @@ public class CompletionProvider {
     };
     private static final Set<String> OBJECT_MEMBER_LABELS =
             Set.of("equals", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait");
+    private static final Cache<MemberCompletionCacheKey, CompletionList> MEMBER_COMPLETION_CACHE =
+            Caffeine.newBuilder().maximumSize(20_000).build();
 
-    public CompletionProvider(
-            CompilerProvider compiler,
-            CompletionSnapshotProvider snapshotProvider,
-            IndexSnapshot indexSnapshot) {
+    private record MemberCompletionCacheKey(
+            long indexVersion,
+            String targetType,
+            boolean staticContext,
+            String partial,
+            boolean endsWithParen,
+            String currentType) {}
+
+    public CompletionProvider(CompilerProvider compiler, TypeMemberIndex completionIndex, long completionIndexVersion) {
         this.compiler = compiler;
-        this.snapshotProvider = snapshotProvider;
-        this.indexSnapshot = indexSnapshot == null ? IndexSnapshot.EMPTY : indexSnapshot;
+        this.completionIndex = completionIndex == null ? TypeMemberIndex.EMPTY : completionIndex;
+        this.completionIndexVersion = Math.max(0L, completionIndexVersion);
     }
 
     public CompletionList complete(Path file, int line, int column) {
@@ -159,9 +170,6 @@ public class CompletionProvider {
 
     public CompletionList complete(Path file, int line, int column, int fileVersionSeen) {
         LOG.info("Complete at " + file.getFileName() + "(" + line + "," + column + ")...");
-        assertIndexSnapshotVersion(file, fileVersionSeen);
-        var snapshotVersion = indexSnapshot.version;
-        var snapshotTypeCount = indexSnapshot.types.size();
         var started = Instant.now();
         var countersBefore = CompileBatch.perfCounters();
         var parseStarted = Instant.now();
@@ -174,25 +182,25 @@ public class CompletionProvider {
         var pruned = contents.toString();
         var memberAccess = memberAccessContext(pruned, (int) cursor);
         var parsePath = new FindCompletionsAt(task.task).scan(task.root, cursor);
-        CompletionOutcome outcome;
+        CompletionList list;
+        String mode;
         if (memberAccess != null && isImportOrPackageContext(parsePath)) {
             // `import foo.bar.` should stay on the import completion path.
-            var list = completeParseOnly(task, pruned, cursor, memberAccess.partial);
-            outcome = new CompletionOutcome(list, false);
+            list = completeParseOnly(task, pruned, cursor, memberAccess.partial);
+            mode = "import_parse";
         } else if (memberAccess != null) {
-            var list =
+            list =
                     completeParseAndIndex(
                             task,
                             parsePath,
                             cursor,
                             memberAccess,
                             endsWithParen(pruned, (int) cursor));
-            LOG.info("[perf] completion_member_path mode=index_only snapshot=false");
-            outcome = new CompletionOutcome(list, false);
+            mode = "member_index";
         } else {
-            outcome = completeReadOnly(file, task, line, column, pruned, cursor);
+            list = completeParseOnly(task, pruned, cursor, partialIdentifier(pruned, (int) cursor));
+            mode = "identifier_parse";
         }
-        var list = outcome.list;
         if (list == NOT_SUPPORTED) {
             return NOT_SUPPORTED;
         }
@@ -210,25 +218,14 @@ public class CompletionProvider {
         var apDelta = countersAfter.apEnabledBatches - countersBefore.apEnabledBatches;
         LOG.info(
                 String.format(
-                        "[perf] completion_read_only file=%s snapshot=%s sources=1 enter=%d analyze=%d ap=%d took=%dms",
+                        "[perf] completion_flow file=%s mode=%s sources=1 enter=%d analyze=%d ap=%d index_version=%d took=%dms",
                         file.getFileName(),
-                        outcome.usedSnapshot,
+                        mode,
                         enterDelta,
                         analyzeDelta,
                         apDelta,
+                        completionIndexVersion,
                         Duration.between(started, Instant.now()).toMillis()));
-        if (snapshotVersion != indexSnapshot.version || snapshotTypeCount != indexSnapshot.types.size()) {
-            LOG.warning(
-                    String.format(
-                            "[completion] snapshot changed during completion file=%s start_version=%d end_version=%d start_types=%d end_types=%d",
-                            file.getFileName(),
-                            snapshotVersion,
-                            indexSnapshot.version,
-                            snapshotTypeCount,
-                            indexSnapshot.types.size()));
-        }
-        assert snapshotVersion == indexSnapshot.version;
-        assert snapshotTypeCount == indexSnapshot.types.size();
         return list;
     }
 
@@ -256,11 +253,11 @@ public class CompletionProvider {
             long cursor,
             MemberAccessContext memberAccess,
             boolean endsWithParen) {
-        if (indexSnapshot == null || indexSnapshot.isEmpty()) {
+        if (completionIndex == null || completionIndex.size() == 0) {
             LOG.info("[perf] completion_member_index state=miss reason=index_empty receiver=" + memberAccess.receiver);
             return EMPTY;
         }
-        var index = indexSnapshot.index();
+        var index = completionIndex;
         var started = Instant.now();
         var resolver = new ParseTypeResolver(parseTask, index, cursor);
         var expression = memberReceiverExpression(parsePath);
@@ -297,6 +294,22 @@ public class CompletionProvider {
                             + " reason=no_members");
             return EMPTY;
         }
+        var cacheKey =
+                new MemberCompletionCacheKey(
+                        completionIndexVersion,
+                        target.qualifiedType,
+                        target.staticContext,
+                        memberAccess.partial,
+                        endsWithParen,
+                        currentType.orElse(""));
+        var cached = MEMBER_COMPLETION_CACHE.getIfPresent(cacheKey);
+        if (cached != null) {
+            LOG.info(
+                    String.format(
+                            "[perf] completion_member_index state=cache_hit receiver=%s type=%s items=%d",
+                            memberAccess.receiver, target.qualifiedType, cached.items.size()));
+            return copyCompletionList(cached);
+        }
 
         var list = new ArrayList<CompletionItem>();
         var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();
@@ -325,7 +338,22 @@ public class CompletionProvider {
                 list.add(keyword("super"));
             }
         }
+        var result = new CompletionList(false, list);
+        if (memberAccess.partial.isEmpty()
+                && !"java.lang.Object".equals(target.qualifiedType)
+                && isWeakObjectOnlyResult(result)) {
+            LOG.info(
+                    "[perf] completion_member_index state=drop_weak_object_only receiver="
+                            + memberAccess.receiver
+                            + " type="
+                            + target.qualifiedType
+                            + " items="
+                            + list.size());
+            return EMPTY;
+        }
         sortCompletionItems(list);
+        result = new CompletionList(false, list);
+        MEMBER_COMPLETION_CACHE.put(cacheKey, freezeCompletionList(result));
         LOG.info(
                 String.format(
                         "[perf] completion_member_index state=hit receiver=%s type=%s items=%d took=%dms",
@@ -333,22 +361,7 @@ public class CompletionProvider {
                         target.qualifiedType,
                         list.size(),
                         Duration.between(started, Instant.now()).toMillis()));
-        return new CompletionList(false, list);
-    }
-
-    private void assertIndexSnapshotVersion(Path file, int fileVersionSeen) {
-        if (fileVersionSeen < 0) {
-            return;
-        }
-        if (indexSnapshot == null) {
-            return;
-        }
-        if (indexSnapshot.version > fileVersionSeen) {
-            LOG.warning(
-                    String.format(
-                            "[perf] completion_index_snapshot state=version_mismatch file=%s snapshot=%d file_version=%d",
-                            file.getFileName(), indexSnapshot.version, fileVersionSeen));
-        }
+        return result;
     }
 
     private boolean isIndexMemberVisible(
@@ -380,18 +393,22 @@ public class CompletionProvider {
 
     private int indexMemberPriority(TypeMemberIndex.Member member) {
         if (member.kind == CompletionItemKind.Method) {
-            if (member.priority == 0) return Priority.METHOD;
-            if (member.priority == 2) return Priority.OBJECT_METHOD;
-            return Priority.INHERITED_METHOD;
+            if (isUtilityMethodName(member.name)) return 90; // always sink utility methods
+            if (member.priority == 2) return 80; // java.lang.Object methods near end
+            if (member.isStatic) return 30;
+            if (member.priority == 0 && isAccessorMethodName(member.name)) return 10;
+            if (member.priority == 0) return 20;
+            return 60;
         }
         if (member.kind == CompletionItemKind.Field) {
-            if (member.priority == 0) return Priority.FIELD;
-            return Priority.INHERITED_FIELD;
+            if (member.isStatic) return 40;
+            if (member.priority == 0) return 35;
+            return 50;
         }
         if (member.kind == CompletionItemKind.Class
                 || member.kind == CompletionItemKind.Interface
                 || member.kind == CompletionItemKind.Enum) {
-            return Priority.FIELD;
+            return 45;
         }
         return Priority.PACKAGE_MEMBER;
     }
@@ -417,15 +434,19 @@ public class CompletionProvider {
         item.kind = CompletionItemKind.Method;
         item.detail = first.detail;
         if (addParens) {
-            if (overloads.size() == 1 && (first.erasedParameterTypes == null || first.erasedParameterTypes.length == 0)) {
-                item.insertText = first.name + "()$0";
+            var noArgs =
+                    overloads.size() == 1
+                            && (first.erasedParameterTypes == null || first.erasedParameterTypes.length == 0);
+            if (noArgs) {
+                item.insertText = first.name + "()";
+                item.insertTextFormat = InsertTextFormat.PlainText;
             } else {
                 item.insertText = first.name + "($0)";
+                item.insertTextFormat = InsertTextFormat.Snippet;
                 item.command = new Command();
                 item.command.command = "editor.action.triggerParameterHints";
                 item.command.title = "Trigger Parameter Hints";
             }
-            item.insertTextFormat = InsertTextFormat.Snippet;
         }
         var data = new CompletionData();
         data.className = first.ownerType;
@@ -597,6 +618,10 @@ public class CompletionProvider {
             if (variable.isPresent()) {
                 return variable;
             }
+            var implicitLogger = resolveImplicitSlf4jLogger(identifier);
+            if (implicitLogger.isPresent()) {
+                return implicitLogger;
+            }
             var nested = resolveNestedTypeInEnclosingScopes(identifier);
             if (nested.isPresent()) {
                 return Optional.of(new TypeResolution(nested.get(), true, false));
@@ -606,6 +631,25 @@ public class CompletionProvider {
                 return Optional.of(new TypeResolution(type.get(), true, false));
             }
             return Optional.empty();
+        }
+
+        private Optional<TypeResolution> resolveImplicitSlf4jLogger(String identifier) {
+            if (!"log".equals(identifier)) {
+                return Optional.empty();
+            }
+            var classPath = enclosingClassPath();
+            if (classPath == null) {
+                return Optional.empty();
+            }
+            var classTree = (ClassTree) classPath.getLeaf();
+            if (!CompletionProvider.hasSlf4jAnnotation(classTree.getModifiers())) {
+                return Optional.empty();
+            }
+            var loggerType = "org.slf4j.Logger";
+            if (!index.types().containsKey(loggerType)) {
+                return Optional.empty();
+            }
+            return Optional.of(new TypeResolution(loggerType, false, false));
         }
 
         private Optional<String> resolveNestedTypeInEnclosingScopes(String simpleName) {
@@ -882,100 +926,6 @@ public class CompletionProvider {
         }
     }
 
-    private CompletionOutcome completeReadOnly(
-            Path file,
-            ParseTask parseTask,
-            int line,
-            int column,
-            String contents,
-            long parseCursor) {
-        var memberAccess = memberAccessContext(contents, (int) parseCursor);
-        var partial = memberAccess == null ? partialIdentifier(contents, (int) parseCursor) : memberAccess.partial;
-        var endsWithParen = endsWithParen(contents, (int) parseCursor);
-        var parsePath = new FindCompletionsAt(parseTask.task).scan(parseTask.root, parseCursor);
-        var memberContext = memberAccess != null && !isImportOrPackageContext(parsePath);
-        var maybeSnapshot = snapshotProvider.acquire(file);
-        if (maybeSnapshot.isEmpty()) {
-            LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=miss");
-            return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
-        }
-        try (var snapshot = maybeSnapshot.get()) {
-            var task = snapshot.task();
-            TreePath path;
-            long cursor;
-            try {
-                var root = task.root(file);
-                cursor = root.getLineMap().getPosition(line, column);
-                path = new FindCompletionsAt(task.task).scan(root, cursor);
-            } catch (RuntimeException noFreshRoot) {
-                LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=stale");
-                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
-            }
-            if (path == null) {
-                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
-            }
-            if (snapshot.stale()) {
-                LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=stale_guard");
-                if (!memberContext) {
-                    return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
-                }
-                var recovered =
-                        recoverMemberCompletionFromSnapshot(
-                                task,
-                                path.getCompilationUnit(),
-                                path,
-                                line,
-                                cursor,
-                                memberAccess,
-                                endsWithParen);
-                if (recovered != null && !recovered.items.isEmpty()) {
-                    LOG.info(
-                            "[perf] completion_snapshot file="
-                                    + file.getFileName()
-                                    + " state=stale_guard_recovered items="
-                                    + recovered.items.size());
-                    return new CompletionOutcome(recovered, true);
-                }
-                LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=stale_guard_parse_only");
-                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
-            }
-            LOG.info("[perf] completion_snapshot file=" + file.getFileName() + " state=hit");
-            if (memberContext) {
-                var recovered =
-                        recoverMemberCompletionFromSnapshot(
-                                task,
-                                path.getCompilationUnit(),
-                                path,
-                                line,
-                                cursor,
-                                memberAccess,
-                                endsWithParen);
-                if (recovered != null && !recovered.items.isEmpty()) {
-                    return new CompletionOutcome(recovered, true);
-                }
-                // Do not allow stale/member requests to degrade to identifier completion (eg. `txn` for `txn.`).
-                return new CompletionOutcome(completeParseOnly(parseTask, contents, parseCursor, partial), false);
-            }
-            var semantic = dispatchCompletion(task, path, contents, cursor, partial, endsWithParen);
-            if (semantic == NOT_SUPPORTED || semantic.items.isEmpty()) {
-                var parseKind = parsePath == null ? "null" : parsePath.getLeaf().getKind().name();
-                var snapshotKind = path.getLeaf().getKind().name();
-                LOG.info(
-                        String.format(
-                                "[perf] completion_empty parse_kind=%s snapshot_kind=%s member=%s partial=%s",
-                                parseKind, snapshotKind, memberContext, partial));
-            }
-            if (shouldFallbackToParse(parsePath, path, semantic, memberContext)) {
-                var fallback = completeParseOnly(parseTask, contents, parseCursor, partial);
-                if (!fallback.items.isEmpty()) {
-                    LOG.info("[perf] completion_snapshot_fallback state=parse_only");
-                    return new CompletionOutcome(fallback, false);
-                }
-            }
-            return new CompletionOutcome(semantic, true);
-        }
-    }
-
     private boolean isImportOrPackageContext(TreePath path) {
         for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
             var kind = cursor.getLeaf().getKind();
@@ -984,151 +934,6 @@ public class CompletionProvider {
             }
         }
         return false;
-    }
-
-    private boolean shouldFallbackToParse(
-            TreePath parsePath, TreePath snapshotPath, CompletionList semantic, boolean memberContext) {
-        if (semantic == NOT_SUPPORTED) {
-            return true;
-        }
-        if (semantic.items.isEmpty()) {
-            return true;
-        }
-        if (memberContext && isKeywordOnly(semantic)) {
-            return true;
-        }
-        if (parsePath == null || snapshotPath == null) {
-            return false;
-        }
-        if (!memberContext
-                && parsePath.getLeaf().getKind() == Tree.Kind.IDENTIFIER
-                && snapshotPath.getLeaf().getKind() != Tree.Kind.IDENTIFIER) {
-            return true;
-        }
-        if (parsePath.getLeaf().getKind() != Tree.Kind.COMPILATION_UNIT
-                && snapshotPath.getLeaf().getKind() == Tree.Kind.COMPILATION_UNIT) {
-            return true;
-        }
-        return false;
-    }
-
-    private boolean isKeywordOnly(CompletionList list) {
-        if (list.items.isEmpty()) {
-            return false;
-        }
-        for (var item : list.items) {
-            if (!Objects.equals(item.kind, CompletionItemKind.Keyword)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private boolean isDotTrigger(String contents, int cursor) {
-        return cursor > 0 && cursor <= contents.length() && contents.charAt(cursor - 1) == '.';
-    }
-
-    private CompletionList recoverMemberCompletionFromSnapshot(
-            CompileTask task,
-            CompilationUnitTree root,
-            TreePath initialPath,
-            int line,
-            long cursor,
-            MemberAccessContext memberAccess,
-            boolean endsWithParen) {
-        var receiver = memberAccess.receiver;
-        var partial = memberAccess.partial;
-        var expressionPath =
-                receiver.isEmpty() ? expressionPathForMemberAccess(initialPath) : expressionPathForDot(initialPath, receiver);
-        var probeA = Math.max(0, cursor - partial.length() - 1);
-        var probeB = Math.max(0, probeA - 1);
-        var probeC = probeA + 1;
-        var probes = new long[] {probeA, probeB, probeC};
-        for (var probe : probes) {
-            if (expressionPath != null) {
-                break;
-            }
-            if (probe == cursor) {
-                continue;
-            }
-            var shiftedPath = new FindCompletionsAt(task.task).scan(root, probe);
-            expressionPath =
-                    receiver.isEmpty() ? expressionPathForMemberAccess(shiftedPath) : expressionPathForDot(shiftedPath, receiver);
-        }
-        CompletionList primary = null;
-        if (expressionPath != null) {
-            primary = completeMembersForExpression(task, expressionPath, expressionPath.getLeaf(), partial, endsWithParen);
-            if (isUsefulMemberResult(primary, partial, receiver) && !isWeakObjectOnlyResult(primary)) {
-                LOG.info(
-                        "[perf] completion_member_recover state=hit receiver="
-                                + (receiver.isEmpty() ? "<expr>" : receiver)
-                                + " items="
-                                + primary.items.size()
-                                + " quality=strong");
-                return primary;
-            }
-            if (isWeakObjectOnlyResult(primary)) {
-                LOG.info(
-                        "[perf] completion_member_recover state=weak_candidate receiver="
-                                + (receiver.isEmpty() ? "<expr>" : receiver)
-                                + " items="
-                                + primary.items.size());
-            }
-        }
-
-        var fallbackCandidates =
-                receiver.isEmpty() ? List.<TreePath>of() : fallbackExpressionPathsForReceiver(task, root, receiver, line, cursor);
-        var best = isCandidateResult(primary, receiver) ? primary : null;
-        for (var candidate : fallbackCandidates) {
-            if (expressionPath != null && samePath(task, root, expressionPath, candidate)) {
-                continue;
-            }
-            var completed = completeMembersForExpression(task, candidate, candidate.getLeaf(), partial, endsWithParen);
-            if (!isCandidateResult(completed, receiver)) {
-                continue;
-            }
-            if (best == null || shouldPreferMemberCandidate(best, completed)) {
-                if (best != null && isWeakObjectOnlyResult(best) && !isWeakObjectOnlyResult(completed)) {
-                    LOG.info(
-                            "[perf] completion_member_recover state=promote_strong receiver="
-                                    + (receiver.isEmpty() ? "<expr>" : receiver)
-                                    + " weak_items="
-                                    + best.items.size()
-                                    + " strong_items="
-                                    + completed.items.size());
-                }
-                best = completed;
-            }
-            if (isUsefulMemberResult(best, partial, receiver) && !isWeakObjectOnlyResult(best)) {
-                break;
-            }
-        }
-        if (best == null) {
-            LOG.info("[perf] completion_member_recover state=miss receiver=" + (receiver.isEmpty() ? "<expr>" : receiver));
-            return null;
-        }
-        if (best == NOT_SUPPORTED || best.items.isEmpty()) {
-            LOG.info("[perf] completion_member_recover state=empty receiver=" + (receiver.isEmpty() ? "<expr>" : receiver));
-            return null;
-        }
-        var quality = isWeakObjectOnlyResult(best) ? "weak_object_only" : "strong";
-        LOG.info(
-                "[perf] completion_member_recover state=hit receiver="
-                        + (receiver.isEmpty() ? "<expr>" : receiver)
-                        + " items="
-                        + best.items.size()
-                        + " quality="
-                        + quality);
-        return best;
-    }
-
-    private boolean shouldPreferMemberCandidate(CompletionList best, CompletionList candidate) {
-        var bestWeak = isWeakObjectOnlyResult(best);
-        var candidateWeak = isWeakObjectOnlyResult(candidate);
-        if (bestWeak != candidateWeak) {
-            return bestWeak && !candidateWeak;
-        }
-        return candidate.items.size() > best.items.size();
     }
 
     private boolean isWeakObjectOnlyResult(CompletionList list) {
@@ -1151,187 +956,12 @@ public class CompletionProvider {
         return sawMember;
     }
 
-    private boolean isCandidateResult(CompletionList list, String receiver) {
-        if (list == null || list == NOT_SUPPORTED || list.items.isEmpty()) {
-            return false;
-        }
-        if (hasNonKeywordItems(list)) {
-            return true;
-        }
-        return acceptsKeywordOnlyMembers(receiver, list);
+    private CompletionList freezeCompletionList(CompletionList list) {
+        return new CompletionList(list.isIncomplete, List.copyOf(list.items));
     }
 
-    private boolean isUsefulMemberResult(CompletionList list, String partial, String receiver) {
-        if (!isCandidateResult(list, receiver)) {
-            return false;
-        }
-        if (!partial.isEmpty()) {
-            return true;
-        }
-        return list.items.size() > 3;
-    }
-
-    private boolean hasNonKeywordItems(CompletionList list) {
-        for (var item : list.items) {
-            if (!Objects.equals(item.kind, CompletionItemKind.Keyword)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean acceptsKeywordOnlyMembers(String receiver, CompletionList list) {
-        if (receiver != null && !receiver.isEmpty() && Character.isUpperCase(receiver.charAt(0))) {
-            return true;
-        }
-        return list.items.size() == 1 && "length".equals(list.items.get(0).label);
-    }
-
-    private boolean samePath(CompileTask task, CompilationUnitTree root, TreePath a, TreePath b) {
-        if (a == null || b == null) {
-            return false;
-        }
-        if (a.getLeaf().getKind() != b.getLeaf().getKind()) {
-            return false;
-        }
-        var positions = Trees.instance(task.task).getSourcePositions();
-        var aStart = positions.getStartPosition(root, a.getLeaf());
-        var bStart = positions.getStartPosition(root, b.getLeaf());
-        return aStart >= 0 && aStart == bStart;
-    }
-
-    private List<TreePath> fallbackExpressionPathsForReceiver(
-            CompileTask task, CompilationUnitTree root, String receiver, int requestedLine, long cursor) {
-        var trees = Trees.instance(task.task);
-        var positions = trees.getSourcePositions();
-        var candidates = new ArrayList<TreePath>();
-        var seen = new HashSet<String>();
-        new TreePathScanner<Void, Void>() {
-            @Override
-            public Void visitIdentifier(IdentifierTree identifier, Void __) {
-                if (receiver.equals(identifier.getName().toString())) {
-                    var path = getCurrentPath();
-                    if (isReceiverCandidateElement(trees.getElement(path))) {
-                        addCandidate(path);
-                    }
-                }
-                return super.visitIdentifier(identifier, __);
-            }
-
-            @Override
-            public Void visitMemberSelect(MemberSelectTree member, Void __) {
-                if (receiverNameMatches(member.getExpression(), receiver)) {
-                    var path = new TreePath(getCurrentPath(), member.getExpression());
-                    if (isReceiverCandidateElement(trees.getElement(path))) {
-                        addCandidate(path);
-                    }
-                }
-                return super.visitMemberSelect(member, __);
-            }
-
-            private void addCandidate(TreePath path) {
-                var start = positions.getStartPosition(root, path.getLeaf());
-                var key = path.getLeaf().getKind().name() + ":" + start;
-                if (seen.add(key)) {
-                    candidates.add(path);
-                }
-            }
-        }.scan(root, null);
-
-        if (candidates.isEmpty()) {
-            return List.of();
-        }
-        candidates.sort(
-                Comparator.comparingInt((TreePath candidate) -> lineDistance(root, positions, candidate, requestedLine))
-                        .thenComparingLong(candidate -> offsetDistance(root, positions, candidate, cursor)));
-        LOG.info("[perf] completion_member_recover state=fallback receiver=" + receiver + " candidates=" + candidates.size());
-        return candidates;
-    }
-
-    private int lineDistance(
-            CompilationUnitTree root, SourcePositions positions, TreePath candidate, int requestedLine) {
-        var start = positions.getStartPosition(root, candidate.getLeaf());
-        if (start < 0) {
-            return Integer.MAX_VALUE / 2;
-        }
-        var line = (int) root.getLineMap().getLineNumber(start);
-        return Math.abs(line - requestedLine);
-    }
-
-    private long offsetDistance(
-            CompilationUnitTree root, SourcePositions positions, TreePath candidate, long requestedCursor) {
-        var start = positions.getStartPosition(root, candidate.getLeaf());
-        if (start < 0) {
-            return Long.MAX_VALUE / 2;
-        }
-        return Math.abs(start - requestedCursor);
-    }
-
-    private boolean isReceiverCandidateElement(Element element) {
-        if (element == null) {
-            return false;
-        }
-        if (element instanceof TypeElement) {
-            return true;
-        }
-        var kind = element.getKind();
-        return kind == ElementKind.FIELD
-                || kind == ElementKind.LOCAL_VARIABLE
-                || kind == ElementKind.PARAMETER
-                || kind == ElementKind.RESOURCE_VARIABLE
-                || kind == ElementKind.EXCEPTION_PARAMETER
-                || kind == ElementKind.ENUM_CONSTANT;
-    }
-
-    private TreePath expressionPathForDot(TreePath path, String receiver) {
-        if (path == null) {
-            return null;
-        }
-        TreePath expressionPath;
-        switch (path.getLeaf().getKind()) {
-            case MEMBER_SELECT:
-                var select = (MemberSelectTree) path.getLeaf();
-                expressionPath = new TreePath(path, select.getExpression());
-                break;
-            case IDENTIFIER:
-                expressionPath = path;
-                break;
-            default:
-                return null;
-        }
-        if (!receiverNameMatches(expressionPath.getLeaf(), receiver)) {
-            return null;
-        }
-        return expressionPath;
-    }
-
-    private TreePath expressionPathForMemberAccess(TreePath path) {
-        if (path == null) {
-            return null;
-        }
-        if (path.getLeaf() instanceof MemberSelectTree select) {
-            return new TreePath(path, select.getExpression());
-        }
-        if (path.getLeaf().getKind() == Tree.Kind.IDENTIFIER) {
-            var parent = path.getParentPath();
-            if (parent != null && parent.getLeaf() instanceof MemberSelectTree select) {
-                return new TreePath(parent, select.getExpression());
-            }
-        }
-        return null;
-    }
-
-    private boolean receiverNameMatches(Tree expression, String expectedName) {
-        if (expectedName.isEmpty()) {
-            return false;
-        }
-        if (expression instanceof IdentifierTree identifier) {
-            return expectedName.equals(identifier.getName().toString());
-        }
-        if (expression instanceof MemberSelectTree select) {
-            return expectedName.equals(select.getIdentifier().toString());
-        }
-        return false;
+    private CompletionList copyCompletionList(CompletionList list) {
+        return new CompletionList(list.isIncomplete, new ArrayList<>(list.items));
     }
 
     private CompletionList completeParseOnly(ParseTask parseTask, String contents, long cursor, String partial) {
@@ -1353,6 +983,7 @@ public class CompletionProvider {
                 var list = new CompletionList();
                 addKeywords(path, partial, list);
                 addSyntacticLocalVariables(parseTask, cursor, partial, list);
+                addSlf4jLoggerIfAnnotated(parseTask, path, cursor, partial, list);
                 addImportedTypeNames(parseTask.root, partial, list);
                 if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
                     addClassNames(parseTask.root, Trees.instance(parseTask.task).getSourcePositions(), partial, list);
@@ -1360,43 +991,6 @@ public class CompletionProvider {
                 boostExactMatches(parseTask.root, list.items, partial);
                 sortCompletionItems(list.items);
                 return list;
-        }
-    }
-
-    private CompletionList dispatchCompletion(
-            CompileTask task, TreePath path, String contents, long cursor, String partial, boolean endsWithParen) {
-        switch (path.getLeaf().getKind()) {
-            case IDENTIFIER:
-                var parent = path.getParentPath();
-                if (parent != null && parent.getLeaf().getKind() == Tree.Kind.MEMBER_SELECT) {
-                    return completeMemberSelect(task, parent, partial, endsWithParen);
-                } else if (parent != null && parent.getLeaf().getKind() == Tree.Kind.MEMBER_REFERENCE) {
-                    return completeMemberReference(task, parent, partial);
-                } else {
-                    return completeIdentifier(task, path, partial, endsWithParen);
-                }
-            case MEMBER_SELECT:
-                return completeMemberSelect(task, path, partial, endsWithParen);
-            case MEMBER_REFERENCE:
-                return completeMemberReference(task, path, partial);
-            case SWITCH:
-                return completeSwitchConstant(task, path, partial);
-            case IMPORT:
-                return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
-            default:
-                var list = new CompletionList();
-                addKeywords(path, partial, list);
-                return list;
-        }
-    }
-
-    private static class CompletionOutcome {
-        final CompletionList list;
-        final boolean usedSnapshot;
-
-        CompletionOutcome(CompletionList list, boolean usedSnapshot) {
-            this.list = list;
-            this.usedSnapshot = usedSnapshot;
         }
     }
 
@@ -1592,6 +1186,110 @@ public class CompletionProvider {
                 return super.visitVariable(t, null);
             }
         }.scan(task.root, null);
+    }
+
+    private void addSlf4jLoggerIfAnnotated(
+            ParseTask parseTask, TreePath path, long cursor, String partial, CompletionList list) {
+        if (!matchesCompletionPrefix("log", partial)) {
+            return;
+        }
+        if (containsCompletionLabel(list, "log")) {
+            return;
+        }
+        var classPath = enclosingClassPath(path);
+        if (classPath == null) {
+            classPath = enclosingClassPath(parseTask, cursor);
+        }
+        if (classPath == null) {
+            return;
+        }
+        var classTree = (ClassTree) classPath.getLeaf();
+        if (!hasSlf4jAnnotation(classTree.getModifiers())) {
+            return;
+        }
+        var logger = new CompletionItem();
+        logger.label = "log";
+        logger.kind = CompletionItemKind.Field;
+        logger.detail = "org.slf4j.Logger log";
+        logger.insertText = "log";
+        logger.insertTextFormat = InsertTextFormat.PlainText;
+        logger.sortText = sortKey(Priority.FIELD, logger.label);
+        list.items.add(logger);
+    }
+
+    private TreePath enclosingClassPath(ParseTask parseTask, long cursor) {
+        var positions = Trees.instance(parseTask.task).getSourcePositions();
+        final TreePath[] best = new TreePath[1];
+        final int[] bestDepth = {-1};
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitClass(ClassTree classTree, Void unused) {
+                var start = positions.getStartPosition(parseTask.root, classTree);
+                var end = positions.getEndPosition(parseTask.root, classTree);
+                if (start < 0 || end < 0 || cursor < start || cursor > end) {
+                    return null;
+                }
+                var depth = pathDepth(getCurrentPath());
+                if (depth > bestDepth[0]) {
+                    bestDepth[0] = depth;
+                    best[0] = getCurrentPath();
+                }
+                return super.visitClass(classTree, unused);
+            }
+        }.scan(parseTask.root, null);
+        return best[0];
+    }
+
+    private int pathDepth(TreePath path) {
+        var depth = 0;
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            depth++;
+        }
+        return depth;
+    }
+
+    private TreePath enclosingClassPath(TreePath path) {
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            if (cursor.getLeaf() instanceof ClassTree) {
+                return cursor;
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasSlf4jAnnotation(ModifiersTree modifiers) {
+        if (modifiers == null) {
+            return false;
+        }
+        for (var annotation : modifiers.getAnnotations()) {
+            if (isSlf4jAnnotation(annotation)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isSlf4jAnnotation(AnnotationTree annotation) {
+        if (annotation == null) {
+            return false;
+        }
+        var type = annotation.getAnnotationType();
+        if (type instanceof IdentifierTree identifier) {
+            return "Slf4j".equals(identifier.getName().toString());
+        }
+        if (type instanceof MemberSelectTree select) {
+            return "lombok.extern.slf4j.Slf4j".equals(select.toString()) || "Slf4j".equals(select.getIdentifier().toString());
+        }
+        return false;
+    }
+
+    private boolean containsCompletionLabel(CompletionList list, String label) {
+        for (var item : list.items) {
+            if (item != null && Objects.equals(label, item.label)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void addSyntacticMemberUsages(
@@ -2261,17 +1959,17 @@ public class CompletionProvider {
         var data = data(task, first, overloads.size());
         i.data = JsonHelper.GSON.toJsonTree(data);
         if (addParens) {
-            if (overloads.size() == 1 && first.getParameters().isEmpty()) {
-                i.insertText = first.getSimpleName() + "()$0";
+            var noArgs = overloads.size() == 1 && first.getParameters().isEmpty();
+            if (noArgs) {
+                i.insertText = first.getSimpleName() + "()";
+                i.insertTextFormat = InsertTextFormat.PlainText;
             } else {
                 i.insertText = first.getSimpleName() + "($0)";
-                // Activate signatureHelp
-                // Remove this if VSCode ever fixes https://github.com/microsoft/vscode/issues/78806
+                i.insertTextFormat = InsertTextFormat.Snippet;
                 i.command = new Command();
                 i.command.command = "editor.action.triggerParameterHints";
                 i.command.title = "Trigger Parameter Hints";
             }
-            i.insertTextFormat = 2; // Snippet
         }
         i.sortText = sortKey(Priority.METHOD, i.label);
         return i;
@@ -2389,21 +2087,59 @@ public class CompletionProvider {
                 enclosing instanceof TypeElement
                         && ((TypeElement) enclosing).getQualifiedName().contentEquals("java.lang.Object");
         if (member.getKind() == ElementKind.METHOD) {
-            if (declaredInOwner) {
-                return Priority.METHOD;
+            if (isUtilityMethodName(member.getSimpleName().toString())) {
+                return 90; // always sink utility methods
             }
             if (declaredInObject) {
-                return Priority.OBJECT_METHOD;
+                return 80;
             }
-            return Priority.INHERITED_METHOD;
+            if (member.getModifiers().contains(Modifier.STATIC)) {
+                return 30;
+            }
+            if (declaredInOwner && isAccessorMethodName(member.getSimpleName().toString())) {
+                return 10;
+            }
+            if (declaredInOwner) {
+                return 20;
+            }
+            return 60;
         }
         if (member.getKind() == ElementKind.FIELD || member.getKind() == ElementKind.ENUM_CONSTANT) {
-            if (declaredInOwner) {
-                return Priority.FIELD;
+            if (member.getModifiers().contains(Modifier.STATIC)) {
+                return 40;
             }
-            return Priority.INHERITED_FIELD;
+            if (declaredInOwner) {
+                return 35;
+            }
+            return 50;
         }
         return priorityForItemKind(kind(member));
+    }
+
+    private boolean isAccessorMethodName(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        if (name.startsWith("get") && name.length() > 3) {
+            return Character.isUpperCase(name.charAt(3));
+        }
+        if (name.startsWith("set") && name.length() > 3) {
+            return Character.isUpperCase(name.charAt(3));
+        }
+        if (name.startsWith("is") && name.length() > 2) {
+            return Character.isUpperCase(name.charAt(2));
+        }
+        return false;
+    }
+
+    private boolean isUtilityMethodName(String name) {
+        if (name == null) {
+            return false;
+        }
+        return "toString".equals(name)
+                || "hashCode".equals(name)
+                || "equals".equals(name)
+                || "canEqual".equals(name);
     }
 
     private int priorityForItemKind(Integer kind) {

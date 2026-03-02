@@ -152,11 +152,11 @@ public class SourceFileObject implements JavaFileObject {
         return path.toString();
     }
 
-    int snapshotVersion() {
+    int contentVersion() {
         return version;
     }
 
-    Instant snapshotModified() {
+    Instant contentModified() {
         if (contents == null) {
             return null;
         }
