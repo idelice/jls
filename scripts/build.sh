@@ -20,6 +20,9 @@ fi
 if [ ! -e dist/windows/bin/java.exe ]; then
     ./scripts/link_windows.sh
 fi
+if [ ! -e dist/mac/bin/java ]; then
+    ./scripts/link_mac.sh
+fi
 
 # Compile sources
 if [ ! -e src/main/java/com/google/devtools/build/lib/analysis/AnalysisProtos.java ]; then
