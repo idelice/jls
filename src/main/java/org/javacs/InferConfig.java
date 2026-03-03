@@ -107,11 +107,11 @@ class InferConfig {
         return Collections.emptySet();
     }
 
-    private boolean isBazelProject(Path root) {
+    boolean isBazelProject(Path root) {
         return Files.exists(root.resolve("WORKSPACE")) || Files.exists(root.resolve("MODULE.bazel"));
     }
 
-    private Path bazelWorkspaceRoot() {
+    Path bazelWorkspaceRoot() {
         for (var current = workspaceRoot; current != null; current = current.getParent()) {
             if (isBazelProject(current)) {
                 return current;
