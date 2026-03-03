@@ -210,7 +210,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private static final String[] watchFiles = {
-        "**/*.java", "**/pom.xml", "**/BUILD", "**/javaconfig.json", "**/WORKSPACE"
+        "**/*.java", "**/pom.xml", "**/BUILD", "**/javaconfig.json", "**/WORKSPACE", "**/MODULE.bazel"
     };
 
     @Override
@@ -275,6 +275,8 @@ class JavaLanguageServer extends LanguageServer {
             switch (name) {
                 case "BUILD":
                 case "pom.xml":
+                case "WORKSPACE":
+                case "MODULE.bazel":
                     LOG.info("Compiler needs to be re-created because " + file + " has changed");
                     modifiedBuild = true;
             }

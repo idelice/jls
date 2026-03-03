@@ -100,16 +100,20 @@ class InferConfig {
 
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
-        if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
+        if (isBazelProject(bazelWorkspaceRoot)) {
             return bazelClasspath(bazelWorkspaceRoot);
         }
 
         return Collections.emptySet();
     }
 
+    private boolean isBazelProject(Path root) {
+        return Files.exists(root.resolve("WORKSPACE")) || Files.exists(root.resolve("MODULE.bazel"));
+    }
+
     private Path bazelWorkspaceRoot() {
         for (var current = workspaceRoot; current != null; current = current.getParent()) {
-            if (Files.exists(current.resolve("WORKSPACE"))) {
+            if (isBazelProject(current)) {
                 return current;
             }
         }
@@ -141,7 +145,7 @@ class InferConfig {
 
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
-        if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
+        if (isBazelProject(bazelWorkspaceRoot)) {
             return bazelSourcepath(bazelWorkspaceRoot);
         }
 

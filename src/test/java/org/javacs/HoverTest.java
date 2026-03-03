@@ -3,6 +3,7 @@ package org.javacs;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
+import java.util.List;
 import java.util.StringJoiner;
 import org.javacs.lsp.*;
 import org.junit.Test;
@@ -78,8 +79,12 @@ public class HoverTest {
         var pos =
                 new TextDocumentPositionParams(
                         new TextDocumentIdentifier(FindResource.uri(file)), new Position(line - 1, character - 1));
+        var hover = server.hover(pos).get();
+        if (hover.contents instanceof MarkupContent) {
+            return ((MarkupContent) hover.contents).value;
+        }
         var result = new StringJoiner("\n");
-        for (var h : server.hover(pos).get().contents) {
+        for (var h : (List<MarkedString>) hover.contents) {
             result.add(h.value);
         }
         return result.toString();
