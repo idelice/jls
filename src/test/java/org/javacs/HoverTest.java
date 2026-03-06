@@ -79,8 +79,8 @@ public class HoverTest {
                 new TextDocumentPositionParams(
                         new TextDocumentIdentifier(FindResource.uri(file)), new Position(line - 1, character - 1));
         var result = new StringJoiner("\n");
-        for (var h : server.hover(pos).get().contents) {
-            result.add(h.value);
+        for (var h : (Iterable<?>) server.hover(pos).get().contents) {
+           result.add(h.toString()); 
         }
         return result.toString();
     }

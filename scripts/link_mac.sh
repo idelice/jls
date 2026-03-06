@@ -3,13 +3,22 @@
 
 set -e
 
-# Set env variables to build with mac toolchain but linux target
-JAVA_HOME="./jdks/mac/jdk-21"
+# Decide which JDK to use
+if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  VERSION=$("$JAVA_HOME/bin/java" -version 2>&1 | awk -F[\".] '/version/ {print $2}')
+  if [ "$VERSION" -ge 21 ]; then
+    JDK="$JAVA_HOME"
+  else
+    JDK="./jdks/mac/jdk-21/Contents/Home"
+  fi
+else
+  JDK="./jdks/mac/jdk-21/Contents/Home"
+fi
 
 # Build using jlink
 rm -rf dist/mac
-$JAVA_HOME/Contents/Home/bin/jlink \
-  --module-path $JAVA_HOME/Contents/Home/jmods \
+"$JDK/bin/jlink" \
+  --module-path "$JDK/jmods" \
   --add-modules java.base,java.compiler,java.logging,java.sql,java.xml,jdk.compiler,jdk.jdi,jdk.unsupported,jdk.zipfs \
   --output dist/mac \
   --no-header-files \
