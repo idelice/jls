@@ -28,13 +28,23 @@ public class HoverProvider {
     }
 
     public MarkupContent hover(Path file, int line, int column) {
-        try (var task = compiler.compile(file)) {
+        var annotationTypeName = annotationTypeNameAt(file, line, column);
+        try (var task = compiler.compileFastWithProcessors(file)) {
             var root = task.root(file);
             if (task.roots.size() > 1) {
                 LOG.fine(String.format("[perf] hover_root_select file=%s roots=%d", file, task.roots.size()));
             }
             var position = root.getLineMap().getPosition(line, column);
-            var element = new FindHoverElement(task.task).scan(root, position);
+            Element element = null;
+            if (annotationTypeName != null) {
+                element = task.task.getElements().getTypeElement(annotationTypeName);
+            }
+            if (element == null) {
+                element = findAnnotationElement(task, root, position);
+            }
+            if (element == null) {
+                element = new FindHoverElement(task.task).scan(root, position);
+            }
             if (element == null) return null;
             var docs = docs(task, element);
             var markdown = new StringBuilder();
@@ -49,6 +59,110 @@ public class HoverProvider {
             }
             return new MarkupContent(MarkupKind.Markdown, markdown.toString());
         }
+    }
+
+    private Element findAnnotationElement(CompileTask task, CompilationUnitTree root, long cursor) {
+        return new TreePathScanner<Element, Long>() {
+            @Override
+            public Element visitAnnotation(AnnotationTree annotation, Long find) {
+                var positions = Trees.instance(task.task).getSourcePositions();
+                var start = positions.getStartPosition(root, annotation);
+                var end = positions.getEndPosition(root, annotation);
+                if (start <= find && find < end) {
+                    var resolved = resolveAnnotationType(task, root, annotation);
+                    if (resolved != null) {
+                        return resolved;
+                    }
+                }
+                return super.visitAnnotation(annotation, find);
+            }
+
+            @Override
+            public Element reduce(Element left, Element right) {
+                if (left != null) {
+                    return left;
+                }
+                return right;
+            }
+        }.scan(root, cursor);
+    }
+
+    private Element resolveAnnotationType(CompileTask task, CompilationUnitTree root, AnnotationTree annotation) {
+        var trees = Trees.instance(task.task);
+        var typePath = new TreePath(new TreePath(root), annotation.getAnnotationType());
+        var direct = trees.getElement(typePath);
+        if (direct != null) {
+            return direct;
+        }
+        var elements = task.task.getElements();
+        var simpleOrQualified = annotation.getAnnotationType().toString();
+        if (simpleOrQualified.contains(".")) {
+            return elements.getTypeElement(simpleOrQualified);
+        }
+        for (var imp : root.getImports()) {
+            var imported = imp.getQualifiedIdentifier().toString();
+            if (imported.endsWith("." + simpleOrQualified)) {
+                var resolved = elements.getTypeElement(imported);
+                if (resolved != null) {
+                    return resolved;
+                }
+            }
+        }
+        var packageName = root.getPackageName();
+        if (packageName != null) {
+            var local = elements.getTypeElement(packageName + "." + simpleOrQualified);
+            if (local != null) {
+                return local;
+            }
+        }
+        return elements.getTypeElement("java.lang." + simpleOrQualified);
+    }
+
+    private String annotationTypeNameAt(Path file, int line, int column) {
+        var parse = compiler.parse(file);
+        var root = parse.root;
+        var cursor = root.getLineMap().getPosition(line, column);
+        return new TreePathScanner<String, Long>() {
+            @Override
+            public String visitAnnotation(AnnotationTree annotation, Long find) {
+                var positions = Trees.instance(parse.task).getSourcePositions();
+                var start = positions.getStartPosition(root, annotation);
+                var end = positions.getEndPosition(root, annotation);
+                if (start <= find && find < end) {
+                    return resolveAnnotationTypeName(root, annotation);
+                }
+                return super.visitAnnotation(annotation, find);
+            }
+
+            @Override
+            public String reduce(String left, String right) {
+                if (left != null) {
+                    return left;
+                }
+                return right;
+            }
+        }.scan(root, cursor);
+    }
+
+    private String resolveAnnotationTypeName(CompilationUnitTree root, AnnotationTree annotation) {
+        var simpleOrQualified = annotation.getAnnotationType().toString();
+        if (simpleOrQualified.contains(".")) {
+            return simpleOrQualified;
+        }
+        for (var imp : root.getImports()) {
+            var imported = imp.getQualifiedIdentifier().toString();
+            if (imported.endsWith("." + simpleOrQualified)) {
+                return imported;
+            }
+            if (imported.endsWith(".*")) {
+                return imported.substring(0, imported.length() - 1) + simpleOrQualified;
+            }
+        }
+        var packageName = root.getPackageName();
+        if (packageName != null) {
+            return packageName + "." + simpleOrQualified;
+        }
+        return "java.lang." + simpleOrQualified;
     }
 
     public void resolveCompletionItem(CompletionItem item) {
@@ -229,6 +343,9 @@ public class HoverProvider {
         }
         var builder = new StringBuilder();
         builder.append("**").append(packageName).append("**\n");
+        if (!qualifiedName.isEmpty()) {
+            builder.append(qualifiedName).append("\n");
+        }
         builder.append(typeSignature(type));
         return builder.toString();
     }

@@ -53,6 +53,52 @@ class FindHoverElement extends TreePathScanner<Element, Long> {
     }
 
     @Override
+    public Element visitAnnotation(AnnotationTree t, Long find) {
+        var pos = Trees.instance(task).getSourcePositions();
+        var start = pos.getStartPosition(root, t);
+        var end = pos.getEndPosition(root, t);
+        if (start <= find && find < end) {
+            var annotationType = resolveAnnotationType(t);
+            if (annotationType != null) {
+                return annotationType;
+            }
+        }
+        return super.visitAnnotation(t, find);
+    }
+
+    private Element resolveAnnotationType(AnnotationTree annotation) {
+        var trees = Trees.instance(task);
+        var direct = trees.getElement(new TreePath(getCurrentPath(), annotation.getAnnotationType()));
+        if (direct != null && direct.getKind() == javax.lang.model.element.ElementKind.ANNOTATION_TYPE) {
+            return direct;
+        }
+        var simpleOrQualified = annotation.getAnnotationType().toString();
+        var elements = task.getElements();
+        if (simpleOrQualified.contains(".")) {
+            var explicit = elements.getTypeElement(simpleOrQualified);
+            if (explicit != null) return explicit;
+        } else {
+            if (root != null) {
+                for (var imp : root.getImports()) {
+                    var imported = imp.getQualifiedIdentifier().toString();
+                    if (imported.endsWith("." + simpleOrQualified)) {
+                        var resolved = elements.getTypeElement(imported);
+                        if (resolved != null) return resolved;
+                    }
+                }
+                var packageName = root.getPackageName();
+                if (packageName != null) {
+                    var local = elements.getTypeElement(packageName + "." + simpleOrQualified);
+                    if (local != null) return local;
+                }
+            }
+            var javaLang = elements.getTypeElement("java.lang." + simpleOrQualified);
+            if (javaLang != null) return javaLang;
+        }
+        return trees.getElement(getCurrentPath());
+    }
+
+    @Override
     public Element reduce(Element a, Element b) {
         if (a != null) return a;
         else return b;

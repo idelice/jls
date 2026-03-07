@@ -93,6 +93,7 @@ public class DefinitionProvider {
                 var path = trees.getPath(member);
                 if (path == null) continue;
                 var location = FindHelper.location(task, path, memberName);
+                if (location == null) continue;
                 locations.add(location);
             }
 
@@ -137,7 +138,11 @@ public class DefinitionProvider {
                             var displayName = "<init>".equals(element.getSimpleName().toString())
                                 ? typeElement.getSimpleName()
                                 : element.getSimpleName();
-                            return List.of(FindHelper.location(task, memberPath, displayName));
+                            var location = FindHelper.location(task, memberPath, displayName);
+                            if (location == null) {
+                                return List.of();
+                            }
+                            return List.of(location);
                         }
                     }
                 }
@@ -148,7 +153,11 @@ public class DefinitionProvider {
             if (path == null) {
                 return List.of();
             }
-            return List.of(FindHelper.location(task, path, typeElement.getSimpleName()));
+            var location = FindHelper.location(task, path, typeElement.getSimpleName());
+            if (location == null) {
+                return List.of();
+            }
+            return List.of(location);
         }
     }
 
@@ -160,6 +169,10 @@ public class DefinitionProvider {
         }
         var name = element.getSimpleName();
         if (name.contentEquals("<init>")) name = element.getEnclosingElement().getSimpleName();
-        return List.of(FindHelper.location(task, path, name));
+        var location = FindHelper.location(task, path, name);
+        if (location == null) {
+            return List.of();
+        }
+        return List.of(location);
     }
 }
