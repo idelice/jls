@@ -23,6 +23,7 @@ public class CompileBatch implements AutoCloseable {
 
     enum AnalysisMode {
         ENTER_ONLY,
+        ATTR,
         FULL
     }
 
@@ -91,18 +92,24 @@ public class CompileBatch implements AutoCloseable {
             parseNanos = System.nanoTime() - parseStarted;
 
             if (allowAP) {
-                // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
-                // Running enter() first can lock in pre-processor symbols (missing Lombok members).
-                var analyzeStarted = System.nanoTime();
-                borrow.task.analyze();
-                analyzeNanos = System.nanoTime() - analyzeStarted;
-                ANALYZE_INVOCATIONS.incrementAndGet();
+                if (analysisMode == AnalysisMode.ENTER_ONLY) {
+                    var enterStarted = System.nanoTime();
+                    invokeEnter(borrow.task);
+                    enterNanos = System.nanoTime() - enterStarted;
+                } else {
+                    // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
+                    // Running enter() first can lock in pre-processor symbols (missing Lombok members).
+                    var analyzeStarted = System.nanoTime();
+                    borrow.task.analyze();
+                    analyzeNanos = System.nanoTime() - analyzeStarted;
+                    ANALYZE_INVOCATIONS.incrementAndGet();
+                }
             } else {
                 var enterStarted = System.nanoTime();
                 invokeEnter(borrow.task);
                 enterNanos = System.nanoTime() - enterStarted;
 
-                if (analysisMode == AnalysisMode.FULL) {
+                if (analysisMode != AnalysisMode.ENTER_ONLY) {
                     // The results of borrow.task.analyze() are unreliable when errors are present
                     // You can get at `Element` values using `Trees`
                     var analyzeStarted = System.nanoTime();
@@ -365,7 +372,7 @@ public class CompileBatch implements AutoCloseable {
         parent.diags.clear();
         var options =
                 allowAP
-                        ? (mode == AnalysisMode.ENTER_ONLY
+                        ? (mode == AnalysisMode.ATTR
                                 ? optionsForFastAp(
                                         parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath)
                                 : options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath))
@@ -375,7 +382,10 @@ public class CompileBatch implements AutoCloseable {
 
     /** Combine source path or class path entries using the system separator, for example ':' in unix */
     private static String joinPath(Collection<Path> classOrSourcePath) {
-        return classOrSourcePath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
+        return classOrSourcePath.stream()
+                .map(Path::toString)
+                .sorted()
+                .collect(Collectors.joining(File.pathSeparator));
     }
 
     private static List<String> options(
@@ -412,8 +422,12 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        list.addAll(extraArgs);
-        for (var export : addExports) {
+        var sortedExtraArgs = new ArrayList<>(extraArgs);
+        Collections.sort(sortedExtraArgs);
+        list.addAll(sortedExtraArgs);
+        var sortedExports = new ArrayList<>(addExports);
+        Collections.sort(sortedExports);
+        for (var export : sortedExports) {
             list.add("--add-exports");
             list.add(export + "=ALL-UNNAMED");
         }
@@ -464,8 +478,12 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        list.addAll(extraArgs);
-        for (var export : addExports) {
+        var sortedExtraArgs = new ArrayList<>(extraArgs);
+        Collections.sort(sortedExtraArgs);
+        list.addAll(sortedExtraArgs);
+        var sortedExports = new ArrayList<>(addExports);
+        Collections.sort(sortedExports);
+        for (var export : sortedExports) {
             list.add("--add-exports");
             list.add(export + "=ALL-UNNAMED");
         }

@@ -8,6 +8,7 @@ import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.tools.*;
 
 class JavaCompilerService implements CompilerProvider {
@@ -232,6 +233,14 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch compileBatch(
             Collection<? extends JavaFileObject> sources, CompileBatch.AnalysisMode mode, boolean allowAP) {
+        LOG.info(
+                String.format(
+                        "[perf] compile_trigger entry=compileBatch request=%s mode=%s allow_ap=%s sources=%d stack=%s",
+                        requestType(),
+                        mode.name().toLowerCase(),
+                        allowAP,
+                        sources.size(),
+                        requestStack()));
         boolean useAP = allowAP && lombokApEnabled;
         var effectiveSources = expandSourcesForLombokAP(sources, useAP);
         var modifiedCache = mode == CompileBatch.AnalysisMode.FULL ? cachedModified : cachedFastModified;
@@ -259,6 +268,10 @@ class JavaCompilerService implements CompilerProvider {
 
     private Collection<? extends JavaFileObject> expandSourcesForLombokAP(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
+        LOG.info(
+                String.format(
+                        "[perf] compile_trigger entry=expandSourcesForLombokAP request=%s allow_ap=%s sources=%d stack=%s",
+                        requestType(), allowAP, sources.size(), requestStack()));
         if (!allowAP || !lombokPresentOnClasspath) {
             return sources;
         }
@@ -272,6 +285,20 @@ class JavaCompilerService implements CompilerProvider {
             } else {
                 expandedNonFile.add(source);
             }
+        }
+
+        // Fast pre-check: if none of the requested source files appear to use Lombok,
+        // skip expensive package/import expansion.
+        var requestedPaths = new ArrayList<Path>(expandedByPath.keySet());
+        var anyRequestedLombok = false;
+        for (var requested : requestedPaths) {
+            if (quickMaybeUsesLombok(requested)) {
+                anyRequestedLombok = true;
+                break;
+            }
+        }
+        if (!anyRequestedLombok) {
+            return sources;
         }
 
         var initialFileCount = expandedByPath.size();
@@ -468,6 +495,44 @@ class JavaCompilerService implements CompilerProvider {
         return cacheSourceUsesLombok.get(file, null);
     }
 
+    private final Cache<Void, Boolean> cacheQuickMaybeUsesLombok = new Cache<>();
+
+    private boolean quickMaybeUsesLombok(Path file) {
+        if (cacheQuickMaybeUsesLombok.needs(file, null)) {
+            var mayUseLombok = false;
+            try (var lines = FileStore.lines(file)) {
+                for (var line = lines.readLine(); line != null; line = lines.readLine()) {
+                    var trimmed = line.trim();
+                    if (trimmed.isEmpty()) continue;
+                    if (trimmed.startsWith("import lombok.")) {
+                        mayUseLombok = true;
+                        break;
+                    }
+                    // If the source has no annotations at all, skip deeper Lombok expansion.
+                    if (trimmed.startsWith("@")) {
+                        mayUseLombok = true;
+                        break;
+                    }
+                    // Stop scanning once we pass imports/package declarations.
+                    if (trimmed.startsWith("class ")
+                            || trimmed.contains(" class ")
+                            || trimmed.startsWith("interface ")
+                            || trimmed.contains(" interface ")
+                            || trimmed.startsWith("enum ")
+                            || trimmed.contains(" enum ")
+                            || trimmed.startsWith("record ")
+                            || trimmed.contains(" record ")) {
+                        break;
+                    }
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            cacheQuickMaybeUsesLombok.load(file, null, mayUseLombok);
+        }
+        return cacheQuickMaybeUsesLombok.get(file, null);
+    }
+
     @Override
     public Set<String> imports() {
         var all = new HashSet<String>();
@@ -660,6 +725,10 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
+        LOG.info(
+                String.format(
+                        "[perf] compile_trigger entry=compile request=%s mode=full sources=%d stack=%s",
+                        requestType(), sources.size(), requestStack()));
         var compile = compileBatch(sources, CompileBatch.AnalysisMode.FULL, true);
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
     }
@@ -684,14 +753,52 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
+        LOG.info(
+                String.format(
+                        "[perf] compile_trigger entry=compileFast request=%s mode=enter_only sources=%d stack=%s",
+                        requestType(), sources.size(), requestStack()));
         var compile = compileBatch(sources, CompileBatch.AnalysisMode.ENTER_ONLY, false);
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
     }
 
     @Override
     public CompileTask compileFastWithProcessors(Collection<? extends JavaFileObject> sources) {
-        var compile = compileBatch(sources, CompileBatch.AnalysisMode.ENTER_ONLY, true);
+        LOG.info(
+                String.format(
+                        "[perf] compile_trigger entry=compileFastWithProcessors request=%s mode=attr sources=%d stack=%s",
+                        requestType(), sources.size(), requestStack()));
+        var compile = compileBatch(sources, CompileBatch.AnalysisMode.ATTR, true);
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
+    }
+
+    private String requestType() {
+        for (var frame : Thread.currentThread().getStackTrace()) {
+            if (!frame.getClassName().startsWith("org.javacs.")) continue;
+            var method = frame.getMethodName();
+            switch (method) {
+                case "completion":
+                case "hover":
+                case "gotoDefinition":
+                case "findReferences":
+                case "signatureHelp":
+                case "didOpenTextDocument":
+                case "didChangeTextDocument":
+                case "didSaveTextDocument":
+                case "lint":
+                    return method;
+                default:
+            }
+        }
+        return "unknown";
+    }
+
+    private String requestStack() {
+        return Arrays.stream(Thread.currentThread().getStackTrace())
+                .filter(f -> f.getClassName().startsWith("org.javacs."))
+                .filter(f -> !f.getClassName().equals(JavaCompilerService.class.getName()))
+                .limit(6)
+                .map(f -> f.getClassName() + "#" + f.getMethodName() + ":" + f.getLineNumber())
+                .collect(Collectors.joining(" > "));
     }
 
     private static boolean hasLombokJar(Set<Path> classPath) {

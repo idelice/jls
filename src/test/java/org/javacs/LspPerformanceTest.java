@@ -20,9 +20,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidOpenTextDocumentParams;
+import org.javacs.lsp.DidSaveTextDocumentParams;
 import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.Position;
+import org.javacs.lsp.ReferenceParams;
 import org.javacs.lsp.PublishDiagnosticsParams;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.ShowMessageParams;
@@ -60,6 +62,97 @@ public class LspPerformanceTest {
         assertThat(counters.fullBatches, is(0L));
         assertThat(counters.analyzeInvocations, is(0L));
         assertThat(counters.apEnabledBatches, is(0L));
+    }
+
+    @Test
+    public void hoverDoesNotTriggerFullCompile() {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/SymbolUnderCursor.java");
+        open(server, file, 1, FileStore.contents(file));
+        server.lint(List.of(file));
+        CompileBatch.resetPerfCounters();
+
+        var result = server.hover(completionPosition(file, 12, 23));
+        assertTrue(result.isPresent());
+
+        var counters = CompileBatch.perfCounters();
+        assertThat(counters.fullBatches, is(0L));
+    }
+
+    @Test
+    public void definitionDoesNotTriggerFullCompile() {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/Goto.java");
+        open(server, file, 1, FileStore.contents(file));
+        server.lint(List.of(file));
+        CompileBatch.resetPerfCounters();
+
+        var result = server.gotoDefinition(completionPosition(file, 17, 14));
+        assertTrue(result.isPresent());
+
+        var counters = CompileBatch.perfCounters();
+        assertThat(counters.fullBatches, is(0L));
+    }
+
+    @Test
+    public void referencesDoNotTriggerFullCompile() {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/GotoOther.java");
+        open(server, file, 1, FileStore.contents(file));
+        server.lint(List.of(file));
+        CompileBatch.resetPerfCounters();
+
+        var params = new ReferenceParams();
+        params.textDocument = new TextDocumentIdentifier(file.toUri());
+        params.position = new Position(5, 29);
+        var result = server.findReferences(params);
+        assertTrue(result.isPresent());
+
+        var counters = CompileBatch.perfCounters();
+        assertThat(counters.fullBatches, is(0L));
+    }
+
+    @Test
+    public void interactiveSequenceAvoidsFullCompileUntilSaveDiagnostics() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var original = FileStore.contents(file);
+        open(server, file, 1, original);
+        server.lint(List.of(file));
+
+        change(server, file, 2, original + "\n// interactive-sequence");
+
+        CompileBatch.resetPerfCounters();
+        server.completion(completionPosition(file, 5, 14));
+        assertThat("completion should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
+
+        CompileBatch.resetPerfCounters();
+        server.hover(completionPosition(file, 5, 14));
+        assertThat("hover should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
+
+        CompileBatch.resetPerfCounters();
+        server.gotoDefinition(completionPosition(file, 5, 14));
+        assertThat("definition should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
+
+        CompileBatch.resetPerfCounters();
+        var refs = new ReferenceParams();
+        refs.textDocument = new TextDocumentIdentifier(file.toUri());
+        refs.position = new Position(4, 13);
+        server.findReferences(refs);
+        assertThat("references should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
+
+        CompileBatch.resetPerfCounters();
+        var save = new DidSaveTextDocumentParams();
+        save.textDocument = new TextDocumentIdentifier(file.toUri());
+        server.didSaveTextDocument(save);
+        var deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadlineNanos && CompileBatch.perfCounters().fullBatches == 0L) {
+            Thread.sleep(25);
+        }
+        assertThat(
+                "save-triggered diagnostics should use full compile",
+                CompileBatch.perfCounters().fullBatches > 0,
+                is(true));
     }
 
     @Test

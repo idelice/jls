@@ -46,7 +46,9 @@ import com.sun.tools.javac.util.Log;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -81,9 +83,16 @@ class ReusableCompiler {
     private static final Logger LOG = Logger.getLogger("main");
     private static final JavacTool systemProvider = JavacTool.create();
 
-    private List<String> currentOptions = new ArrayList<>();
-    private ReusableContext currentContext;
-    private boolean checkedOut;
+    private final Map<List<String>, ReusableContextState> contexts = new HashMap<>();
+
+    private static class ReusableContextState {
+        final ReusableContext context;
+        boolean checkedOut;
+
+        ReusableContextState(ReusableContext context) {
+            this.context = context;
+        }
+    }
 
     /**
      * Creates a new task as if by {@link javax.tools.JavaCompiler#getTask} and runs the provided worker with it. The
@@ -108,33 +117,37 @@ class ReusableCompiler {
             Iterable<String> options,
             Iterable<String> classes,
             Iterable<? extends JavaFileObject> compilationUnits) {
-        if (checkedOut) {
-            throw new RuntimeException("Compiler is already in-use!");
-        }
-        checkedOut = true;
         List<String> opts =
                 StreamSupport.stream(options.spliterator(), false).collect(Collectors.toCollection(ArrayList::new));
-        if (!opts.equals(currentOptions)) {
-            LOG.warning(String.format("Options changed from %s to %s, creating new compiler", options, opts));
-            currentOptions = opts;
-            currentContext = new ReusableContext(opts);
+        var key = List.copyOf(opts);
+        var state = contexts.get(key);
+        if (state == null) {
+            LOG.info(String.format("[perf] compiler_context_create options=%s", opts));
+            state = new ReusableContextState(new ReusableContext(opts));
+            contexts.put(key, state);
         }
+        if (state.checkedOut) {
+            throw new RuntimeException("Compiler is already in-use!");
+        }
+        state.checkedOut = true;
         JavacTaskImpl task =
                 (JavacTaskImpl)
                         systemProvider.getTask(
-                                null, fileManager, diagnosticListener, opts, classes, compilationUnits, currentContext);
+                                null, fileManager, diagnosticListener, opts, classes, compilationUnits, state.context);
 
-        task.addTaskListener(currentContext);
+        task.addTaskListener(state.context);
 
-        return new Borrow(task, currentContext);
+        return new Borrow(task, state);
     }
 
     class Borrow implements AutoCloseable {
         final JavacTask task;
+        final ReusableContextState state;
         boolean closed;
 
-        Borrow(JavacTask task, ReusableContext ctx) {
+        Borrow(JavacTask task, ReusableContextState state) {
             this.task = task;
+            this.state = state;
         }
 
         @Override
@@ -145,7 +158,7 @@ class ReusableCompiler {
                 // If either fails due to a corrupted state (e.g., after AP failure),
                 // we still need to unlock the compiler so subsequent attempts can proceed.
                 try {
-                    currentContext.clear();
+                    state.context.clear();
                 } catch (Throwable e) {
                     // Context cleanup failed - likely due to AP infrastructure corruption.
                     // Log and continue. We need to unlock the compiler.
@@ -163,7 +176,7 @@ class ReusableCompiler {
             } finally {
                 // CRITICAL: Always unlock the compiler, even if cleanup operations fail.
                 // If we don't do this, the compiler will be permanently locked.
-                checkedOut = false;
+                state.checkedOut = false;
                 closed = true;
             }
         }

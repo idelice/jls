@@ -1,5 +1,6 @@
 package org.javacs;
 
+import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
@@ -8,9 +9,11 @@ import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.javacs.lsp.DidOpenTextDocumentParams;
+import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidSaveTextDocumentParams;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.TextDocumentIdentifier;
@@ -101,6 +104,58 @@ public class JavaLanguageServerTest {
         Assert.assertTrue(
                 "member completion should keep using index after unsaved change",
                 completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
+    }
+
+    @Test
+    public void concurrentCompilerCallsAfterSettingsChangeRecreateCompilerOnce() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var before = completionIndexVersion(server);
+
+        var settings = new JsonObject();
+        var java = new JsonObject();
+        var inlayHints = new JsonObject();
+        inlayHints.addProperty("enabled", true);
+        java.add("inlayHints", inlayHints);
+        java.addProperty("codeLens", true);
+        settings.add("java", java);
+        var change = new DidChangeConfigurationParams();
+        change.settings = settings;
+        server.didChangeConfiguration(change);
+
+        var workers = 6;
+        var ready = new CountDownLatch(workers);
+        var start = new CountDownLatch(1);
+        var done = new CountDownLatch(workers);
+        var failures = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
+
+        for (int i = 0; i < workers; i++) {
+            var t =
+                    new Thread(
+                            () -> {
+                                try {
+                                    ready.countDown();
+                                    start.await(5, TimeUnit.SECONDS);
+                                    server.compiler();
+                                } catch (Throwable e) {
+                                    failures.add(e);
+                                } finally {
+                                    done.countDown();
+                                }
+                            },
+                            "compiler-race-" + i);
+            t.start();
+        }
+
+        Assert.assertTrue("workers were not ready in time", ready.await(5, TimeUnit.SECONDS));
+        start.countDown();
+        Assert.assertTrue("workers did not finish in time", done.await(60, TimeUnit.SECONDS));
+        Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
+
+        var after = completionIndexVersion(server);
+        Assert.assertEquals(
+                "settings change should recreate compiler exactly once under concurrency",
+                before + 1,
+                after);
     }
 
     private long completionIndexVersion(JavaLanguageServer server) throws Exception {

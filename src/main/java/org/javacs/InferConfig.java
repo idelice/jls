@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors; // Added for Collectors.toSet()
@@ -17,6 +18,18 @@ import java.util.stream.Stream;
 
 class InferConfig {
     private static final Logger LOG = Logger.getLogger("main");
+    private static final Map<String, MavenDependencyCacheEntry> MVN_DEPENDENCY_CACHE =
+            new ConcurrentHashMap<>();
+
+    private static class MavenDependencyCacheEntry {
+        final long pomLastModifiedMillis;
+        final Set<Path> dependencies;
+
+        MavenDependencyCacheEntry(long pomLastModifiedMillis, Set<Path> dependencies) {
+            this.pomLastModifiedMillis = pomLastModifiedMillis;
+            this.dependencies = dependencies;
+        }
+    }
 
     /** Root of the workspace that is currently open in VSCode */
     private final Path workspaceRoot;
@@ -202,6 +215,18 @@ class InferConfig {
     static Set<Path> mvnDependencies(Path pomXml, String goal, Map<String, String> envVars) {
         Objects.requireNonNull(pomXml, "pom.xml path is null");
         try {
+            var pomAbsolute = pomXml.toAbsolutePath().normalize();
+            var pomLastModifiedMillis = Files.getLastModifiedTime(pomAbsolute).toMillis();
+            var cacheKey = pomAbsolute + "|" + goal;
+            var cached = MVN_DEPENDENCY_CACHE.get(cacheKey);
+            if (cached != null && cached.pomLastModifiedMillis == pomLastModifiedMillis) {
+                LOG.info(
+                        String.format(
+                                "[perf] maven_probe cache=hit goal=%s pom=%s deps=%d",
+                                goal, pomAbsolute, cached.dependencies.size()));
+                return cached.dependencies;
+            }
+
             // TODO consider using mvn valide dependency:copy-dependencies -DoutputDirectory=??? instead
             // Run maven as a subprocess
             String[] command = {
@@ -235,7 +260,13 @@ class InferConfig {
                     dependencies.add(jar);
                 }
             }
-            return dependencies;
+            var immutable = Set.copyOf(dependencies);
+            MVN_DEPENDENCY_CACHE.put(cacheKey, new MavenDependencyCacheEntry(pomLastModifiedMillis, immutable));
+            LOG.info(
+                    String.format(
+                            "[perf] maven_probe cache=miss goal=%s pom=%s deps=%d",
+                            goal, pomAbsolute, immutable.size()));
+            return immutable;
         } catch (InterruptedException | IOException e) {
             throw new RuntimeException(e);
         }

@@ -72,7 +72,7 @@ public class ReferenceProvider {
     private List<Location> findTypeReferences(String className) {
         var files = compiler.findTypeReferences(className);
         if (files.length == 0) return List.of();
-        try (var task = compiler.compile(files)) {
+        try (var task = compiler.compileFastWithProcessors(files)) {
             return findReferences(task);
         }
     }
@@ -80,7 +80,7 @@ public class ReferenceProvider {
     private List<Location> findMemberReferences(String className, String memberName) {
         var files = compiler.findMemberReferences(className, memberName);
         if (files.length == 0) return List.of();
-        try (var task = compiler.compile(files)) {
+        try (var task = compiler.compileFastWithProcessors(files)) {
             return findReferences(task);
         }
     }
@@ -105,7 +105,7 @@ public class ReferenceProvider {
                 return refs;
             }
         }
-        try (var task = compiler.compile(files)) {
+        try (var task = compiler.compileFastWithProcessors(files)) {
             return findFieldAndAccessorReferences(task, className, memberName);
         }
     }

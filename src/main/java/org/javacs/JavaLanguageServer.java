@@ -70,7 +70,7 @@ class JavaLanguageServer extends LanguageServer {
             new AtomicReference<>(TypeMemberIndex.EMPTY);
     private final AtomicLong completionIndexVersion = new AtomicLong();
 
-    JavaCompilerService compiler() {
+    synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
             var compilers = createCompilers();
             cacheCompiler = compilers.interactive;

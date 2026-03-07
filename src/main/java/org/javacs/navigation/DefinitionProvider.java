@@ -31,7 +31,7 @@ public class DefinitionProvider {
     }
 
     public List<Location> find() {
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileFastWithProcessors(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
             if (element == null) return NOT_SUPPORTED;
             if (element.asType().getKind() == TypeKind.ERROR) {
@@ -82,7 +82,7 @@ public class DefinitionProvider {
             sources = List.of(fileAsSource);
         }
         var locations = new ArrayList<Location>();
-        try (var task = compiler.compile(sources)) {
+        try (var task = compiler.compileFastWithProcessors(sources)) {
             var trees = Trees.instance(task.task);
             var elements = task.task.getElements();
             var parentClass = elements.getTypeElement(className);
@@ -113,14 +113,14 @@ public class DefinitionProvider {
     }
 
     private List<Location> findRemoteDefinitionsLocal(JavaFileObject otherFile, Element element) {
-        try (var task = compiler.compile(List.of(new SourceFileObject(file), otherFile))) {
+        try (var task = compiler.compileFastWithProcessors(List.of(new SourceFileObject(file), otherFile))) {
             var elementFromLocal = NavigationHelper.findElement(task, file, line, column);
             return findDefinitions(task, elementFromLocal);
         }
     }
 
     private List<Location> findRemoteDefinitions(JavaFileObject otherFile, String className, Element element) {
-        try (var task = compiler.compile(List.of(otherFile))) {
+        try (var task = compiler.compileFastWithProcessors(List.of(otherFile))) {
             var elements = task.task.getElements();
             var typeElement = elements.getTypeElement(className);
             if (typeElement == null) {
