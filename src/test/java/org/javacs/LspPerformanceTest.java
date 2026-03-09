@@ -1271,6 +1271,9 @@ public class LspPerformanceTest {
         public void registerCapability(String method, JsonElement options) {}
 
         @Override
+        public void refreshInlayHints() {}
+
+        @Override
         public void customNotification(String method, JsonElement params) {}
     }
 }

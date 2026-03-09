@@ -44,6 +44,9 @@ public class SemanticColorsTest {
                         public void registerCapability(String method, JsonElement options) {}
 
                         @Override
+                        public void refreshInlayHints() {}
+
+                        @Override
                         public void customNotification(String method, JsonElement params) {
                             if (method.equals("java/colors")) {
                                 colors = JsonHelper.GSON.fromJson(params, SemanticColors.class);

@@ -1047,6 +1047,7 @@ class JavaCompilerService implements CompilerProvider {
                 case "gotoDefinition":
                 case "findReferences":
                 case "signatureHelp":
+                case "inlayHint":
                 case "didOpenTextDocument":
                 case "didChangeTextDocument":
                 case "didSaveTextDocument":

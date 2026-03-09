@@ -68,6 +68,7 @@ class JavaLanguageServer extends LanguageServer {
     private static final long COMPLETION_INDEX_DEBOUNCE_MS = 100;
     private boolean lombokVerifiedForCurrentCompiler;
     private boolean lombokEnabledForCurrentCompiler = true;
+    private boolean clientSupportsInlayHintRefresh;
     private final AtomicReference<TypeMemberIndex> completionIndexRef =
             new AtomicReference<>(TypeMemberIndex.EMPTY);
     private final AtomicLong completionIndexVersion = new AtomicLong();
@@ -262,6 +263,9 @@ class JavaLanguageServer extends LanguageServer {
                 String.format(
                         "[perf] completion_type_index trigger=%s version=%d types=%d took=%dms",
                         trigger, indexVersion, rebuilt.size(), took.toMillis()));
+        if (!FileStore.activeDocuments().isEmpty()) {
+            refreshInlayHints(trigger);
+        }
     }
 
     private long nextIndexVersion() {
@@ -738,6 +742,7 @@ class JavaLanguageServer extends LanguageServer {
     public InitializeResult initialize(InitializeParams params) {
         this.workspaceRoot = Paths.get(params.rootUri);
         FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
+        clientSupportsInlayHintRefresh = supportsInlayHintRefresh(params.capabilities);
 
         var c = new JsonObject();
         c.addProperty("textDocumentSync", 2); // Incremental
@@ -762,6 +767,7 @@ class JavaLanguageServer extends LanguageServer {
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
+        c.addProperty("inlayHintProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
@@ -1001,6 +1007,15 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     @Override
+    public List<InlayHint> inlayHint(InlayHintParams params) {
+        if (params == null || params.textDocument == null || !FileStore.isJavaFile(params.textDocument.uri)) {
+            return List.of();
+        }
+        var file = Paths.get(params.textDocument.uri);
+        return new InlayHintService(compiler(), completionIndexRef.get()).inlayHints(file, params.range);
+    }
+
+    @Override
     public Optional<RenameResponse> prepareRename(TextDocumentPositionParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         LOG.info("Try to rename...");
@@ -1172,6 +1187,30 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void doAsyncWork() {}
+
+    private void refreshInlayHints(String trigger) {
+        if (!clientSupportsInlayHintRefresh) {
+            return;
+        }
+        LOG.info("[perf] inlay_hint_refresh trigger=" + trigger);
+        client.refreshInlayHints();
+    }
+
+    private boolean supportsInlayHintRefresh(JsonElement capabilities) {
+        if (capabilities == null || !capabilities.isJsonObject()) {
+            return false;
+        }
+        var root = capabilities.getAsJsonObject();
+        if (!root.has("workspace") || !root.get("workspace").isJsonObject()) {
+            return false;
+        }
+        var workspace = root.getAsJsonObject("workspace");
+        if (!workspace.has("inlayHint") || !workspace.get("inlayHint").isJsonObject()) {
+            return false;
+        }
+        var inlayHint = workspace.getAsJsonObject("inlayHint");
+        return inlayHint.has("refreshSupport") && inlayHint.get("refreshSupport").getAsBoolean();
+    }
 
     private static final Logger LOG = Logger.getLogger("main");
 }

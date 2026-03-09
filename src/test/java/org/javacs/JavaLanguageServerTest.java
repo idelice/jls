@@ -30,6 +30,7 @@ import org.javacs.lsp.Diagnostic;
 import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
+import org.javacs.lsp.InitializeParams;
 import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
@@ -555,6 +556,9 @@ public class JavaLanguageServerTest {
                                         String method, com.google.gson.JsonElement options) {}
 
                                 @Override
+                                public void refreshInlayHints() {}
+
+                                @Override
                                 public void customNotification(
                                         String method, com.google.gson.JsonElement params) {}
                             });
@@ -579,6 +583,104 @@ public class JavaLanguageServerTest {
             server.shutdown();
         } finally {
             logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void didOpenDoesNotEagerlyRefreshInlayHintsBeforeIndexInstall() throws Exception {
+        FileStore.reset();
+        var client = new RecordingInlayHintClient();
+        var server = new JavaLanguageServer(client);
+        var init = new InitializeParams();
+        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+        var capabilities = new JsonObject();
+        var workspace = new JsonObject();
+        var inlayHint = new JsonObject();
+        inlayHint.addProperty("refreshSupport", true);
+        workspace.add("inlayHint", inlayHint);
+        capabilities.add("workspace", workspace);
+        init.capabilities = capabilities;
+        server.initialize(init);
+        server.initialized();
+
+        try {
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+            var text = FileStore.contents(file);
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+
+            Assert.assertEquals("didOpen should not request immediate inlay hint refresh", 0, client.refreshCount.get());
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    public void didOpenRefreshesInlayHintsAfterInitialIndexInstall() throws Exception {
+        FileStore.reset();
+        var client = new RecordingInlayHintClient();
+        var server = new JavaLanguageServer(client);
+        var init = new InitializeParams();
+        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+        var capabilities = new JsonObject();
+        var workspace = new JsonObject();
+        var inlayHint = new JsonObject();
+        inlayHint.addProperty("refreshSupport", true);
+        workspace.add("inlayHint", inlayHint);
+        capabilities.add("workspace", workspace);
+        init.capabilities = capabilities;
+        server.initialize(init);
+        server.initialized();
+
+        try {
+            var before = completionIndexVersion(server);
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+            var text = FileStore.contents(file);
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected completion index to advance after open",
+                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "expected one inlay hint refresh after index install",
+                    client.awaitRefreshCountAtLeast(1, 10, TimeUnit.SECONDS));
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    public void didOpenDoesNotRefreshInlayHintsWithoutClientSupport() throws Exception {
+        FileStore.reset();
+        var client = new RecordingInlayHintClient();
+        var server = new JavaLanguageServer(client);
+        var init = new InitializeParams();
+        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+        server.initialize(init);
+        server.initialized();
+
+        try {
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+            var text = FileStore.contents(file);
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+
+            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
+        } finally {
+            server.shutdown();
         }
     }
 
@@ -796,6 +898,9 @@ public class JavaLanguageServerTest {
         public void registerCapability(String method, com.google.gson.JsonElement options) {}
 
         @Override
+        public void refreshInlayHints() {}
+
+        @Override
         public void customNotification(String method, com.google.gson.JsonElement params) {}
 
         boolean awaitErrorMatching(
@@ -838,6 +943,44 @@ public class JavaLanguageServerTest {
             return diagnostics.stream()
                     .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
                     .anyMatch(predicate);
+        }
+    }
+
+    private static class RecordingInlayHintClient implements LanguageClient {
+        private final CountDownLatch refreshRequested = new CountDownLatch(1);
+        private final AtomicInteger refreshCount = new AtomicInteger();
+
+        @Override
+        public void publishDiagnostics(PublishDiagnosticsParams params) {}
+
+        @Override
+        public void showMessage(ShowMessageParams params) {}
+
+        @Override
+        public void registerCapability(String method, com.google.gson.JsonElement options) {}
+
+        @Override
+        public void refreshInlayHints() {
+            refreshCount.incrementAndGet();
+            refreshRequested.countDown();
+        }
+
+        @Override
+        public void customNotification(String method, com.google.gson.JsonElement params) {}
+
+        private boolean awaitRefresh(long timeout, TimeUnit unit) throws InterruptedException {
+            return refreshRequested.await(timeout, unit) && refreshCount.get() > 0;
+        }
+
+        private boolean awaitRefreshCountAtLeast(int target, long timeout, TimeUnit unit) throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (System.nanoTime() < deadline) {
+                if (refreshCount.get() >= target) {
+                    return true;
+                }
+                Thread.sleep(25);
+            }
+            return refreshCount.get() >= target;
         }
     }
 

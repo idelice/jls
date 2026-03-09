@@ -58,6 +58,7 @@ public class TypeMemberIndex {
         public final int priority;
         public final String detail;
         public final String returnType;
+        public final String[] parameterNames;
         public final String[] erasedParameterTypes;
 
         Member(
@@ -69,6 +70,7 @@ public class TypeMemberIndex {
                 int priority,
                 String detail,
                 String returnType,
+                String[] parameterNames,
                 String[] erasedParameterTypes) {
             this.ownerType = ownerType;
             this.name = name;
@@ -78,6 +80,7 @@ public class TypeMemberIndex {
             this.priority = priority;
             this.detail = detail;
             this.returnType = returnType;
+            this.parameterNames = parameterNames;
             this.erasedParameterTypes = erasedParameterTypes;
         }
     }
@@ -356,13 +359,16 @@ public class TypeMemberIndex {
 
                 String detail;
                 String returnType = null;
+                String[] parameterNames = null;
                 String[] erasedParameterTypes = null;
                 if (member instanceof ExecutableElement executable) {
                     detail = executable.getReturnType() + " " + executable;
                     returnType = typeName(executable.getReturnType());
+                    parameterNames = new String[executable.getParameters().size()];
                     erasedParameterTypes = new String[executable.getParameters().size()];
                     for (int i = 0; i < executable.getParameters().size(); i++) {
                         var param = executable.getParameters().get(i);
+                        parameterNames[i] = param.getSimpleName().toString();
                         erasedParameterTypes[i] = types.erasure(param.asType()).toString();
                     }
                 } else {
@@ -380,6 +386,7 @@ public class TypeMemberIndex {
                                 priority,
                                 detail,
                                 returnType,
+                                parameterNames,
                                 erasedParameterTypes);
                 var key = next.kind + ":" + next.name + ":" + String.join(",", next.erasedParameterTypes == null ? new String[0] : next.erasedParameterTypes);
                 var existing = seen.get(key);
