@@ -60,6 +60,41 @@ public class FindReferencesTest {
         assertThat(items("/org/javacs/example/VarTypeReferences.java", 4, 27), contains("VarTypeReferences.java(9)"));
     }
 
+    @Test
+    public void staticImportFieldReferences() {
+        assertThat(
+                items("/org/javacs/example/StaticImportInterface.java", 4, 12),
+                contains("GotoStaticImportField.java(7)"));
+    }
+
+    @Test
+    public void staticImportFieldReferencesFromUsage() {
+        assertThat(
+                items("/org/javacs/example/GotoStaticImportField.java", 7, 21),
+                contains("GotoStaticImportField.java(7)"));
+    }
+
+    @Test
+    public void staticImportFieldReferencesCrossPackage() {
+        assertThat(
+                items("/org/javacs/example/models/StaticImportCrossPackageInterface.java", 4, 12),
+                contains("StaticImportCrossPackageUsage.java(7)"));
+    }
+
+    @Test
+    public void staticImportMethodReferencesCrossPackage() {
+        assertThat(
+                items("/org/javacs/example/models/StaticImportCrossPackageInterface.java", 6, 19),
+                contains("StaticImportCrossPackageUsage.java(11)"));
+    }
+
+    @Test
+    public void staticImportMethodReferencesFromUsageCrossPackage() {
+        assertThat(
+                items("/org/javacs/example/service/StaticImportCrossPackageUsage.java", 11, 16),
+                contains("StaticImportCrossPackageUsage.java(11)"));
+    }
+
     private static ReferenceContext referenceContext() {
         var workspaceRoot = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT;
         FileStore.reset();

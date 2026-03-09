@@ -992,6 +992,7 @@ public class CompletionProvider {
                 addKeywords(path, partial, list);
                 addSyntacticLocalVariables(parseTask, cursor, partial, list);
                 addSlf4jLoggerIfAnnotated(parseTask, path, cursor, partial, list);
+                addStaticImportsFromIndex(parseTask.root, partial, false, list);
                 addImportedTypeNames(parseTask.root, partial, list);
                 if (!list.isIncomplete && partial.length() > 0 && Character.isUpperCase(partial.charAt(0))) {
                     addClassNames(parseTask.root, Trees.instance(parseTask.task).getSourcePositions(), partial, list);
@@ -1406,12 +1407,63 @@ public class CompletionProvider {
         LOG.info("...found " + (list.items.size() - previousSize) + " static imports");
     }
 
+    private void addStaticImportsFromIndex(
+            CompilationUnitTree root, String partial, boolean endsWithParen, CompletionList list) {
+        if (completionIndex == null || completionIndex.size() == 0 || root == null) {
+            return;
+        }
+        var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();
+        var methodPriority = new HashMap<String, Integer>();
+        var seen = new HashSet<String>();
+        for (var item : list.items) {
+            if (item != null && item.label != null) {
+                seen.add(item.label);
+            }
+        }
+        var previousSize = list.items.size();
+        outer:
+        for (var importTree : root.getImports()) {
+            if (!importTree.isStatic()) continue;
+            if (!(importTree.getQualifiedIdentifier() instanceof MemberSelectTree id)) continue;
+            var importedName = id.getIdentifier().toString();
+            var ownerType = id.getExpression().toString();
+            if (!importMatchesPartial(id.getIdentifier(), partial)) continue;
+            for (var member : completionIndex.members(ownerType, true)) {
+                if (!memberMatchesImport(id.getIdentifier(), member.name)) continue;
+                if (!matchesCompletionPrefix(member.name, partial)) continue;
+                if (member.kind == CompletionItemKind.Method) {
+                    methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
+                    methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
+                } else if (seen.add(member.name)) {
+                    var item = indexedMember(member);
+                    item.sortText = sortKey(indexMemberPriority(member), item.label);
+                    list.items.add(item);
+                }
+                if (list.items.size() + methods.size() > MAX_COMPLETION_ITEMS) {
+                    list.isIncomplete = true;
+                    break outer;
+                }
+            }
+        }
+        for (var entry : methods.entrySet()) {
+            if (!seen.add(entry.getKey())) continue;
+            var method = indexedMethod(entry.getValue(), !endsWithParen);
+            method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
+            list.items.add(method);
+        }
+        LOG.info("...found " + (list.items.size() - previousSize) + " static imports from index");
+    }
+
     private boolean importMatchesPartial(Name staticImport, String partial) {
         return staticImport.contentEquals("*") || StringSearch.matchesPartialName(staticImport, partial);
     }
 
     private boolean memberMatchesImport(Name staticImport, Element member) {
         return staticImport.contentEquals("*") || staticImport.contentEquals(member.getSimpleName());
+    }
+
+    private boolean memberMatchesImport(Name staticImport, String memberName) {
+        return staticImport.contentEquals("*") || staticImport.contentEquals(memberName);
     }
 
     private void addClassNames(

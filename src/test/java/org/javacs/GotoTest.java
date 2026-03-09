@@ -198,6 +198,18 @@ public class GotoTest {
         assertThat(doGoto(file, 7, 15, false), hasItem("Gson.java:105"));
     }
 
+    @Test
+    public void gotoStaticImportField() {
+        var file = "/org/javacs/example/GotoStaticImportField.java";
+        assertThat(doGoto(file, 7, 21), hasItem("StaticImportInterface.java:4"));
+    }
+
+    @Test
+    public void gotoStaticImportMethodCrossPackage() {
+        var file = "/org/javacs/example/service/StaticImportCrossPackageUsage.java";
+        assertThat(doGoto(file, 11, 16), hasItem("StaticImportCrossPackageInterface.java:6"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

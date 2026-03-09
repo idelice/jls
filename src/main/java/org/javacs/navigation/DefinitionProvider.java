@@ -106,7 +106,7 @@ public class DefinitionProvider {
         var parent = path.getParentPath() != null ? path.getParentPath().getLeaf() : null;
 
         if (parent instanceof MethodInvocationTree invocation && invocation.getMethodSelect() == identifier) {
-            return resolveUnqualifiedMethodInvocation(types, invocation, name);
+            return resolveUnqualifiedMethodInvocation(parse, types, invocation, name);
         }
 
         if (parent instanceof NewClassTree newClassTree && newClassTree.getIdentifier() == identifier) {
@@ -146,6 +146,11 @@ public class DefinitionProvider {
         var nestedType = findNestedTypeInEnclosingScopes(parse, path, name);
         if (nestedType.isPresent()) {
             return resolveTypeName(nestedType.get(), name);
+        }
+
+        var staticImportField = resolveStaticImportField(parse, name);
+        if (staticImportField.isPresent()) {
+            return staticImportField.get();
         }
 
         return resolveTypeTree(parse, identifier, name);
@@ -208,13 +213,20 @@ public class DefinitionProvider {
     }
 
     private ResolvedSymbol resolveUnqualifiedMethodInvocation(
-            ParseTypeResolver types, MethodInvocationTree invocation, String methodName) {
-        var owner = types.currentEnclosingTypeName();
-        if (owner.isEmpty()) {
-            return new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName);
-        }
+            ParseTask parse, ParseTypeResolver types, MethodInvocationTree invocation, String methodName) {
         var argTypes = resolveArgumentTypes(invocation.getArguments(), types);
-        return resolveMethod(owner.get(), methodName, invocation.getArguments().size(), argTypes, null);
+        var owner = types.currentEnclosingTypeName();
+        if (owner.isPresent()) {
+            var resolved = resolveMethod(owner.get(), methodName, invocation.getArguments().size(), argTypes, null);
+            if (!resolved.locations().isEmpty()) {
+                return resolved;
+            }
+        }
+        var staticImport = resolveStaticImportMethod(parse.root, methodName, invocation.getArguments().size(), argTypes);
+        if (staticImport.isPresent()) {
+            return staticImport.get();
+        }
+        return new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName);
     }
 
     private ResolvedSymbol resolveQualifiedMethodInvocation(
@@ -261,10 +273,6 @@ public class DefinitionProvider {
             if (!locations.isEmpty()) {
                 return new ResolvedSymbol(locations, fallbackOwner, methodName, true, member, methodName);
             }
-        }
-        var typeLocation = findTypeLocation(fallbackOwner, methodName);
-        if (!typeLocation.isEmpty()) {
-            return new ResolvedSymbol(typeLocation, fallbackOwner, methodName, true, member, methodName);
         }
         return new ResolvedSymbol(NOT_SUPPORTED, fallbackOwner, methodName, true, member, methodName);
     }
@@ -324,6 +332,70 @@ public class DefinitionProvider {
             return new ResolvedSymbol(NOT_SUPPORTED, qualifiedType, null, false, null, simpleName);
         }
         return new ResolvedSymbol(locations, qualifiedType, null, false, null, simpleName);
+    }
+
+    private Optional<ResolvedSymbol> resolveStaticImportField(ParseTask parse, String fieldName) {
+        ResolvedSymbol match = null;
+        for (var ownerType : TypeMemberIndex.staticImportOwnerTypes(fieldName, parse.root)) {
+            var member = completionIndex.member(ownerType, fieldName, true).orElse(null);
+            var resolved =
+                    member != null
+                            ? resolveFieldFromMember(ownerType, fieldName, member)
+                            : resolveStaticFieldWithoutIndex(ownerType, fieldName);
+            if (resolved.locations().isEmpty()) {
+                continue;
+            }
+            if (match != null && !sameLocations(match.locations(), resolved.locations())) {
+                return Optional.empty();
+            }
+            match = resolved;
+        }
+        return Optional.ofNullable(match);
+    }
+
+    private Optional<ResolvedSymbol> resolveStaticImportMethod(
+            com.sun.source.tree.CompilationUnitTree root, String methodName, int argCount, List<String> argTypes) {
+        ResolvedSymbol match = null;
+        for (var ownerType : TypeMemberIndex.staticImportOwnerTypes(methodName, root)) {
+            var member = completionIndex.member(ownerType, methodName, true).orElse(null);
+            var resolved = resolveMethod(ownerType, methodName, argCount, argTypes, member);
+            if (resolved.locations().isEmpty()) {
+                continue;
+            }
+            if (match != null && !sameLocations(match.locations(), resolved.locations())) {
+                return Optional.empty();
+            }
+            match = resolved;
+        }
+        return Optional.ofNullable(match);
+    }
+
+    private ResolvedSymbol resolveStaticFieldWithoutIndex(String ownerType, String fieldName) {
+        var locations = findFieldLocations(ownerType, fieldName);
+        if (!locations.isEmpty()) {
+            return new ResolvedSymbol(locations, ownerType, fieldName, false, null, fieldName);
+        }
+        return new ResolvedSymbol(NOT_SUPPORTED, ownerType, fieldName, false, null, fieldName);
+    }
+
+    private boolean sameLocations(List<Location> left, List<Location> right) {
+        if (left.size() != right.size()) {
+            return false;
+        }
+        for (int i = 0; i < left.size(); i++) {
+            var a = left.get(i);
+            var b = right.get(i);
+            if (!a.uri.equals(b.uri)) {
+                return false;
+            }
+            if (a.range.start.line != b.range.start.line
+                    || a.range.start.character != b.range.start.character
+                    || a.range.end.line != b.range.end.line
+                    || a.range.end.character != b.range.end.character) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private ResolvedSymbol fromDeclaration(ParseTask parse, TreePath path, String name) {

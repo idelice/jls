@@ -222,6 +222,19 @@ public class TypeMemberIndex {
         return Optional.empty();
     }
 
+    public static List<String> staticImportOwnerTypes(String memberName, CompilationUnitTree root) {
+        if (memberName == null || memberName.isBlank() || root == null) {
+            return List.of();
+        }
+        var owners = new ObjectLinkedOpenHashSet<String>();
+        for (var importTree : root.getImports()) {
+            if (!importTree.isStatic()) continue;
+            var imported = importTree.getQualifiedIdentifier().toString();
+            staticImportOwnerType(imported, memberName).ifPresent(owners::add);
+        }
+        return List.copyOf(owners);
+    }
+
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
         if (typeName == null || typeName.isBlank()) {
             return Optional.empty();
@@ -289,6 +302,19 @@ public class TypeMemberIndex {
             return Optional.of(candidates.iterator().next());
         }
         return Optional.empty();
+    }
+
+    private static Optional<String> staticImportOwnerType(String imported, String memberName) {
+        if (imported == null || imported.isBlank()) {
+            return Optional.empty();
+        }
+        if (imported.endsWith(".*")) {
+            return Optional.of(imported.substring(0, imported.length() - 2));
+        }
+        if (!imported.endsWith("." + memberName)) {
+            return Optional.empty();
+        }
+        return Optional.of(imported.substring(0, imported.length() - memberName.length() - 1));
     }
 
     private static String normalizeTypeName(String typeName) {

@@ -687,6 +687,13 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void staticImportInterfaceConstant() {
+        var file = "/org/javacs/example/AutocompleteStaticImportInterface.java";
+        var suggestions = filterText(file, 7, 19);
+        assertThat("suggests star-imported interface constant", suggestions, hasItems("NAME"));
+    }
+
+    @Test
     public void withinConstructor() {
         var file = "/org/javacs/example/AutocompleteContext.java";
         var suggestions = filterText(file, 8, 38);

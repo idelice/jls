@@ -707,8 +707,8 @@ class JavaCompilerService implements CompilerProvider {
 
     private static final Pattern PACKAGE_EXTRACTOR = Pattern.compile("^([a-z][_a-zA-Z0-9]*\\.)*[a-z][_a-zA-Z0-9]*");
     private static final Pattern SIMPLE_EXTRACTOR = Pattern.compile("[A-Z][_a-zA-Z0-9]*$");
-    private static final Pattern IMPORT_CLASS = Pattern.compile("^import +([\\w\\.]+\\.\\w+);");
-    private static final Pattern IMPORT_STAR = Pattern.compile("^import +([\\w\\.]+\\.\\*);");
+    private static final Pattern IMPORT_CLASS = Pattern.compile("^import +(static +)?([\\w\\.]+\\.\\w+);");
+    private static final Pattern IMPORT_STAR = Pattern.compile("^import +(static +)?([\\w\\.]+\\.\\*);");
     private static final int LOMBOK_SCAN_LINE_LIMIT = 200;
     private static final Pattern QUALIFIED_TYPE_PATTERN =
             Pattern.compile("\\b(?:[a-z][_a-zA-Z0-9]*\\.)+[A-Z][_a-zA-Z0-9]*(?:\\.[A-Z][_a-zA-Z0-9]*)*\\b");
@@ -796,12 +796,12 @@ class JavaCompilerService implements CompilerProvider {
                 // import foo.bar.Doh;
                 var matchesClass = IMPORT_CLASS.matcher(line);
                 if (matchesClass.matches()) {
-                    list.add(matchesClass.group(1));
+                    list.add(matchesClass.group(2));
                 }
                 // import foo.bar.*
                 var matchesStar = IMPORT_STAR.matcher(line);
                 if (matchesStar.matches()) {
-                    list.add(matchesStar.group(1));
+                    list.add(matchesStar.group(2));
                 }
             }
         } catch (IOException e) {
@@ -846,9 +846,16 @@ class JavaCompilerService implements CompilerProvider {
         var packageName = packageName(className);
         // Note: FileStore.packageName may return null.
         if (packageName.equals(FileStore.packageName(file))) return true;
-        var star = packageName + ".*";
+        var packageStar = packageName + ".*";
+        var staticStar = className + ".*";
+        var staticMemberPrefix = className + ".";
         for (var i : readImports(file)) {
-            if (i.equals(className) || i.equals(star)) return true;
+            if (i.equals(className)
+                    || i.equals(packageStar)
+                    || i.equals(staticStar)
+                    || i.startsWith(staticMemberPrefix)) {
+                return true;
+            }
         }
         return false;
     }
