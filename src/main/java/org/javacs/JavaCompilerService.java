@@ -100,6 +100,19 @@ class JavaCompilerService implements CompilerProvider {
         }
     };
     private long cachedFastCompileContentRevision = -1;
+    private CompileBatch cachedFastCompileNoAp;
+    private final Map<JavaFileObject, SourceFingerprint> cachedFastNoApModified =
+        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+            boolean remove = size() > MAX_CACHE_SIZE;
+            if (remove) {
+                LOG.fine("Cache eviction: removing oldest entry");
+            }
+            return remove;
+        }
+    };
+    private long cachedFastCompileNoApContentRevision = -1;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
     private static final Map<Path, ParsedUnit> SHARED_PARSED_UNITS = new ConcurrentHashMap<>();
     final Map<Path, ParsedUnit> parsedUnits = SHARED_PARSED_UNITS;
@@ -255,8 +268,15 @@ class JavaCompilerService implements CompilerProvider {
             CompileBatch.AnalysisMode mode,
             boolean allowAP,
             long contentRevision) {
-        var compileCache = mode == CompileBatch.AnalysisMode.FULL ? cachedCompile : cachedFastCompile;
-        var modifiedCache = mode == CompileBatch.AnalysisMode.FULL ? cachedModified : cachedFastModified;
+        var attrWithoutAp = mode == CompileBatch.AnalysisMode.ATTR && !allowAP;
+        var compileCache =
+                mode == CompileBatch.AnalysisMode.FULL
+                        ? cachedCompile
+                        : attrWithoutAp ? cachedFastCompileNoAp : cachedFastCompile;
+        var modifiedCache =
+                mode == CompileBatch.AnalysisMode.FULL
+                        ? cachedModified
+                        : attrWithoutAp ? cachedFastNoApModified : cachedFastModified;
         if (compileCache != null) {
             if (!compileCache.closed) {
                 throw new RuntimeException("Compiler is still in-use!");
@@ -267,6 +287,9 @@ class JavaCompilerService implements CompilerProvider {
         if (mode == CompileBatch.AnalysisMode.FULL) {
             cachedCompile = loaded;
             cachedCompileContentRevision = contentRevision;
+        } else if (attrWithoutAp) {
+            cachedFastCompileNoAp = loaded;
+            cachedFastCompileNoApContentRevision = contentRevision;
         } else {
             cachedFastCompile = loaded;
             cachedFastCompileContentRevision = contentRevision;
@@ -298,12 +321,16 @@ class JavaCompilerService implements CompilerProvider {
                         requestStack()));
         boolean useAP = allowAP && lombokApEnabled;
         var effectiveSources = expandSourcesForLombokAP(sources, useAP);
-        var modifiedCache = mode == CompileBatch.AnalysisMode.FULL ? cachedModified : cachedFastModified;
+        var attrWithoutAp = mode == CompileBatch.AnalysisMode.ATTR && !useAP;
+        var modifiedCache =
+                mode == CompileBatch.AnalysisMode.FULL
+                        ? cachedModified
+                        : attrWithoutAp ? cachedFastNoApModified : cachedFastModified;
         var currentContentRevision = FileStore.contentRevision();
         var cachedContentRevision =
                 mode == CompileBatch.AnalysisMode.FULL
                         ? cachedCompileContentRevision
-                        : cachedFastCompileContentRevision;
+                        : attrWithoutAp ? cachedFastCompileNoApContentRevision : cachedFastCompileContentRevision;
         if (cachedContentRevision != currentContentRevision || needsCompile(effectiveSources, modifiedCache)) {
             if (cachedContentRevision != currentContentRevision) {
                 LOG.info(
@@ -318,7 +345,9 @@ class JavaCompilerService implements CompilerProvider {
                             "[perf] javac_cache_hit mode=%s content_revision=%d",
                             mode.name().toLowerCase(), currentContentRevision));
         }
-        return mode == CompileBatch.AnalysisMode.FULL ? cachedCompile : cachedFastCompile;
+        return mode == CompileBatch.AnalysisMode.FULL
+                ? cachedCompile
+                : attrWithoutAp ? cachedFastCompileNoAp : cachedFastCompile;
     }
 
     private Collection<? extends JavaFileObject> expandSourcesForLombokAP(
@@ -403,9 +432,18 @@ class JavaCompilerService implements CompilerProvider {
         }
 
         var requestedSet = new LinkedHashSet<>(requestedPaths);
+        var visited = new LinkedHashSet<>(requestedPaths);
+        var pending = new ArrayDeque<>(requestedPaths);
         var referenced = new LinkedHashSet<Path>();
-        for (var requested : requestedPaths) {
-            referenced.addAll(referencedLombokSourcesIn(requested, index));
+        while (!pending.isEmpty()) {
+            var requested = pending.removeFirst();
+            for (var candidate : referencedLombokSourcesIn(requested, index)) {
+                if (!visited.add(candidate)) {
+                    continue;
+                }
+                referenced.add(candidate);
+                pending.addLast(candidate);
+            }
         }
         referenced.removeAll(requestedSet);
         return referenced;
@@ -640,6 +678,9 @@ class JavaCompilerService implements CompilerProvider {
         dropCachedCompilation(cachedFastCompile, cachedFastModified);
         cachedFastCompile = null;
         cachedFastCompileContentRevision = -1;
+        dropCachedCompilation(cachedFastCompileNoAp, cachedFastNoApModified);
+        cachedFastCompileNoAp = null;
+        cachedFastCompileNoApContentRevision = -1;
         var root = rootCause(failure);
         var message =
                 String.format(
@@ -668,10 +709,6 @@ class JavaCompilerService implements CompilerProvider {
     private static final Pattern IMPORT_CLASS = Pattern.compile("^import +([\\w\\.]+\\.\\w+);");
     private static final Pattern IMPORT_STAR = Pattern.compile("^import +([\\w\\.]+\\.\\*);");
     private static final int LOMBOK_SCAN_LINE_LIMIT = 200;
-    private static final Pattern LOMBOK_ANNOTATION_PATTERN =
-            Pattern.compile(
-                    "@(?:lombok\\.(?:experimental\\.)?)?"
-                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With)\\b");
     private static final Pattern QUALIFIED_TYPE_PATTERN =
             Pattern.compile("\\b(?:[a-z][_a-zA-Z0-9]*\\.)+[A-Z][_a-zA-Z0-9]*(?:\\.[A-Z][_a-zA-Z0-9]*)*\\b");
     private static final Pattern SIMPLE_TYPE_PATTERN = Pattern.compile("\\b[A-Z][_a-zA-Z0-9]*\\b");
@@ -719,16 +756,7 @@ class JavaCompilerService implements CompilerProvider {
         if (cacheHasLombokAnnotation.needs(file, null)) {
             var hasLombok = false;
             try (var lines = FileStore.lines(file)) {
-                for (int i = 0; i < LOMBOK_SCAN_LINE_LIMIT; i++) {
-                    var line = lines.readLine();
-                    if (line == null) {
-                        break;
-                    }
-                    if (LOMBOK_ANNOTATION_PATTERN.matcher(line).find()) {
-                        hasLombok = true;
-                        break;
-                    }
-                }
+                hasLombok = LombokAnnotations.sourceMayRequireLombokExpansion(lines, LOMBOK_SCAN_LINE_LIMIT);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
@@ -1015,7 +1043,7 @@ class JavaCompilerService implements CompilerProvider {
         for (var f : files) {
             sources.add(new SourceFileObject(f));
         }
-        return compileFastWithProcessors(sources);
+        return compileFast(sources);
     }
 
     @Override
@@ -1034,6 +1062,16 @@ class JavaCompilerService implements CompilerProvider {
                         "[perf] compile_trigger entry=compileFastWithProcessors request=%s mode=attr sources=%d stack=%s",
                         requestType(), sources.size(), requestStack()));
         var compile = compileBatch(sources, CompileBatch.AnalysisMode.ATTR, true);
+        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
+    }
+
+    @Override
+    public CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
+        LOG.info(
+                String.format(
+                        "[perf] compile_trigger entry=compileFast request=%s mode=attr sources=%d stack=%s",
+                        requestType(), sources.size(), requestStack()));
+        var compile = compileBatch(sources, CompileBatch.AnalysisMode.ATTR, false);
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
     }
 

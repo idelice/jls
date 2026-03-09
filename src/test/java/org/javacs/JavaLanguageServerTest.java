@@ -32,6 +32,7 @@ import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
 import org.javacs.lsp.InitializeParams;
 import org.javacs.lsp.LanguageClient;
+import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
 import org.javacs.lsp.ShowMessageParams;
@@ -95,6 +96,196 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didChangeRefreshesCompletionIndexIncrementallyForLombokModel() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var model = FindResource.path("org/javacs/example/LombokCrossTypeModel.java");
+        var original = FileStore.contents(model);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = model.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = original;
+        server.didOpenTextDocument(open);
+        Assert.assertTrue(
+                "expected completion index to initialize before didChange check",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+        var before = completionIndexVersion(server);
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = model.toUri();
+        change.textDocument.version = 2;
+        var delta = new TextDocumentContentChangeEvent();
+        delta.text = original.replace("private String name;", "private String title;");
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
+
+        Assert.assertTrue(
+                "didChange should refresh completion index for Lombok model updates",
+                awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+    }
+
+    @Test
+    public void completionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/LombokCrossTypeCompletion.java");
+
+        Assert.assertEquals("expected empty completion index before bootstrap", 0L, completionIndexVersion(server));
+
+        var position =
+                new TextDocumentPositionParams(
+                        new TextDocumentIdentifier(file.toUri()), new Position(5, 14));
+        Optional<CompletionList> completion = server.completion(position);
+
+        Assert.assertTrue("expected completion result after bootstrap", completion.isPresent());
+        var labels =
+                completion.get().items.stream().map(item -> item.label).collect(java.util.stream.Collectors.toSet());
+        Assert.assertTrue("expected getter completion after bootstrap", labels.contains("getName"));
+        Assert.assertTrue("expected setter completion after bootstrap", labels.contains("setName"));
+        Assert.assertTrue(
+                "completion should initialize the completion index",
+                completionIndexVersion(server) > 0);
+    }
+
+    @Test
+    public void didOpenBuildsInitialCompletionIndexFromSharedDiagnosticsPass() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+            var text = FileStore.contents(file);
+
+            Assert.assertEquals("expected empty completion index before didOpen", 0L, completionIndexVersion(server));
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "didOpen should initialize the completion index from the shared diagnostics pass",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var debounce = capture.lastLineContaining("[perf] diagnostics_debounce trigger=didOpen");
+            Assert.assertNotNull("expected didOpen diagnostics debounce log", debounce);
+            Assert.assertTrue(
+                    "initial didOpen should reuse the diagnostics compile to build the index, line=" + debounce,
+                    debounce.contains("shared_index=true"));
+            Assert.assertTrue(
+                    "initial shared diagnostics pass should install a full bootstrap index",
+                    capture.countContaining("completion_index_refresh_shared trigger=async:didOpen files=1 version=") > 0);
+            var shared = capture.lastLineContaining("completion_index_refresh_shared trigger=async:didOpen");
+            Assert.assertTrue("expected full bootstrap mode, line=" + shared, shared.contains("mode=full_bootstrap"));
+            Assert.assertEquals(
+                    "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+            Assert.assertEquals(
+                    "full bootstrap should not immediately schedule a redundant activeDeclarations refresh",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void didOpenBootstrapIndexIncludesReferencedTypesForMemberCompletion() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var fieldFile = FindResource.path("org/javacs/example/CompletionBootstrapFieldMembers.java");
+        var fieldText = FileStore.contents(fieldFile);
+
+        var openField = new DidOpenTextDocumentParams();
+        openField.textDocument.uri = fieldFile.toUri();
+        openField.textDocument.version = 1;
+        openField.textDocument.languageId = "java";
+        openField.textDocument.text = fieldText;
+        server.didOpenTextDocument(openField);
+
+        Assert.assertTrue(
+                "didOpen should initialize the completion index",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+        var fieldCompletion =
+                server.completion(
+                                new TextDocumentPositionParams(
+                                        new TextDocumentIdentifier(fieldFile.toUri()),
+                                        new Position(6, 19)))
+                        .orElseThrow();
+        var fieldLabels =
+                fieldCompletion.items.stream()
+                        .map(item -> item.label)
+                        .collect(java.util.stream.Collectors.toSet());
+        Assert.assertTrue("field receiver should resolve referenced type members", fieldLabels.contains("value"));
+
+        FileStore.reset();
+        server = LanguageServerFixture.getJavaLanguageServer();
+        var localFile = FindResource.path("org/javacs/example/CompletionBootstrapLocalMembers.java");
+        var localText = FileStore.contents(localFile);
+
+        var openLocal = new DidOpenTextDocumentParams();
+        openLocal.textDocument.uri = localFile.toUri();
+        openLocal.textDocument.version = 1;
+        openLocal.textDocument.languageId = "java";
+        openLocal.textDocument.text = localText;
+        server.didOpenTextDocument(openLocal);
+
+        Assert.assertTrue(
+                "didOpen should initialize the completion index for local receiver test",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+        var localCompletion =
+                server.completion(
+                                new TextDocumentPositionParams(
+                                        new TextDocumentIdentifier(localFile.toUri()),
+                                        new Position(5, 10)))
+                        .orElseThrow();
+        var localLabels =
+                localCompletion.items.stream()
+                        .map(item -> item.label)
+                        .collect(java.util.stream.Collectors.toSet());
+        Assert.assertTrue("local receiver should resolve referenced type members", localLabels.contains("value"));
+    }
+
+    @Test
+    public void didChangeClearsPublishedDiagnosticsBeforeDebouncedRefresh() throws Exception {
+        var client = new RecordingDiagnosticsClient();
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+        var file = FindResource.path("org/javacs/example/Goto.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        Assert.assertTrue(
+                "expected initial diagnostics on open",
+                client.awaitErrorMatching(file.toUri(), __ -> true, 10, TimeUnit.SECONDS));
+
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = file.toUri();
+        change.textDocument.version = 2;
+        var delta = new TextDocumentContentChangeEvent();
+        delta.text = text + "\n// clear-stale";
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
+
+        Assert.assertTrue(
+                "didChange should clear stale diagnostics immediately",
+                client.awaitDiagnosticsCount(file.toUri(), 0, 2, TimeUnit.SECONDS));
+    }
+
+    @Test
     public void didSaveCompilesOnceAndRefreshesIndexFromSharedResult() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/HelloWorld.java");
@@ -155,14 +346,115 @@ public class JavaLanguageServerTest {
 
     @Test
     public void lombokAnnotationTypeDetectionHandlesQualifiedAndSimpleNames() {
-        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("lombok.Data"));
-        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("lombok.experimental.SuperBuilder"));
-        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("Data"));
-        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("Getter"));
+        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("lombok.Data"));
+        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("lombok.experimental.SuperBuilder"));
+        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("Data"));
+        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("Getter"));
 
-        Assert.assertFalse(JavaLanguageServer.isLombokAnnotationType(null));
-        Assert.assertFalse(JavaLanguageServer.isLombokAnnotationType(""));
-        Assert.assertFalse(JavaLanguageServer.isLombokAnnotationType("org.example.Custom"));
+        Assert.assertFalse(LombokAnnotations.isLombokAnnotationType(null));
+        Assert.assertFalse(LombokAnnotations.isLombokAnnotationType(""));
+        Assert.assertFalse(LombokAnnotations.isLombokAnnotationType("org.example.Custom"));
+    }
+
+    @Test
+    public void diagnosticsStalenessTracksContentRevisionOnly() {
+        Assert.assertFalse(JavaLanguageServer.isStaleDiagnosticsContent(-1, 42));
+        Assert.assertFalse(JavaLanguageServer.isStaleDiagnosticsContent(7, 7));
+        Assert.assertTrue(JavaLanguageServer.isStaleDiagnosticsContent(7, 8));
+    }
+
+    @Test
+    public void lombokStructuralAnnotationDetectionExcludesSlf4j() {
+        Assert.assertTrue(LombokAnnotations.isStructuralLombokAnnotationType("lombok.Data"));
+        Assert.assertTrue(LombokAnnotations.isStructuralLombokAnnotationType("Getter"));
+        Assert.assertFalse(LombokAnnotations.isStructuralLombokAnnotationType("lombok.extern.slf4j.Slf4j"));
+        Assert.assertFalse(LombokAnnotations.isStructuralLombokAnnotationType("Slf4j"));
+    }
+
+    @Test
+    public void slf4jDidChangeDoesNotFanoutDiagnosticsAcrossActiveDocuments() throws Exception {
+        var workspace = Files.createTempDirectory("jls-slf4j-no-fanout");
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var serviceFile = pkg.resolve("ServiceTwo.java");
+            var otherFile = pkg.resolve("Other.java");
+            Files.writeString(
+                    serviceFile,
+                    "package p;\n"
+                            + "import lombok.extern.slf4j.Slf4j;\n"
+                            + "@Slf4j\n"
+                            + "class ServiceTwo {\n"
+                            + "  void test() {\n"
+                            + "    log.info(\"x\");\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    otherFile,
+                    "package p;\n"
+                            + "class Other {\n"
+                            + "  void test(ServiceTwo service) {\n"
+                            + "    service.toString();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            var otherOpen = new DidOpenTextDocumentParams();
+            otherOpen.textDocument.uri = otherFile.toUri();
+            otherOpen.textDocument.version = 1;
+            otherOpen.textDocument.languageId = "java";
+            otherOpen.textDocument.text = Files.readString(otherFile);
+            server.didOpenTextDocument(otherOpen);
+
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = serviceFile.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = serviceOpen.textDocument.text + "\n// logger-change";
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            String didChangeDebounce = null;
+            while (System.nanoTime() < deadline) {
+                didChangeDebounce = capture.lastLineContaining("[perf] diagnostics_debounce trigger=didChange");
+                if (didChangeDebounce != null) {
+                    break;
+                }
+                Thread.sleep(20);
+            }
+
+            Assert.assertNotNull("expected didChange diagnostics debounce log", didChangeDebounce);
+            Assert.assertTrue(
+                    "logging-only Lombok should stay on single-file diagnostics path",
+                    didChangeDebounce.contains("files=1"));
+            Assert.assertTrue(
+                    "logging-only Lombok should not reuse shared diagnostics compile for index refresh",
+                    didChangeDebounce.contains("shared_index=false"));
+            Assert.assertEquals(
+                    "logging-only Lombok should not fan diagnostics out across active docs",
+                    0,
+                    capture.countContaining(
+                            "[perf] diagnostics_active_fanout trigger=didChange file=ServiceTwo.java"));
+            Assert.assertEquals(
+                    "logging-only Lombok should not use shared completion-index refresh on didChange",
+                    0,
+                    capture.countContaining("[perf] completion_index_refresh_shared trigger=async:didChange"));
+        } finally {
+            logger.removeHandler(capture);
+            deleteRecursively(workspace);
+        }
     }
 
     @Test
@@ -221,6 +513,88 @@ public class JavaLanguageServerTest {
 
             Assert.assertTrue(
                     "expected Lombok member diagnostics to stay resolved after model save",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void didChangeLombokModelRefreshesDiagnosticsForActiveConsumersWithoutSave() throws Exception {
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var client = new RecordingDiagnosticsClient();
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+
+        var serviceFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        var modelFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/model/ReproTxn.java");
+        var originalModel = Files.readString(modelFile);
+
+        try {
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            var modelOpen = new DidOpenTextDocumentParams();
+            modelOpen.textDocument.uri = modelFile.toUri();
+            modelOpen.textDocument.version = 1;
+            modelOpen.textDocument.languageId = "java";
+            modelOpen.textDocument.text = originalModel;
+            server.didOpenTextDocument(modelOpen);
+
+            Assert.assertTrue(
+                    "expected baseline Lombok consumer diagnostics to be clean",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+
+            var brokenModel = originalModel.replace("msref", "title");
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = modelFile.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = brokenModel;
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Assert.assertTrue(
+                    "changing a Lombok model should refresh active consumer diagnostics without save",
+                    client.awaitErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "lombok didChange should reuse the diagnostics compile for the completion index",
+                    capture.countContaining("[perf] completion_index_refresh_shared trigger=async:didChange")
+                            > 0);
+
+            var revert = new DidChangeTextDocumentParams();
+            revert.textDocument.uri = modelFile.toUri();
+            revert.textDocument.version = 3;
+            var revertDelta = new TextDocumentContentChangeEvent();
+            revertDelta.text = originalModel;
+            revert.contentChanges.add(revertDelta);
+            server.didChangeTextDocument(revert);
+
+            Assert.assertTrue(
+                    "restoring the Lombok model should clear active consumer diagnostics without save",
                     client.awaitNoErrorMatching(
                             serviceFile.toUri(),
                             d -> containsAny(d.message, "getMsref()", "setMsref("),
@@ -498,7 +872,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compilerRecreatedRefreshUsesActiveFilesForSyncPass() throws Exception {
+    public void compilerRecreatedRefreshUsesSharedDiagnosticsPassForActiveFiles() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
@@ -525,18 +899,30 @@ public class JavaLanguageServerTest {
             server.didChangeConfiguration(change);
 
             server.compiler();
-            var line = capture.lastLineContaining("completion_index_refresh_sync trigger=compilerRecreated");
-            Assert.assertTrue("expected compilerRecreated sync index refresh log", line != null);
+            var line = capture.lastLineContaining("[perf] diagnostics_debounce trigger=compilerRecreated");
+            Assert.assertTrue("expected compilerRecreated diagnostics debounce log", line != null);
             Assert.assertTrue(
-                    "sync compilerRecreated refresh should use active files only, line=" + line,
+                    "compilerRecreated shared diagnostics pass should use active files only, line=" + line,
                     line.matches(".*files=1\\b.*"));
+            Assert.assertTrue(
+                    "compilerRecreated active-file startup pass should refresh the index from shared compile, line="
+                            + line,
+                    line.contains("shared_index=true"));
+            Assert.assertEquals(
+                    "compilerRecreated should not schedule a separate sync completion refresh when active files exist",
+                    0,
+                    capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
+            Assert.assertEquals(
+                    "compilerRecreated should not schedule a separate deferred completion refresh when active files exist",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
         } finally {
             logger.removeHandler(capture);
         }
     }
 
     @Test
-    public void startupCompilerRecreatedRefreshIsDeferredWhenNoActiveDocs() throws Exception {
+    public void startupCompilerRecreatedRefreshIsLazyWhenNoActiveDocs() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
         var capture = new TestLogCapture();
@@ -567,20 +953,55 @@ public class JavaLanguageServerTest {
             server.initialize(init);
             server.initialized();
 
-            var syncLine =
-                    capture.lastLineContaining(
-                            "completion_index_refresh_sync trigger=compilerRecreated");
-            Assert.assertTrue(
+            Assert.assertEquals(
                     "startup should not do synchronous full refresh when no active docs",
-                    syncLine == null);
-
-            var debounceLine =
-                    capture.lastLineContaining(
-                            "completion_index_debounce trigger=compilerRecreated");
+                    0,
+                    capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
+            Assert.assertEquals(
+                    "startup should not schedule a deferred compilerRecreated refresh without active docs",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
             Assert.assertTrue(
-                    "startup should schedule deferred compilerRecreated refresh", debounceLine != null);
+                    "startup should log that compilerRecreated refresh is deferred until real demand",
+                    capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs")
+                            > 0);
 
             server.shutdown();
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void didOpenDoesNotOverlapWithCompilerRecreatedProjectIndexCompile() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+            var text = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "didOpen should still bootstrap the completion index",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            Assert.assertEquals(
+                    "startup should not skip a compilerRecreated refresh after already doing the expensive work",
+                    0,
+                    capture.countContaining("completion_index_refresh_skip trigger=compilerRecreated"));
+            Assert.assertEquals(
+                    "didOpen bootstrap should not schedule a second declaration refresh compile",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
         } finally {
             logger.removeHandler(capture);
         }
@@ -943,6 +1364,19 @@ public class JavaLanguageServerTest {
             return diagnostics.stream()
                     .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
                     .anyMatch(predicate);
+        }
+
+        boolean awaitDiagnosticsCount(java.net.URI uri, int count, long timeout, TimeUnit unit)
+                throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (System.nanoTime() < deadline) {
+                var diagnostics = diagnosticsByUri.get(uri);
+                if (diagnostics != null && diagnostics.size() == count) {
+                    return true;
+                }
+                Thread.sleep(25);
+            }
+            return false;
         }
     }
 

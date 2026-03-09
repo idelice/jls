@@ -66,6 +66,10 @@ public class DefinitionProvider {
         var cursor = parse.root.getLineMap().getPosition(line, column);
         var path = new FindNameAt(parse).scan(parse.root, cursor);
         if (path == null) return new ResolvedSymbol(NOT_SUPPORTED, null, null, false, null, null);
+        return resolve(parse, path, cursor);
+    }
+
+    ResolvedSymbol resolve(ParseTask parse, TreePath path, long cursor) {
         var resolver = new ParseTypeResolver(parse, completionIndex, compiler, cursor);
         return resolve(parse, path, resolver);
     }
@@ -74,20 +78,13 @@ public class DefinitionProvider {
         var leaf = path.getLeaf();
         LOG.fine(String.format("[perf] definition_path kind=%s leaf=%s", leaf.getKind(), leaf));
         if (leaf instanceof ClassTree cls) {
-            return fromDeclaration(parse, path, cls.getSimpleName().toString());
+            return typeDeclaration(parse, path, cls);
         }
         if (leaf instanceof MethodTree method) {
-            var name = method.getName().toString();
-            if ("<init>".equals(name)) {
-                var parent = nearestClass(path);
-                if (parent != null) {
-                    name = ((ClassTree) parent.getLeaf()).getSimpleName().toString();
-                }
-            }
-            return fromDeclaration(parse, path, name);
+            return methodDeclaration(parse, path, method);
         }
         if (leaf instanceof VariableTree variable) {
-            return fromDeclaration(parse, path, variable.getName().toString());
+            return variableDeclaration(parse, path, variable);
         }
         if (leaf instanceof IdentifierTree identifier) {
             return resolveIdentifier(parse, path, identifier, types);
@@ -118,6 +115,11 @@ public class DefinitionProvider {
 
         var local = types.resolveVisibleDeclaration(name);
         if (local.isPresent()) {
+            if (local.get().getLeaf() instanceof VariableTree variable
+                    && local.get().getParentPath() != null
+                    && local.get().getParentPath().getLeaf() instanceof ClassTree) {
+                return variableDeclaration(parse, local.get(), variable);
+            }
             var location = FindHelper.location(parse, local.get(), name);
             if (location != null) {
                 return new ResolvedSymbol(List.of(location), null, name, false, null, name);
@@ -128,7 +130,8 @@ public class DefinitionProvider {
         if (field.isPresent()) {
             var location = FindHelper.location(parse, field.get(), name);
             if (location != null) {
-                return new ResolvedSymbol(List.of(location), null, name, false, null, name);
+                var owner = qualifiedClassName(parse, nearestClass(field.get()));
+                return new ResolvedSymbol(List.of(location), owner, name, false, null, name);
             }
         }
 
@@ -196,6 +199,10 @@ public class DefinitionProvider {
         var receiver = types.resolveExpression(memberReference.getQualifierExpression());
         if (receiver.isEmpty()) {
             return new ResolvedSymbol(NOT_SUPPORTED, null, name, true, null, name);
+        }
+        if ("new".equals(name)) {
+            var ownerType = receiver.get().qualifiedType;
+            return new ResolvedSymbol(findConstructorLocations(ownerType, -1), ownerType, simpleName(ownerType), true, null, simpleName(ownerType));
         }
         return resolveQualifiedMethodInvocation(types, memberReference.getQualifierExpression(), name, List.of());
     }
@@ -272,7 +279,11 @@ public class DefinitionProvider {
 
     private ResolvedSymbol resolveConstructorInvocation(
             ParseTask parse, NewClassTree newClassTree, ParseTypeResolver types, String simpleName) {
-        var resolved = resolveTypeName(parse, newClassTree.getIdentifier().toString());
+        var resolved =
+                types.resolveTypeTree(newClassTree.getIdentifier(), true).map(type -> type.qualifiedType);
+        if (resolved.isEmpty()) {
+            resolved = resolveTypeName(parse, newClassTree.getIdentifier().toString());
+        }
         if (resolved.isEmpty()) {
             return new ResolvedSymbol(NOT_SUPPORTED, null, null, false, null, simpleName);
         }
@@ -321,6 +332,39 @@ public class DefinitionProvider {
             return new ResolvedSymbol(NOT_SUPPORTED, null, name, false, null, name);
         }
         return new ResolvedSymbol(List.of(location), null, name, false, null, name);
+    }
+
+    private ResolvedSymbol typeDeclaration(ParseTask parse, TreePath path, ClassTree cls) {
+        var qualifiedType = qualifiedClassName(parse, path);
+        var location = FindHelper.location(parse, path, cls.getSimpleName());
+        if (location == null) {
+            return new ResolvedSymbol(NOT_SUPPORTED, qualifiedType, null, false, null, cls.getSimpleName().toString());
+        }
+        return new ResolvedSymbol(List.of(location), qualifiedType, null, false, null, cls.getSimpleName().toString());
+    }
+
+    private ResolvedSymbol methodDeclaration(ParseTask parse, TreePath path, MethodTree method) {
+        var classPath = nearestClass(path);
+        var ownerType = classPath == null ? null : qualifiedClassName(parse, classPath);
+        var simpleName = method.getName().contentEquals("<init>")
+                ? classPath != null ? ((ClassTree) classPath.getLeaf()).getSimpleName().toString() : method.getName().toString()
+                : method.getName().toString();
+        var location = FindHelper.location(parse, path, simpleName);
+        if (location == null) {
+            return new ResolvedSymbol(NOT_SUPPORTED, ownerType, simpleName, true, null, simpleName);
+        }
+        return new ResolvedSymbol(List.of(location), ownerType, simpleName, true, null, simpleName);
+    }
+
+    private ResolvedSymbol variableDeclaration(ParseTask parse, TreePath path, VariableTree variable) {
+        var parent = path.getParentPath() != null ? path.getParentPath().getLeaf() : null;
+        var memberField = parent instanceof ClassTree;
+        var ownerType = memberField ? qualifiedClassName(parse, path.getParentPath()) : null;
+        var location = FindHelper.location(parse, path, variable.getName());
+        if (location == null) {
+            return new ResolvedSymbol(NOT_SUPPORTED, ownerType, variable.getName().toString(), false, null, variable.getName().toString());
+        }
+        return new ResolvedSymbol(List.of(location), ownerType, variable.getName().toString(), false, null, variable.getName().toString());
     }
 
     private Optional<TreePath> findFieldInEnclosingClass(ParseTask parse, TreePath path, String fieldName) {
@@ -649,6 +693,11 @@ public class DefinitionProvider {
             case "char", "java.lang.Character" -> "java.lang.Character";
             default -> raw;
         };
+    }
+
+    private static String simpleName(String qualifiedType) {
+        var index = qualifiedType.lastIndexOf('.');
+        return index >= 0 ? qualifiedType.substring(index + 1) : qualifiedType;
     }
 
     private static final class TypeSource {

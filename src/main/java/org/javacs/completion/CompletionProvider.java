@@ -2,7 +2,6 @@ package org.javacs.completion;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
@@ -13,7 +12,6 @@ import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.ModifiersTree;
 import com.sun.source.tree.NewArrayTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.ParenthesizedTree;
@@ -64,6 +62,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FileStore;
 import org.javacs.JsonHelper;
+import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
 import org.javacs.lsp.Command;
@@ -642,8 +641,16 @@ public class CompletionProvider {
                 return Optional.empty();
             }
             var classTree = (ClassTree) classPath.getLeaf();
-            if (!CompletionProvider.hasSlf4jAnnotation(classTree.getModifiers())) {
+            if (!LombokAnnotations.hasLoggingOnlyLombokAnnotation(classTree.getModifiers())) {
                 return Optional.empty();
+            }
+            var ownerType = qualifiedClassName(classPath);
+            var loggerMember = index.member(ownerType, "log", false);
+            if (loggerMember.isEmpty()) {
+                loggerMember = index.member(ownerType, "log", true);
+            }
+            if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
+                return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
             }
             var loggerType = "org.slf4j.Logger";
             if (!index.types().containsKey(loggerType)) {
@@ -1204,7 +1211,7 @@ public class CompletionProvider {
             return;
         }
         var classTree = (ClassTree) classPath.getLeaf();
-        if (!hasSlf4jAnnotation(classTree.getModifiers())) {
+        if (!LombokAnnotations.hasLoggingOnlyLombokAnnotation(classTree.getModifiers())) {
             return;
         }
         var logger = new CompletionItem();
@@ -1255,32 +1262,6 @@ public class CompletionProvider {
             }
         }
         return null;
-    }
-
-    private static boolean hasSlf4jAnnotation(ModifiersTree modifiers) {
-        if (modifiers == null) {
-            return false;
-        }
-        for (var annotation : modifiers.getAnnotations()) {
-            if (isSlf4jAnnotation(annotation)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isSlf4jAnnotation(AnnotationTree annotation) {
-        if (annotation == null) {
-            return false;
-        }
-        var type = annotation.getAnnotationType();
-        if (type instanceof IdentifierTree identifier) {
-            return "Slf4j".equals(identifier.getName().toString());
-        }
-        if (type instanceof MemberSelectTree select) {
-            return "lombok.extern.slf4j.Slf4j".equals(select.toString()) || "Slf4j".equals(select.getIdentifier().toString());
-        }
-        return false;
     }
 
     private boolean containsCompletionLabel(CompletionList list, String label) {

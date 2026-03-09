@@ -13,11 +13,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import org.javacs.completion.TypeMemberIndex;
+import org.javacs.navigation.ReferenceProvider;
 import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidSaveTextDocumentParams;
@@ -99,20 +102,33 @@ public class LspPerformanceTest {
 
     @Test
     public void referencesDoNotTriggerFullCompile() {
-        var server = LanguageServerFixture.getJavaLanguageServer();
+        var referenceContext = referenceContext(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         var file = FindResource.path("org/javacs/example/GotoOther.java");
-        open(server, file, 1, FileStore.contents(file));
-        server.lint(List.of(file));
         CompileBatch.resetPerfCounters();
 
-        var params = new ReferenceParams();
-        params.textDocument = new TextDocumentIdentifier(file.toUri());
-        params.position = new Position(5, 29);
-        var result = server.findReferences(params);
-        assertTrue(result.isPresent());
+        var result = new ReferenceProvider(referenceContext.compiler, referenceContext.index, file, 6, 30).find();
+        assertTrue(!result.isEmpty());
 
         var counters = CompileBatch.perfCounters();
         assertThat(counters.fullBatches, is(0L));
+        assertThat(counters.analyzeInvocations, is(0L));
+        assertThat(counters.apEnabledBatches, is(0L));
+    }
+
+    @Test
+    public void referencesInLombokProjectDoNotRunAnnotationProcessors() {
+        var referenceContext = referenceContext(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+        CompileBatch.resetPerfCounters();
+
+        var result =
+                new ReferenceProvider(referenceContext.compiler, referenceContext.index, LOMBOK_MEMBER_FILE, 5, 25)
+                        .find();
+        assertTrue(!result.isEmpty());
+
+        var counters = CompileBatch.perfCounters();
+        assertThat(counters.fullBatches, is(0L));
+        assertThat(counters.analyzeInvocations, is(0L));
+        assertThat(counters.apEnabledBatches, is(0L));
     }
 
     @Test
@@ -836,18 +852,25 @@ public class LspPerformanceTest {
     }
 
     @Test
-    public void crossFilePojoUpdateAppearsOnlyAfterSnapshotSwitch() {
+    public void crossFilePojoUpdateAppearsAfterDebouncedIncrementalIndexRefresh() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var modelOriginal = FileStore.contents(LOMBOK_MODEL_FILE);
         var useOriginal = FileStore.contents(LOMBOK_MEMBER_FILE);
 
         open(server, LOMBOK_MODEL_FILE, 1, modelOriginal);
         open(server, LOMBOK_MEMBER_FILE, 1, useOriginal);
-        server.lint(List.of(LOMBOK_MODEL_FILE, LOMBOK_MEMBER_FILE));
 
-        var baseline = server.completion(completionPosition(LOMBOK_MEMBER_FILE, 6, 15));
-        assertTrue(baseline.isPresent());
-        var baselineLabels = baseline.get().items.stream().map(item -> item.label).collect(Collectors.toSet());
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        Set<String> baselineLabels = Set.of();
+        while (System.nanoTime() < deadline) {
+            var baseline = server.completion(completionPosition(LOMBOK_MEMBER_FILE, 6, 15));
+            assertTrue(baseline.isPresent());
+            baselineLabels = baseline.get().items.stream().map(item -> item.label).collect(Collectors.toSet());
+            if (baselineLabels.contains("getName")) {
+                break;
+            }
+            Thread.sleep(50);
+        }
         assertTrue("expected baseline lombok getter", baselineLabels.contains("getName"));
         assertTrue("unexpected future field getter in baseline", !baselineLabels.contains("getTitle"));
 
@@ -857,15 +880,22 @@ public class LspPerformanceTest {
         var beforeSwitch = server.completion(completionPosition(LOMBOK_MEMBER_FILE, 6, 15));
         assertTrue(beforeSwitch.isPresent());
         var beforeSwitchLabels = beforeSwitch.get().items.stream().map(item -> item.label).collect(Collectors.toSet());
-        assertTrue("snapshot switched before diagnostics rebuild", beforeSwitchLabels.contains("getName"));
-        assertTrue("new getter appeared before snapshot switch", !beforeSwitchLabels.contains("getTitle"));
+        assertTrue("snapshot switched too early after unsaved change", beforeSwitchLabels.contains("getName"));
+        assertTrue("new getter appeared before debounced refresh", !beforeSwitchLabels.contains("getTitle"));
 
-        server.lint(List.of(LOMBOK_MODEL_FILE, LOMBOK_MEMBER_FILE));
+        deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        Set<String> afterSwitchLabels = Set.of();
+        while (System.nanoTime() < deadline) {
+            var afterSwitch = server.completion(completionPosition(LOMBOK_MEMBER_FILE, 6, 15));
+            assertTrue(afterSwitch.isPresent());
+            afterSwitchLabels = afterSwitch.get().items.stream().map(item -> item.label).collect(Collectors.toSet());
+            if (afterSwitchLabels.contains("getTitle") && !afterSwitchLabels.contains("getName")) {
+                break;
+            }
+            Thread.sleep(50);
+        }
 
-        var afterSwitch = server.completion(completionPosition(LOMBOK_MEMBER_FILE, 6, 15));
-        assertTrue(afterSwitch.isPresent());
-        var afterSwitchLabels = afterSwitch.get().items.stream().map(item -> item.label).collect(Collectors.toSet());
-        assertTrue("updated getter missing after snapshot switch", afterSwitchLabels.contains("getTitle"));
+        assertTrue("updated getter missing after incremental refresh", afterSwitchLabels.contains("getTitle"));
         assertTrue("ghost getter leaked from old snapshot", !afterSwitchLabels.contains("getName"));
     }
 
@@ -1195,6 +1225,30 @@ public class LspPerformanceTest {
         Collections.sort(sorted);
         var index = (int) Math.ceil(sorted.size() * 0.95) - 1;
         return sorted.get(Math.max(index, 0));
+    }
+
+    private ReferenceContext referenceContext(Path workspaceRoot) {
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspaceRoot));
+        var infer = new InferConfig(workspaceRoot);
+        var compiler =
+                new JavaCompilerService(
+                        infer.classPath(), infer.buildDocPath(), Collections.emptySet(), Collections.emptySet());
+        TypeMemberIndex index;
+        try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
+            index = TypeMemberIndex.from(task);
+        }
+        return new ReferenceContext(compiler, index);
+    }
+
+    private static class ReferenceContext {
+        final JavaCompilerService compiler;
+        final TypeMemberIndex index;
+
+        ReferenceContext(JavaCompilerService compiler, TypeMemberIndex index) {
+            this.compiler = compiler;
+            this.index = index;
+        }
     }
 
     private static class TrackingClient implements LanguageClient {

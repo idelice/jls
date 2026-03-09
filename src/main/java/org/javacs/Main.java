@@ -24,6 +24,8 @@ public class Main {
         }
 
         try {
+            // JDK FINE logging for ProcessBuilder.start() is noisy and redundant with our own probe logs.
+            Logger.getLogger("java.lang.ProcessBuilder").setLevel(Level.INFO);
             // Logger.getLogger("").addHandler(new FileHandler("javacs.%u.log", false));
             setRootFormat();
 

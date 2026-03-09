@@ -6,6 +6,7 @@ import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.ModifiersTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TreeVisitor;
@@ -41,14 +42,16 @@ import javax.lang.model.type.TypeVariable;
 import javax.lang.model.type.UnionType;
 import javax.lang.model.type.WildcardType;
 import org.javacs.CompileTask;
+import org.javacs.LombokAnnotations;
 import org.javacs.lsp.CompletionItemKind;
 
 public class TypeMemberIndex {
     public static final TypeMemberIndex EMPTY =
-            new TypeMemberIndex(Map.of());
+            new TypeMemberIndex(Map.of(), Map.of());
     private static final Set<String> PRIMITIVE_TYPE_NAMES =
             Set.of("boolean", "byte", "short", "int", "long", "float", "double", "char", "void");
-
+    private static final Set<String> LOMBOK_ACCESSOR_ANNOTATIONS =
+            Set.of("Data", "Getter", "Setter", "Value");
     public static class Member {
         public final String ownerType;
         public final String name;
@@ -107,9 +110,10 @@ public class TypeMemberIndex {
     }
 
     private final Map<String, TypeInfo> typesByQualifiedName;
+    private final Map<Path, Set<String>> workspaceTypesByFile;
     private static final Logger LOG = Logger.getLogger("main");
 
-    private TypeMemberIndex(Map<String, TypeInfo> typesByQualifiedName) {
+    private TypeMemberIndex(Map<String, TypeInfo> typesByQualifiedName, Map<Path, Set<String>> workspaceTypesByFile) {
         var verified = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
         for (var entry : typesByQualifiedName.entrySet()) {
             var key = entry.getKey();
@@ -121,6 +125,13 @@ public class TypeMemberIndex {
             verified.put(key, entry.getValue());
         }
         this.typesByQualifiedName = Collections.unmodifiableMap(verified);
+        var verifiedWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
+        for (var entry : workspaceTypesByFile.entrySet()) {
+            verifiedWorkspaceTypes.put(
+                    entry.getKey(),
+                    Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(entry.getValue())));
+        }
+        this.workspaceTypesByFile = Collections.unmodifiableMap(verifiedWorkspaceTypes);
     }
 
     public Map<String, TypeInfo> types() {
@@ -129,6 +140,54 @@ public class TypeMemberIndex {
 
     public int size() {
         return typesByQualifiedName.size();
+    }
+
+    public TypeMemberIndex replaceWorkspaceDeclarations(TypeMemberIndex updates, Set<Path> replacedFiles) {
+        if ((updates == null || updates.workspaceTypesByFile.isEmpty()) && (replacedFiles == null || replacedFiles.isEmpty())) {
+            return this;
+        }
+        var nextTypes = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>(typesByQualifiedName);
+        var nextWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
+        for (var entry : workspaceTypesByFile.entrySet()) {
+            nextWorkspaceTypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
+        }
+
+        var filesToReplace = new ObjectLinkedOpenHashSet<Path>();
+        if (replacedFiles != null) {
+            filesToReplace.addAll(replacedFiles);
+        }
+        if (updates != null) {
+            filesToReplace.addAll(updates.workspaceTypesByFile.keySet());
+        }
+
+        for (var file : filesToReplace) {
+            var previousTypes = nextWorkspaceTypes.remove(file);
+            if (previousTypes == null) {
+                continue;
+            }
+            for (var qualifiedName : previousTypes) {
+                var existing = nextTypes.get(qualifiedName);
+                if (existing != null && file.equals(existing.sourcePath)) {
+                    nextTypes.remove(qualifiedName);
+                }
+            }
+        }
+
+        if (updates != null) {
+            for (var entry : updates.workspaceTypesByFile.entrySet()) {
+                var file = entry.getKey();
+                var declaredTypes = new ObjectLinkedOpenHashSet<String>(entry.getValue());
+                nextWorkspaceTypes.put(file, declaredTypes);
+                for (var qualifiedName : declaredTypes) {
+                    var typeInfo = updates.typesByQualifiedName.get(qualifiedName);
+                    if (typeInfo != null) {
+                        nextTypes.put(qualifiedName, typeInfo);
+                    }
+                }
+            }
+        }
+
+        return new TypeMemberIndex(nextTypes, nextWorkspaceTypes);
     }
 
     public List<Member> members(String qualifiedName, boolean staticContext) {
@@ -256,11 +315,20 @@ public class TypeMemberIndex {
     }
 
     public static TypeMemberIndex from(CompileTask task) {
+        return from(task, true);
+    }
+
+    public static TypeMemberIndex workspaceDeclarations(CompileTask task) {
+        return from(task, false);
+    }
+
+    private static TypeMemberIndex from(CompileTask task, boolean includeReferencedTypes) {
         var trees = Trees.instance(task.task);
         var elements = task.task.getElements();
         var types = task.task.getTypes();
 
         var rootDeclaredTypeSources = new Object2ObjectOpenHashMap<String, Path>();
+        var rootDeclaredTypeTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
         var collectedTypes = new Object2ObjectLinkedOpenHashMap<String, TypeElement>();
         var seenMirrors = new ObjectOpenHashSet<String>();
         var skippedInvalidTypeKeys = new ObjectLinkedOpenHashSet<String>();
@@ -273,70 +341,82 @@ public class TypeMemberIndex {
             var rootPath = sourcePath;
             new TreePathScanner<Void, Void>() {
                 @Override
-                public Void visitClass(ClassTree tree, Void p) {
-                    var element = trees.getElement(getCurrentPath());
-                    if (element instanceof TypeElement typeElement) {
-                        var qualifiedName = typeElement.getQualifiedName().toString();
-                        if (isValidIndexKey(qualifiedName)) {
+                    public Void visitClass(ClassTree tree, Void p) {
+                        var element = trees.getElement(getCurrentPath());
+                        if (element instanceof TypeElement typeElement) {
+                            var qualifiedName = typeElement.getQualifiedName().toString();
+                            if (isValidIndexKey(qualifiedName)) {
                             collectedTypes.putIfAbsent(qualifiedName, typeElement);
                             if (rootPath != null) {
                                 rootDeclaredTypeSources.put(qualifiedName, rootPath);
                             }
-                        } else if (qualifiedName != null && !qualifiedName.isBlank()) {
-                            skippedInvalidTypeKeys.add(qualifiedName);
+                            rootDeclaredTypeTrees.putIfAbsent(qualifiedName, tree);
+                            } else if (qualifiedName != null && !qualifiedName.isBlank()) {
+                                skippedInvalidTypeKeys.add(qualifiedName);
+                            }
+                            if (LombokAnnotations.hasLoggingOnlyLombokAnnotation(tree.getModifiers())) {
+                                collectNamedType(elements, "org.slf4j.Logger", collectedTypes);
+                            }
                         }
+                        return super.visitClass(tree, p);
                     }
-                    return super.visitClass(tree, p);
-                }
             }.scan(root, null);
 
-            new TreePathScanner<Void, Void>() {
-                @Override
-                public Void visitVariable(VariableTree tree, Void p) {
-                    collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
-                    return super.visitVariable(tree, p);
-                }
+            if (includeReferencedTypes) {
+                new TreePathScanner<Void, Void>() {
+                    @Override
+                    public Void visitVariable(VariableTree tree, Void p) {
+                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        return super.visitVariable(tree, p);
+                    }
 
-                @Override
-                public Void visitMethod(MethodTree tree, Void p) {
-                    collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
-                    return super.visitMethod(tree, p);
-                }
+                    @Override
+                    public Void visitMethod(MethodTree tree, Void p) {
+                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        return super.visitMethod(tree, p);
+                    }
 
-                @Override
-                public Void visitMethodInvocation(MethodInvocationTree tree, Void p) {
-                    collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
-                    return super.visitMethodInvocation(tree, p);
-                }
+                    @Override
+                    public Void visitMethodInvocation(MethodInvocationTree tree, Void p) {
+                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        return super.visitMethodInvocation(tree, p);
+                    }
 
-                @Override
-                public Void visitIdentifier(IdentifierTree tree, Void p) {
-                    collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
-                    return super.visitIdentifier(tree, p);
-                }
+                    @Override
+                    public Void visitIdentifier(IdentifierTree tree, Void p) {
+                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        return super.visitIdentifier(tree, p);
+                    }
 
-                @Override
-                public Void visitMemberSelect(MemberSelectTree tree, Void p) {
-                    collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
-                    return super.visitMemberSelect(tree, p);
-                }
+                    @Override
+                    public Void visitMemberSelect(MemberSelectTree tree, Void p) {
+                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        return super.visitMemberSelect(tree, p);
+                    }
 
-                @Override
-                public Void visitNewClass(NewClassTree tree, Void p) {
-                    collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
-                    return super.visitNewClass(tree, p);
-                }
-            }.scan(root, null);
+                    @Override
+                    public Void visitNewClass(NewClassTree tree, Void p) {
+                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        return super.visitNewClass(tree, p);
+                    }
+                }.scan(root, null);
+            }
         }
 
         var typeEntries = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
-        for (var type : collectedTypes.values()) {
-            var qualifiedName = type.getQualifiedName().toString();
+        for (var collected : collectedTypes.values()) {
+            var qualifiedName = collected.getQualifiedName().toString();
             if (!isValidIndexKey(qualifiedName)) {
                 if (qualifiedName != null && !qualifiedName.isBlank()) {
                     skippedInvalidTypeKeys.add(qualifiedName);
                 }
                 continue;
+            }
+            var type = elements.getTypeElement(qualifiedName);
+            if (type == null) {
+                type = collected;
+            } else if (type != collected) {
+                LOG.fine(String.format("[completion] canonicalized type symbol %s for index extraction", qualifiedName));
             }
 
             var members = new ArrayList<Member>();
@@ -394,6 +474,9 @@ public class TypeMemberIndex {
                     seen.put(key, next);
                 }
             }
+            var declaredTree = rootDeclaredTypeTrees.get(qualifiedName);
+            addSyntheticLombokAccessors(qualifiedName, declaredTree, seen);
+            addSyntheticSlf4jLoggerField(qualifiedName, declaredTree, seen);
 
             members.addAll(seen.values());
             members.sort(
@@ -413,13 +496,18 @@ public class TypeMemberIndex {
             typeEntries.put(qualifiedName, typeEntry);
         }
 
+        var workspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
+        for (var entry : rootDeclaredTypeSources.entrySet()) {
+            workspaceTypes.computeIfAbsent(entry.getValue(), __ -> new ObjectLinkedOpenHashSet<>()).add(entry.getKey());
+        }
+
         if (!skippedInvalidTypeKeys.isEmpty()) {
             LOG.fine(
                     String.format(
                             "[completion] skipped non-fqn types while building index: %s",
                             skippedInvalidTypeKeys));
         }
-        return new TypeMemberIndex(Collections.unmodifiableMap(typeEntries));
+        return new TypeMemberIndex(Collections.unmodifiableMap(typeEntries), Collections.unmodifiableMap(workspaceTypes));
     }
 
     private static Integer memberKind(Element member) {
@@ -514,7 +602,143 @@ public class TypeMemberIndex {
         }
     }
 
+    private static void collectNamedType(
+            javax.lang.model.util.Elements elements,
+            String qualifiedName,
+            Map<String, TypeElement> collectedTypes) {
+        if (!isValidIndexKey(qualifiedName) || collectedTypes.containsKey(qualifiedName)) {
+            return;
+        }
+        var type = elements.getTypeElement(qualifiedName);
+        if (type != null) {
+            collectedTypes.put(qualifiedName, type);
+        }
+    }
+
     private static boolean isValidIndexKey(String key) {
         return key != null && !key.isBlank() && (key.contains(".") || isPrimitiveTypeName(key));
+    }
+
+    private static void addSyntheticLombokAccessors(
+            String ownerQualifiedName, ClassTree declaration, Map<String, Member> seen) {
+        if (declaration == null || !hasAnyLombokAccessorAnnotation(declaration.getModifiers())) {
+            return;
+        }
+        var classGetter = hasLombokAnnotation(declaration.getModifiers(), "Data", "Getter", "Value");
+        var classSetter = hasLombokAnnotation(declaration.getModifiers(), "Data", "Setter");
+        for (var member : declaration.getMembers()) {
+            if (!(member instanceof VariableTree variable)) {
+                continue;
+            }
+            if (variable.getName() == null) {
+                continue;
+            }
+            if (variable.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                continue;
+            }
+            var fieldName = variable.getName().toString();
+            if (fieldName.isBlank()) {
+                continue;
+            }
+            var fieldType = variable.getType() == null ? "java.lang.Object" : variable.getType().toString();
+            var getterEnabled = classGetter || hasLombokAnnotation(variable.getModifiers(), "Getter");
+            var setterEnabled = classSetter || hasLombokAnnotation(variable.getModifiers(), "Setter");
+            var suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+            var booleanField = "boolean".equals(fieldType) || "java.lang.Boolean".equals(fieldType);
+            if (getterEnabled) {
+                var getterName = (booleanField ? "is" : "get") + suffix;
+                putSyntheticMethod(
+                        seen,
+                        new Member(
+                                ownerQualifiedName,
+                                getterName,
+                                CompletionItemKind.Method,
+                                false,
+                                false,
+                                0,
+                                fieldType + " " + getterName + "()",
+                                fieldType,
+                                new String[0],
+                                new String[0]));
+            }
+            if (setterEnabled) {
+                var setterName = "set" + suffix;
+                putSyntheticMethod(
+                        seen,
+                        new Member(
+                                ownerQualifiedName,
+                                setterName,
+                                CompletionItemKind.Method,
+                                false,
+                                false,
+                                0,
+                                "void " + setterName + "(" + fieldType + " " + fieldName + ")",
+                                "void",
+                                new String[] {fieldName},
+                                new String[] {normalizeTypeName(fieldType)}));
+            }
+        }
+    }
+
+    private static void addSyntheticSlf4jLoggerField(
+            String ownerQualifiedName, ClassTree declaration, Map<String, Member> seen) {
+        if (declaration == null || !LombokAnnotations.hasLoggingOnlyLombokAnnotation(declaration.getModifiers())) {
+            return;
+        }
+        var next =
+                new Member(
+                        ownerQualifiedName,
+                        "log",
+                        CompletionItemKind.Field,
+                        true,
+                        true,
+                        0,
+                        "org.slf4j.Logger log",
+                        "org.slf4j.Logger",
+                        null,
+                        null);
+        seen.putIfAbsent(next.kind + ":" + next.name + ":", next);
+    }
+
+    private static void putSyntheticMethod(Map<String, Member> seen, Member next) {
+        var key =
+                next.kind
+                        + ":"
+                        + next.name
+                        + ":"
+                        + String.join(",", next.erasedParameterTypes == null ? new String[0] : next.erasedParameterTypes);
+        seen.putIfAbsent(key, next);
+    }
+
+    private static boolean hasAnyLombokAccessorAnnotation(ModifiersTree modifiers) {
+        for (var annotation : modifiers.getAnnotations()) {
+            var annotationType = annotation.getAnnotationType().toString();
+            if (!isLombokAnnotationType(annotationType)) {
+                continue;
+            }
+            var simpleName = LombokAnnotations.simpleName(annotationType);
+            if (LOMBOK_ACCESSOR_ANNOTATIONS.contains(simpleName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasLombokAnnotation(ModifiersTree modifiers, String... simpleNames) {
+        var allowed = Set.of(simpleNames);
+        for (var annotation : modifiers.getAnnotations()) {
+            var annotationType = annotation.getAnnotationType().toString();
+            if (!isLombokAnnotationType(annotationType)) {
+                continue;
+            }
+            if (allowed.contains(LombokAnnotations.simpleName(annotationType))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isLombokAnnotationType(String annotationType) {
+        return LombokAnnotations.isLombokAnnotationType(annotationType);
     }
 }

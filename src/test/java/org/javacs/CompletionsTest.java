@@ -169,6 +169,14 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void lombokSlf4jLoggerMemberCompletion() {
+        refreshServer();
+        var file = "/org/javacs/example/LombokSlf4jCompletion.java";
+        var suggestions = filterText(file, 8, 13);
+        assertThat(suggestions, hasItem("info"));
+    }
+
+    @Test
     public void enumMapMembers() {
         var suggestions = filterText("/org/javacs/example/CompleteEnumMap.java", 9, 13);
         String[] expect = {
