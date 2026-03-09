@@ -10,6 +10,7 @@ import com.sun.source.tree.ParameterizedTypeTree;
 import com.sun.source.tree.PrimitiveTypeTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
+import com.sun.source.util.JavacTask;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.io.IOException;
@@ -145,8 +146,20 @@ public class FindHelper {
         return location(task, path, "");
     }
 
+    public static Location location(ParseTask task, TreePath path) {
+        return location(task.task, path, "", false);
+    }
+
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
         return location(task, path, name, false);
+    }
+
+    public static Location location(ParseTask task, TreePath path, CharSequence name) {
+        return location(task.task, path, name, false);
+    }
+
+    public static Location locationStrict(ParseTask task, TreePath path, CharSequence name) {
+        return location(task.task, path, name, true);
     }
 
     public static Location locationStrict(CompileTask task, TreePath path, CharSequence name) {
@@ -154,8 +167,12 @@ public class FindHelper {
     }
 
     private static Location location(CompileTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
+        return location(task.task, path, name, strictNameMatch);
+    }
+
+    private static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
         var lines = path.getCompilationUnit().getLineMap();
-        var pos = Trees.instance(task.task).getSourcePositions();
+        var pos = Trees.instance(task).getSourcePositions();
         var start = -1;
         var end = -1;
         for (var current = path; current != null; current = current.getParentPath()) {

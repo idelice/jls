@@ -58,7 +58,6 @@ public class LspPerformanceTest {
         assertTrue(maybe.isPresent());
 
         var counters = CompileBatch.perfCounters();
-        assertThat(counters.enterOnlyBatches, is(0L));
         assertThat(counters.fullBatches, is(0L));
         assertThat(counters.analyzeInvocations, is(0L));
         assertThat(counters.apEnabledBatches, is(0L));
@@ -77,6 +76,10 @@ public class LspPerformanceTest {
 
         var counters = CompileBatch.perfCounters();
         assertThat(counters.fullBatches, is(0L));
+        assertThat(counters.analyzeInvocations, is(0L));
+        assertThat(counters.apEnabledBatches, is(0L));
+        assertThat(counters.analyzeInvocations, is(0L));
+        assertThat(counters.apEnabledBatches, is(0L));
     }
 
     @Test
@@ -129,10 +132,12 @@ public class LspPerformanceTest {
         CompileBatch.resetPerfCounters();
         server.hover(completionPosition(file, 5, 14));
         assertThat("hover should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
+        assertThat("hover should not analyze", CompileBatch.perfCounters().analyzeInvocations, is(0L));
 
         CompileBatch.resetPerfCounters();
         server.gotoDefinition(completionPosition(file, 5, 14));
         assertThat("definition should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
+        assertThat("definition should not analyze", CompileBatch.perfCounters().analyzeInvocations, is(0L));
 
         CompileBatch.resetPerfCounters();
         var refs = new ReferenceParams();

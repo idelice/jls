@@ -7,6 +7,7 @@ import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.Trees;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
@@ -60,9 +61,10 @@ class JavaLanguageServer extends LanguageServer {
                     });
     private final AtomicLong diagnosticsRevision = new AtomicLong();
     private final AtomicLong completionIndexRevision = new AtomicLong();
+    private final Object diagnosticsCompileMutex = new Object();
     private ScheduledFuture<?> pendingDiagnostics;
     private ScheduledFuture<?> pendingCompletionIndex;
-    private static final long DIAGNOSTIC_DEBOUNCE_MS = 200;
+    private static final long DIAGNOSTIC_DEBOUNCE_MS = 400;
     private static final long COMPLETION_INDEX_DEBOUNCE_MS = 100;
     private boolean lombokVerifiedForCurrentCompiler;
     private boolean lombokEnabledForCurrentCompiler = true;
@@ -78,15 +80,10 @@ class JavaLanguageServer extends LanguageServer {
             lombokEnabledForCurrentCompiler = compilers.lombokEnabled;
             lombokVerifiedForCurrentCompiler = false;
             completionIndexRevision.incrementAndGet();
-            synchronized (this) {
-                if (pendingCompletionIndex != null) {
-                    pendingCompletionIndex.cancel(false);
-                    pendingCompletionIndex = null;
-                }
-            }
-            cacheSettings = settings;
+            cancelPendingCompletionIndex("compilerRecreated");
+            cacheSettings = compilerSettingsSnapshot(settings);
             modifiedBuild = false;
-            refreshProjectCompletionIndexNow("compilerRecreated");
+            refreshCompletionIndexForCompilerRecreated();
         }
         return cacheCompiler;
     }
@@ -100,81 +97,160 @@ class JavaLanguageServer extends LanguageServer {
         if (modifiedBuild) {
             return true;
         }
-        if (!settings.equals(cacheSettings)) {
+        var currentCompilerSettings = compilerSettingsSnapshot(settings);
+        if (!currentCompilerSettings.equals(cacheSettings)) {
             LOG.info("Settings\n\t" + settings + "\nis different than\n\t" + cacheSettings);
             return true;
         }
         return false;
     }
 
-    void lint(Collection<Path> files) {
-        cancelPendingDiagnostics("foreground");
-        var selection = selectDiagnosticsCompiler();
-        lint(files, selection.compiler, "foreground", -1);
+    private JsonObject compilerSettingsSnapshot(JsonObject source) {
+        var snapshot = new JsonObject();
+        if (source == null) {
+            return snapshot;
+        }
+        copySettingIfPresent(source, snapshot, "externalDependencies");
+        copySettingIfPresent(source, snapshot, "classPath");
+        copySettingIfPresent(source, snapshot, "extraCompilerArgs");
+        copySettingIfPresent(source, snapshot, "docPath");
+        copySettingIfPresent(source, snapshot, "addExports");
+        copySettingIfPresent(source, snapshot, "lombokEnabled");
+        copySettingIfPresent(source, snapshot, "lombok.enabled");
+        copySettingIfPresent(source, snapshot, "lombok");
+        return snapshot;
     }
 
-    private void lint(
+    private void copySettingIfPresent(JsonObject source, JsonObject target, String key) {
+        if (!source.has(key)) {
+            return;
+        }
+        target.add(key, source.get(key).deepCopy());
+    }
+
+    private void refreshCompletionIndexForCompilerRecreated() {
+        var active = FileStore.activeDocuments();
+        if (!active.isEmpty()) {
+            refreshCompletionIndexNow(active, "compilerRecreated");
+            return;
+        }
+        scheduleProjectCompletionIndexRefresh("compilerRecreated", COMPLETION_INDEX_DEBOUNCE_MS);
+    }
+
+    void lint(Collection<Path> files) {
+        cancelPendingDiagnostics("foreground");
+        cancelPendingCompletionIndex("foreground");
+        var selection = selectDiagnosticsCompiler();
+        compileAndPublish(files, selection.compiler, "foreground", -1, false);
+    }
+
+    private void compileAndPublish(
             Collection<Path> files,
             JavaCompilerService diagnosticsCompiler,
             String trigger,
-            long expectedRevision) {
-        if (files.isEmpty()) return;
-        LOG.info("Lint " + files.size() + " files...");
-        var started = Instant.now();
-        CompileTask task = null;
-        try {
-            task = diagnosticsCompiler.compile(files.toArray(Path[]::new));
-            var compiled = Instant.now();
-            LOG.info(
-                    String.format(
-                            "[perf] diagnostics_compile trigger=%s files=%d took=%dms",
-                            trigger, files.size(), Duration.between(started, compiled).toMillis()));
-            if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "post_compile")) {
-                return;
+            long expectedRevision,
+            boolean updateCompletionIndex) {
+        var waitStarted = Instant.now();
+        synchronized (diagnosticsCompileMutex) {
+            var waited = Duration.between(waitStarted, Instant.now()).toMillis();
+            if (waited > 0) {
+                LOG.info(
+                        String.format(
+                                "[perf] diagnostics_compile_wait trigger=%s waited=%dms",
+                                trigger, waited));
             }
-            verifyLombokSymbols(task, "diagnostics");
-            var publishStarted = Instant.now();
-            if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "pre_publish")) {
-                return;
-            }
-            var diagnosticsCount = 0;
-            var publishedUris = new HashSet<java.net.URI>();
-            for (var errs : new ErrorProvider(task).errors()) {
-                if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "publish_loop")) {
+            var javaFiles = normalizeJavaFiles(files);
+            if (javaFiles.isEmpty()) return;
+            LOG.info("Lint " + javaFiles.size() + " files...");
+            var started = Instant.now();
+            CompileTask task = null;
+            try {
+                task = diagnosticsCompiler.compile(javaFiles.toArray(Path[]::new));
+                var compiled = Instant.now();
+                LOG.info(
+                        String.format(
+                                "[perf] diagnostics_compile trigger=%s files=%d took=%dms",
+                                trigger, javaFiles.size(), Duration.between(started, compiled).toMillis()));
+                if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "post_compile")) {
                     return;
                 }
-                client.publishDiagnostics(errs);
-                diagnosticsCount += errs.diagnostics.size();
-                publishedUris.add(errs.uri);
-            }
-            // Always clear diagnostics for requested files that did not produce any root in this compile.
-            for (var file : files) {
-                if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "publish_clear_loop")) {
+                verifyLombokSymbols(task, "diagnostics");
+                if (updateCompletionIndex) {
+                    var indexStarted = Instant.now();
+                    var nextIndex = TypeMemberIndex.from(task);
+                    if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "post_index_build")) {
+                        return;
+                    }
+                    var indexVersion = nextIndexVersion();
+                    installTypeMemberIndex(
+                            nextIndex,
+                            indexVersion,
+                            "index:" + trigger,
+                            Duration.between(indexStarted, Instant.now()));
+                    LOG.info(
+                            String.format(
+                                    "[perf] completion_index_refresh_shared trigger=%s files=%d version=%d took=%dms",
+                                    trigger,
+                                    javaFiles.size(),
+                                    indexVersion,
+                                    Duration.between(indexStarted, Instant.now()).toMillis()));
+                    if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "post_index_install")) {
+                        return;
+                    }
+                }
+                var publishStarted = Instant.now();
+                if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "pre_publish")) {
                     return;
                 }
-                if (!FileStore.isJavaFile(file)) continue;
-                var uri = file.toUri();
-                if (publishedUris.contains(uri)) continue;
-                client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
-            }
-            for (var colors : new ColorProvider(task).colors()) {
-                client.customNotification("java/colors", GSON.toJsonTree(colors));
-            }
-            LOG.info(
-                    String.format(
-                            "[perf] diagnostics_publish trigger=%s files=%d diagnostics=%d took=%dms",
-                            trigger,
-                            files.size(),
-                            diagnosticsCount,
-                            Duration.between(publishStarted, Instant.now()).toMillis()));
-            if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "post_publish")) {
-                return;
-            }
-        } finally {
-            if (task != null) {
-                task.close();
+                var diagnosticsCount = 0;
+                var publishedUris = new HashSet<java.net.URI>();
+                for (var errs : new ErrorProvider(task).errors()) {
+                    if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "publish_loop")) {
+                        return;
+                    }
+                    client.publishDiagnostics(errs);
+                    diagnosticsCount += errs.diagnostics.size();
+                    publishedUris.add(errs.uri);
+                }
+                // Always clear diagnostics for requested files that did not produce any root in this compile.
+                for (var file : javaFiles) {
+                    if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "publish_clear_loop")) {
+                        return;
+                    }
+                    if (!FileStore.isJavaFile(file)) continue;
+                    var uri = file.toUri();
+                    if (publishedUris.contains(uri)) continue;
+                    client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
+                }
+                for (var colors : new ColorProvider(task).colors()) {
+                    client.customNotification("java/colors", GSON.toJsonTree(colors));
+                }
+                LOG.info(
+                        String.format(
+                                "[perf] diagnostics_publish trigger=%s files=%d diagnostics=%d took=%dms",
+                                trigger,
+                                javaFiles.size(),
+                                diagnosticsCount,
+                                Duration.between(publishStarted, Instant.now()).toMillis()));
+                if (shouldSkipStaleDiagnostics(expectedRevision, trigger, "post_publish")) {
+                    return;
+                }
+            } finally {
+                if (task != null) {
+                    task.close();
+                }
             }
         }
+    }
+
+    private List<Path> normalizeJavaFiles(Collection<Path> files) {
+        var javaFiles = new ArrayList<Path>();
+        for (var file : files) {
+            if (FileStore.isJavaFile(file)) {
+                javaFiles.add(file);
+            }
+        }
+        return javaFiles;
     }
 
     private void installTypeMemberIndex(
@@ -197,12 +273,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void refreshCompletionIndexNow(Collection<Path> files, String trigger) {
-        var javaFiles = new ArrayList<Path>();
-        for (var file : files) {
-            if (FileStore.isJavaFile(file)) {
-                javaFiles.add(file);
-            }
-        }
+        var javaFiles = normalizeJavaFiles(files);
         if (javaFiles.isEmpty()) {
             return;
         }
@@ -251,12 +322,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void scheduleCompletionIndexRefresh(Collection<Path> files, String trigger, long delayMs) {
-        var javaFiles = new ArrayList<Path>();
-        for (var file : files) {
-            if (FileStore.isJavaFile(file)) {
-                javaFiles.add(file);
-            }
-        }
+        var javaFiles = normalizeJavaFiles(files);
         if (javaFiles.isEmpty()) {
             return;
         }
@@ -335,9 +401,10 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void scheduleDiagnostics(Collection<Path> files, String trigger, long delayMs) {
-        if (files.isEmpty()) return;
+        var javaFiles = normalizeJavaFiles(files);
+        if (javaFiles.isEmpty()) return;
         var revision = diagnosticsRevision.incrementAndGet();
-        var filesBatch = List.copyOf(files);
+        var filesBatch = List.copyOf(javaFiles);
         synchronized (this) {
             if (pendingDiagnostics != null) {
                 pendingDiagnostics.cancel(false);
@@ -350,8 +417,8 @@ class JavaLanguageServer extends LanguageServer {
         }
         LOG.info(
                 String.format(
-                        "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms",
-                        trigger, filesBatch.size(), delayMs));
+                        "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms revision=%d",
+                        trigger, filesBatch.size(), delayMs, revision));
     }
 
     private void cancelPendingDiagnostics(String reason) {
@@ -373,11 +440,44 @@ class JavaLanguageServer extends LanguageServer {
         }
         var selection = selectDiagnosticsCompiler();
         try {
-            lint(files, selection.compiler, "async:" + trigger, revision);
+            compileAndPublish(files, selection.compiler, "async:" + trigger, revision, false);
         } catch (Exception e) {
             LOG.warning("Async lint failed for " + files + ": " + e.getMessage());
             LOG.log(java.util.logging.Level.FINE, "", e);
         }
+    }
+
+    private void preparseActiveDocument(Path file, String trigger) {
+        try {
+            var interactive = compiler();
+            interactive.parse(file);
+            var parsedCompilers = 1;
+            if (cacheDiagnosticsCompilerPrimary != null && cacheDiagnosticsCompilerPrimary != interactive) {
+                cacheDiagnosticsCompilerPrimary.parse(file);
+                parsedCompilers++;
+            }
+            LOG.fine(
+                    String.format(
+                            "[perf] parse_lifecycle trigger=%s file=%s compilers=%d",
+                            trigger, file.getFileName(), parsedCompilers));
+        } catch (RuntimeException e) {
+            LOG.fine(
+                    String.format(
+                            "[perf] parse_lifecycle trigger=%s file=%s status=failed reason=%s",
+                            trigger, file.getFileName(), e.getMessage()));
+        }
+    }
+
+    private void cancelPendingCompletionIndex(String reason) {
+        synchronized (this) {
+            if (pendingCompletionIndex == null) {
+                return;
+            }
+            completionIndexRevision.incrementAndGet();
+            pendingCompletionIndex.cancel(false);
+            pendingCompletionIndex = null;
+        }
+        LOG.info("[perf] completion_index_cancel reason=" + reason);
     }
 
     private boolean shouldSkipStaleDiagnostics(long expectedRevision, String trigger, String phase) {
@@ -440,13 +540,27 @@ class JavaLanguageServer extends LanguageServer {
     private boolean hasLombokAnnotation(ClassTree cls) {
         for (var annotation : cls.getModifiers().getAnnotations()) {
             var annotationType = annotation.getAnnotationType().toString();
-            if (annotationType.startsWith("lombok.")
-                    || annotationType.startsWith("lombok")
-                    || KNOWN_LOMBOK_ANNOTATIONS.contains(annotationType)) {
+            if (isLombokAnnotationType(annotationType)) {
+                LOG.fine("[perf] lombok_annotation_match type=" + annotationType);
                 return true;
             }
         }
         return false;
+    }
+
+    static boolean isLombokAnnotationType(String annotationType) {
+        if (annotationType == null || annotationType.isBlank()) {
+            return false;
+        }
+        if (annotationType.startsWith("lombok.")) {
+            return true;
+        }
+        var simpleName = annotationType;
+        var lastDot = annotationType.lastIndexOf('.');
+        if (lastDot >= 0 && lastDot + 1 < annotationType.length()) {
+            simpleName = annotationType.substring(lastDot + 1);
+        }
+        return KNOWN_LOMBOK_ANNOTATIONS.contains(simpleName);
     }
 
     private Set<String> expectedLombokMethodNames(ClassTree cls) {
@@ -475,11 +589,13 @@ class JavaLanguageServer extends LanguageServer {
                     "Setter",
                     "Builder",
                     "Value",
+                    "SuperBuilder",
                     "AllArgsConstructor",
                     "NoArgsConstructor",
                     "RequiredArgsConstructor",
                     "ToString",
                     "EqualsAndHashCode",
+                    "With",
                     "Slf4j");
 
     private void javaStartProgress(JavaStartProgressParams params) {
@@ -715,23 +831,53 @@ class JavaLanguageServer extends LanguageServer {
         for (var c : params.changes) {
             var file = Paths.get(c.uri);
             if (FileStore.isJavaFile(file)) {
+                var activeDocuments = FileStore.activeDocuments();
+                var activeJavaDocument = activeDocuments.contains(file);
+                var suppressActiveDocumentWork = activeJavaDocument && c.type != FileChangeType.Deleted;
                 switch (c.type) {
                     case FileChangeType.Created:
-                        FileStore.externalCreate(file);
-                        scheduleProjectCompletionIndexRefresh("didChangeWatchedFiles:javaCreated", 0);
+                        // Some clients report save-on-open-file as "Created" for an existing path.
+                        // Treat that as a normal change to avoid full project refresh churn.
+                        if (activeJavaDocument || Files.exists(file)) {
+                            FileStore.externalChange(file);
+                            if (suppressActiveDocumentWork) {
+                                LOG.info(
+                                        "[perf] watched_java_change_skip reason=active_document event=created file="
+                                                + file);
+                            } else {
+                                scheduleCompletionIndexRefresh(
+                                        List.of(file), "didChangeWatchedFiles:javaCreatedExisting");
+                            }
+                        } else {
+                            FileStore.externalCreate(file);
+                            scheduleProjectCompletionIndexRefresh(
+                                    "didChangeWatchedFiles:javaCreated", 0);
+                        }
                         break;
                     case FileChangeType.Changed:
                         FileStore.externalChange(file);
-                        scheduleCompletionIndexRefresh(
-                                List.of(file), "didChangeWatchedFiles:javaChanged");
+                        if (suppressActiveDocumentWork) {
+                            LOG.info(
+                                    "[perf] watched_java_change_skip reason=active_document event=changed file="
+                                            + file);
+                        } else {
+                            scheduleCompletionIndexRefresh(
+                                    List.of(file), "didChangeWatchedFiles:javaChanged");
+                        }
                         break;
                     case FileChangeType.Deleted:
                         FileStore.externalDelete(file);
                         scheduleProjectCompletionIndexRefresh("didChangeWatchedFiles:javaDeleted", 0);
                         break;
                 }
-                if (!FileStore.activeDocuments().isEmpty()) {
-                    scheduleDiagnostics(FileStore.activeDocuments(), "didChangeWatchedFiles");
+                if (!activeDocuments.isEmpty()) {
+                    if (suppressActiveDocumentWork) {
+                        LOG.info(
+                                "[perf] diagnostics_watched_skip reason=active_document file="
+                                        + file);
+                    } else {
+                        scheduleDiagnostics(activeDocuments, "didChangeWatchedFiles");
+                    }
                 }
                 return;
             }
@@ -760,7 +906,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public CompletionItem resolveCompletionItem(CompletionItem unresolved) {
-        new HoverProvider(compiler()).resolveCompletionItem(unresolved);
+        new HoverProvider(compiler(), completionIndexRef.get()).resolveCompletionItem(unresolved);
         return unresolved;
     }
 
@@ -771,7 +917,7 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
-        var content = new HoverProvider(compiler()).hover(file, line, column);
+        var content = new HoverProvider(compiler(), completionIndexRef.get()).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
         }
@@ -796,7 +942,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var found = new DefinitionProvider(compiler(), file, line, column).find();
+        var found = new DefinitionProvider(compiler(), completionIndexRef.get(), file, line, column).find();
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -976,15 +1122,18 @@ class JavaLanguageServer extends LanguageServer {
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isJavaFile(params.textDocument.uri)) return;
-        scheduleDiagnostics(List.of(Paths.get(params.textDocument.uri)), "didOpen");
+        var file = Paths.get(params.textDocument.uri);
+        preparseActiveDocument(file, "didOpen");
+        scheduleDiagnostics(List.of(file), "didOpen");
     }
 
     @Override
     public void didChangeTextDocument(DidChangeTextDocumentParams params) {
         FileStore.change(params);
-        if (FileStore.isJavaFile(params.textDocument.uri)) {
-            scheduleDiagnostics(List.of(Paths.get(params.textDocument.uri)), "didChange");
-        }
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return;
+        var file = Paths.get(params.textDocument.uri);
+        preparseActiveDocument(file, "didChange");
+        scheduleDiagnostics(List.of(file), "didChange");
     }
 
     @Override
@@ -1010,9 +1159,14 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isJavaFile(params.textDocument.uri)) {
-            // Re-lint all active documents
-            scheduleDiagnostics(FileStore.activeDocuments(), "didSave", 0);
-            scheduleCompletionIndexRefresh(List.of(Paths.get(params.textDocument.uri)), "didSave", 0);
+            diagnosticsRevision.incrementAndGet();
+            cancelPendingDiagnostics("didSave");
+            cancelPendingCompletionIndex("didSave");
+            var files = new LinkedHashSet<Path>();
+            files.addAll(FileStore.activeDocuments());
+            files.add(Paths.get(params.textDocument.uri));
+            var selection = selectDiagnosticsCompiler();
+            compileAndPublish(files, selection.compiler, "didSave", -1, true);
         }
     }
 

@@ -8,15 +8,34 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
+import org.javacs.lsp.DidChangeTextDocumentParams;
+import org.javacs.lsp.DidChangeWatchedFilesParams;
 import org.javacs.lsp.DidSaveTextDocumentParams;
+import org.javacs.lsp.Diagnostic;
+import org.javacs.lsp.DiagnosticSeverity;
+import org.javacs.lsp.FileChangeType;
+import org.javacs.lsp.FileEvent;
+import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.Position;
+import org.javacs.lsp.PublishDiagnosticsParams;
+import org.javacs.lsp.ShowMessageParams;
 import org.javacs.lsp.TextDocumentIdentifier;
+import org.javacs.lsp.TextDocumentContentChangeEvent;
 import org.javacs.lsp.TextDocumentPositionParams;
 import org.javacs.lsp.TextDocumentItem;
 import org.junit.Assert;
@@ -75,6 +94,143 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didSaveCompilesOnceAndRefreshesIndexFromSharedResult() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        Thread.sleep(900);
+
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var before = completionIndexVersion(server);
+            CompileBatch.resetPerfCounters();
+
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = file.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = text + "\n// force-save-compile";
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Thread.sleep(80);
+            var save = new DidSaveTextDocumentParams();
+            save.textDocument = new TextDocumentIdentifier(file.toUri());
+            server.didSaveTextDocument(save);
+            var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
+            Assert.assertTrue("didSave should refresh completion index", updated);
+
+            Thread.sleep(300);
+            Assert.assertEquals(
+                    "didSave should compile diagnostics exactly once",
+                    1,
+                    capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
+            Assert.assertEquals(
+                    "didSave should rebuild completion index from the same compile",
+                    1,
+                    capture.countContaining("[perf] completion_index_refresh_shared trigger=didSave"));
+            Assert.assertEquals(
+                    "didSave should run one semantic compile",
+                    1L,
+                    CompileBatch.perfCounters().analyzeInvocations);
+            Assert.assertEquals(
+                    "pending didChange diagnostics should be canceled by save",
+                    0,
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange"));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void lombokAnnotationTypeDetectionHandlesQualifiedAndSimpleNames() {
+        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("lombok.Data"));
+        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("lombok.experimental.SuperBuilder"));
+        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("Data"));
+        Assert.assertTrue(JavaLanguageServer.isLombokAnnotationType("Getter"));
+
+        Assert.assertFalse(JavaLanguageServer.isLombokAnnotationType(null));
+        Assert.assertFalse(JavaLanguageServer.isLombokAnnotationType(""));
+        Assert.assertFalse(JavaLanguageServer.isLombokAnnotationType("org.example.Custom"));
+    }
+
+    @Test
+    public void lombokConsumerDiagnosticsRemainResolvedBeforeAndAfterModelSave() throws Exception {
+        var client = new RecordingDiagnosticsClient();
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+
+        var serviceFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        var modelFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/model/ReproTxn.java");
+
+        var serviceOpen = new DidOpenTextDocumentParams();
+        serviceOpen.textDocument.uri = serviceFile.toUri();
+        serviceOpen.textDocument.version = 1;
+        serviceOpen.textDocument.languageId = "java";
+        serviceOpen.textDocument.text = Files.readString(serviceFile);
+        try {
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "expected consumer compile set to include referenced Lombok model",
+                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=2") > 0);
+
+            var modelOpen = new DidOpenTextDocumentParams();
+            modelOpen.textDocument.uri = modelFile.toUri();
+            modelOpen.textDocument.version = 1;
+            modelOpen.textDocument.languageId = "java";
+            modelOpen.textDocument.text = Files.readString(modelFile);
+            server.didOpenTextDocument(modelOpen);
+
+            var modelSave = new DidSaveTextDocumentParams();
+            modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
+            server.didSaveTextDocument(modelSave);
+
+            var changed = new FileEvent();
+            changed.uri = modelFile.toUri();
+            changed.type = FileChangeType.Changed;
+            var watched = new DidChangeWatchedFilesParams();
+            watched.changes = List.of(changed);
+            server.didChangeWatchedFiles(watched);
+
+            Assert.assertTrue(
+                    "expected Lombok member diagnostics to stay resolved after model save",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
     public void completionUsesCurrentIndexEvenAfterUnsavedVersionChange() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
@@ -86,6 +242,9 @@ public class JavaLanguageServerTest {
         open.textDocument.languageId = "java";
         open.textDocument.text = original;
         server.didOpenTextDocument(open);
+        Assert.assertTrue(
+                "expected completion index to initialize before unsaved-change check",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
 
         var broken = original.replace("this.", "this.\n");
         var change = new org.javacs.lsp.DidChangeTextDocumentParams();
@@ -107,7 +266,214 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void completionRequestDoesNotInvokeCompileBatch() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+
+        Thread.sleep(1200);
+        CompileBatch.resetPerfCounters();
+
+        var completion =
+                server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+        Assert.assertTrue(completion.isPresent());
+        Assert.assertEquals(
+                "completion should not invoke semantic compile",
+                0L,
+                CompileBatch.perfCounters().analyzeInvocations);
+    }
+
+    @Test
+    public void compileAndPublishSerializesConcurrentDiagnosticsCompiles() throws Exception {
+        var workspace = Files.createTempDirectory("jls-compile-lock");
+        var a = workspace.resolve("A.java");
+        var b = workspace.resolve("B.java");
+        Files.writeString(a, "class A {}\n");
+        Files.writeString(b, "class B {}\n");
+
+        var server = new JavaLanguageServer(new RecordingDiagnosticsClient());
+        setLombokVerifyBypass(server);
+        var compiler = new ConcurrencyTrackingCompiler();
+
+        var start = new CountDownLatch(1);
+        var done = new CountDownLatch(2);
+        var failure = new AtomicReference<Throwable>();
+
+        var t1 =
+                new Thread(
+                        () -> {
+                            try {
+                                start.await(2, TimeUnit.SECONDS);
+                                invokeCompileAndPublish(server, List.of(a), compiler, "foreground");
+                            } catch (Throwable t) {
+                                failure.compareAndSet(null, t);
+                            } finally {
+                                done.countDown();
+                            }
+                        },
+                        "compile-test-1");
+
+        var t2 =
+                new Thread(
+                        () -> {
+                            try {
+                                start.await(2, TimeUnit.SECONDS);
+                                invokeCompileAndPublish(server, List.of(b), compiler, "foreground");
+                            } catch (Throwable t) {
+                                failure.compareAndSet(null, t);
+                            } finally {
+                                done.countDown();
+                            }
+                        },
+                        "compile-test-2");
+
+        t1.start();
+        t2.start();
+        start.countDown();
+
+        Assert.assertTrue("both compile tasks should complete", done.await(5, TimeUnit.SECONDS));
+        if (failure.get() != null) {
+            throw new AssertionError("concurrent compile call failed", failure.get());
+        }
+        Assert.assertEquals(
+                "compileAndPublish should not overlap diagnostics compiler usage",
+                1,
+                compiler.maxConcurrentCompiles());
+
+        deleteRecursively(workspace);
+    }
+
+    @Test
+    public void parseLifecycleParsesOnOpenAndChangeThenReusesForRequestsAndSave() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        var compiler = server.compiler();
+        var opened = compiler.parsedUnits.get(file);
+        Assert.assertNotNull("didOpen should parse and store AST", opened);
+        var openedRoot = opened.task.root;
+
+        var firstCompletion =
+                server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+        Assert.assertTrue(firstCompletion.isPresent());
+        server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
+
+        var afterOpenRequests = compiler.parsedUnits.get(file);
+        Assert.assertNotNull(afterOpenRequests);
+        Assert.assertSame(
+                "completion/hover should reuse didOpen parse result when text is unchanged",
+                openedRoot,
+                afterOpenRequests.task.root);
+
+        var save = new DidSaveTextDocumentParams();
+        save.textDocument = new TextDocumentIdentifier(file.toUri());
+        server.didSaveTextDocument(save);
+
+        var afterSave = compiler.parsedUnits.get(file);
+        Assert.assertNotNull(afterSave);
+        Assert.assertSame(
+                "didSave should reuse existing parse result when there is no text change",
+                openedRoot,
+                afterSave.task.root);
+
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = file.toUri();
+        change.textDocument.version = 2;
+        var delta = new TextDocumentContentChangeEvent();
+        delta.text = text + "\n// parse-lifecycle-change";
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
+
+        var changed = compiler.parsedUnits.get(file);
+        Assert.assertNotNull("didChange should refresh parsed unit", changed);
+        Assert.assertNotSame(
+                "didChange should reparse when text changes", openedRoot, changed.task.root);
+        var changedRoot = changed.task.root;
+
+        var secondCompletion =
+                server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+        Assert.assertTrue(secondCompletion.isPresent());
+        server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
+
+        var afterChangeRequests = compiler.parsedUnits.get(file);
+        Assert.assertNotNull(afterChangeRequests);
+        Assert.assertSame(
+                "completion/hover should reuse didChange parse result until next edit",
+                changedRoot,
+                afterChangeRequests.task.root);
+    }
+
+    @Test
     public void concurrentCompilerCallsAfterSettingsChangeRecreateCompilerOnce() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var extraCompilerArgs = new com.google.gson.JsonArray();
+            extraCompilerArgs.add("-Xlint:deprecation");
+            java.add("extraCompilerArgs", extraCompilerArgs);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            var workers = 6;
+            var ready = new CountDownLatch(workers);
+            var start = new CountDownLatch(1);
+            var done = new CountDownLatch(workers);
+            var failures = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
+
+            for (int i = 0; i < workers; i++) {
+                var t =
+                        new Thread(
+                                () -> {
+                                    try {
+                                        ready.countDown();
+                                        start.await(5, TimeUnit.SECONDS);
+                                        server.compiler();
+                                    } catch (Throwable e) {
+                                        failures.add(e);
+                                    } finally {
+                                        done.countDown();
+                                    }
+                                },
+                                "compiler-race-" + i);
+                t.start();
+            }
+
+            Assert.assertTrue("workers were not ready in time", ready.await(5, TimeUnit.SECONDS));
+            start.countDown();
+            Assert.assertTrue("workers did not finish in time", done.await(60, TimeUnit.SECONDS));
+            Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
+
+            Assert.assertEquals(
+                    "settings change should recreate compiler exactly once under concurrency",
+                    1,
+                    capture.countContaining("[perf] lombok_setting enabled="));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void nonCompilerSettingsDoNotRecreateCompiler() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var before = completionIndexVersion(server);
 
@@ -122,46 +488,271 @@ public class JavaLanguageServerTest {
         change.settings = settings;
         server.didChangeConfiguration(change);
 
-        var workers = 6;
-        var ready = new CountDownLatch(workers);
-        var start = new CountDownLatch(1);
-        var done = new CountDownLatch(workers);
-        var failures = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
-
-        for (int i = 0; i < workers; i++) {
-            var t =
-                    new Thread(
-                            () -> {
-                                try {
-                                    ready.countDown();
-                                    start.await(5, TimeUnit.SECONDS);
-                                    server.compiler();
-                                } catch (Throwable e) {
-                                    failures.add(e);
-                                } finally {
-                                    done.countDown();
-                                }
-                            },
-                            "compiler-race-" + i);
-            t.start();
-        }
-
-        Assert.assertTrue("workers were not ready in time", ready.await(5, TimeUnit.SECONDS));
-        start.countDown();
-        Assert.assertTrue("workers did not finish in time", done.await(60, TimeUnit.SECONDS));
-        Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
-
+        server.compiler();
         var after = completionIndexVersion(server);
         Assert.assertEquals(
-                "settings change should recreate compiler exactly once under concurrency",
-                before + 1,
+                "non-compiler Java settings should not recreate compiler",
+                before,
                 after);
+    }
+
+    @Test
+    public void compilerRecreatedRefreshUsesActiveFilesForSyncPass() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var extraCompilerArgs = new com.google.gson.JsonArray();
+            extraCompilerArgs.add("-Xlint:deprecation");
+            java.add("extraCompilerArgs", extraCompilerArgs);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            server.compiler();
+            var line = capture.lastLineContaining("completion_index_refresh_sync trigger=compilerRecreated");
+            Assert.assertTrue("expected compilerRecreated sync index refresh log", line != null);
+            Assert.assertTrue(
+                    "sync compilerRecreated refresh should use active files only, line=" + line,
+                    line.matches(".*files=1\\b.*"));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void startupCompilerRecreatedRefreshIsDeferredWhenNoActiveDocs() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server =
+                    new JavaLanguageServer(
+                            new org.javacs.lsp.LanguageClient() {
+                                @Override
+                                public void publishDiagnostics(org.javacs.lsp.PublishDiagnosticsParams params) {}
+
+                                @Override
+                                public void showMessage(org.javacs.lsp.ShowMessageParams params) {}
+
+                                @Override
+                                public void registerCapability(
+                                        String method, com.google.gson.JsonElement options) {}
+
+                                @Override
+                                public void customNotification(
+                                        String method, com.google.gson.JsonElement params) {}
+                            });
+            var init = new org.javacs.lsp.InitializeParams();
+            init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+            server.initialize(init);
+            server.initialized();
+
+            var syncLine =
+                    capture.lastLineContaining(
+                            "completion_index_refresh_sync trigger=compilerRecreated");
+            Assert.assertTrue(
+                    "startup should not do synchronous full refresh when no active docs",
+                    syncLine == null);
+
+            var debounceLine =
+                    capture.lastLineContaining(
+                            "completion_index_debounce trigger=compilerRecreated");
+            Assert.assertTrue(
+                    "startup should schedule deferred compilerRecreated refresh", debounceLine != null);
+
+            server.shutdown();
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void didChangeDiagnosticsAreCoalescedWithLongerDebounce() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        Thread.sleep(900);
+
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            for (int i = 0; i < 5; i++) {
+                var change = new DidChangeTextDocumentParams();
+                change.textDocument.uri = file.toUri();
+                change.textDocument.version = 2 + i;
+                var delta = new TextDocumentContentChangeEvent();
+                delta.text = text + "\n// debounce-change-" + i;
+                change.contentChanges.add(delta);
+                server.didChangeTextDocument(change);
+                Thread.sleep(35);
+            }
+
+            Thread.sleep(1200);
+            Assert.assertEquals(
+                    "rapid didChange burst should compile diagnostics exactly once after debounce",
+                    1,
+                    capture.countContaining("diagnostics_compile trigger=async:didChange"));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void didSaveCancelsPendingDidChangeDiagnostics() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        Thread.sleep(900);
+
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = file.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = text + "\n// pending-diagnostics-change";
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Thread.sleep(80);
+            var save = new DidSaveTextDocumentParams();
+            save.textDocument = new TextDocumentIdentifier(file.toUri());
+            server.didSaveTextDocument(save);
+
+            Thread.sleep(900);
+            Assert.assertEquals(
+                    "save should cancel pending async didChange diagnostics compile",
+                    0,
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange"));
+            Assert.assertEquals(
+                    "save should compile diagnostics immediately once",
+                    1,
+                    capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void watchedCreatedForActiveJavaFileSkipsDuplicateWork() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        Thread.sleep(700);
+
+        var logger = Logger.getLogger("main");
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var created = new FileEvent();
+            created.uri = file.toUri();
+            created.type = FileChangeType.Created;
+            var watched = new DidChangeWatchedFilesParams();
+            watched.changes = List.of(created);
+            server.didChangeWatchedFiles(watched);
+
+            Thread.sleep(250);
+            Assert.assertEquals(
+                    "active-doc watched create should not trigger full-project index refresh",
+                    0,
+                    capture.countContaining(
+                            "[perf] completion_index_debounce trigger=didChangeWatchedFiles:javaCreated "));
+            Assert.assertEquals(
+                    "active-doc watched create should not trigger diagnostics debounce",
+                    0,
+                    capture.countContaining(
+                            "[perf] diagnostics_debounce trigger=didChangeWatchedFiles"));
+            Assert.assertTrue(
+                    "expected skip log for active-doc watched create",
+                    capture.lastLineContaining(
+                                    "[perf] watched_java_change_skip reason=active_document event=created")
+                            != null);
+        } finally {
+            logger.removeHandler(capture);
+        }
     }
 
     private long completionIndexVersion(JavaLanguageServer server) throws Exception {
         var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
         field.setAccessible(true);
         return ((AtomicLong) field.get(server)).get();
+    }
+
+    private void invokeCompileAndPublish(
+            JavaLanguageServer server, List<Path> files, JavaCompilerService compiler, String trigger)
+            throws Exception {
+        var compileAndPublish =
+                JavaLanguageServer.class.getDeclaredMethod(
+                        "compileAndPublish",
+                        java.util.Collection.class,
+                        JavaCompilerService.class,
+                        String.class,
+                        long.class,
+                        boolean.class);
+        compileAndPublish.setAccessible(true);
+        compileAndPublish.invoke(server, files, compiler, trigger, -1L, false);
+    }
+
+    private void setLombokVerifyBypass(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("lombokVerifiedForCurrentCompiler");
+        field.setAccessible(true);
+        field.setBoolean(server, true);
+    }
+
+    private static void deleteRecursively(Path root) throws IOException {
+        try (var walk = Files.walk(root)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(
+                            path -> {
+                                try {
+                                    Files.deleteIfExists(path);
+                                } catch (IOException ignored) {
+                                }
+                            });
+        }
     }
 
     private boolean awaitCompletionIndexAdvance(
@@ -174,5 +765,155 @@ public class JavaLanguageServerTest {
             Thread.sleep(20);
         }
         return false;
+    }
+
+    private static boolean containsAny(String text, String... needles) {
+        if (text == null) {
+            return false;
+        }
+        for (var needle : needles) {
+            if (text.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static class RecordingDiagnosticsClient implements LanguageClient {
+        private final Map<java.net.URI, List<Diagnostic>> diagnosticsByUri = new ConcurrentHashMap<>();
+        private final AtomicInteger diagnosticsPublishCount = new AtomicInteger();
+
+        @Override
+        public void publishDiagnostics(PublishDiagnosticsParams params) {
+            diagnosticsByUri.put(params.uri, List.copyOf(params.diagnostics));
+            diagnosticsPublishCount.incrementAndGet();
+        }
+
+        @Override
+        public void showMessage(ShowMessageParams params) {}
+
+        @Override
+        public void registerCapability(String method, com.google.gson.JsonElement options) {}
+
+        @Override
+        public void customNotification(String method, com.google.gson.JsonElement params) {}
+
+        boolean awaitErrorMatching(
+                java.net.URI uri,
+                Predicate<Diagnostic> predicate,
+                long timeout,
+                TimeUnit unit)
+                throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (System.nanoTime() < deadline) {
+                if (hasErrorMatching(uri, predicate)) {
+                    return true;
+                }
+                Thread.sleep(25);
+            }
+            return false;
+        }
+
+        boolean awaitNoErrorMatching(
+                java.net.URI uri,
+                Predicate<Diagnostic> predicate,
+                long timeout,
+                TimeUnit unit)
+                throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (System.nanoTime() < deadline) {
+                if (diagnosticsPublishCount.get() > 0 && !hasErrorMatching(uri, predicate)) {
+                    return true;
+                }
+                Thread.sleep(25);
+            }
+            return false;
+        }
+
+        private boolean hasErrorMatching(java.net.URI uri, Predicate<Diagnostic> predicate) {
+            var diagnostics = diagnosticsByUri.get(uri);
+            if (diagnostics == null) {
+                return false;
+            }
+            return diagnostics.stream()
+                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                    .anyMatch(predicate);
+        }
+    }
+
+    private static class TestLogCapture extends Handler {
+        private final java.util.concurrent.CopyOnWriteArrayList<String> lines =
+                new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @Override
+        public void publish(LogRecord record) {
+            if (record == null || record.getLevel().intValue() < Level.INFO.intValue()) {
+                return;
+            }
+            lines.add(record.getMessage());
+        }
+
+        @Override
+        public void flush() {}
+
+        @Override
+        public void close() {}
+
+        String lastLineContaining(String needle) {
+            for (int i = lines.size() - 1; i >= 0; i--) {
+                var line = lines.get(i);
+                if (line != null && line.contains(needle)) {
+                    return line;
+                }
+            }
+            return null;
+        }
+
+        int countContaining(String needle) {
+            var count = 0;
+            for (var line : lines) {
+                if (line != null && line.contains(needle)) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        int countMatching(String pattern) {
+            var count = 0;
+            for (var line : lines) {
+                if (line != null && line.matches(pattern)) {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+
+    private static class ConcurrencyTrackingCompiler extends JavaCompilerService {
+        private final AtomicInteger inFlight = new AtomicInteger();
+        private final AtomicInteger maxInFlight = new AtomicInteger();
+
+        ConcurrencyTrackingCompiler() {
+            super(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), true);
+        }
+
+        @Override
+        public CompileTask compile(Path... files) {
+            var active = inFlight.incrementAndGet();
+            maxInFlight.accumulateAndGet(active, Math::max);
+            try {
+                Thread.sleep(120);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } finally {
+                inFlight.decrementAndGet();
+            }
+            return new CompileTask(null, List.of(), List.of(), Map.of(), () -> {});
+        }
+
+        int maxConcurrentCompiles() {
+            return maxInFlight.get();
+        }
     }
 }

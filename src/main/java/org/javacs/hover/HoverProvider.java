@@ -1,168 +1,370 @@
 package org.javacs.hover;
 
 import com.google.gson.JsonNull;
-import com.sun.source.tree.*;
-import com.sun.source.util.*;
+import com.sun.source.tree.AnnotationTree;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.Tree;
+import com.sun.source.tree.VariableTree;
+import com.sun.source.util.DocTrees;
+import com.sun.source.util.TreePath;
+import com.sun.source.util.Trees;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
+import java.util.Optional;
 import java.util.StringJoiner;
 import java.util.logging.Logger;
-import javax.lang.model.element.*;
-import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FindHelper;
+import org.javacs.FindNameAt;
 import org.javacs.JsonHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
+import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.CompletionItem;
+import org.javacs.lsp.Location;
 import org.javacs.lsp.MarkupContent;
 import org.javacs.lsp.MarkupKind;
+import org.javacs.navigation.DefinitionProvider;
 
 public class HoverProvider {
+    private static final Logger LOG = Logger.getLogger("main");
+
     final CompilerProvider compiler;
+    final TypeMemberIndex completionIndex;
 
     public HoverProvider(CompilerProvider compiler) {
+        this(compiler, TypeMemberIndex.EMPTY);
+    }
+
+    public HoverProvider(CompilerProvider compiler, TypeMemberIndex completionIndex) {
         this.compiler = compiler;
+        this.completionIndex = completionIndex == null ? TypeMemberIndex.EMPTY : completionIndex;
     }
 
     public MarkupContent hover(Path file, int line, int column) {
-        var annotationTypeName = annotationTypeNameAt(file, line, column);
-        try (var task = compiler.compileFastWithProcessors(file)) {
-            var root = task.root(file);
-            if (task.roots.size() > 1) {
-                LOG.fine(String.format("[perf] hover_root_select file=%s roots=%d", file, task.roots.size()));
-            }
-            var position = root.getLineMap().getPosition(line, column);
-            Element element = null;
-            if (annotationTypeName != null) {
-                element = task.task.getElements().getTypeElement(annotationTypeName);
-            }
-            if (element == null) {
-                element = findAnnotationElement(task, root, position);
-            }
-            if (element == null) {
-                element = new FindHoverElement(task.task).scan(root, position);
-            }
-            if (element == null) return null;
-            var docs = docs(task, element);
-            var markdown = new StringBuilder();
-            if (element instanceof TypeElement) {
-                markdown.append(renderTypeHeader((TypeElement) element));
-            } else {
-                var code = printType(element);
-                markdown.append("```java\n").append(code).append("\n```");
-            }
-            if (!docs.isEmpty()) {
-                markdown.append("\n\n---\n\n").append(docs);
-            }
-            return new MarkupContent(MarkupKind.Markdown, markdown.toString());
-        }
-    }
-
-    private Element findAnnotationElement(CompileTask task, CompilationUnitTree root, long cursor) {
-        return new TreePathScanner<Element, Long>() {
-            @Override
-            public Element visitAnnotation(AnnotationTree annotation, Long find) {
-                var positions = Trees.instance(task.task).getSourcePositions();
-                var start = positions.getStartPosition(root, annotation);
-                var end = positions.getEndPosition(root, annotation);
-                if (start <= find && find < end) {
-                    var resolved = resolveAnnotationType(task, root, annotation);
-                    if (resolved != null) {
-                        return resolved;
-                    }
-                }
-                return super.visitAnnotation(annotation, find);
-            }
-
-            @Override
-            public Element reduce(Element left, Element right) {
-                if (left != null) {
-                    return left;
-                }
-                return right;
-            }
-        }.scan(root, cursor);
-    }
-
-    private Element resolveAnnotationType(CompileTask task, CompilationUnitTree root, AnnotationTree annotation) {
-        var trees = Trees.instance(task.task);
-        var typePath = new TreePath(new TreePath(root), annotation.getAnnotationType());
-        var direct = trees.getElement(typePath);
-        if (direct != null) {
-            return direct;
-        }
-        var elements = task.task.getElements();
-        var simpleOrQualified = annotation.getAnnotationType().toString();
-        if (simpleOrQualified.contains(".")) {
-            return elements.getTypeElement(simpleOrQualified);
-        }
-        for (var imp : root.getImports()) {
-            var imported = imp.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + simpleOrQualified)) {
-                var resolved = elements.getTypeElement(imported);
-                if (resolved != null) {
-                    return resolved;
-                }
-            }
-        }
-        var packageName = root.getPackageName();
-        if (packageName != null) {
-            var local = elements.getTypeElement(packageName + "." + simpleOrQualified);
-            if (local != null) {
-                return local;
-            }
-        }
-        return elements.getTypeElement("java.lang." + simpleOrQualified);
-    }
-
-    private String annotationTypeNameAt(Path file, int line, int column) {
         var parse = compiler.parse(file);
-        var root = parse.root;
-        var cursor = root.getLineMap().getPosition(line, column);
-        return new TreePathScanner<String, Long>() {
-            @Override
-            public String visitAnnotation(AnnotationTree annotation, Long find) {
-                var positions = Trees.instance(parse.task).getSourcePositions();
-                var start = positions.getStartPosition(root, annotation);
-                var end = positions.getEndPosition(root, annotation);
-                if (start <= find && find < end) {
-                    return resolveAnnotationTypeName(root, annotation);
-                }
-                return super.visitAnnotation(annotation, find);
-            }
+        var cursor = parse.root.getLineMap().getPosition(line, column);
+        var path = new FindNameAt(parse).scan(parse.root, cursor);
+        if (path == null) {
+            return null;
+        }
 
-            @Override
-            public String reduce(String left, String right) {
-                if (left != null) {
-                    return left;
-                }
-                return right;
+        var symbol = new DefinitionProvider(compiler, completionIndex, file, line, column).resolveSymbol();
+        var fallback = renderFromPath(parse, path);
+        if (symbol.locations().isEmpty()) {
+            var generated = renderGeneratedMember(symbol);
+            if (generated != null) {
+                return generated;
             }
-        }.scan(root, cursor);
+            return fallback;
+        }
+
+        var resolved = resolveLocation(symbol.locations().get(0));
+        if (resolved.isEmpty()) {
+            var generated = renderGeneratedMember(symbol);
+            if (generated != null) {
+                return generated;
+            }
+            return fallback;
+        }
+
+        return renderResolvedDeclaration(resolved.get(), symbol).orElseGet(() -> {
+            var generated = renderGeneratedMember(symbol);
+            if (generated != null) {
+                return generated;
+            }
+            return fallback;
+        });
     }
 
-    private String resolveAnnotationTypeName(CompilationUnitTree root, AnnotationTree annotation) {
-        var simpleOrQualified = annotation.getAnnotationType().toString();
-        if (simpleOrQualified.contains(".")) {
-            return simpleOrQualified;
+    private Optional<ResolvedDeclaration> resolveLocation(Location location) {
+        if (location == null || location.uri == null || !"file".equals(location.uri.getScheme())) {
+            return Optional.empty();
         }
-        for (var imp : root.getImports()) {
-            var imported = imp.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + simpleOrQualified)) {
-                return imported;
+        try {
+            var target = Paths.get(location.uri);
+            var parse = compiler.parse(target);
+            var line = location.range.start.line + 1;
+            var column = location.range.start.character + 1;
+            var cursor = parse.root.getLineMap().getPosition(line, column);
+            var path = new FindNameAt(parse).scan(parse.root, cursor);
+            if (path == null) {
+                return Optional.empty();
+            }
+            return Optional.of(new ResolvedDeclaration(parse, path));
+        } catch (RuntimeException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private Optional<MarkupContent> renderResolvedDeclaration(
+            ResolvedDeclaration resolved, DefinitionProvider.ResolvedSymbol symbol) {
+        var tree = resolved.path().getLeaf();
+        if (tree instanceof ClassTree cls && symbol != null && symbol.method() && symbol.memberName() != null) {
+            var methodPath = findMethodInClass(resolved.parse(), resolved.path(), symbol.memberName());
+            if (methodPath.isPresent()) {
+                tree = methodPath.get().getLeaf();
+                resolved = new ResolvedDeclaration(resolved.parse(), methodPath.get());
+            } else {
+                var generated = renderGeneratedMember(symbol);
+                if (generated != null) {
+                    return Optional.of(generated);
+                }
+            }
+        }
+        var code = renderDeclaration(resolved.parse(), resolved.path(), symbol);
+        if (code == null || code.isBlank()) {
+            return Optional.empty();
+        }
+        var markdown = new StringBuilder();
+        if (tree instanceof ClassTree cls) {
+            markdown.append(renderTypeHeader(resolved.parse(), resolved.path(), cls));
+        } else {
+            markdown.append("```java\n").append(code).append("\n```");
+        }
+        var docs = docs(resolved.parse(), resolved.path());
+        if (!docs.isEmpty()) {
+            markdown.append("\n\n---\n\n").append(docs);
+        }
+        return Optional.of(new MarkupContent(MarkupKind.Markdown, markdown.toString()));
+    }
+
+    private MarkupContent renderFromPath(ParseTask parse, TreePath path) {
+        var tree = path.getLeaf();
+        var code = renderDeclaration(parse, path, null);
+        if (code == null || code.isBlank()) {
+            return null;
+        }
+        var markdown = new StringBuilder();
+        if (tree instanceof ClassTree cls) {
+            markdown.append(renderTypeHeader(parse, path, cls));
+        } else {
+            markdown.append("```java\n").append(code).append("\n```");
+        }
+        var docs = docs(parse, path);
+        if (!docs.isEmpty()) {
+            markdown.append("\n\n---\n\n").append(docs);
+        }
+        return new MarkupContent(MarkupKind.Markdown, markdown.toString());
+    }
+
+    private MarkupContent renderGeneratedMember(DefinitionProvider.ResolvedSymbol symbol) {
+        if (symbol == null) {
+            return null;
+        }
+        var detail = "";
+        if (symbol.indexMember() != null) {
+            var member = symbol.indexMember();
+            detail = member.detail;
+            if (detail == null || detail.isBlank()) {
+                detail = member.name + "()";
+            }
+        } else if (symbol.method() && symbol.memberName() != null && !symbol.memberName().isBlank()) {
+            detail = symbol.memberName() + "()";
+        }
+        if (detail.isBlank()) {
+            return null;
+        }
+        var markdown = new StringBuilder();
+        markdown.append("```java\n").append(detail).append("\n```");
+        if (symbol.qualifiedType() != null && !symbol.qualifiedType().isBlank()) {
+            markdown.append("\n\n").append(symbol.qualifiedType());
+        }
+        return new MarkupContent(MarkupKind.Markdown, markdown.toString());
+    }
+
+    private String renderDeclaration(ParseTask parse, TreePath path, DefinitionProvider.ResolvedSymbol symbol) {
+        var tree = path.getLeaf();
+        if (tree instanceof ClassTree cls) {
+            return classSignature(parse, path, cls);
+        }
+        if (tree instanceof MethodTree method) {
+            return methodSignature(parse, method);
+        }
+        if (tree instanceof VariableTree variable) {
+            var type = variable.getType() == null ? "var" : variable.getType().toString();
+            return type + " " + variable.getName();
+        }
+        if (tree instanceof AnnotationTree annotation) {
+            return annotation.getAnnotationType().toString();
+        }
+        if (symbol != null && symbol.indexMember() != null && symbol.method()) {
+            return symbol.indexMember().detail;
+        }
+        return tree.toString();
+    }
+
+    private String classSignature(ParseTask parse, TreePath classPath, ClassTree cls) {
+        var modifiers = joinModifiers(cls.getModifiers().getFlags().stream().map(Enum::toString).toList());
+        var kind = switch (cls.getKind()) {
+            case ANNOTATION_TYPE -> "@interface";
+            case INTERFACE -> "interface";
+            case ENUM -> "enum";
+            case RECORD -> "record";
+            default -> "class";
+        };
+        var header = new StringBuilder();
+        if (!modifiers.isBlank()) {
+            header.append(modifiers).append(" ");
+        }
+        header.append(kind).append(" ").append(cls.getSimpleName());
+        if (cls.getExtendsClause() != null) {
+            header.append(" extends ").append(cls.getExtendsClause());
+        }
+        if (!cls.getImplementsClause().isEmpty()) {
+            var join = new StringJoiner(", ");
+            for (var implemented : cls.getImplementsClause()) {
+                join.add(implemented.toString());
+            }
+            header.append(" implements ").append(join);
+        }
+        return header.toString();
+    }
+
+    private String methodSignature(ParseTask parse, MethodTree method) {
+        var header = new StringBuilder();
+        var modifiers = joinModifiers(method.getModifiers().getFlags().stream().map(Enum::toString).toList());
+        if (!modifiers.isBlank()) {
+            header.append(modifiers).append(" ");
+        }
+        if (method.getReturnType() != null) {
+            header.append(method.getReturnType()).append(" ");
+        }
+        header.append(method.getName()).append("(");
+        var parameters = new StringJoiner(", ");
+        for (var parameter : method.getParameters()) {
+            var type = parameter.getType() == null ? "var" : parameter.getType().toString();
+            parameters.add(type + " " + parameter.getName());
+        }
+        header.append(parameters).append(")");
+        if (!method.getThrows().isEmpty()) {
+            var thrown = new StringJoiner(", ");
+            for (var thrownType : method.getThrows()) {
+                var resolved = resolveTypeName(parse, thrownType.toString());
+                thrown.add(resolved.orElse(thrownType.toString()));
+            }
+            header.append(" throws ").append(thrown);
+        }
+        return header.toString();
+    }
+
+    private String renderTypeHeader(ParseTask parse, TreePath classPath, ClassTree cls) {
+        var qualifiedName = qualifiedClassName(parse, classPath);
+        var packageName = packageName(qualifiedName);
+        if (packageName.isBlank()) {
+            packageName = "(default package)";
+        }
+        return "**" + packageName + "**\n" + qualifiedName + "\n" + classSignature(parse, classPath, cls);
+    }
+
+    private String qualifiedClassName(ParseTask parse, TreePath classPath) {
+        var names = new ArrayList<String>();
+        for (var cursor = classPath; cursor != null; cursor = cursor.getParentPath()) {
+            if (cursor.getLeaf() instanceof ClassTree cls) {
+                names.add(cls.getSimpleName().toString());
+            }
+        }
+        java.util.Collections.reverse(names);
+        var pkg = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        if (pkg.isBlank()) {
+            return String.join(".", names);
+        }
+        return pkg + "." + String.join(".", names);
+    }
+
+    private String packageName(String qualifiedName) {
+        var i = qualifiedName.lastIndexOf('.');
+        if (i < 0) {
+            return "";
+        }
+        return qualifiedName.substring(0, i);
+    }
+
+    private String docs(ParseTask task, TreePath path) {
+        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+        if (docTree == null) return "";
+        return MarkdownHelper.asMarkdown(docTree);
+    }
+
+    private Optional<TreePath> findMethodInClass(ParseTask parse, TreePath classPath, String methodName) {
+        var classTree = (ClassTree) classPath.getLeaf();
+        for (var member : classTree.getMembers()) {
+            if (!(member instanceof MethodTree method)) continue;
+            if (!method.getName().contentEquals(methodName)) continue;
+            return Optional.of(new TreePath(classPath, method));
+        }
+        return Optional.empty();
+    }
+
+    private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return Optional.empty();
+        }
+        var indexed = completionIndex.resolveTypeName(typeName, parse.root);
+        if (indexed.isPresent()) {
+            return indexed;
+        }
+        var raw = typeName.trim();
+        while (raw.endsWith("[]")) {
+            raw = raw.substring(0, raw.length() - 2);
+        }
+        var genericStart = raw.indexOf('<');
+        if (genericStart >= 0) {
+            raw = raw.substring(0, genericStart);
+        }
+        if (raw.startsWith("? extends ")) {
+            raw = raw.substring("? extends ".length()).trim();
+        } else if (raw.startsWith("? super ")) {
+            raw = raw.substring("? super ".length()).trim();
+        } else if ("?".equals(raw)) {
+            return Optional.empty();
+        }
+        if (raw.isBlank()) {
+            return Optional.empty();
+        }
+        if (TypeMemberIndex.isPrimitiveTypeName(raw)) {
+            return Optional.of(raw);
+        }
+        if (raw.contains(".") && compiler.findAnywhere(raw).isPresent()) {
+            return Optional.of(raw);
+        }
+        var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        if (!packageName.isBlank()) {
+            var candidate = packageName + "." + raw;
+            if (compiler.findAnywhere(candidate).isPresent()) {
+                return Optional.of(candidate);
+            }
+        }
+        for (var importTree : parse.root.getImports()) {
+            if (importTree.isStatic()) continue;
+            var imported = importTree.getQualifiedIdentifier().toString();
+            if (imported.endsWith("." + raw) && compiler.findAnywhere(imported).isPresent()) {
+                return Optional.of(imported);
             }
             if (imported.endsWith(".*")) {
-                return imported.substring(0, imported.length() - 1) + simpleOrQualified;
+                var candidate = imported.substring(0, imported.length() - 1) + raw;
+                if (compiler.findAnywhere(candidate).isPresent()) {
+                    return Optional.of(candidate);
+                }
             }
         }
-        var packageName = root.getPackageName();
-        if (packageName != null) {
-            return packageName + "." + simpleOrQualified;
+        var javaLang = "java.lang." + raw;
+        if (compiler.findAnywhere(javaLang).isPresent()) {
+            return Optional.of(javaLang);
         }
-        return "java.lang." + simpleOrQualified;
+        return Optional.empty();
+    }
+
+    private String joinModifiers(List<String> modifiers) {
+        var join = new StringJoiner(" ");
+        for (var modifier : modifiers) {
+            join.add(modifier);
+        }
+        return join.toString();
     }
 
     public void resolveCompletionItem(CompletionItem item) {
@@ -189,10 +391,8 @@ public class HoverProvider {
         item.documentation = MarkdownHelper.asMarkupContent(docTree);
     }
 
-    // TODO consider showing actual source code instead of just types and names
     private void resolveDetail(CompletionItem item, CompletionData data, Tree tree) {
-        if (tree instanceof MethodTree) {
-            var method = (MethodTree) tree;
+        if (tree instanceof MethodTree method) {
             var parameters = new StringJoiner(", ");
             for (var p : method.getParameters()) {
                 parameters.add(p.getType() + " " + p.getName());
@@ -224,219 +424,5 @@ public class HoverProvider {
         throw new RuntimeException("no className");
     }
 
-    private String docs(CompileTask task, Element element) {
-        if (element instanceof TypeElement) {
-            var type = (TypeElement) element;
-            var className = type.getQualifiedName().toString();
-            var file = compiler.findAnywhere(className);
-            if (file.isEmpty()) return "";
-            var parse = compiler.parse(file.get());
-            var tree = FindHelper.findType(parse, className);
-            return docs(parse, tree);
-        } else if (element.getKind() == ElementKind.FIELD) {
-            var field = (VariableElement) element;
-            var type = (TypeElement) field.getEnclosingElement();
-            var className = type.getQualifiedName().toString();
-            var file = compiler.findAnywhere(className);
-            if (file.isEmpty()) return "";
-            var parse = compiler.parse(file.get());
-            try {
-                var tree = FindHelper.findField(parse, className, field.getSimpleName().toString());
-                return docs(parse, tree);
-            } catch (RuntimeException e) {
-                LOG.fine(String.format("Skip hover docs for unresolved field %s#%s", className, field.getSimpleName()));
-                return "";
-            }
-        } else if (element instanceof ExecutableElement) {
-            var method = (ExecutableElement) element;
-            var type = (TypeElement) method.getEnclosingElement();
-            var className = type.getQualifiedName().toString();
-            var methodName = method.getSimpleName().toString();
-            var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
-            var file = compiler.findAnywhere(className);
-            if (file.isEmpty()) return "";
-            var parse = compiler.parse(file.get());
-            try {
-                var tree = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-                return docs(parse, tree);
-            } catch (RuntimeException e) {
-                LOG.fine(String.format("Skip hover docs for unresolved method %s#%s", className, methodName));
-                return "";
-            }
-        } else {
-            return "";
-        }
-    }
-
-    private String docs(ParseTask task, Tree tree) {
-        var path = Trees.instance(task.task).getPath(task.root, tree);
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
-        if (docTree == null) return "";
-        return MarkdownHelper.asMarkdown(docTree);
-    }
-
-    // TODO this should be merged with logic in CompletionProvider
-    // TODO this should parameterize the type
-    // TODO show more information about declarations---was this a parameter, a field? What were the modifiers?
-    private String printType(Element e) {
-        if (e instanceof ExecutableElement) {
-            var m = (ExecutableElement) e;
-            return ShortTypePrinter.DEFAULT.printMethod(m);
-        } else if (e instanceof VariableElement) {
-            var v = (VariableElement) e;
-            return ShortTypePrinter.DEFAULT.print(v.asType()) + " " + v;
-        } else if (e instanceof TypeElement) {
-            var t = (TypeElement) e;
-            var lines = new StringJoiner("\n");
-            lines.add(hoverTypeDeclaration(t) + " {");
-            for (var member : t.getEnclosedElements()) {
-                // TODO check accessibility
-                if (member instanceof ExecutableElement || member instanceof VariableElement) {
-                    lines.add("  " + printType(member) + ";");
-                } else if (member instanceof TypeElement) {
-                    lines.add("  " + hoverTypeDeclaration((TypeElement) member) + " { /* removed */ }");
-                }
-            }
-            lines.add("}");
-            return lines.toString();
-        } else {
-            return e.toString();
-        }
-    }
-
-    private String hoverTypeDeclaration(TypeElement t) {
-        var result = new StringBuilder();
-        switch (t.getKind()) {
-            case ANNOTATION_TYPE:
-                result.append("@interface");
-                break;
-            case INTERFACE:
-                result.append("interface");
-                break;
-            case CLASS:
-                result.append("class");
-                break;
-            case ENUM:
-                result.append("enum");
-                break;
-            default:
-                LOG.warning("Don't know what to call type element " + t);
-                result.append("_");
-        }
-        result.append(" ").append(ShortTypePrinter.DEFAULT.print(t.asType()));
-        var superType = ShortTypePrinter.DEFAULT.print(t.getSuperclass());
-        switch (superType) {
-            case "Object":
-            case "none":
-                break;
-            default:
-                result.append(" extends ").append(superType);
-        }
-        return result.toString();
-    }
-
-    private String renderTypeHeader(TypeElement type) {
-        var qualifiedName = type.getQualifiedName().toString();
-        var packageName = packageName(qualifiedName);
-        if (packageName.isEmpty()) {
-            packageName = "(default package)";
-        }
-        var builder = new StringBuilder();
-        builder.append("**").append(packageName).append("**\n");
-        if (!qualifiedName.isEmpty()) {
-            builder.append(qualifiedName).append("\n");
-        }
-        builder.append(typeSignature(type));
-        return builder.toString();
-    }
-
-    private String typeSignature(TypeElement type) {
-        var signature = new StringBuilder();
-        var modifiers = typeModifiers(type.getModifiers());
-        if (!modifiers.isEmpty()) {
-            signature.append(modifiers).append(" ");
-        }
-        signature.append(typeKind(type)).append(" ").append(type.getSimpleName());
-
-        var selfQualified = type.getQualifiedName().toString();
-        var selfSimple = type.getSimpleName().toString();
-        var interfaces = type.getInterfaces().stream()
-                .map(t -> displayType(t.toString(), selfQualified, selfSimple))
-                .toList();
-        var superType = type.getSuperclass();
-        var superName = displayType(superType.toString(), selfQualified, selfSimple);
-
-        if (type.getKind() == ElementKind.INTERFACE || type.getKind() == ElementKind.ANNOTATION_TYPE) {
-            if (!interfaces.isEmpty()) {
-                signature.append("\n").append(formatImplements("extends", interfaces));
-            }
-        } else {
-            if (!superName.equals("Object") && !superName.equals("none")) {
-                signature.append("\n").append("extends ").append(superName);
-            }
-            if (!interfaces.isEmpty()) {
-                signature.append("\n").append(formatImplements("implements", interfaces));
-            }
-        }
-        return signature.toString();
-    }
-
-    private String typeKind(TypeElement type) {
-        switch (type.getKind()) {
-            case ANNOTATION_TYPE:
-                return "@interface";
-            case INTERFACE:
-                return "interface";
-            case CLASS:
-                return "class";
-            case ENUM:
-                return "enum";
-            default:
-                return "class";
-        }
-    }
-
-    private String typeModifiers(Set<Modifier> modifiers) {
-        var order = List.of(
-                Modifier.PUBLIC,
-                Modifier.PROTECTED,
-                Modifier.PRIVATE,
-                Modifier.ABSTRACT,
-                Modifier.STATIC,
-                Modifier.FINAL,
-                Modifier.SEALED,
-                Modifier.NON_SEALED);
-        var join = new StringJoiner(" ");
-        for (var m : order) {
-            if (modifiers.contains(m)) {
-                join.add(m.toString());
-            }
-        }
-        return join.toString();
-    }
-
-    private String formatImplements(String keyword, List<String> types) {
-        if (types.isEmpty()) return "";
-        var indent = " ".repeat(keyword.length() + 1);
-        var result = new StringBuilder();
-        result.append(keyword).append(" ").append(types.get(0));
-        for (int i = 1; i < types.size(); i++) {
-            result.append(",\n").append(indent).append(types.get(i));
-        }
-        return result.toString();
-    }
-
-    private String displayType(String raw, String selfQualified, String selfSimple) {
-        var value = raw.replace(selfQualified, selfSimple);
-        value = value.replace("java.lang.", "");
-        return value;
-    }
-
-    private String packageName(String qualifiedName) {
-        var lastDot = qualifiedName.lastIndexOf('.');
-        if (lastDot == -1) return "";
-        return qualifiedName.substring(0, lastDot);
-    }
-
-    private static final Logger LOG = Logger.getLogger("main");
+    private record ResolvedDeclaration(ParseTask parse, TreePath path) {}
 }

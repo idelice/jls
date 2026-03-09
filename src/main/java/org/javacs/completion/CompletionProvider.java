@@ -213,7 +213,7 @@ public class CompletionProvider {
         sortCompletionItems(list.items);
         logCompletionTiming(started, list.items, list.isIncomplete);
         var countersAfter = CompileBatch.perfCounters();
-        var enterDelta = countersAfter.enterOnlyBatches - countersBefore.enterOnlyBatches;
+        var enterDelta = countersAfter.fullBatches - countersBefore.fullBatches;
         var analyzeDelta = countersAfter.analyzeInvocations - countersBefore.analyzeInvocations;
         var apDelta = countersAfter.apEnabledBatches - countersBefore.apEnabledBatches;
         LOG.info(

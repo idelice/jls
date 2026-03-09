@@ -30,17 +30,13 @@ public class ReferenceProvider {
     }
 
     public List<Location> find() {
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compileFastWithProcessors(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
             if (element != null) {
                 return find(task, element);
             }
         }
-        try (var task = compiler.compileFastWithProcessors(file)) {
-            var element = NavigationHelper.findElement(task, file, line, column);
-            if (element == null) return NOT_SUPPORTED;
-            return find(task, element);
-        }
+        return NOT_SUPPORTED;
     }
 
     private List<Location> find(CompileTask task, Element element) {

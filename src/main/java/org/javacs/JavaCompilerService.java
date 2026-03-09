@@ -1,5 +1,14 @@
 package org.javacs;
 
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.Tree;
+import com.sun.source.tree.VariableTree;
+import com.sun.source.util.TreeScanner;
+import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
@@ -63,13 +72,49 @@ class JavaCompilerService implements CompilerProvider {
         this.fileManager = new SourceFileManager();
     }
 
+    private static final int MAX_CACHE_SIZE = 1000;
+
     private CompileBatch cachedCompile;
-    private final Map<JavaFileObject, SourceFingerprint> cachedModified = new HashMap<>();
+    private final Map<JavaFileObject, SourceFingerprint> cachedModified =
+        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+            boolean remove = size() > MAX_CACHE_SIZE;
+            if (remove) {
+                LOG.fine("Cache eviction: removing oldest entry");
+            }
+            return remove;
+        }
+    };
     private long cachedCompileContentRevision = -1;
     private CompileBatch cachedFastCompile;
-    private final Map<JavaFileObject, SourceFingerprint> cachedFastModified = new HashMap<>();
+    private final Map<JavaFileObject, SourceFingerprint> cachedFastModified =
+        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+            boolean remove = size() > MAX_CACHE_SIZE;
+            if (remove) {
+                LOG.fine("Cache eviction: removing oldest entry");
+            }
+            return remove;
+        }
+    };
     private long cachedFastCompileContentRevision = -1;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
+    private static final Map<Path, ParsedUnit> SHARED_PARSED_UNITS = new ConcurrentHashMap<>();
+    final Map<Path, ParsedUnit> parsedUnits = SHARED_PARSED_UNITS;
+    private volatile long lombokTypeIndexContentRevision = -1;
+    private volatile LombokTypeIndex lombokTypeIndex = LombokTypeIndex.empty();
+
+    static class ParsedUnit {
+        final ParseTask task;
+        final SourceFingerprint fingerprint;
+
+        ParsedUnit(ParseTask task, SourceFingerprint fingerprint) {
+            this.task = task;
+            this.fingerprint = fingerprint;
+        }
+    }
 
     private static class SourceFingerprint {
         final long modifiedMillis;
@@ -92,6 +137,25 @@ class JavaCompilerService implements CompilerProvider {
         @Override
         public int hashCode() {
             return Objects.hash(modifiedMillis, version);
+        }
+    }
+
+    private static class LombokTypeIndex {
+        final Set<String> lombokTypes;
+        final Map<String, Path> byQualifiedName;
+        final Map<String, Set<String>> bySimpleName;
+
+        LombokTypeIndex(
+                Set<String> lombokTypes,
+                Map<String, Path> byQualifiedName,
+                Map<String, Set<String>> bySimpleName) {
+            this.lombokTypes = lombokTypes;
+            this.byQualifiedName = byQualifiedName;
+            this.bySimpleName = bySimpleName;
+        }
+
+        static LombokTypeIndex empty() {
+            return new LombokTypeIndex(Set.of(), Map.of(), Map.of());
         }
     }
 
@@ -142,7 +206,7 @@ class JavaCompilerService implements CompilerProvider {
             throw e;
         }
 
-        if (mode == CompileBatch.AnalysisMode.ENTER_ONLY) {
+        if (mode == CompileBatch.AnalysisMode.ATTR) {
             return firstAttempt;
         }
 
@@ -193,15 +257,6 @@ class JavaCompilerService implements CompilerProvider {
             long contentRevision) {
         var compileCache = mode == CompileBatch.AnalysisMode.FULL ? cachedCompile : cachedFastCompile;
         var modifiedCache = mode == CompileBatch.AnalysisMode.FULL ? cachedModified : cachedFastModified;
-        if (mode == CompileBatch.AnalysisMode.FULL) {
-            closeCacheIfIdle(cachedFastCompile, cachedFastModified);
-            cachedFastCompile = null;
-            cachedFastCompileContentRevision = -1;
-        } else {
-            closeCacheIfIdle(cachedCompile, cachedModified);
-            cachedCompile = null;
-            cachedCompileContentRevision = -1;
-        }
         if (compileCache != null) {
             if (!compileCache.closed) {
                 throw new RuntimeException("Compiler is still in-use!");
@@ -276,72 +331,281 @@ class JavaCompilerService implements CompilerProvider {
             return sources;
         }
 
-        var expandedByPath = new LinkedHashMap<Path, JavaFileObject>();
-        var expandedNonFile = new ArrayList<JavaFileObject>();
+        var requestedHasLombokAnnotations = requestedSourcesUseLombokAnnotations(sources);
+        var referencedLombokSources = referencedLombokSources(sources);
+        if (!requestedHasLombokAnnotations && referencedLombokSources.isEmpty()) {
+            LOG.info(
+                    String.format(
+                            "[perf] lombok_ap_sources requested=%d expanded=%d reason=no_lombok_annotations_or_references",
+                            sources.size(), sources.size()));
+            return sources;
+        }
+
+        var expanded = new LinkedHashMap<Path, JavaFileObject>();
+        var nonFileSources = new ArrayList<JavaFileObject>();
+        for (var source : sources) {
+            var path = sourcePath(source);
+            if (path == null) {
+                nonFileSources.add(source);
+                continue;
+            }
+            expanded.put(path, source);
+        }
+
+        for (var lombokSource : referencedLombokSources) {
+            expanded.putIfAbsent(lombokSource, new SourceFileObject(lombokSource));
+        }
+
+        var reason =
+                requestedHasLombokAnnotations
+                        ? (referencedLombokSources.isEmpty()
+                                ? "requested_lombok_annotations"
+                                : "annotations_and_references")
+                        : "referenced_lombok_types";
+
+        if (expanded.size() + nonFileSources.size() == sources.size()) {
+            LOG.info(
+                    String.format(
+                            "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
+                            sources.size(), sources.size(), reason));
+            return sources;
+        }
+
+        LOG.info(
+                String.format(
+                        "[perf] lombok_ap_references requested=%d referenced=%d",
+                        sources.size(), referencedLombokSources.size()));
+
+        var result = new ArrayList<JavaFileObject>(expanded.values());
+        result.addAll(nonFileSources);
+        LOG.info(
+                String.format(
+                        "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
+                        sources.size(), result.size(), reason));
+        return result;
+    }
+
+    private Set<Path> referencedLombokSources(Collection<? extends JavaFileObject> sources) {
+        var requestedPaths = new ArrayList<Path>();
         for (var source : sources) {
             var path = sourcePath(source);
             if (path != null) {
-                expandedByPath.putIfAbsent(path, source);
-            } else {
-                expandedNonFile.add(source);
+                requestedPaths.add(path);
             }
         }
+        if (requestedPaths.isEmpty()) {
+            return Set.of();
+        }
 
-        // Fast pre-check: if none of the requested source files appear to use Lombok,
-        // skip expensive package/import expansion.
-        var requestedPaths = new ArrayList<Path>(expandedByPath.keySet());
-        var anyRequestedLombok = false;
+        var index = currentLombokTypeIndex();
+        if (index.lombokTypes.isEmpty()) {
+            return Set.of();
+        }
+
+        var requestedSet = new LinkedHashSet<>(requestedPaths);
+        var referenced = new LinkedHashSet<Path>();
         for (var requested : requestedPaths) {
-            if (quickMaybeUsesLombok(requested)) {
-                anyRequestedLombok = true;
-                break;
+            referenced.addAll(referencedLombokSourcesIn(requested, index));
+        }
+        referenced.removeAll(requestedSet);
+        return referenced;
+    }
+
+    private Set<Path> referencedLombokSourcesIn(Path source, LombokTypeIndex index) {
+        var referenced = new LinkedHashSet<Path>();
+        var explicitImports = new HashMap<String, String>();
+        var importedPackages = new LinkedHashSet<String>();
+
+        var packageName = FileStore.packageName(source);
+        if (packageName != null && !packageName.isBlank()) {
+            importedPackages.add(packageName);
+        }
+        for (var imported : readImports(source)) {
+            if (imported.endsWith(".*")) {
+                importedPackages.add(imported.substring(0, imported.length() - 2));
+            } else {
+                explicitImports.put(simpleName(imported), imported);
             }
         }
-        if (!anyRequestedLombok) {
-            return sources;
+
+        for (var typeReference : collectReferencedTypeNames(source)) {
+            addResolvedLombokSource(typeReference, explicitImports, importedPackages, index, referenced);
+        }
+        return referenced;
+    }
+
+    private Set<String> collectReferencedTypeNames(Path source) {
+        var referenced = new LinkedHashSet<String>();
+        ParseTask parsed;
+        try {
+            parsed = parse(source);
+        } catch (RuntimeException e) {
+            LOG.fine(
+                    String.format(
+                            "[perf] lombok_reference_scan file=%s parsed=false reason=%s",
+                            source.getFileName(), e.getMessage()));
+            return referenced;
         }
 
-        var initialFileCount = expandedByPath.size();
-        var roots = new ArrayList<>(expandedByPath.keySet());
-        for (var root : roots) {
-            addLombokSourcesFromPackage(expandedByPath, root, FileStore.packageName(root));
-            for (var imported : readImports(root)) {
-                if (imported.endsWith(".*")) {
-                    addLombokSourcesFromPackage(expandedByPath, root, imported.substring(0, imported.length() - 2));
-                    continue;
+        new TreeScanner<Void, Set<String>>() {
+            @Override
+            public Void visitClass(ClassTree node, Set<String> refs) {
+                addTypeTokens(node.getExtendsClause(), refs);
+                for (var iface : node.getImplementsClause()) {
+                    addTypeTokens(iface, refs);
                 }
-                var declaration = findTypeDeclaration(imported);
-                if (declaration == NOT_FOUND) continue;
-                if (!sourceUsesLombok(declaration)) continue;
-                expandedByPath.putIfAbsent(declaration, new SourceFileObject(declaration));
+                return super.visitClass(node, refs);
+            }
+
+            @Override
+            public Void visitMethod(MethodTree node, Set<String> refs) {
+                addTypeTokens(node.getReturnType(), refs);
+                for (var parameter : node.getParameters()) {
+                    addTypeTokens(parameter.getType(), refs);
+                }
+                return super.visitMethod(node, refs);
+            }
+
+            @Override
+            public Void visitVariable(VariableTree node, Set<String> refs) {
+                addTypeTokens(node.getType(), refs);
+                return super.visitVariable(node, refs);
+            }
+
+            @Override
+            public Void visitNewClass(NewClassTree node, Set<String> refs) {
+                addTypeTokens(node.getIdentifier(), refs);
+                return super.visitNewClass(node, refs);
+            }
+        }.scan(parsed.root, referenced);
+        return referenced;
+    }
+
+    private void addTypeTokens(Tree tree, Set<String> referenced) {
+        if (tree == null) {
+            return;
+        }
+        var text = tree.toString();
+        if (text == null || text.isBlank()) {
+            return;
+        }
+
+        var qualified = QUALIFIED_TYPE_PATTERN.matcher(text);
+        while (qualified.find()) {
+            referenced.add(qualified.group());
+        }
+        var simple = SIMPLE_TYPE_PATTERN.matcher(text);
+        while (simple.find()) {
+            referenced.add(simple.group());
+        }
+    }
+
+    private void addResolvedLombokSource(
+            String typeReference,
+            Map<String, String> explicitImports,
+            Set<String> importedPackages,
+            LombokTypeIndex index,
+            Set<Path> referenced) {
+        if (typeReference == null || typeReference.isBlank()) {
+            return;
+        }
+
+        var direct = index.byQualifiedName.get(typeReference);
+        if (direct != null) {
+            referenced.add(direct);
+            return;
+        }
+
+        var simple = typeReference;
+        var lastDot = simple.lastIndexOf('.');
+        if (lastDot >= 0 && lastDot + 1 < simple.length()) {
+            simple = simple.substring(lastDot + 1);
+        }
+
+        var explicit = explicitImports.get(simple);
+        if (explicit != null) {
+            var imported = index.byQualifiedName.get(explicit);
+            if (imported != null) {
+                referenced.add(imported);
+                return;
             }
         }
 
-        if (expandedByPath.size() == initialFileCount) {
-            return sources;
+        for (var importedPackage : importedPackages) {
+            var candidate = importedPackage + "." + simple;
+            var resolved = index.byQualifiedName.get(candidate);
+            if (resolved != null) {
+                referenced.add(resolved);
+            }
         }
 
-        var expanded = new ArrayList<JavaFileObject>(expandedByPath.size() + expandedNonFile.size());
-        expanded.addAll(expandedByPath.values());
-        expanded.addAll(expandedNonFile);
-        LOG.info(
-                String.format(
-                        "[perf] lombok_ap_sources requested=%d expanded=%d",
-                        sources.size(), expanded.size()));
-        return expanded;
-    }
-
-    private void addLombokSourcesFromPackage(
-            Map<Path, JavaFileObject> expandedByPath, Path source, String packageName) {
-        if (packageName == null) return;
-        for (var candidate : FileStore.list(packageName)) {
-            if (candidate.equals(source)) continue;
-            if (!sourceUsesLombok(candidate)) continue;
-            if (!containsWord(source, simpleTypeName(candidate))) continue;
-            expandedByPath.putIfAbsent(candidate, new SourceFileObject(candidate));
+        var bySimple = index.bySimpleName.get(simple);
+        if (bySimple == null || bySimple.size() != 1) {
+            return;
+        }
+        var qualified = bySimple.iterator().next();
+        var resolved = index.byQualifiedName.get(qualified);
+        if (resolved != null) {
+            referenced.add(resolved);
         }
     }
 
+    private LombokTypeIndex currentLombokTypeIndex() {
+        var revision = FileStore.contentRevision();
+        if (lombokTypeIndexContentRevision == revision) {
+            return lombokTypeIndex;
+        }
+        synchronized (this) {
+            if (lombokTypeIndexContentRevision == revision) {
+                return lombokTypeIndex;
+            }
+            var byQualifiedName = new Object2ObjectLinkedOpenHashMap<String, Path>();
+            var bySimpleName = new Object2ObjectOpenHashMap<String, Set<String>>();
+            for (var source : FileStore.all()) {
+                if (!hasLombokAnnotation(source)) continue;
+                var simple = simpleTypeName(source);
+                var pkg = FileStore.packageName(source);
+                var qualified = pkg == null || pkg.isBlank() ? simple : pkg + "." + simple;
+                byQualifiedName.putIfAbsent(qualified, source);
+                bySimpleName.computeIfAbsent(simple, __ -> new ObjectLinkedOpenHashSet<>()).add(qualified);
+            }
+
+            var copiedSimple = new Object2ObjectOpenHashMap<String, Set<String>>();
+            for (var entry : bySimpleName.entrySet()) {
+                copiedSimple.put(
+                        entry.getKey(),
+                        Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(entry.getValue())));
+            }
+
+            lombokTypeIndex =
+                    new LombokTypeIndex(
+                            Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(byQualifiedName.keySet())),
+                            Collections.unmodifiableMap(byQualifiedName),
+                            Collections.unmodifiableMap(copiedSimple));
+            lombokTypeIndexContentRevision = revision;
+            LOG.fine(
+                    String.format(
+                            "[perf] lombok_type_index revision=%d types=%d",
+                            revision, lombokTypeIndex.lombokTypes.size()));
+            return lombokTypeIndex;
+        }
+    }
+
+    private boolean requestedSourcesUseLombokAnnotations(Collection<? extends JavaFileObject> sources) {
+        for (var source : sources) {
+            var path = sourcePath(source);
+            if (path == null) {
+                continue;
+            }
+            if (quickMaybeUsesLombok(path)) {
+                LOG.fine("[perf] lombok_ap_gate enabled=true file=" + path.getFileName());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    
     private String simpleTypeName(Path file) {
         var name = file.getFileName().toString();
         if (name.endsWith(".java")) {
@@ -400,6 +664,17 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private static final Pattern PACKAGE_EXTRACTOR = Pattern.compile("^([a-z][_a-zA-Z0-9]*\\.)*[a-z][_a-zA-Z0-9]*");
+    private static final Pattern SIMPLE_EXTRACTOR = Pattern.compile("[A-Z][_a-zA-Z0-9]*$");
+    private static final Pattern IMPORT_CLASS = Pattern.compile("^import +([\\w\\.]+\\.\\w+);");
+    private static final Pattern IMPORT_STAR = Pattern.compile("^import +([\\w\\.]+\\.\\*);");
+    private static final int LOMBOK_SCAN_LINE_LIMIT = 200;
+    private static final Pattern LOMBOK_ANNOTATION_PATTERN =
+            Pattern.compile(
+                    "@(?:lombok\\.(?:experimental\\.)?)?"
+                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With)\\b");
+    private static final Pattern QUALIFIED_TYPE_PATTERN =
+            Pattern.compile("\\b(?:[a-z][_a-zA-Z0-9]*\\.)+[A-Z][_a-zA-Z0-9]*(?:\\.[A-Z][_a-zA-Z0-9]*)*\\b");
+    private static final Pattern SIMPLE_TYPE_PATTERN = Pattern.compile("\\b[A-Z][_a-zA-Z0-9]*\\b");
 
     private String packageName(String className) {
         var m = PACKAGE_EXTRACTOR.matcher(className);
@@ -408,8 +683,6 @@ class JavaCompilerService implements CompilerProvider {
         }
         return "";
     }
-
-    private static final Pattern SIMPLE_EXTRACTOR = Pattern.compile("[A-Z][_a-zA-Z0-9]*$");
 
     private String simpleName(String className) {
         var m = SIMPLE_EXTRACTOR.matcher(className);
@@ -440,8 +713,43 @@ class JavaCompilerService implements CompilerProvider {
         return cacheContainsType.get(file, null).contains(className);
     }
 
-    private Cache<Void, List<String>> cacheFileImports = new Cache<>();
-    private final Cache<Void, Boolean> cacheSourceUsesLombok = new Cache<>();
+    private final Cache<Void, Boolean> cacheHasLombokAnnotation = new Cache<>();
+
+    private boolean hasLombokAnnotation(Path file) {
+        if (cacheHasLombokAnnotation.needs(file, null)) {
+            var hasLombok = false;
+            try (var lines = FileStore.lines(file)) {
+                for (int i = 0; i < LOMBOK_SCAN_LINE_LIMIT; i++) {
+                    var line = lines.readLine();
+                    if (line == null) {
+                        break;
+                    }
+                    if (LOMBOK_ANNOTATION_PATTERN.matcher(line).find()) {
+                        hasLombok = true;
+                        break;
+                    }
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            LOG.fine(
+                    String.format(
+                            "[perf] lombok_scan file=%s lines=%d detected=%s",
+                            file.getFileName(), LOMBOK_SCAN_LINE_LIMIT, hasLombok));
+            cacheHasLombokAnnotation.load(file, null, hasLombok);
+        }
+        return cacheHasLombokAnnotation.get(file, null);
+    }
+
+    private boolean sourceUsesLombok(Path file) {
+        return hasLombokAnnotation(file);
+    }
+
+    private boolean quickMaybeUsesLombok(Path file) {
+        return hasLombokAnnotation(file);
+    }
+
+    private final Cache<Void, List<String>> cacheFileImports = new Cache<>();
 
     private List<String> readImports(Path file) {
         if (cacheFileImports.needs(file, null)) {
@@ -452,20 +760,17 @@ class JavaCompilerService implements CompilerProvider {
 
     private void loadImports(Path file) {
         var list = new ArrayList<String>();
-        var importClass = Pattern.compile("^import +([\\w\\.]+\\.\\w+);");
-        var importStar = Pattern.compile("^import +([\\w\\.]+\\.\\*);");
         try (var lines = FileStore.lines(file)) {
             for (var line = lines.readLine(); line != null; line = lines.readLine()) {
                 // If we reach a class declaration, stop looking for imports
-                // TODO This could be a little more specific
-                if (line.contains("class")) break;
+                if (line.contains("class") || line.contains("interface") || line.contains("enum")) break;
                 // import foo.bar.Doh;
-                var matchesClass = importClass.matcher(line);
+                var matchesClass = IMPORT_CLASS.matcher(line);
                 if (matchesClass.matches()) {
                     list.add(matchesClass.group(1));
                 }
                 // import foo.bar.*
-                var matchesStar = importStar.matcher(line);
+                var matchesStar = IMPORT_STAR.matcher(line);
                 if (matchesStar.matches()) {
                     list.add(matchesStar.group(1));
                 }
@@ -474,63 +779,6 @@ class JavaCompilerService implements CompilerProvider {
             throw new RuntimeException(e);
         }
         cacheFileImports.load(file, null, list);
-    }
-
-    private boolean sourceUsesLombok(Path file) {
-        if (cacheSourceUsesLombok.needs(file, null)) {
-            var usesLombok = false;
-            try (var lines = FileStore.lines(file)) {
-                for (var line = lines.readLine(); line != null; line = lines.readLine()) {
-                    var trimmed = line.trim();
-                    if (trimmed.contains("lombok.")) {
-                        usesLombok = true;
-                        break;
-                    }
-                }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            cacheSourceUsesLombok.load(file, null, usesLombok);
-        }
-        return cacheSourceUsesLombok.get(file, null);
-    }
-
-    private final Cache<Void, Boolean> cacheQuickMaybeUsesLombok = new Cache<>();
-
-    private boolean quickMaybeUsesLombok(Path file) {
-        if (cacheQuickMaybeUsesLombok.needs(file, null)) {
-            var mayUseLombok = false;
-            try (var lines = FileStore.lines(file)) {
-                for (var line = lines.readLine(); line != null; line = lines.readLine()) {
-                    var trimmed = line.trim();
-                    if (trimmed.isEmpty()) continue;
-                    if (trimmed.startsWith("import lombok.")) {
-                        mayUseLombok = true;
-                        break;
-                    }
-                    // If the source has no annotations at all, skip deeper Lombok expansion.
-                    if (trimmed.startsWith("@")) {
-                        mayUseLombok = true;
-                        break;
-                    }
-                    // Stop scanning once we pass imports/package declarations.
-                    if (trimmed.startsWith("class ")
-                            || trimmed.contains(" class ")
-                            || trimmed.startsWith("interface ")
-                            || trimmed.contains(" interface ")
-                            || trimmed.startsWith("enum ")
-                            || trimmed.contains(" enum ")
-                            || trimmed.startsWith("record ")
-                            || trimmed.contains(" record ")) {
-                        break;
-                    }
-                }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            cacheQuickMaybeUsesLombok.load(file, null, mayUseLombok);
-        }
-        return cacheQuickMaybeUsesLombok.get(file, null);
     }
 
     @Override
@@ -704,14 +952,42 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public ParseTask parse(Path file) {
-        var parser = Parser.parseFile(file);
-        return new ParseTask(parser.task, parser.root);
+        var source = new SourceFileObject(file);
+        return parseCached(source, file);
     }
 
     @Override
     public ParseTask parse(JavaFileObject file) {
+        var filePath = sourcePath(file);
+        if (filePath != null && FileStore.isJavaFile(filePath)) {
+            return parseCached(file, filePath);
+        }
         var parser = Parser.parseJavaFileObject(file);
         return new ParseTask(parser.task, parser.root);
+    }
+
+    private ParseTask parseCached(JavaFileObject file, Path filePath) {
+        var currentFingerprint = fingerprint(file);
+        var cached = parsedUnits.get(filePath);
+        if (cached != null && currentFingerprint.equals(cached.fingerprint)) {
+            LOG.fine(
+                    String.format(
+                            "[perf] parse_cache_hit file=%s version=%d modified=%d",
+                            filePath.getFileName(),
+                            currentFingerprint.version,
+                            currentFingerprint.modifiedMillis));
+            return cached.task;
+        }
+        var parser = Parser.parseJavaFileObject(file);
+        var task = new ParseTask(parser.task, parser.root);
+        parsedUnits.put(filePath, new ParsedUnit(task, currentFingerprint));
+        LOG.fine(
+                String.format(
+                        "[perf] parse_cache_store file=%s version=%d modified=%d",
+                        filePath.getFileName(),
+                        currentFingerprint.version,
+                        currentFingerprint.modifiedMillis));
+        return task;
     }
 
     @Override
@@ -739,7 +1015,7 @@ class JavaCompilerService implements CompilerProvider {
         for (var f : files) {
             sources.add(new SourceFileObject(f));
         }
-        return compileFast(sources);
+        return compileFastWithProcessors(sources);
     }
 
     @Override
@@ -749,16 +1025,6 @@ class JavaCompilerService implements CompilerProvider {
             sources.add(new SourceFileObject(f));
         }
         return compileFastWithProcessors(sources);
-    }
-
-    @Override
-    public CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
-        LOG.info(
-                String.format(
-                        "[perf] compile_trigger entry=compileFast request=%s mode=enter_only sources=%d stack=%s",
-                        requestType(), sources.size(), requestStack()));
-        var compile = compileBatch(sources, CompileBatch.AnalysisMode.ENTER_ONLY, false);
-        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
     }
 
     @Override

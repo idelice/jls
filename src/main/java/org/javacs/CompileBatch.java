@@ -10,19 +10,18 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.util.*;
 import javax.tools.*;
 
 public class CompileBatch implements AutoCloseable {
     static final int MAX_COMPLETION_ITEMS = 50;
     private static final Logger LOG = Logger.getLogger("main");
-    private static final AtomicLong ENTER_ONLY_BATCHES = new AtomicLong();
-    private static final AtomicLong FULL_BATCHES = new AtomicLong();
+        private static final AtomicLong FULL_BATCHES = new AtomicLong();
     private static final AtomicLong ANALYZE_INVOCATIONS = new AtomicLong();
     private static final AtomicLong AP_ENABLED_BATCHES = new AtomicLong();
 
     enum AnalysisMode {
-        ENTER_ONLY,
         ATTR,
         FULL
     }
@@ -92,31 +91,23 @@ public class CompileBatch implements AutoCloseable {
             parseNanos = System.nanoTime() - parseStarted;
 
             if (allowAP) {
-                if (analysisMode == AnalysisMode.ENTER_ONLY) {
-                    var enterStarted = System.nanoTime();
-                    invokeEnter(borrow.task);
-                    enterNanos = System.nanoTime() - enterStarted;
-                } else {
-                    // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
-                    // Running enter() first can lock in pre-processor symbols (missing Lombok members).
-                    var analyzeStarted = System.nanoTime();
-                    borrow.task.analyze();
-                    analyzeNanos = System.nanoTime() - analyzeStarted;
-                    ANALYZE_INVOCATIONS.incrementAndGet();
-                }
+                // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
+                // Running enter() first can lock in pre-processor symbols (missing Lombok members).
+                var analyzeStarted = System.nanoTime();
+                borrow.task.analyze();
+                analyzeNanos = System.nanoTime() - analyzeStarted;
+                ANALYZE_INVOCATIONS.incrementAndGet();
             } else {
                 var enterStarted = System.nanoTime();
                 invokeEnter(borrow.task);
                 enterNanos = System.nanoTime() - enterStarted;
 
-                if (analysisMode != AnalysisMode.ENTER_ONLY) {
-                    // The results of borrow.task.analyze() are unreliable when errors are present
-                    // You can get at `Element` values using `Trees`
-                    var analyzeStarted = System.nanoTime();
-                    borrow.task.analyze();
-                    analyzeNanos = System.nanoTime() - analyzeStarted;
-                    ANALYZE_INVOCATIONS.incrementAndGet();
-                }
+                // The results of borrow.task.analyze() are unreliable when errors are present
+                // You can get at `Element` values using `Trees`
+                var analyzeStarted = System.nanoTime();
+                borrow.task.analyze();
+                analyzeNanos = System.nanoTime() - analyzeStarted;
+                ANALYZE_INVOCATIONS.incrementAndGet();
             }
         } catch (IOException e) {
             try {
@@ -148,7 +139,8 @@ public class CompileBatch implements AutoCloseable {
             if (analysisMode == AnalysisMode.FULL) {
                 FULL_BATCHES.incrementAndGet();
             } else {
-                ENTER_ONLY_BATCHES.incrementAndGet();
+                // ATTR mode
+                FULL_BATCHES.incrementAndGet();
             }
             if (allowAP) {
                 AP_ENABLED_BATCHES.incrementAndGet();
@@ -158,7 +150,6 @@ public class CompileBatch implements AutoCloseable {
     }
 
     public static void resetPerfCounters() {
-        ENTER_ONLY_BATCHES.set(0);
         FULL_BATCHES.set(0);
         ANALYZE_INVOCATIONS.set(0);
         AP_ENABLED_BATCHES.set(0);
@@ -166,24 +157,20 @@ public class CompileBatch implements AutoCloseable {
 
     public static PerfCounters perfCounters() {
         return new PerfCounters(
-                ENTER_ONLY_BATCHES.get(),
                 FULL_BATCHES.get(),
                 ANALYZE_INVOCATIONS.get(),
                 AP_ENABLED_BATCHES.get());
     }
 
     public static class PerfCounters {
-        public final long enterOnlyBatches;
         public final long fullBatches;
         public final long analyzeInvocations;
         public final long apEnabledBatches;
 
         PerfCounters(
-                long enterOnlyBatches,
                 long fullBatches,
                 long analyzeInvocations,
                 long apEnabledBatches) {
-            this.enterOnlyBatches = enterOnlyBatches;
             this.fullBatches = fullBatches;
             this.analyzeInvocations = analyzeInvocations;
             this.apEnabledBatches = apEnabledBatches;
@@ -349,9 +336,13 @@ public class CompileBatch implements AutoCloseable {
 
     private Path findPackagePrivateClass(String packageName, String className) {
         for (var file : FileStore.list(packageName)) {
-            var parse = Parser.parseFile(file);
-            for (var candidate : parse.packagePrivateClasses()) {
-                if (candidate.contentEquals(className)) {
+            var parse = parent.parse(file);
+            for (var declaration : parse.root.getTypeDecls()) {
+                if (!(declaration instanceof ClassTree)) continue;
+                var cls = (ClassTree) declaration;
+                var isPublic = cls.getModifiers().getFlags().contains(Modifier.PUBLIC);
+                if (isPublic) continue;
+                if (cls.getSimpleName().contentEquals(className)) {
                     return file;
                 }
             }
