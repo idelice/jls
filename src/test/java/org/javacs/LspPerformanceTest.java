@@ -19,7 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.completion.ExternalBinaryTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
+import org.javacs.completion.WorkspaceTypeIndex;
 import org.javacs.navigation.ReferenceProvider;
 import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidOpenTextDocumentParams;
@@ -1234,18 +1237,21 @@ public class LspPerformanceTest {
         var compiler =
                 new JavaCompilerService(
                         infer.classPath(), infer.buildDocPath(), Collections.emptySet(), Collections.emptySet());
-        TypeMemberIndex index;
+        CompositeTypeIndex index;
         try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
-            index = TypeMemberIndex.from(task);
+            index =
+                    new CompositeTypeIndex(
+                            WorkspaceTypeIndex.wrap(TypeMemberIndex.from(task)),
+                            new ExternalBinaryTypeIndex(compiler));
         }
         return new ReferenceContext(compiler, index);
     }
 
     private static class ReferenceContext {
         final JavaCompilerService compiler;
-        final TypeMemberIndex index;
+        final CompositeTypeIndex index;
 
-        ReferenceContext(JavaCompilerService compiler, TypeMemberIndex index) {
+        ReferenceContext(JavaCompilerService compiler, CompositeTypeIndex index) {
             this.compiler = compiler;
             this.index = index;
         }

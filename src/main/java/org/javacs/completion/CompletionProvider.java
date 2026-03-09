@@ -77,7 +77,7 @@ public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
-    private final TypeMemberIndex completionIndex;
+    private final CompositeTypeIndex completionIndex;
     private final long completionIndexVersion;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
@@ -159,9 +159,9 @@ public class CompletionProvider {
             boolean endsWithParen,
             String currentType) {}
 
-    public CompletionProvider(CompilerProvider compiler, TypeMemberIndex completionIndex, long completionIndexVersion) {
+    public CompletionProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, long completionIndexVersion) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? TypeMemberIndex.EMPTY : completionIndex;
+        this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
         this.completionIndexVersion = Math.max(0L, completionIndexVersion);
     }
 
@@ -253,7 +253,7 @@ public class CompletionProvider {
             long cursor,
             MemberAccessContext memberAccess,
             boolean endsWithParen) {
-        if (completionIndex == null || completionIndex.size() == 0) {
+        if (completionIndex == null) {
             LOG.fine("[perf] completion_member_index state=miss reason=index_empty receiver=" + memberAccess.receiver);
             return EMPTY;
         }
@@ -486,13 +486,13 @@ public class CompletionProvider {
         private final ParseTask parseTask;
         private final CompilationUnitTree root;
         private final SourcePositions positions;
-        private final TypeMemberIndex index;
+        private final CompositeTypeIndex index;
         private final long cursor;
         private final TreePath cursorPath;
         private TypeResolution thisType;
         private TypeResolution superType;
 
-        ParseTypeResolver(ParseTask parseTask, TypeMemberIndex index, long cursor) {
+        ParseTypeResolver(ParseTask parseTask, CompositeTypeIndex index, long cursor) {
             this.parseTask = parseTask;
             this.root = parseTask.root;
             this.positions = Trees.instance(parseTask.task).getSourcePositions();
@@ -654,7 +654,7 @@ public class CompletionProvider {
                 return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
             }
             var loggerType = "org.slf4j.Logger";
-            if (!index.types().containsKey(loggerType)) {
+            if (!index.containsType(loggerType)) {
                 return Optional.empty();
             }
             return Optional.of(new TypeResolution(loggerType, false, false));
@@ -664,7 +664,7 @@ public class CompletionProvider {
             for (var classPath = enclosingClassPath(); classPath != null; classPath = parentClassPath(classPath.getParentPath())) {
                 var owner = qualifiedClassName(classPath);
                 var candidate = owner + "." + simpleName;
-                if (index.types().containsKey(candidate)) {
+                if (index.containsType(candidate)) {
                     return Optional.of(candidate);
                 }
             }
@@ -781,7 +781,7 @@ public class CompletionProvider {
             var classPath = enclosingClassPath();
             if (classPath == null) return Optional.empty();
             var qualified = qualifiedClassName(classPath);
-            if (!index.types().containsKey(qualified)) {
+            if (!index.containsType(qualified)) {
                 return Optional.empty();
             }
             thisType = new TypeResolution(qualified, false, false);
@@ -1409,7 +1409,7 @@ public class CompletionProvider {
 
     private void addStaticImportsFromIndex(
             CompilationUnitTree root, String partial, boolean endsWithParen, CompletionList list) {
-        if (completionIndex == null || completionIndex.size() == 0 || root == null) {
+        if (completionIndex == null || root == null) {
             return;
         }
         var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();

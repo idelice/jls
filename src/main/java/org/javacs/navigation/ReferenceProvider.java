@@ -22,12 +22,13 @@ import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.ParseTask;
+import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.Location;
 
 public class ReferenceProvider {
     private final CompilerProvider compiler;
-    private final TypeMemberIndex completionIndex;
+    private final CompositeTypeIndex completionIndex;
     private final Path file;
     private final int line, column;
 
@@ -35,12 +36,12 @@ public class ReferenceProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, TypeMemberIndex.EMPTY, file, line, column);
+        this(compiler, CompositeTypeIndex.EMPTY, file, line, column);
     }
 
-    public ReferenceProvider(CompilerProvider compiler, TypeMemberIndex completionIndex, Path file, int line, int column) {
+    public ReferenceProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, Path file, int line, int column) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? TypeMemberIndex.EMPTY : completionIndex;
+        this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
         this.file = file;
         this.line = line;
         this.column = column;

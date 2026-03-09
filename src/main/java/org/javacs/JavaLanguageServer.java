@@ -22,9 +22,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
 import org.javacs.action.CodeActionProvider;
+import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.CompletionProvider;
+import org.javacs.completion.ExternalBinaryTypeIndex;
 import org.javacs.completion.SignatureProvider;
 import org.javacs.completion.TypeMemberIndex;
+import org.javacs.completion.WorkspaceTypeIndex;
 import org.javacs.fold.FoldProvider;
 import org.javacs.hover.HoverProvider;
 import org.javacs.index.SymbolProvider;
@@ -73,6 +76,8 @@ class JavaLanguageServer extends LanguageServer {
     private boolean clientSupportsInlayHintRefresh;
     private final AtomicReference<TypeMemberIndex> completionIndexRef =
             new AtomicReference<>(TypeMemberIndex.EMPTY);
+    private final AtomicReference<ExternalBinaryTypeIndex> externalBinaryIndexRef =
+            new AtomicReference<>(ExternalBinaryTypeIndex.EMPTY);
     private final AtomicLong completionIndexVersion = new AtomicLong();
 
     private enum CompletionIndexRefreshMode {
@@ -93,6 +98,7 @@ class JavaLanguageServer extends LanguageServer {
             lombokEnabledForCurrentCompiler = compilers.lombokEnabled;
             lombokVerifiedForCurrentCompiler = false;
             completionIndexRef.set(TypeMemberIndex.EMPTY);
+            externalBinaryIndexRef.set(new ExternalBinaryTypeIndex(cacheCompiler));
             completionIndexVersion.set(0);
             completionIndexRevision.incrementAndGet();
             cancelPendingCompletionIndex("compilerRecreated");
@@ -101,6 +107,12 @@ class JavaLanguageServer extends LanguageServer {
             refreshCompletionIndexForCompilerRecreated();
         }
         return cacheCompiler;
+    }
+
+    private CompositeTypeIndex typeIndex() {
+        return new CompositeTypeIndex(
+                WorkspaceTypeIndex.wrap(completionIndexRef.get()),
+                externalBinaryIndexRef.get());
     }
 
     private DiagnosticsCompilerSelection selectDiagnosticsCompiler() {
@@ -1076,7 +1088,7 @@ class JavaLanguageServer extends LanguageServer {
                             file.getFileName()));
             refreshCompletionIndexNow(FileStore.all(), "completionBootstrap");
         }
-        var completionIndex = completionIndexRef.get();
+        var completionIndex = typeIndex();
         var indexVersion = completionIndexVersion.get();
         var provider = new CompletionProvider(cacheCompiler, completionIndex, indexVersion);
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1, -1);
@@ -1086,7 +1098,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public CompletionItem resolveCompletionItem(CompletionItem unresolved) {
-        new HoverProvider(compiler(), completionIndexRef.get()).resolveCompletionItem(unresolved);
+        new HoverProvider(compiler(), typeIndex()).resolveCompletionItem(unresolved);
         return unresolved;
     }
 
@@ -1097,7 +1109,7 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
-        var content = new HoverProvider(compiler(), completionIndexRef.get()).hover(file, line, column);
+        var content = new HoverProvider(compiler(), typeIndex()).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
         }
@@ -1122,7 +1134,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var found = new DefinitionProvider(compiler(), completionIndexRef.get(), file, line, column).find();
+        var found = new DefinitionProvider(compiler(), typeIndex(), file, line, column).find();
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -1135,7 +1147,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var found = new ReferenceProvider(compiler(), completionIndexRef.get(), file, line, column).find();
+        var found = new ReferenceProvider(compiler(), typeIndex(), file, line, column).find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }

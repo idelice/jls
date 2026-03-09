@@ -23,6 +23,7 @@ import org.javacs.FindNameAt;
 import org.javacs.JsonHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
+import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.Location;
@@ -34,15 +35,15 @@ public class HoverProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     final CompilerProvider compiler;
-    final TypeMemberIndex completionIndex;
+    final CompositeTypeIndex completionIndex;
 
     public HoverProvider(CompilerProvider compiler) {
-        this(compiler, TypeMemberIndex.EMPTY);
+        this(compiler, CompositeTypeIndex.EMPTY);
     }
 
-    public HoverProvider(CompilerProvider compiler, TypeMemberIndex completionIndex) {
+    public HoverProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? TypeMemberIndex.EMPTY : completionIndex;
+        this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
     }
 
     public MarkupContent hover(Path file, int line, int column) {

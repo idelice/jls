@@ -23,13 +23,14 @@ import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.FindNameAt;
 import org.javacs.ParseTask;
+import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 
 public class DefinitionProvider {
     private final CompilerProvider compiler;
-    private final TypeMemberIndex completionIndex;
+    private final CompositeTypeIndex completionIndex;
     private final Path file;
     private final int line;
     private final int column;
@@ -46,12 +47,12 @@ public class DefinitionProvider {
             String simpleName) {}
 
     public DefinitionProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, TypeMemberIndex.EMPTY, file, line, column);
+        this(compiler, CompositeTypeIndex.EMPTY, file, line, column);
     }
 
-    public DefinitionProvider(CompilerProvider compiler, TypeMemberIndex completionIndex, Path file, int line, int column) {
+    public DefinitionProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, Path file, int line, int column) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? TypeMemberIndex.EMPTY : completionIndex;
+        this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -181,7 +182,7 @@ public class DefinitionProvider {
             }
 
             var nestedType = receiver.get().qualifiedType + "." + name;
-            if (completionIndex.types().containsKey(nestedType)) {
+            if (completionIndex.containsType(nestedType)) {
                 return resolveTypeName(nestedType, name);
             }
             if (compiler.findAnywhere(nestedType).isPresent()) {
@@ -527,8 +528,21 @@ public class DefinitionProvider {
         if (source.isEmpty()) {
             return List.of();
         }
-        var parse = source.get().task;
-        var classPath = source.get().classPath;
+        var locations = findMethodLocations(source.get(), methodName, argCount, argTypes);
+        if (!locations.isEmpty()) {
+            return locations;
+        }
+        var stub = openStubTypeSource(ownerType);
+        if (stub.isPresent()) {
+            return findMethodLocations(stub.get(), methodName, argCount, argTypes);
+        }
+        return List.of();
+    }
+
+    private List<Location> findMethodLocations(
+            TypeSource source, String methodName, int argCount, List<String> argTypes) {
+        var parse = source.task;
+        var classPath = source.classPath;
         var classTree = (ClassTree) classPath.getLeaf();
         var methods = new ArrayList<MethodTree>();
         for (var member : classTree.getMembers()) {
@@ -645,8 +659,21 @@ public class DefinitionProvider {
             LOG.fine(String.format("[perf] definition_field_source_missing owner=%s field=%s", ownerType, fieldName));
             return List.of();
         }
-        var parse = source.get().task;
-        var classPath = source.get().classPath;
+        var locations = findFieldLocations(source.get(), fieldName);
+        if (!locations.isEmpty()) {
+            return locations;
+        }
+        var stub = openStubTypeSource(ownerType);
+        if (stub.isPresent()) {
+            return findFieldLocations(stub.get(), fieldName);
+        }
+        LOG.fine(String.format("[perf] definition_field_not_found owner=%s field=%s", ownerType, fieldName));
+        return List.of();
+    }
+
+    private List<Location> findFieldLocations(TypeSource source, String fieldName) {
+        var parse = source.task;
+        var classPath = source.classPath;
         var classTree = (ClassTree) classPath.getLeaf();
         for (var member : classTree.getMembers()) {
             if (!(member instanceof VariableTree variable)) continue;
@@ -657,7 +684,6 @@ public class DefinitionProvider {
                 return List.of(location);
             }
         }
-        LOG.fine(String.format("[perf] definition_field_not_found owner=%s field=%s", ownerType, fieldName));
         return List.of();
     }
 
@@ -689,10 +715,22 @@ public class DefinitionProvider {
         if (source.isEmpty()) {
             return List.of();
         }
-        var path = source.get().classPath;
-        var location = FindHelper.location(source.get().task, path, labelName);
+        var locations = findTypeLocation(source.get(), labelName);
+        if (!locations.isEmpty()) {
+            return locations;
+        }
+        var stub = openStubTypeSource(qualifiedType);
+        if (stub.isPresent()) {
+            return findTypeLocation(stub.get(), labelName);
+        }
+        return List.of();
+    }
+
+    private List<Location> findTypeLocation(TypeSource source, String labelName) {
+        var path = source.classPath;
+        var location = FindHelper.location(source.task, path, labelName);
         if (location == null) {
-            location = FindHelper.location(source.get().task, path);
+            location = FindHelper.location(source.task, path);
         }
         if (location == null) {
             return List.of();
@@ -701,7 +739,7 @@ public class DefinitionProvider {
     }
 
     private Optional<TypeSource> openTypeSource(String qualifiedType) {
-        var type = completionIndex.types().get(qualifiedType);
+        var type = completionIndex.typeInfo(qualifiedType).orElse(null);
         if (type != null && type.sourcePath != null) {
             var parse = compiler.parse(type.sourcePath);
             var classPath = findClassPath(parse, qualifiedType);
@@ -731,7 +769,28 @@ public class DefinitionProvider {
                 return Optional.of(new TypeSource(parse, classPath.get()));
             }
         }
+        var stubSource = completionIndex.externalStubSourcePath(qualifiedType);
+        if (stubSource.isPresent()) {
+            var parse = compiler.parse(stubSource.get());
+            var classPath = findClassPath(parse, qualifiedType);
+            if (classPath.isPresent()) {
+                return Optional.of(new TypeSource(parse, classPath.get()));
+            }
+        }
         return Optional.empty();
+    }
+
+    private Optional<TypeSource> openStubTypeSource(String qualifiedType) {
+        var stubSource = completionIndex.externalStubSourcePath(qualifiedType);
+        if (stubSource.isEmpty()) {
+            return Optional.empty();
+        }
+        var parse = compiler.parse(stubSource.get());
+        var classPath = findClassPath(parse, qualifiedType);
+        if (classPath.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(new TypeSource(parse, classPath.get()));
     }
 
     private Optional<TreePath> findClassPath(ParseTask parse, String qualifiedType) {

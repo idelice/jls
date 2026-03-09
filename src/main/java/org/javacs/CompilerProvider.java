@@ -13,6 +13,10 @@ public interface CompilerProvider {
 
     List<String> publicTopLevelTypes();
 
+    default Set<Path> classPathRoots() {
+        return Set.of();
+    }
+
     List<String> packagePrivateTopLevelTypes(String packageName);
 
     Iterable<Path> search(String query);

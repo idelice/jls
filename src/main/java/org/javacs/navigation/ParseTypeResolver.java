@@ -27,6 +27,7 @@ import java.util.Collections;
 import java.util.Optional;
 import org.javacs.CompilerProvider;
 import org.javacs.ParseTask;
+import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 
 final class ParseTypeResolver {
@@ -47,16 +48,16 @@ final class ParseTypeResolver {
     private final CompilationUnitTree root;
     private final SourcePositions positions;
     private final CompilerProvider compiler;
-    private final TypeMemberIndex index;
+    private final CompositeTypeIndex index;
     private final long cursor;
     private TypeResolution thisType;
     private TypeResolution superType;
 
-    ParseTypeResolver(ParseTask parseTask, TypeMemberIndex index, CompilerProvider compiler, long cursor) {
+    ParseTypeResolver(ParseTask parseTask, CompositeTypeIndex index, CompilerProvider compiler, long cursor) {
         this.root = parseTask.root;
         this.positions = Trees.instance(parseTask.task).getSourcePositions();
         this.compiler = compiler;
-        this.index = index == null ? TypeMemberIndex.EMPTY : index;
+        this.index = index == null ? CompositeTypeIndex.EMPTY : index;
         this.cursor = cursor;
     }
 
@@ -497,7 +498,7 @@ final class ParseTypeResolver {
                 classPath = parentClassPath(classPath.getParentPath())) {
             var owner = qualifiedClassName(classPath);
             var candidate = owner + "." + simpleName;
-            if (index.types().containsKey(candidate) || compiler.findAnywhere(candidate).isPresent()) {
+            if (index.containsType(candidate) || compiler.findAnywhere(candidate).isPresent()) {
                 return Optional.of(candidate);
             }
             var classTree = (ClassTree) classPath.getLeaf();

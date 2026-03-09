@@ -838,6 +838,11 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     @Override
+    public Set<Path> classPathRoots() {
+        return classPath;
+    }
+
+    @Override
     public List<String> packagePrivateTopLevelTypes(String packageName) {
         return List.of("TODO");
     }
