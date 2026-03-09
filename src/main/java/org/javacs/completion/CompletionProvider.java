@@ -74,6 +74,8 @@ import org.javacs.lsp.TextEdit;
 import org.javacs.rewrite.AddImport;
 
 public class CompletionProvider {
+    private static final Logger LOG = Logger.getLogger("main");
+
     private final CompilerProvider compiler;
     private final TypeMemberIndex completionIndex;
     private final long completionIndexVersion;
@@ -168,7 +170,6 @@ public class CompletionProvider {
     }
 
     public CompletionList complete(Path file, int line, int column, int fileVersionSeen) {
-        LOG.info("Complete at " + file.getFileName() + "(" + line + "," + column + ")...");
         var started = Instant.now();
         var countersBefore = CompileBatch.perfCounters();
         var parseStarted = Instant.now();
@@ -253,7 +254,7 @@ public class CompletionProvider {
             MemberAccessContext memberAccess,
             boolean endsWithParen) {
         if (completionIndex == null || completionIndex.size() == 0) {
-            LOG.info("[perf] completion_member_index state=miss reason=index_empty receiver=" + memberAccess.receiver);
+            LOG.fine("[perf] completion_member_index state=miss reason=index_empty receiver=" + memberAccess.receiver);
             return EMPTY;
         }
         var index = completionIndex;
@@ -263,7 +264,7 @@ public class CompletionProvider {
         var resolved = resolver.resolve(expression, memberAccess.receiver);
         if (resolved.isEmpty()) {
             LOG.info("[completion] unresolved receiver at position " + cursor + ", no fallback used");
-            LOG.info(
+            LOG.fine(
                     "[perf] completion_member_index state=miss receiver="
                             + memberAccess.receiver
                             + " reason=unresolved_type");
@@ -272,7 +273,7 @@ public class CompletionProvider {
         var target = resolved.get();
         if (!target.arrayType && !isQualifiedTypeName(target.qualifiedType)) {
             LOG.info("[completion] unresolved receiver at position " + cursor + ", no fallback used");
-            LOG.info(
+            LOG.fine(
                     "[perf] completion_member_index state=miss receiver="
                             + memberAccess.receiver
                             + " reason=non_fqn_type type="
@@ -285,7 +286,7 @@ public class CompletionProvider {
         }
         var members = index.members(target.qualifiedType, target.staticContext);
         if (members.isEmpty()) {
-            LOG.info(
+            LOG.fine(
                     "[perf] completion_member_index state=miss receiver="
                             + memberAccess.receiver
                             + " type="
@@ -303,7 +304,7 @@ public class CompletionProvider {
                         currentType.orElse(""));
         var cached = MEMBER_COMPLETION_CACHE.getIfPresent(cacheKey);
         if (cached != null) {
-            LOG.info(
+            LOG.fine(
                     String.format(
                             "[perf] completion_member_index state=cache_hit receiver=%s type=%s items=%d",
                             memberAccess.receiver, target.qualifiedType, cached.items.size()));
@@ -341,7 +342,7 @@ public class CompletionProvider {
         if (memberAccess.partial.isEmpty()
                 && !"java.lang.Object".equals(target.qualifiedType)
                 && isWeakObjectOnlyResult(result)) {
-            LOG.info(
+            LOG.fine(
                     "[perf] completion_member_index state=drop_weak_object_only receiver="
                             + memberAccess.receiver
                             + " type="
@@ -2201,8 +2202,8 @@ public class CompletionProvider {
     private void logCompletionTiming(Instant started, List<?> list, boolean isIncomplete) {
         var elapsedMs = Duration.between(started, Instant.now()).toMillis();
         if (isIncomplete)
-            LOG.info(String.format("[perf] completion_total items=%d incomplete=true took=%dms", list.size(), elapsedMs));
-        else LOG.info(String.format("[perf] completion_total items=%d incomplete=false took=%dms", list.size(), elapsedMs));
+            LOG.fine(String.format("[perf] completion_total items=%d incomplete=true took=%dms", list.size(), elapsedMs));
+        else LOG.fine(String.format("[perf] completion_total items=%d incomplete=false took=%dms", list.size(), elapsedMs));
     }
 
     private CharSequence simpleName(String className) {
@@ -2211,5 +2212,4 @@ public class CompletionProvider {
         return className.subSequence(dot + 1, className.length());
     }
 
-    private static final Logger LOG = Logger.getLogger("main");
 }

@@ -36,6 +36,8 @@ import org.javacs.navigation.ReferenceProvider;
 import org.javacs.rewrite.*;
 
 class JavaLanguageServer extends LanguageServer {
+    private static final Logger LOG = Logger.getLogger("main");
+
     // TODO allow multiple workspace roots
     private Path workspaceRoot;
     private final LanguageClient client;
@@ -148,7 +150,7 @@ class JavaLanguageServer extends LanguageServer {
             scheduleDiagnostics(active, "compilerRecreated", 0, true);
             return;
         }
-        LOG.info("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
+        LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
     }
 
     void lint(Collection<Path> files) {
@@ -171,7 +173,7 @@ class JavaLanguageServer extends LanguageServer {
         synchronized (diagnosticsCompileMutex) {
             var waited = Duration.between(waitStarted, Instant.now()).toMillis();
             if (waited > 0) {
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] diagnostics_compile_wait trigger=%s waited=%dms",
                                 trigger, waited));
@@ -217,7 +219,7 @@ class JavaLanguageServer extends LanguageServer {
                                 "index:" + trigger,
                                 Duration.between(indexStarted, Instant.now()));
                     }
-                    LOG.info(
+                    LOG.fine(
                         String.format(
                                 "[perf] completion_index_refresh_shared trigger=%s files=%d version=%d mode=%s took=%dms",
                                 trigger,
@@ -253,7 +255,7 @@ class JavaLanguageServer extends LanguageServer {
                     if (publishedUris.contains(uri)) continue;
                     client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
                 }
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] diagnostics_publish trigger=%s files=%d diagnostics=%d took=%dms",
                                 trigger,
@@ -286,7 +288,7 @@ class JavaLanguageServer extends LanguageServer {
         var rebuilt = nextIndex == null ? TypeMemberIndex.EMPTY : nextIndex;
         completionIndexRef.set(rebuilt);
         completionIndexVersion.set(indexVersion);
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] completion_type_index trigger=%s version=%d types=%d took=%dms",
                         trigger, indexVersion, rebuilt.size(), took.toMillis()));
@@ -309,7 +311,7 @@ class JavaLanguageServer extends LanguageServer {
                                 new LinkedHashSet<>(replacedFiles));
         completionIndexRef.set(merged);
         completionIndexVersion.set(indexVersion);
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] completion_type_index_merge trigger=%s version=%d types=%d files=%d took=%dms",
                         trigger, indexVersion, merged.size(), replacedFiles.size(), took.toMillis()));
@@ -358,7 +360,7 @@ class JavaLanguageServer extends LanguageServer {
                         indexVersion,
                         "index:" + trigger,
                         Duration.between(indexStarted, Instant.now()));
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] completion_index_refresh_sync trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
                                 trigger,
@@ -411,7 +413,7 @@ class JavaLanguageServer extends LanguageServer {
                             delayMs,
                             TimeUnit.MILLISECONDS);
         }
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] completion_index_debounce trigger=%s files=%d mode=%s delay=%dms revision=%d",
                         trigger, filesBatch.size(), mode.name().toLowerCase(), delayMs, revision));
@@ -432,7 +434,7 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 task = indexCompiler.compile(files.toArray(Path[]::new));
                 if (revision != completionIndexRevision.get()) {
-                    LOG.info(
+                    LOG.fine(
                             String.format(
                                     "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
                                     trigger, revision, completionIndexRevision.get()));
@@ -444,7 +446,7 @@ class JavaLanguageServer extends LanguageServer {
                                 ? TypeMemberIndex.workspaceDeclarations(task)
                                 : TypeMemberIndex.from(task);
                 if (revision != completionIndexRevision.get()) {
-                    LOG.info(
+                    LOG.fine(
                             String.format(
                                     "[perf] completion_index_refresh_skip trigger=%s phase=post_index expected=%d current=%d",
                                     trigger, revision, completionIndexRevision.get()));
@@ -458,7 +460,7 @@ class JavaLanguageServer extends LanguageServer {
                         indexVersion,
                         "index:" + trigger,
                         Duration.between(indexStarted, Instant.now()));
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
                                 trigger,
@@ -552,7 +554,7 @@ class JavaLanguageServer extends LanguageServer {
         if (activeJavaFiles.isEmpty()) {
             return List.of(file);
         }
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] diagnostics_active_fanout trigger=%s file=%s files=%d reason=lombok",
                         trigger, file.getFileName(), activeJavaFiles.size()));
@@ -587,7 +589,7 @@ class JavaLanguageServer extends LanguageServer {
                             delayMs,
                             TimeUnit.MILLISECONDS);
         }
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms revision=%d content_revision=%d shared_index=%s",
                         trigger,
@@ -606,7 +608,7 @@ class JavaLanguageServer extends LanguageServer {
         for (var file : javaFiles) {
             client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
         }
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] diagnostics_clear trigger=%s files=%d",
                         trigger, javaFiles.size()));
@@ -621,7 +623,7 @@ class JavaLanguageServer extends LanguageServer {
             pendingDiagnostics.cancel(false);
             pendingDiagnostics = null;
         }
-        LOG.info("[perf] diagnostics_cancel reason=" + reason);
+        LOG.fine("[perf] diagnostics_cancel reason=" + reason);
     }
 
     private void runDiagnostics(List<Path> files, ScheduledDiagnosticsRequest request, String trigger) {
@@ -676,7 +678,7 @@ class JavaLanguageServer extends LanguageServer {
             pendingCompletionIndex.cancel(false);
             pendingCompletionIndex = null;
         }
-        LOG.info("[perf] completion_index_cancel reason=" + reason);
+        LOG.fine("[perf] completion_index_cancel reason=" + reason);
     }
 
     private boolean shouldSkipStaleDiagnostics(long expectedContentRevision, String trigger, String phase) {
@@ -684,7 +686,7 @@ class JavaLanguageServer extends LanguageServer {
         if (!isStaleDiagnosticsContent(expectedContentRevision, current)) {
             return false;
         }
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] diagnostics_skip_stale trigger=%s phase=%s expected_content=%d current_content=%d",
                         trigger, phase, expectedContentRevision, current));
@@ -702,7 +704,7 @@ class JavaLanguageServer extends LanguageServer {
     private void verifyLombokSymbols(CompileTask task, String phase) {
         if (lombokVerifiedForCurrentCompiler) return;
         if (!lombokEnabledForCurrentCompiler) {
-            LOG.info("[perf] lombok_verify phase=" + phase + " skipped=disabled_by_setting");
+            LOG.fine("[perf] lombok_verify phase=" + phase + " skipped=disabled_by_setting");
             lombokVerifiedForCurrentCompiler = true;
             return;
         }
@@ -724,7 +726,7 @@ class JavaLanguageServer extends LanguageServer {
                                 .collect(java.util.stream.Collectors.toSet());
                 var expectedGenerated = expectedLombokMethodNames(cls);
                 var generatedVisible = visibleMethods.stream().anyMatch(expectedGenerated::contains);
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] lombok_verify phase=%s class=%s generated_members_visible=%s enclosed_count=%d",
                                 phase,
@@ -737,7 +739,7 @@ class JavaLanguageServer extends LanguageServer {
                 return;
             }
         }
-        LOG.info("[perf] lombok_verify phase=" + phase + " skipped=no_lombok_annotated_class");
+        LOG.fine("[perf] lombok_verify phase=" + phase + " skipped=no_lombok_annotated_class");
         lombokVerifiedForCurrentCompiler = true;
     }
 
@@ -1005,7 +1007,7 @@ class JavaLanguageServer extends LanguageServer {
                         if (activeJavaDocument || Files.exists(file)) {
                             FileStore.externalChange(file);
                             if (suppressActiveDocumentWork) {
-                                LOG.info(
+                                LOG.fine(
                                         "[perf] watched_java_change_skip reason=active_document event=created file="
                                                 + file);
                             } else {
@@ -1024,7 +1026,7 @@ class JavaLanguageServer extends LanguageServer {
                     case FileChangeType.Changed:
                         FileStore.externalChange(file);
                         if (suppressActiveDocumentWork) {
-                            LOG.info(
+                            LOG.fine(
                                     "[perf] watched_java_change_skip reason=active_document event=changed file="
                                             + file);
                         } else {
@@ -1042,7 +1044,7 @@ class JavaLanguageServer extends LanguageServer {
                 }
                 if (!activeDocuments.isEmpty()) {
                     if (suppressActiveDocumentWork) {
-                        LOG.info(
+                        LOG.fine(
                                 "[perf] diagnostics_watched_skip reason=active_document file="
                                         + file);
                     } else {
@@ -1068,7 +1070,7 @@ class JavaLanguageServer extends LanguageServer {
         compiler();
         if (completionIndexVersion.get() == 0) {
             cancelPendingCompletionIndex("completionBootstrap");
-            LOG.info(
+            LOG.fine(
                     String.format(
                             "[perf] completion_index_bootstrap trigger=completion file=%s",
                             file.getFileName()));
@@ -1401,5 +1403,4 @@ class JavaLanguageServer extends LanguageServer {
         return inlayHint.has("refreshSupport") && inlayHint.get("refreshSupport").getAsBoolean();
     }
 
-    private static final Logger LOG = Logger.getLogger("main");
 }

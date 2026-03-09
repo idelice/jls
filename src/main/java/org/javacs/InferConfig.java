@@ -220,7 +220,7 @@ class InferConfig {
             var cacheKey = pomAbsolute + "|" + goal;
             var cached = MVN_DEPENDENCY_CACHE.get(cacheKey);
             if (cached != null && cached.pomLastModifiedMillis == pomLastModifiedMillis) {
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] maven_probe cache=hit goal=%s pom=%s deps=%d",
                                 goal, pomAbsolute, cached.dependencies.size()));
@@ -262,7 +262,7 @@ class InferConfig {
             }
             var immutable = Set.copyOf(dependencies);
             MVN_DEPENDENCY_CACHE.put(cacheKey, new MavenDependencyCacheEntry(pomLastModifiedMillis, immutable));
-            LOG.info(
+            LOG.fine(
                     String.format(
                             "[perf] maven_probe cache=miss goal=%s pom=%s deps=%d",
                             goal, pomAbsolute, immutable.size()));
@@ -282,7 +282,7 @@ class InferConfig {
         }
         var artifact = match.group(1);
         var path = match.group(2);
-        LOG.info(String.format("...%s => %s", artifact, path));
+        LOG.fine(String.format("...%s => %s", artifact, path));
         return Paths.get(path);
     }
 

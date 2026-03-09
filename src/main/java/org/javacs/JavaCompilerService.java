@@ -21,6 +21,7 @@ import java.util.stream.Collectors;
 import javax.tools.*;
 
 class JavaCompilerService implements CompilerProvider {
+    private static final Logger LOG = Logger.getLogger("main");
     // Not modifiable! If you want to edit these, you need to create a new instance
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
@@ -333,14 +334,14 @@ class JavaCompilerService implements CompilerProvider {
                         : attrWithoutAp ? cachedFastCompileNoApContentRevision : cachedFastCompileContentRevision;
         if (cachedContentRevision != currentContentRevision || needsCompile(effectiveSources, modifiedCache)) {
             if (cachedContentRevision != currentContentRevision) {
-                LOG.info(
+                LOG.fine(
                         String.format(
                                 "[perf] javac_cache_refresh mode=%s reason=content_revision_change cached=%d current=%d",
                                 mode.name().toLowerCase(), cachedContentRevision, currentContentRevision));
             }
             loadCompile(effectiveSources, mode, useAP, currentContentRevision);
         } else {
-            LOG.info(
+            LOG.fine(
                     String.format(
                             "[perf] javac_cache_hit mode=%s content_revision=%d",
                             mode.name().toLowerCase(), currentContentRevision));
@@ -352,7 +353,7 @@ class JavaCompilerService implements CompilerProvider {
 
     private Collection<? extends JavaFileObject> expandSourcesForLombokAP(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] compile_trigger entry=expandSourcesForLombokAP request=%s allow_ap=%s sources=%d stack=%s",
                         requestType(), allowAP, sources.size(), requestStack()));
@@ -363,7 +364,7 @@ class JavaCompilerService implements CompilerProvider {
         var requestedHasLombokAnnotations = requestedSourcesUseLombokAnnotations(sources);
         var referencedLombokSources = referencedLombokSources(sources);
         if (!requestedHasLombokAnnotations && referencedLombokSources.isEmpty()) {
-            LOG.info(
+            LOG.fine(
                     String.format(
                             "[perf] lombok_ap_sources requested=%d expanded=%d reason=no_lombok_annotations_or_references",
                             sources.size(), sources.size()));
@@ -393,21 +394,21 @@ class JavaCompilerService implements CompilerProvider {
                         : "referenced_lombok_types";
 
         if (expanded.size() + nonFileSources.size() == sources.size()) {
-            LOG.info(
+            LOG.fine(
                     String.format(
                             "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
                             sources.size(), sources.size(), reason));
             return sources;
         }
 
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] lombok_ap_references requested=%d referenced=%d",
                         sources.size(), referencedLombokSources.size()));
 
         var result = new ArrayList<JavaFileObject>(expanded.values());
         result.addAll(nonFileSources);
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
                         sources.size(), result.size(), reason));
@@ -889,7 +890,7 @@ class JavaCompilerService implements CompilerProvider {
     private Optional<JavaFileObject> findPublicTypeDeclarationInJdk(String className) {
         var cached = jdkSourceCache.get(className);
         if (cached != null) {
-            LOG.info(String.format("[perf] jdk_lookup class=%s took=0ms cache=hit found=%s", className, cached.isPresent()));
+            LOG.fine(String.format("[perf] jdk_lookup class=%s took=0ms cache=hit found=%s", className, cached.isPresent()));
             return cached;
         }
         var started = System.nanoTime();
@@ -900,10 +901,10 @@ class JavaCompilerService implements CompilerProvider {
                 var fromModuleSourcePath =
                         docs.fileManager.getJavaFileForInput(moduleLocation, className, JavaFileObject.Kind.SOURCE);
                 if (fromModuleSourcePath != null) {
-                    LOG.info(String.format("...found %s in module %s of jdk", fromModuleSourcePath.toUri(), module));
+                    LOG.fine(String.format("...found %s in module %s of jdk", fromModuleSourcePath.toUri(), module));
                     var found = Optional.of(fromModuleSourcePath);
                     jdkSourceCache.put(className, found);
-                    LOG.info(
+                    LOG.fine(
                             String.format(
                                     "[perf] jdk_lookup class=%s took=%dms cache=miss found=true",
                                     className, (System.nanoTime() - started) / 1_000_000));
@@ -915,7 +916,7 @@ class JavaCompilerService implements CompilerProvider {
         }
         var notFound = Optional.<JavaFileObject>empty();
         jdkSourceCache.put(className, notFound);
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] jdk_lookup class=%s took=%dms cache=miss found=false",
                         className, (System.nanoTime() - started) / 1_000_000));
@@ -1115,5 +1116,4 @@ class JavaCompilerService implements CompilerProvider {
                         });
     }
 
-    private static final Logger LOG = Logger.getLogger("main");
 }

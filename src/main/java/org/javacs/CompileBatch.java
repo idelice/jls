@@ -179,7 +179,7 @@ public class CompileBatch implements AutoCloseable {
 
     private void logPhaseTimings(
             int sourceCount, AnalysisMode mode, long parseNanos, long enterNanos, long analyzeNanos) {
-        LOG.info(
+        LOG.fine(
                 String.format(
                         "[perf] javac_phases mode=%s sources=%d parse=%dms enter=%dms analyze=%dms",
                         mode.name().toLowerCase(),
