@@ -1,6 +1,7 @@
 package org.javacs;
 
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Tree;
@@ -48,14 +49,14 @@ class JavaCompilerService implements CompilerProvider {
             Set<String> addExports,
             Set<String> extraArgs,
             boolean lombokConfiguredEnabled) {
-        System.err.println("Class path:");
-        for (var p : classPath) {
-            System.err.println("  " + p);
-        }
-        System.err.println("Doc path:");
-        for (var p : docPath) {
-            System.err.println("  " + p);
-        }
+        // System.err.println("Class path:");
+        // for (var p : classPath) {
+        //     System.err.println("  " + p);
+        // }
+        // System.err.println("Doc path:");
+        // for (var p : docPath) {
+        //     System.err.println("  " + p);
+        // }
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
         this.classPath = Collections.unmodifiableSet(classPath);
         this.docPath = Collections.unmodifiableSet(docPath);
@@ -516,6 +517,12 @@ class JavaCompilerService implements CompilerProvider {
                 addTypeTokens(node.getIdentifier(), refs);
                 return super.visitNewClass(node, refs);
             }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree node, Set<String> refs) {
+                addTypeTokens(node.getExpression(), refs);
+                return super.visitMemberSelect(node, refs);
+            }
         }.scan(parsed.root, referenced);
         return referenced;
     }
@@ -636,7 +643,7 @@ class JavaCompilerService implements CompilerProvider {
             if (path == null) {
                 continue;
             }
-            if (quickMaybeUsesLombok(path)) {
+            if (hasLombokAnnotation(path)) {
                 LOG.fine("[perf] lombok_ap_gate enabled=true file=" + path.getFileName());
                 return true;
             }
@@ -768,14 +775,6 @@ class JavaCompilerService implements CompilerProvider {
             cacheHasLombokAnnotation.load(file, null, hasLombok);
         }
         return cacheHasLombokAnnotation.get(file, null);
-    }
-
-    private boolean sourceUsesLombok(Path file) {
-        return hasLombokAnnotation(file);
-    }
-
-    private boolean quickMaybeUsesLombok(Path file) {
-        return hasLombokAnnotation(file);
     }
 
     private final Cache<Void, List<String>> cacheFileImports = new Cache<>();

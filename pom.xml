@@ -50,6 +50,11 @@
             <artifactId>fastutil</artifactId>
             <version>8.5.14</version>
         </dependency>
+        <dependency>
+            <groupId>org.vineflower</groupId>
+            <artifactId>vineflower</artifactId>
+            <version>1.11.2</version>
+        </dependency>
         <!-- Testing framework -->
         <dependency>
             <groupId>junit</groupId>
@@ -140,6 +145,10 @@
                     <source>20</source>
                     <target>20</target>
                     <compilerArgs>
+                        <arg>--add-modules</arg>
+                        <arg>jdk.jdeps</arg>
+                        <arg>--add-exports</arg>
+                        <arg>jdk.jdeps/com.sun.tools.classfile=ALL-UNNAMED</arg>
                         <arg>--add-exports</arg>
                         <arg>jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED</arg>
                         <arg>--add-exports</arg>
@@ -172,6 +181,8 @@
                 <version>3.0.0-M7</version>
                 <configuration>
                     <argLine>
+                        --add-modules jdk.jdeps
+                        --add-exports jdk.jdeps/com.sun.tools.classfile=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED

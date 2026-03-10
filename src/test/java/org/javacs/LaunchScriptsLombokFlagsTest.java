@@ -36,6 +36,13 @@ public class LaunchScriptsLombokFlagsTest {
         assertContainsRequiredFlags(Path.of("dist/launch_windows.cmd"));
     }
 
+    @Test
+    public void linkScriptsIncludeJdepsModuleForClassfileFallback() throws IOException {
+        assertContainsLinkedModule(Path.of("scripts/link_mac.sh"), "jdk.jdeps");
+        assertContainsLinkedModule(Path.of("scripts/link_linux.sh"), "jdk.jdeps");
+        assertContainsLinkedModule(Path.of("scripts/link_windows.sh"), "jdk.jdeps");
+    }
+
     private void assertContainsRequiredFlags(Path script) throws IOException {
         var content = Files.readString(script);
         for (var javacPackage : REQUIRED_JAVAC_PACKAGES) {
@@ -43,5 +50,10 @@ public class LaunchScriptsLombokFlagsTest {
             assertThat(content, containsString("--add-exports " + moduleAccess));
             assertThat(content, containsString("--add-opens " + moduleAccess));
         }
+    }
+
+    private void assertContainsLinkedModule(Path script, String moduleName) throws IOException {
+        var content = Files.readString(script);
+        assertThat(content, containsString(moduleName));
     }
 }

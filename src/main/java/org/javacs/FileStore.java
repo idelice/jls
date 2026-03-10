@@ -229,7 +229,7 @@ public class FileStore {
     }
 
     static void open(DidOpenTextDocumentParams params) {
-        if (!isJavaFile(params.textDocument.uri)) return;
+        if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var document = params.textDocument;
         var file = Paths.get(document.uri);
         activeDocuments.put(file, new VersionedContent(document.text, document.version));
@@ -237,7 +237,7 @@ public class FileStore {
     }
 
     static void change(DidChangeTextDocumentParams params) {
-        if (!isJavaFile(params.textDocument.uri)) return;
+        if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var document = params.textDocument;
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
@@ -255,7 +255,7 @@ public class FileStore {
     }
 
     static void close(DidCloseTextDocumentParams params) {
-        if (!isJavaFile(params.textDocument.uri)) return;
+        if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         activeDocuments.remove(file);
         bumpContentRevision();
@@ -410,6 +410,27 @@ public class FileStore {
 
     static boolean isJavaFile(URI uri) {
         return uri.getScheme().equals("file") && isJavaFile(Paths.get(uri));
+    }
+
+    static boolean isWorkspaceFile(Path file) {
+        if (file == null) {
+            return false;
+        }
+        var normalized = file.toAbsolutePath().normalize();
+        for (var root : workspaceRoots) {
+            if (normalized.startsWith(root)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean isWorkspaceJavaFile(Path file) {
+        return isJavaFile(file) && isWorkspaceFile(file);
+    }
+
+    static boolean isWorkspaceJavaFile(URI uri) {
+        return uri.getScheme().equals("file") && isWorkspaceJavaFile(Paths.get(uri));
     }
 
     static Optional<Path> findDeclaringFile(TypeElement el) {

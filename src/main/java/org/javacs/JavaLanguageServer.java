@@ -340,30 +340,19 @@ class JavaLanguageServer extends LanguageServer {
         refreshCompletionIndexNow(FileStore.all(), trigger, CompletionIndexRefreshMode.FULL_REBUILD);
     }
 
-    private void refreshCompletionIndexNow(Collection<Path> files, String trigger) {
-        refreshCompletionIndexNow(files, trigger, CompletionIndexRefreshMode.FULL_REBUILD);
-    }
-
     private void refreshCompletionIndexNow(
             Collection<Path> files, String trigger, CompletionIndexRefreshMode mode) {
         var javaFiles = normalizeJavaFiles(files);
         if (javaFiles.isEmpty()) {
             return;
         }
-        var indexCompiler = completionIndexCompiler(mode);
-        if (indexCompiler == null) {
-            return;
-        }
         synchronized (completionIndexCompileMutex) {
             var started = Instant.now();
             CompileTask task = null;
             try {
-                task = indexCompiler.compile(javaFiles.toArray(Path[]::new));
+                task = compiler().compile(javaFiles.toArray(Path[]::new));
                 var indexStarted = Instant.now();
-                var nextIndex =
-                        mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                                ? TypeMemberIndex.workspaceDeclarations(task)
-                                : TypeMemberIndex.from(task);
+                var nextIndex = buildCompletionIndex(task, mode);
                 var indexVersion = nextIndexVersion();
                 installCompletionIndex(
                         nextIndex,
@@ -399,14 +388,6 @@ class JavaLanguageServer extends LanguageServer {
         scheduleCompletionIndexRefresh(FileStore.all(), trigger, delayMs, CompletionIndexRefreshMode.FULL_REBUILD);
     }
 
-    private void scheduleCompletionIndexRefresh(Collection<Path> files, String trigger) {
-        scheduleCompletionIndexRefresh(files, trigger, COMPLETION_INDEX_DEBOUNCE_MS, CompletionIndexRefreshMode.FULL_REBUILD);
-    }
-
-    private void scheduleCompletionIndexRefresh(Collection<Path> files, String trigger, long delayMs) {
-        scheduleCompletionIndexRefresh(files, trigger, delayMs, CompletionIndexRefreshMode.FULL_REBUILD);
-    }
-
     private void scheduleCompletionIndexRefresh(
             Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
         var javaFiles = normalizeJavaFiles(files);
@@ -436,15 +417,11 @@ class JavaLanguageServer extends LanguageServer {
         if (revision != completionIndexRevision.get()) {
             return;
         }
-        var indexCompiler = completionIndexCompiler(mode);
-        if (indexCompiler == null) {
-            return;
-        }
         synchronized (completionIndexCompileMutex) {
             var started = Instant.now();
             CompileTask task = null;
             try {
-                task = indexCompiler.compile(files.toArray(Path[]::new));
+                task = compiler().compile(files.toArray(Path[]::new));
                 if (revision != completionIndexRevision.get()) {
                     LOG.fine(
                             String.format(
@@ -453,10 +430,7 @@ class JavaLanguageServer extends LanguageServer {
                     return;
                 }
                 var indexStarted = Instant.now();
-                var nextIndex =
-                        mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                                ? TypeMemberIndex.workspaceDeclarations(task)
-                                : TypeMemberIndex.from(task);
+                var nextIndex = buildCompletionIndex(task, mode);
                 if (revision != completionIndexRevision.get()) {
                     LOG.fine(
                             String.format(
@@ -509,6 +483,12 @@ class JavaLanguageServer extends LanguageServer {
         installTypeMemberIndex(nextIndex, indexVersion, trigger, took);
     }
 
+    private TypeMemberIndex buildCompletionIndex(CompileTask task, CompletionIndexRefreshMode mode) {
+        return mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
+                ? TypeMemberIndex.workspaceDeclarations(task)
+                : TypeMemberIndex.from(task);
+    }
+
     private ActiveDocumentChangeImpact analyzeActiveDocumentChange(Path file) {
         try {
             var parse = compiler().parse(file);
@@ -559,26 +539,93 @@ class JavaLanguageServer extends LanguageServer {
 
     private Collection<Path> diagnosticsTargetsForActiveDocumentChange(
             Path file, String trigger, ActiveDocumentChangeImpact impact) {
-        if (!impact.fanoutDiagnostics()) {
-            return List.of(file);
-        }
         var activeJavaFiles = normalizeJavaFiles(FileStore.activeDocuments());
-        if (activeJavaFiles.isEmpty()) {
+        if (activeJavaFiles.isEmpty() || !activeJavaFiles.contains(file)) {
             return List.of(file);
         }
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_active_fanout trigger=%s file=%s files=%d reason=lombok",
-                        trigger, file.getFileName(), activeJavaFiles.size()));
-        return activeJavaFiles;
+        if (impact.fanoutDiagnostics()) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_active_fanout trigger=%s file=%s files=%d reason=lombok",
+                            trigger, file.getFileName(), activeJavaFiles.size()));
+            return activeJavaFiles;
+        }
+
+        var related = relatedActiveDocuments(file, activeJavaFiles, impact);
+        if (related.size() > 1) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_active_related trigger=%s file=%s files=%d reason=active_type_dependency",
+                            trigger, file.getFileName(), related.size()));
+        }
+        return related;
+    }
+
+    private Collection<Path> relatedActiveDocuments(
+            Path file, Collection<Path> activeJavaFiles, ActiveDocumentChangeImpact impact) {
+        var declarationsByFile = new LinkedHashMap<Path, Set<String>>();
+        for (var active : activeJavaFiles) {
+            declarationsByFile.put(active, topLevelQualifiedTypes(active));
+        }
+
+        var related = new LinkedHashSet<Path>();
+        related.add(file);
+        var currentTypes = declarationsByFile.getOrDefault(file, Set.of());
+        for (var active : activeJavaFiles) {
+            if (active.equals(file)) {
+                continue;
+            }
+            var activeTypes = declarationsByFile.getOrDefault(active, Set.of());
+            if (referencesAnyType(file, activeTypes)
+                    || (impact.refreshCompletionIndex() && referencesAnyType(active, currentTypes))) {
+                related.add(active);
+            }
+        }
+        return List.copyOf(related);
+    }
+
+    private Set<String> topLevelQualifiedTypes(Path file) {
+        try {
+            var parse = compiler().parse(file);
+            var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+            var result = new LinkedHashSet<String>();
+            for (var typeDecl : parse.root.getTypeDecls()) {
+                if (!(typeDecl instanceof ClassTree cls)) {
+                    continue;
+                }
+                var simpleName = cls.getSimpleName().toString();
+                if (simpleName.isBlank()) {
+                    continue;
+                }
+                result.add(packageName.isBlank() ? simpleName : packageName + "." + simpleName);
+            }
+            return result;
+        } catch (RuntimeException e) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_active_related_types file=%s status=failed reason=%s",
+                            file.getFileName(), e.getMessage()));
+            return Set.of();
+        }
+    }
+
+    private boolean referencesAnyType(Path file, Set<String> qualifiedTypes) {
+        if (qualifiedTypes.isEmpty()) {
+            return false;
+        }
+        var compiler = compiler();
+        for (var qualifiedType : qualifiedTypes) {
+            for (var candidate : compiler.findTypeReferences(qualifiedType)) {
+                if (file.equals(candidate)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private void scheduleDiagnostics(Collection<Path> files, String trigger) {
         scheduleDiagnostics(files, trigger, DIAGNOSTIC_DEBOUNCE_MS, false);
-    }
-
-    private void scheduleDiagnostics(Collection<Path> files, String trigger, long delayMs) {
-        scheduleDiagnostics(files, trigger, delayMs, false);
     }
 
     private void scheduleDiagnostics(
@@ -654,10 +701,6 @@ class JavaLanguageServer extends LanguageServer {
             LOG.warning("Async lint failed for " + files + ": " + e.getMessage());
             LOG.log(java.util.logging.Level.FINE, "", e);
         }
-    }
-
-    private JavaCompilerService completionIndexCompiler(CompletionIndexRefreshMode mode) {
-        return compiler();
     }
 
     private void preparseActiveDocument(Path file, String trigger) {
@@ -1086,7 +1129,8 @@ class JavaLanguageServer extends LanguageServer {
                     String.format(
                             "[perf] completion_index_bootstrap trigger=completion file=%s",
                             file.getFileName()));
-            refreshCompletionIndexNow(FileStore.all(), "completionBootstrap");
+            refreshCompletionIndexNow(
+                    FileStore.all(), "completionBootstrap", CompletionIndexRefreshMode.FULL_REBUILD);
         }
         var completionIndex = typeIndex();
         var indexVersion = completionIndexVersion.get();
@@ -1194,7 +1238,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<InlayHint> inlayHint(InlayHintParams params) {
-        if (params == null || params.textDocument == null || !FileStore.isJavaFile(params.textDocument.uri)) {
+        if (params == null || params.textDocument == null || !FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
             return List.of();
         }
         var file = Paths.get(params.textDocument.uri);
@@ -1322,7 +1366,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return;
+        if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         preparseActiveDocument(file, "didOpen");
         var impact = analyzeActiveDocumentChange(file);
@@ -1339,7 +1383,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didChangeTextDocument(DidChangeTextDocumentParams params) {
         FileStore.change(params);
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return;
+        if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         preparseActiveDocument(file, "didChange");
         var impact = analyzeActiveDocumentChange(file);
@@ -1359,7 +1403,7 @@ class JavaLanguageServer extends LanguageServer {
     public void didCloseTextDocument(DidCloseTextDocumentParams params) {
         FileStore.close(params);
 
-        if (FileStore.isJavaFile(params.textDocument.uri)) {
+        if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }
@@ -1377,7 +1421,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
-        if (FileStore.isJavaFile(params.textDocument.uri)) {
+        if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
             cancelPendingDiagnostics("didSave");
             cancelPendingCompletionIndex("didSave");
             var files = new LinkedHashSet<Path>();

@@ -31,10 +31,12 @@ import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
 import org.javacs.lsp.InitializeParams;
+import org.javacs.lsp.InlayHintParams;
 import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
+import org.javacs.lsp.Range;
 import org.javacs.lsp.ShowMessageParams;
 import org.javacs.lsp.TextDocumentIdentifier;
 import org.javacs.lsp.TextDocumentContentChangeEvent;
@@ -375,6 +377,8 @@ public class JavaLanguageServerTest {
     public void slf4jDidChangeDoesNotFanoutDiagnosticsAcrossActiveDocuments() throws Exception {
         var workspace = Files.createTempDirectory("jls-slf4j-no-fanout");
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -439,9 +443,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "logging-only Lombok should stay on single-file diagnostics path",
                     didChangeDebounce.contains("files=1"));
-            Assert.assertTrue(
-                    "logging-only Lombok should not reuse shared diagnostics compile for index refresh",
-                    didChangeDebounce.contains("shared_index=false"));
             Assert.assertEquals(
                     "logging-only Lombok should not fan diagnostics out across active docs",
                     0,
@@ -453,6 +454,211 @@ public class JavaLanguageServerTest {
                     capture.countContaining("[perf] completion_index_refresh_shared trigger=async:didChange"));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void didOpenConsumerIncludesUnsavedActiveEnumDependencyInDiagnosticsCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-enum-related-open");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.getType();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text =
+                    "package com.example.demo.models;\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST;\n"
+                            + "  public String getType() {\n"
+                            + "    return name();\n"
+                            + "  }\n"
+                            + "}\n";
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "consumer diagnostics should include the active unsaved enum dependency on open",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getType()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "didOpen should log active-type diagnostics relation for the consumer",
+                    capture.countContaining(
+                                    "[perf] diagnostics_active_related trigger=didOpen file=ServiceTwo.java")
+                            > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void didOpenConsumerIncludesReferencedLombokEnumDependencyWithoutOpeningEnum() throws Exception {
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var client = new RecordingDiagnosticsClient();
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+        var serviceFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproEnumService.java");
+        try {
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "consumer diagnostics should include the referenced Lombok enum dependency on first open",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getType()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "didOpen should expand the consumer compile with the referenced Lombok enum",
+                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=2") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void didChangeEnumRefreshesDiagnosticsForActiveConsumerWithoutSave() throws Exception {
+        var workspace = Files.createTempDirectory("jls-enum-related-change");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.getType();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text = Files.readString(enumFile);
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "baseline should show the missing enum member error before the unsaved enum change",
+                    client.awaitErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getType()"),
+                            10,
+                            TimeUnit.SECONDS));
+
+            var enumChange = new DidChangeTextDocumentParams();
+            enumChange.textDocument.uri = enumFile.toUri();
+            enumChange.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text =
+                    "package com.example.demo.models;\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST;\n"
+                            + "  public String getType() {\n"
+                            + "    return name();\n"
+                            + "  }\n"
+                            + "}\n";
+            enumChange.contentChanges.add(delta);
+            server.didChangeTextDocument(enumChange);
+
+            Assert.assertTrue(
+                    "changing the enum should refresh active consumer diagnostics without save",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getType()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "didChange should log active-type diagnostics relation for the enum",
+                    capture.countContaining(
+                                    "[perf] diagnostics_active_related trigger=didChange file=MyEnum.java")
+                            > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -461,6 +667,8 @@ public class JavaLanguageServerTest {
     public void lombokConsumerDiagnosticsRemainResolvedBeforeAndAfterModelSave() throws Exception {
         var client = new RecordingDiagnosticsClient();
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         var server =
@@ -520,12 +728,15 @@ public class JavaLanguageServerTest {
                             TimeUnit.SECONDS));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
     @Test
     public void didChangeLombokModelRefreshesDiagnosticsForActiveConsumersWithoutSave() throws Exception {
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         var client = new RecordingDiagnosticsClient();
@@ -602,6 +813,7 @@ public class JavaLanguageServerTest {
                             TimeUnit.SECONDS));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -1106,6 +1318,59 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void externalJavaSourceSkipsWorkspaceDiagnosticsAndInlayHints() throws Exception {
+        FileStore.reset();
+        var workspace = Files.createTempDirectory("jls-workspace-only");
+        var externalRoot = Files.createTempDirectory("jls-external-java");
+        var client = new RecordingDiagnosticsClient();
+        try {
+            var workspaceFile = workspace.resolve("src/app/Main.java");
+            Files.createDirectories(workspaceFile.getParent());
+            Files.writeString(workspaceFile, "package app;\nclass Main {}\n");
+
+            var externalFile = externalRoot.resolve("cached/ext/ExternalPojo.java");
+            Files.createDirectories(externalFile.getParent());
+            Files.writeString(
+                    externalFile,
+                    "package ext;\n"
+                            + "class ExternalPojo {\n"
+                            + "  void test() {\n"
+                            + "    var value = unknown();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = externalFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(externalFile);
+            server.didOpenTextDocument(open);
+
+            Thread.sleep(1100);
+            Assert.assertFalse(
+                    "external cached-source files should not become active workspace documents",
+                    FileStore.activeDocuments().contains(externalFile));
+            Assert.assertEquals(
+                    "external cached-source files should not publish diagnostics",
+                    0,
+                    client.diagnosticsPublishCount.get());
+
+            var hints =
+                    server.inlayHint(
+                            new InlayHintParams(
+                                    new TextDocumentIdentifier(externalFile.toUri()),
+                                    new Range(new Position(0, 0), new Position(10, 0))));
+            Assert.assertTrue(
+                    "external cached-source files should not return inlay hints",
+                    hints.isEmpty());
+        } finally {
+            deleteRecursively(externalRoot);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void didChangeDiagnosticsAreCoalescedWithLongerDebounce() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
@@ -1424,7 +1689,7 @@ public class JavaLanguageServerTest {
 
         @Override
         public void publish(LogRecord record) {
-            if (record == null || record.getLevel().intValue() < Level.INFO.intValue()) {
+            if (record == null || record.getLevel().intValue() < Level.FINE.intValue()) {
                 return;
             }
             lines.add(record.getMessage());

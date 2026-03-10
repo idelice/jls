@@ -2,8 +2,13 @@ package org.javacs.completion;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.sun.tools.classfile.AccessFlags;
+import com.sun.tools.classfile.ClassFile;
+import com.sun.tools.classfile.ConstantPoolException;
+import com.sun.tools.classfile.Descriptor;
 import com.sun.source.tree.CompilationUnitTree;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
@@ -16,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.StringJoiner;
+import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.javacs.CompilerProvider;
@@ -28,21 +34,28 @@ public final class ExternalBinaryTypeIndex {
 
     private final CompilerProvider compiler;
     private final String classPathFingerprint;
+    private final Set<Path> classPathRoots;
     private final ClassLoader classLoader;
     private final Cache<String, Optional<TypeMemberIndex.TypeInfo>> typeCache;
-    private final Cache<String, Optional<Path>> stubCache;
+    private final Cache<String, Optional<Path>> decompiledSourceCache;
+    private final Cache<String, Optional<BinaryClassModel>> classFileCache;
+    private final ExternalBinaryDecompiler decompiler;
 
     private ExternalBinaryTypeIndex() {
         this.compiler = null;
         this.classPathFingerprint = "";
+        this.classPathRoots = Set.of();
         this.classLoader = ExternalBinaryTypeIndex.class.getClassLoader();
         this.typeCache = Caffeine.newBuilder().maximumSize(1).build();
-        this.stubCache = Caffeine.newBuilder().maximumSize(1).build();
+        this.decompiledSourceCache = Caffeine.newBuilder().maximumSize(1).build();
+        this.classFileCache = Caffeine.newBuilder().maximumSize(1).build();
+        this.decompiler = new ExternalBinaryDecompiler(Set.of(), "", classLoader);
     }
 
     public ExternalBinaryTypeIndex(CompilerProvider compiler) {
         this.compiler = compiler;
         var classPath = compiler == null ? Set.<Path>of() : compiler.classPathRoots();
+        this.classPathRoots = Set.copyOf(classPath);
         this.classPathFingerprint = fingerprint(classPath);
         this.classLoader = buildClassLoader(classPath);
         this.typeCache =
@@ -50,11 +63,17 @@ public final class ExternalBinaryTypeIndex {
                         .maximumSize(20_000)
                         .expireAfterAccess(Duration.ofMinutes(30))
                         .build();
-        this.stubCache =
+        this.decompiledSourceCache =
                 Caffeine.newBuilder()
                         .maximumSize(5_000)
                         .expireAfterAccess(Duration.ofMinutes(30))
                         .build();
+        this.classFileCache =
+                Caffeine.newBuilder()
+                        .maximumSize(20_000)
+                        .expireAfterAccess(Duration.ofMinutes(30))
+                        .build();
+        this.decompiler = new ExternalBinaryDecompiler(this.classPathRoots, this.classPathFingerprint, this.classLoader);
     }
 
     public Optional<TypeMemberIndex.TypeInfo> typeInfo(String qualifiedName) {
@@ -141,11 +160,11 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
-    public Optional<Path> stubSourcePath(String qualifiedName) {
+    public Optional<Path> decompiledSourcePath(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
-        return stubCache.get(qualifiedName, this::buildStubSourcePath);
+        return decompiledSourceCache.get(qualifiedName, decompiler::decompileSourcePath);
     }
 
     private Optional<TypeMemberIndex.TypeInfo> loadTypeInfo(String qualifiedName) {
@@ -156,63 +175,81 @@ public final class ExternalBinaryTypeIndex {
             }
             var seen = new LinkedHashMap<String, TypeMemberIndex.Member>();
             for (var field : binaryClass.getFields()) {
-                if (field.isSynthetic()) {
-                    continue;
+                try {
+                    if (field.isSynthetic()) {
+                        continue;
+                    }
+                    var declaring = field.getDeclaringClass().getName();
+                    var priority = memberPriority(qualifiedName, declaring);
+                    var member =
+                            new TypeMemberIndex.Member(
+                                    declaring,
+                                    field.getName(),
+                                    CompletionItemKind.Field,
+                                    java.lang.reflect.Modifier.isStatic(field.getModifiers()),
+                                    java.lang.reflect.Modifier.isPrivate(field.getModifiers()),
+                                    priority,
+                                    field.getType().getTypeName() + " " + field.getName(),
+                                    canonicalTypeName(field.getType()),
+                                    null,
+                                    null);
+                    seen.putIfAbsent(memberKey(member), member);
+                } catch (TypeNotPresentException | LinkageError ex) {
+                    LOG.fine(
+                            String.format(
+                                    "[external-binary] skip field owner=%s field=%s reason=%s",
+                                    qualifiedName,
+                                    field.getName(),
+                                    ex.getClass().getSimpleName()));
                 }
-                var declaring = field.getDeclaringClass().getName();
-                var priority = memberPriority(qualifiedName, declaring);
-                var member =
-                        new TypeMemberIndex.Member(
-                                declaring,
-                                field.getName(),
-                                CompletionItemKind.Field,
-                                java.lang.reflect.Modifier.isStatic(field.getModifiers()),
-                                java.lang.reflect.Modifier.isPrivate(field.getModifiers()),
-                                priority,
-                                field.getType().getTypeName() + " " + field.getName(),
-                                canonicalTypeName(field.getType()),
-                                null,
-                                null);
-                seen.putIfAbsent(memberKey(member), member);
             }
             for (var method : binaryClass.getMethods()) {
-                if (method.isSynthetic() || method.isBridge()) {
-                    continue;
-                }
-                var declaring = method.getDeclaringClass().getName();
-                var priority = memberPriority(qualifiedName, declaring);
-                var parameterNames = new String[method.getParameterCount()];
-                var erasedParameterTypes = new String[method.getParameterCount()];
-                var parameters = new StringJoiner(", ");
-                for (int i = 0; i < method.getParameterCount(); i++) {
-                    var parameter = method.getParameters()[i];
-                    parameterNames[i] = parameter.getName();
-                    erasedParameterTypes[i] = method.getParameterTypes()[i].getTypeName();
-                    parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + parameter.getName());
-                }
-                var detail =
-                        canonicalTypeName(method.getReturnType())
-                                + " "
-                                + method.getName()
-                                + "("
-                                + parameters
-                                + ")";
-                var member =
-                        new TypeMemberIndex.Member(
-                                declaring,
-                                method.getName(),
-                                CompletionItemKind.Method,
-                                java.lang.reflect.Modifier.isStatic(method.getModifiers()),
-                                java.lang.reflect.Modifier.isPrivate(method.getModifiers()),
-                                priority,
-                                detail,
-                                canonicalTypeName(method.getReturnType()),
-                                parameterNames,
-                                erasedParameterTypes);
-                var key = memberKey(member);
-                var existing = seen.get(key);
-                if (existing == null || member.priority < existing.priority) {
-                    seen.put(key, member);
+                try {
+                    if (method.isSynthetic() || method.isBridge()) {
+                        continue;
+                    }
+                    var declaring = method.getDeclaringClass().getName();
+                    var priority = memberPriority(qualifiedName, declaring);
+                    var parameterNames = new String[method.getParameterCount()];
+                    var erasedParameterTypes = new String[method.getParameterCount()];
+                    var parameters = new StringJoiner(", ");
+                    for (int i = 0; i < method.getParameterCount(); i++) {
+                        var parameter = method.getParameters()[i];
+                        parameterNames[i] = parameter.getName();
+                        erasedParameterTypes[i] = method.getParameterTypes()[i].getTypeName();
+                        parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + parameter.getName());
+                    }
+                    var detail =
+                            canonicalTypeName(method.getReturnType())
+                                    + " "
+                                    + method.getName()
+                                    + "("
+                                    + parameters
+                                    + ")";
+                    var member =
+                            new TypeMemberIndex.Member(
+                                    declaring,
+                                    method.getName(),
+                                    CompletionItemKind.Method,
+                                    java.lang.reflect.Modifier.isStatic(method.getModifiers()),
+                                    java.lang.reflect.Modifier.isPrivate(method.getModifiers()),
+                                    priority,
+                                    detail,
+                                    canonicalTypeName(method.getReturnType()),
+                                    parameterNames,
+                                    erasedParameterTypes);
+                    var key = memberKey(member);
+                    var existing = seen.get(key);
+                    if (existing == null || member.priority < existing.priority) {
+                        seen.put(key, member);
+                    }
+                } catch (TypeNotPresentException | LinkageError ex) {
+                    LOG.fine(
+                            String.format(
+                                    "[external-binary] skip method owner=%s method=%s reason=%s",
+                                    qualifiedName,
+                                    method.getName(),
+                                    ex.getClass().getSimpleName()));
                 }
             }
             var members = new ArrayList<>(seen.values());
@@ -228,228 +265,144 @@ public final class ExternalBinaryTypeIndex {
                             false,
                             null));
         } catch (ClassNotFoundException | LinkageError ex) {
+            LOG.fine(
+                    String.format(
+                            "[external-binary] reflect miss type=%s reason=%s",
+                            qualifiedName,
+                            ex.getClass().getSimpleName()));
+            var fallback = classFileCache.get(qualifiedName, this::loadBinaryClassModel);
+            if (fallback.isPresent()) {
+                LOG.fine(String.format("[external-binary] classfile fallback type=%s", qualifiedName));
+                return Optional.of(fallback.get().typeInfo());
+            }
             LOG.fine(String.format("[external-binary] miss type=%s reason=%s", qualifiedName, ex.getClass().getSimpleName()));
             return Optional.empty();
         }
     }
 
-    private Optional<Path> buildStubSourcePath(String qualifiedName) {
-        var type = typeInfo(qualifiedName);
-        if (type.isEmpty()) {
-            return Optional.empty();
+    private Optional<BinaryClassModel> loadBinaryClassModel(String qualifiedName) {
+        var relative = qualifiedName.replace('.', '/') + ".class";
+        for (var root : classPathRoots) {
+            try {
+                if (Files.isDirectory(root)) {
+                    var classFile = root.resolve(relative);
+                    if (!Files.isRegularFile(classFile)) {
+                        continue;
+                    }
+                    try (var in = Files.newInputStream(classFile)) {
+                        return Optional.of(parseBinaryClassModel(qualifiedName, in));
+                    }
+                }
+                if (!Files.isRegularFile(root)) {
+                    continue;
+                }
+                try (var jar = new JarFile(root.toFile())) {
+                    var entry = jar.getJarEntry(relative);
+                    if (entry == null) {
+                        continue;
+                    }
+                    try (var in = jar.getInputStream(entry)) {
+                        return Optional.of(parseBinaryClassModel(qualifiedName, in));
+                    }
+                }
+            } catch (IOException | ConstantPoolException | Descriptor.InvalidDescriptor ex) {
+                LOG.fine(
+                        String.format(
+                                "[external-binary] classfile miss type=%s root=%s reason=%s",
+                                qualifiedName,
+                                root.getFileName(),
+                                ex.getClass().getSimpleName()));
+            }
         }
-        try {
-            var binaryClass = Class.forName(qualifiedName, false, classLoader);
-            var base =
-                    Path.of(System.getProperty("java.io.tmpdir"))
-                            .resolve("jls-binary-stubs")
-                            .resolve(classPathFingerprint);
-            var packageName = packageName(qualifiedName);
-            var relative = packageName.isBlank() ? Path.of("") : Path.of(packageName.replace('.', '/'));
-            var dir = base.resolve(relative);
-            Files.createDirectories(dir);
-            var file = dir.resolve(binaryClass.getSimpleName() + ".java");
-            Files.writeString(file, renderStubSource(binaryClass));
-            return Optional.of(file);
-        } catch (IOException | ClassNotFoundException | LinkageError ex) {
-            LOG.fine(String.format("[external-binary] stub miss type=%s reason=%s", qualifiedName, ex.getClass().getSimpleName()));
-            return Optional.empty();
-        }
+        return Optional.empty();
     }
 
-    private String renderStubSource(Class<?> binaryClass) {
-        var out = new StringBuilder();
-        if (binaryClass.getPackageName() != null && !binaryClass.getPackageName().isBlank()) {
-            out.append("package ").append(binaryClass.getPackageName()).append(";\n\n");
-        }
-        out.append(renderTypeHeader(binaryClass)).append(" {\n");
-        for (var field : binaryClass.getFields()) {
-            if (field.isSynthetic()) {
+    private BinaryClassModel parseBinaryClassModel(String qualifiedName, InputStream input)
+            throws IOException, ConstantPoolException, Descriptor.InvalidDescriptor {
+        var classFile = ClassFile.read(input);
+        var simpleName = simpleName(qualifiedName);
+        var seenMembers = new LinkedHashMap<String, TypeMemberIndex.Member>();
+
+        for (var field : classFile.fields) {
+            if (field.access_flags.is(AccessFlags.ACC_SYNTHETIC)) {
                 continue;
             }
-            out.append("    ")
-                    .append(renderField(field))
-                    .append("\n");
-        }
-        var constructors = visibleConstructors(binaryClass);
-        if (binaryClass.getFields().length > 0 && !constructors.isEmpty()) {
-            out.append("\n");
-        }
-        for (var constructor : constructors) {
-            out.append(renderConstructor(binaryClass, constructor));
-        }
-        if ((!constructors.isEmpty() || binaryClass.getFields().length > 0) && binaryClass.getMethods().length > 0) {
-            out.append("\n");
-        }
-        for (var method : binaryClass.getMethods()) {
-            if (method.isSynthetic() || method.isBridge()) {
+            var name = field.getName(classFile.constant_pool);
+            if (name == null || name.isBlank()) {
                 continue;
             }
-            out.append(renderMethod(binaryClass, method));
+            var type = normalizeBinaryType(field.descriptor.getFieldType(classFile.constant_pool));
+            var staticMember = field.access_flags.is(AccessFlags.ACC_STATIC);
+            var privateMember = field.access_flags.is(AccessFlags.ACC_PRIVATE);
+            var member =
+                    new TypeMemberIndex.Member(
+                            qualifiedName,
+                            name,
+                            CompletionItemKind.Field,
+                            staticMember,
+                            privateMember,
+                            0,
+                            type + " " + name,
+                            type,
+                            null,
+                            null);
+            seenMembers.putIfAbsent(memberKey(member), member);
         }
-        out.append("}\n");
-        return out.toString();
-    }
 
-    private String renderTypeHeader(Class<?> binaryClass) {
-        var modifiers = sanitizeTypeModifiers(binaryClass.getModifiers(), binaryClass);
-        var kind =
-                binaryClass.isAnnotation()
-                        ? "@interface"
-                        : binaryClass.isInterface()
-                                ? "interface"
-                                : binaryClass.isEnum() ? "enum" : "class";
-        var header = new StringBuilder();
-        if (!modifiers.isBlank()) {
-            header.append(modifiers).append(" ");
-        }
-        header.append(kind).append(" ").append(binaryClass.getSimpleName());
-        return header.toString();
-    }
-
-    private String renderField(java.lang.reflect.Field field) {
-        var modifiers = java.lang.reflect.Modifier.toString(field.getModifiers());
-        var assignment = defaultValueExpression(field.getType());
-        var out = new StringBuilder();
-        if (!modifiers.isBlank()) {
-            out.append(modifiers).append(" ");
-        }
-        out.append(canonicalTypeName(field.getType())).append(" ").append(field.getName());
-        if (assignment != null) {
-            out.append(" = ").append(assignment);
-        }
-        out.append(";");
-        return out.toString();
-    }
-
-    private String renderConstructor(Class<?> owner, java.lang.reflect.Constructor<?> constructor) {
-        var out = new StringBuilder("    ");
-        var modifiers = sanitizeConstructorModifiers(constructor.getModifiers(), owner);
-        if (!modifiers.isBlank()) {
-            out.append(modifiers).append(" ");
-        }
-        out.append(owner.getSimpleName()).append("(");
-        var parameters = new StringJoiner(", ");
-        for (int i = 0; i < constructor.getParameterCount(); i++) {
-            parameters.add(
-                    canonicalTypeName(constructor.getParameterTypes()[i])
+        for (var method : classFile.methods) {
+            if (method.access_flags.is(AccessFlags.ACC_SYNTHETIC)
+                    || method.access_flags.is(AccessFlags.ACC_BRIDGE)) {
+                continue;
+            }
+            var name = method.getName(classFile.constant_pool);
+            if (name == null || name.isBlank() || "<clinit>".equals(name)) {
+                continue;
+            }
+            var parameterTypes = parseBinaryParameterTypes(method.descriptor, classFile);
+            var parameterNames = syntheticParameterNames(parameterTypes.length);
+            if ("<init>".equals(name)) {
+                if (classFile.access_flags.is(AccessFlags.ACC_ENUM)) {
+                    var normalized = stripEnumConstructorPrefix(parameterTypes, parameterNames);
+                    parameterTypes = normalized.parameterTypes();
+                    parameterNames = normalized.parameterNames();
+                }
+                continue;
+            }
+            var returnType = normalizeBinaryType(method.descriptor.getReturnType(classFile.constant_pool));
+            var staticMember = method.access_flags.is(AccessFlags.ACC_STATIC);
+            var privateMember = method.access_flags.is(AccessFlags.ACC_PRIVATE);
+            var detail =
+                    returnType
                             + " "
-                            + constructor.getParameters()[i].getName());
-        }
-        out.append(parameters).append(")");
-        if (constructor.getExceptionTypes().length > 0) {
-            var thrown = new StringJoiner(", ");
-            for (var exceptionType : constructor.getExceptionTypes()) {
-                thrown.add(canonicalTypeName(exceptionType));
+                            + name
+                            + "("
+                            + renderParameters(parameterTypes, parameterNames)
+                            + ")";
+            var member =
+                    new TypeMemberIndex.Member(
+                            qualifiedName,
+                            name,
+                            CompletionItemKind.Method,
+                            staticMember,
+                            privateMember,
+                            0,
+                            detail,
+                            returnType,
+                            parameterNames,
+                            parameterTypes);
+            var key = memberKey(member);
+            var existing = seenMembers.get(key);
+            if (existing == null || member.priority < existing.priority) {
+                seenMembers.put(key, member);
             }
-            out.append(" throws ").append(thrown);
         }
-        out.append(" {\n");
-        out.append("    }\n");
-        return out.toString();
-    }
 
-    private String renderMethod(Class<?> owner, java.lang.reflect.Method method) {
-        var out = new StringBuilder("    ");
-        var modifiers = sanitizeMethodModifiers(method.getModifiers(), owner);
-        if (!modifiers.isBlank()) {
-            out.append(modifiers).append(" ");
-        }
-        out.append(canonicalTypeName(method.getReturnType()))
-                .append(" ")
-                .append(method.getName())
-                .append("(");
-        var parameters = new StringJoiner(", ");
-        for (int i = 0; i < method.getParameterCount(); i++) {
-            parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + method.getParameters()[i].getName());
-        }
-        out.append(parameters).append(")");
-        if (method.getExceptionTypes().length > 0) {
-            var thrown = new StringJoiner(", ");
-            for (var exceptionType : method.getExceptionTypes()) {
-                thrown.add(canonicalTypeName(exceptionType));
-            }
-            out.append(" throws ").append(thrown);
-        }
-        if (java.lang.reflect.Modifier.isAbstract(method.getModifiers())
-                || (owner.isInterface() && !java.lang.reflect.Modifier.isStatic(method.getModifiers()))) {
-            out.append(";\n");
-            return out.toString();
-        }
-        out.append(" {\n");
-        var returnExpression = defaultReturnStatement(method.getReturnType());
-        if (!returnExpression.isBlank()) {
-            out.append("        ").append(returnExpression).append("\n");
-        }
-        out.append("    }\n");
-        return out.toString();
-    }
-
-    private String sanitizeTypeModifiers(int modifiers, Class<?> binaryClass) {
-        var parts = new ArrayList<String>();
-        if (java.lang.reflect.Modifier.isPublic(modifiers)) parts.add("public");
-        if (java.lang.reflect.Modifier.isProtected(modifiers)) parts.add("protected");
-        if (java.lang.reflect.Modifier.isAbstract(modifiers) && !binaryClass.isInterface()) parts.add("abstract");
-        if (java.lang.reflect.Modifier.isFinal(modifiers) && !binaryClass.isEnum()) parts.add("final");
-        return String.join(" ", parts);
-    }
-
-    private String sanitizeConstructorModifiers(int modifiers, Class<?> owner) {
-        var parts = new ArrayList<String>();
-        if (java.lang.reflect.Modifier.isPublic(modifiers)) parts.add("public");
-        if (java.lang.reflect.Modifier.isProtected(modifiers)) parts.add("protected");
-        if (owner.isEnum() && java.lang.reflect.Modifier.isPrivate(modifiers)) parts.add("private");
-        return String.join(" ", parts);
-    }
-
-    private String sanitizeMethodModifiers(int modifiers, Class<?> owner) {
-        var parts = new ArrayList<String>();
-        if (java.lang.reflect.Modifier.isPublic(modifiers)) parts.add("public");
-        if (java.lang.reflect.Modifier.isProtected(modifiers)) parts.add("protected");
-        if (java.lang.reflect.Modifier.isStatic(modifiers)) parts.add("static");
-        if (java.lang.reflect.Modifier.isFinal(modifiers) && !owner.isInterface()) parts.add("final");
-        if (java.lang.reflect.Modifier.isAbstract(modifiers) && !owner.isInterface()) parts.add("abstract");
-        return String.join(" ", parts);
-    }
-
-    private String defaultReturnStatement(Class<?> type) {
-        if (Void.TYPE.equals(type)) {
-            return "";
-        }
-        return "return " + defaultValueExpression(type) + ";";
-    }
-
-    private String defaultValueExpression(Class<?> type) {
-        if (!type.isPrimitive()) {
-            return "null";
-        }
-        if (Boolean.TYPE.equals(type)) return "false";
-        if (Character.TYPE.equals(type)) return "'\\0'";
-        if (Long.TYPE.equals(type)) return "0L";
-        if (Float.TYPE.equals(type)) return "0f";
-        if (Double.TYPE.equals(type)) return "0d";
-        return "0";
-    }
-
-    private List<java.lang.reflect.Constructor<?>> visibleConstructors(Class<?> binaryClass) {
-        if (binaryClass.isInterface() || binaryClass.isAnnotation()) {
-            return List.of();
-        }
-        var result = new ArrayList<java.lang.reflect.Constructor<?>>();
-        for (var constructor : binaryClass.getDeclaredConstructors()) {
-            if (constructor.isSynthetic()) {
-                continue;
-            }
-            var modifiers = constructor.getModifiers();
-            if (!java.lang.reflect.Modifier.isPublic(modifiers)
-                    && !java.lang.reflect.Modifier.isProtected(modifiers)
-                    && !(binaryClass.isEnum() && java.lang.reflect.Modifier.isPrivate(modifiers))) {
-                continue;
-            }
-            result.add(constructor);
-        }
-        result.sort(java.util.Comparator.comparingInt(java.lang.reflect.Constructor::getParameterCount));
-        return result;
+        var members = new ArrayList<>(seenMembers.values());
+        members.sort(
+                java.util.Comparator.comparingInt((TypeMemberIndex.Member member) -> member.priority)
+                        .thenComparing(member -> member.name, String.CASE_INSENSITIVE_ORDER)
+                        .thenComparing(member -> member.detail));
+        return new BinaryClassModel(qualifiedName, simpleName, members);
     }
 
     private int memberPriority(String targetType, String declaringType) {
@@ -496,12 +449,12 @@ public final class ExternalBinaryTypeIndex {
         return raw;
     }
 
-    private static String packageName(String qualifiedName) {
+    private static String simpleName(String qualifiedName) {
         var index = qualifiedName.lastIndexOf('.');
         if (index < 0) {
-            return "";
+            return qualifiedName;
         }
-        return qualifiedName.substring(0, index);
+        return qualifiedName.substring(index + 1);
     }
 
     private static String fingerprint(Set<Path> classPath) {
@@ -527,5 +480,67 @@ public final class ExternalBinaryTypeIndex {
                                 })
                         .toArray(URL[]::new);
         return new URLClassLoader(urls, ExternalBinaryTypeIndex.class.getClassLoader());
+    }
+
+    private String[] parseBinaryParameterTypes(Descriptor descriptor, ClassFile classFile)
+            throws ConstantPoolException, Descriptor.InvalidDescriptor {
+        var raw = descriptor.getParameterTypes(classFile.constant_pool).trim();
+        if (raw.isEmpty() || "()".equals(raw)) {
+            return new String[0];
+        }
+        if (raw.startsWith("(") && raw.endsWith(")")) {
+            raw = raw.substring(1, raw.length() - 1).trim();
+        }
+        if (raw.isEmpty()) {
+            return new String[0];
+        }
+        var parts = raw.split(",\\s*");
+        var normalized = new String[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            normalized[i] = normalizeBinaryType(parts[i]);
+        }
+        return normalized;
+    }
+
+    private String renderParameters(String[] parameterTypes, String[] parameterNames) {
+        var parameters = new StringJoiner(", ");
+        for (int i = 0; i < parameterTypes.length; i++) {
+            parameters.add(parameterTypes[i] + " " + parameterNames[i]);
+        }
+        return parameters.toString();
+    }
+
+    private String[] syntheticParameterNames(int count) {
+        var names = new String[count];
+        for (int i = 0; i < count; i++) {
+            names[i] = "arg" + i;
+        }
+        return names;
+    }
+
+    private ParameterList stripEnumConstructorPrefix(String[] parameterTypes, String[] parameterNames) {
+        if (parameterTypes.length >= 2
+                && "java.lang.String".equals(parameterTypes[0])
+                && "int".equals(parameterTypes[1])) {
+            return new ParameterList(
+                    java.util.Arrays.copyOfRange(parameterTypes, 2, parameterTypes.length),
+                    java.util.Arrays.copyOfRange(parameterNames, 2, parameterNames.length));
+        }
+        return new ParameterList(parameterTypes, parameterNames);
+    }
+
+    private String normalizeBinaryType(String typeName) {
+        if (typeName == null) {
+            return "java.lang.Object";
+        }
+        return typeName.replace('$', '.');
+    }
+
+    private record ParameterList(String[] parameterTypes, String[] parameterNames) {}
+
+    private record BinaryClassModel(String qualifiedName, String simpleName, List<TypeMemberIndex.Member> members) {
+        private TypeMemberIndex.TypeInfo typeInfo() {
+            return new TypeMemberIndex.TypeInfo(qualifiedName, simpleName, members, false, null);
+        }
     }
 }

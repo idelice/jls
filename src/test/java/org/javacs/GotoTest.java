@@ -210,6 +210,12 @@ public class GotoTest {
         assertThat(doGoto(file, 11, 16), hasItem("StaticImportCrossPackageInterface.java:6"));
     }
 
+    @Test
+    public void gotoSwitchCaseEnumConstant() {
+        var file = "/org/javacs/example/GotoSwitchCaseEnum.java";
+        assertThat(doGoto(file, 11, 18), hasItem("GotoSwitchCaseEnum.java:5"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

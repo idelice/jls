@@ -61,6 +61,99 @@ public class ExternalBinaryTypeIndexTest {
     }
 
     @Test
+    public void completesStaticMembersFromExternalBinaryImportedType() throws Exception {
+        var fixture =
+                createFixture(
+                        false,
+                        "package ext;\n"
+                                + "public final class ExternalPojo {\n"
+                                + "  private ExternalPojo() {}\n"
+                                + "  public static String clean(String value) { return value; }\n"
+                                + "  public static void copy(Object source, Object target) {}\n"
+                                + "}\n",
+                        "package app;\n"
+                                + "import ext.ExternalPojo;\n"
+                                + "class UseExternal {\n"
+                                + "  void test() {\n"
+                                + "    ExternalPojo.c\n"
+                                + "  }\n"
+                                + "}\n");
+        try {
+            assertThat(completionLabels(fixture, false, "ExternalPojo.c"), hasItems("clean", "copy"));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void completesUsableMembersWhenExternalBinaryHasMissingSignatureTypes() throws Exception {
+        var root = Files.createTempDirectory("external-binary-missing-signature-");
+        try {
+            var externalSrcRoot = root.resolve("external-src");
+            var consumerSrcRoot = root.resolve("workspace");
+            var dependencySource =
+                    writeJavaSource(
+                            externalSrcRoot,
+                            "ext/MissingType.java",
+                            "package ext;\npublic class MissingType {}\n");
+            var externalSourceFile =
+                    writeJavaSource(
+                            externalSrcRoot,
+                            "ext/ExternalPojo.java",
+                            "package ext;\n"
+                                    + "public class ExternalPojo {\n"
+                                    + "  private String name;\n"
+                                    + "  public String getName() { return name; }\n"
+                                    + "  public MissingType getMissing() { return null; }\n"
+                                    + "}\n");
+            var consumerFile =
+                    writeJavaSource(
+                            consumerSrcRoot,
+                            "app/UseExternal.java",
+                            "package app;\n"
+                                    + "import ext.ExternalPojo;\n"
+                                    + "class UseExternal {\n"
+                                    + "  void test() {\n"
+                                    + "    ExternalPojo user = new ExternalPojo();\n"
+                                    + "    user.ge\n"
+                                    + "  }\n"
+                                    + "}\n");
+
+            var dependencyClasses = root.resolve("dependency-classes");
+            Files.createDirectories(dependencyClasses);
+            compileExternalSources(List.of(dependencySource), dependencyClasses, List.of(), false);
+
+            var classesDir = root.resolve("external-classes");
+            Files.createDirectories(classesDir);
+            compileExternalSources(List.of(externalSourceFile), classesDir, List.of(dependencyClasses), false);
+
+            var binaryJar = root.resolve("external-lib.jar");
+            createJar(classesDir, binaryJar);
+
+            FileStore.setWorkspaceRoots(Set.of(consumerSrcRoot));
+            var compileCompiler = new JavaCompilerService(Set.of(binaryJar), Collections.emptySet(), Set.of(), Set.of());
+            var fixture =
+                    new Fixture(
+                            root,
+                            consumerSrcRoot,
+                            consumerFile,
+                            compileCompiler,
+                            compileCompiler,
+                            binaryJar,
+                            null);
+            try {
+                assertThat(completionLabels(fixture, false, "user.ge"), hasItems("getName"));
+            } finally {
+                fixture.close();
+            }
+        } finally {
+            if (Files.exists(root)) {
+                deleteTree(root);
+            }
+        }
+    }
+
+    @Test
     public void gotoDefinitionUsesAttachedSourceJarForExternalType() throws Exception {
         var fixture =
                 createFixture(
@@ -82,6 +175,34 @@ public class ExternalBinaryTypeIndexTest {
             var locations =
                     new DefinitionProvider(fixture.compiler(true), fixture.index(), fixture.consumerFile, cursor.line, cursor.character)
                             .find();
+            assertThat(locations, not(empty()));
+            var uri = locations.get(0).uri.toString();
+            assertThat(uri, containsString("jls-jar-sources"));
+            assertThat(uri, containsString("ExternalPojo.java"));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void gotoDefinitionUsesAttachedSourceJarForExternalStaticMethod() throws Exception {
+        var fixture =
+                createFixture(
+                        false,
+                        "package ext;\n"
+                                + "public final class ExternalPojo {\n"
+                                + "  private ExternalPojo() {}\n"
+                                + "  public static String clean(String value) { return value; }\n"
+                                + "}\n",
+                        "package app;\n"
+                                + "import ext.ExternalPojo;\n"
+                                + "class UseExternal {\n"
+                                + "  void test() {\n"
+                                + "    ExternalPojo.clean(\"x\");\n"
+                                + "  }\n"
+                                + "}\n");
+        try {
+            var locations = definitionLocations(fixture, "clean(\"x\")");
             assertThat(locations, not(empty()));
             var uri = locations.get(0).uri.toString();
             assertThat(uri, containsString("jls-jar-sources"));
@@ -149,7 +270,7 @@ public class ExternalBinaryTypeIndexTest {
     }
 
     @Test
-    public void gotoDefinitionUsesGeneratedStubForExternalLombokMethod() throws Exception {
+    public void gotoDefinitionUsesDecompiledSourceForExternalLombokMethod() throws Exception {
         var fixture =
                 createFixture(
                         true,
@@ -171,7 +292,7 @@ public class ExternalBinaryTypeIndexTest {
             var locations = definitionLocations(fixture, "getName()");
             assertThat(locations, not(empty()));
             var uri = locations.get(0).uri.toString();
-            assertThat(uri, containsString("jls-binary-stubs"));
+            assertThat(uri, containsString("jls-binary-decompiled"));
             assertThat(uri, containsString("ExternalLombokPojo.java"));
         } finally {
             fixture.close();
@@ -179,7 +300,7 @@ public class ExternalBinaryTypeIndexTest {
     }
 
     @Test
-    public void gotoDefinitionUsesGeneratedStubForExternalConstructorWithoutSources() throws Exception {
+    public void gotoDefinitionUsesDecompiledSourceForExternalConstructorWithoutSources() throws Exception {
         var fixture =
                 createFixture(
                         false,
@@ -201,8 +322,97 @@ public class ExternalBinaryTypeIndexTest {
                             .find();
             assertThat(locations, not(empty()));
             var uri = locations.get(0).uri.toString();
-            assertThat(uri, containsString("jls-binary-stubs"));
+            assertThat(uri, containsString("jls-binary-decompiled"));
             assertThat(uri, containsString("ExternalPojo.java"));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void decompiledEnumSourceUsesEnumConstantsInsteadOfStaticFields() throws Exception {
+        var root = Files.createTempDirectory("external-binary-enum-decompiled-");
+        try {
+            var externalSrcRoot = root.resolve("external-src");
+            var consumerSrcRoot = root.resolve("workspace");
+            var externalSourceFile =
+                    writeJavaSource(
+                            externalSrcRoot,
+                            "ext/ExternalEnum.java",
+                            "package ext;\n"
+                                    + "public enum ExternalEnum {\n"
+                                    + "  HELLO(\"x\");\n"
+                                    + "  private final String label;\n"
+                                    + "  ExternalEnum(String label) { this.label = label; }\n"
+                                    + "}\n");
+            var consumerFile =
+                    writeJavaSource(
+                            consumerSrcRoot,
+                            "app/UseExternal.java",
+                            "package app;\n"
+                                    + "import ext.ExternalEnum;\n"
+                                    + "class UseExternal {\n"
+                                    + "  void test() {\n"
+                                    + "    ExternalEnum value = ExternalEnum.HELLO;\n"
+                                    + "  }\n"
+                                    + "}\n");
+            var classesDir = root.resolve("external-classes");
+            Files.createDirectories(classesDir);
+            compileExternalSources(List.of(externalSourceFile), classesDir, List.of(), false);
+            var binaryJar = root.resolve("external-lib.jar");
+            var sourceJar = root.resolve("external-lib-sources.jar");
+            createJar(classesDir, binaryJar);
+            createJar(externalSrcRoot, sourceJar);
+            FileStore.setWorkspaceRoots(Set.of(consumerSrcRoot));
+            var compileCompiler = new JavaCompilerService(Set.of(binaryJar), Collections.emptySet(), Set.of(), Set.of());
+            var definitionCompiler = new JavaCompilerService(Set.of(binaryJar), Set.of(sourceJar), Set.of(), Set.of());
+            var fixture =
+                    new Fixture(
+                            root,
+                            consumerSrcRoot,
+                            consumerFile,
+                            compileCompiler,
+                            definitionCompiler,
+                            binaryJar,
+                            sourceJar);
+            var source = fixture.index().externalDecompiledSourcePath("ext.ExternalEnum").orElseThrow();
+            var text = Files.readString(source);
+            assertThat(text, containsString("public enum ExternalEnum"));
+            assertThat(text, containsString("HELLO"));
+            assertThat(text, not(containsString("public static final ext.ExternalEnum HELLO = null;")));
+            assertThat(text, not(containsString("java.lang.String arg0, int arg1")));
+            fixture.close();
+        } finally {
+            if (Files.exists(root)) {
+                deleteTree(root);
+            }
+        }
+    }
+
+    @Test
+    public void decompiledClassSourceOmitsInheritedObjectMembers() throws Exception {
+        var fixture =
+                createFixture(
+                        false,
+                        "package ext;\n"
+                                + "public class ExternalPojo {\n"
+                                + "  private String name;\n"
+                                + "  public String getName() { return name; }\n"
+                                + "}\n",
+                        "package app;\n"
+                                + "import ext.ExternalPojo;\n"
+                                + "class UseExternal {\n"
+                                + "  void test() {\n"
+                                + "    ExternalPojo user = new ExternalPojo();\n"
+                                + "  }\n"
+                                + "}\n");
+        try {
+            var source = fixture.index().externalDecompiledSourcePath("ext.ExternalPojo").orElseThrow();
+            var text = Files.readString(source);
+            assertThat(text, containsString("public class ExternalPojo"));
+            assertThat(text, containsString("getName("));
+            assertThat(text, not(containsString("wait(")));
+            assertThat(text, not(containsString("hashCode(")));
         } finally {
             fixture.close();
         }
@@ -257,18 +467,27 @@ public class ExternalBinaryTypeIndexTest {
     }
 
     private static void compileExternalSource(Path sourceFile, Path classesDir, boolean lombok) throws IOException {
+        compileExternalSources(List.of(sourceFile), classesDir, List.of(), lombok);
+    }
+
+    private static void compileExternalSources(
+            List<Path> sourceFiles, Path classesDir, List<Path> classPathEntries, boolean lombok) throws IOException {
         var javac = ToolProvider.getSystemJavaCompiler();
         Assert.assertNotNull("System compiler is required for external binary tests", javac);
         try (var fileManager = javac.getStandardFileManager(null, null, StandardCharsets.UTF_8)) {
-            var units = fileManager.getJavaFileObjectsFromPaths(List.of(sourceFile));
+            var units = fileManager.getJavaFileObjectsFromPaths(sourceFiles);
             var options = new ArrayList<String>();
             options.add("-parameters");
             options.add("-d");
             options.add(classesDir.toString());
+            var classpath = new ArrayList<Path>(classPathEntries);
             if (lombok) {
                 var lombokJar = runtimeJarPath("lombok.Data");
+                classpath.add(lombokJar);
+            }
+            if (!classpath.isEmpty()) {
                 options.add("-classpath");
-                options.add(lombokJar.toString());
+                options.add(classpath.stream().map(Path::toString).collect(java.util.stream.Collectors.joining(java.io.File.pathSeparator)));
             }
             var output = new StringWriter();
             var ok = javac.getTask(output, fileManager, null, options, null, units).call();

@@ -61,7 +61,7 @@ public final class CompositeTypeIndex {
         return external.typeInfo(qualifiedName);
     }
 
-    public Optional<Path> externalStubSourcePath(String qualifiedName) {
-        return external.stubSourcePath(qualifiedName);
+    public Optional<Path> externalDecompiledSourcePath(String qualifiedName) {
+        return external.decompiledSourcePath(qualifiedName);
     }
 }

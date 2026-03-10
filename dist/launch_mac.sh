@@ -1,5 +1,7 @@
 #!/bin/sh
 JLINK_VM_OPTIONS="\
+--add-modules jdk.jdeps \
+--add-exports jdk.jdeps/com.sun.tools.classfile=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED \

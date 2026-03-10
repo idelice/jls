@@ -8,6 +8,9 @@ import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.CaseTree;
+import com.sun.source.tree.SwitchExpressionTree;
+import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TypeParameterTree;
 import com.sun.source.tree.VariableTree;
@@ -152,6 +155,11 @@ public class DefinitionProvider {
         var staticImportField = resolveStaticImportField(parse, name);
         if (staticImportField.isPresent()) {
             return staticImportField.get();
+        }
+
+        var switchCaseField = resolveSwitchCaseField(path, name, types);
+        if (switchCaseField.isPresent()) {
+            return switchCaseField.get();
         }
 
         return resolveTypeTree(parse, identifier, name);
@@ -371,6 +379,48 @@ public class DefinitionProvider {
         return Optional.ofNullable(match);
     }
 
+    private Optional<ResolvedSymbol> resolveSwitchCaseField(TreePath path, String fieldName, ParseTypeResolver types) {
+        var labelPath = path.getParentPath();
+        if (labelPath == null || labelPath.getLeaf().getKind() != Tree.Kind.CONSTANT_CASE_LABEL) {
+            return Optional.empty();
+        }
+        var casePath = labelPath.getParentPath();
+        if (casePath == null || !(casePath.getLeaf() instanceof CaseTree)) {
+            return Optional.empty();
+        }
+        var switchPath = casePath.getParentPath();
+        if (switchPath == null) {
+            return Optional.empty();
+        }
+
+        Tree switchExpression = null;
+        if (switchPath.getLeaf() instanceof SwitchTree switchTree) {
+            switchExpression = switchTree.getExpression();
+        } else if (switchPath.getLeaf() instanceof SwitchExpressionTree switchExpressionTree) {
+            switchExpression = switchExpressionTree.getExpression();
+        }
+        if (switchExpression == null) {
+            return Optional.empty();
+        }
+
+        var ownerType = types.resolveExpression(switchExpression).map(type -> type.qualifiedType);
+        if (ownerType.isEmpty() || ownerType.get().isBlank()) {
+            return Optional.empty();
+        }
+
+        var member =
+                completionIndex.member(ownerType.get(), fieldName, true)
+                        .or(() -> completionIndex.member(ownerType.get(), fieldName, false))
+                        .orElse(null);
+        var resolved = member != null
+                ? resolveFieldFromMember(ownerType.get(), fieldName, member)
+                : resolveStaticFieldWithoutIndex(ownerType.get(), fieldName);
+        if (resolved.locations().isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(resolved);
+    }
+
     private ResolvedSymbol resolveStaticFieldWithoutIndex(String ownerType, String fieldName) {
         var locations = findFieldLocations(ownerType, fieldName);
         if (!locations.isEmpty()) {
@@ -532,9 +582,9 @@ public class DefinitionProvider {
         if (!locations.isEmpty()) {
             return locations;
         }
-        var stub = openStubTypeSource(ownerType);
-        if (stub.isPresent()) {
-            return findMethodLocations(stub.get(), methodName, argCount, argTypes);
+        var decompiled = openDecompiledTypeSource(ownerType);
+        if (decompiled.isPresent()) {
+            return findMethodLocations(decompiled.get(), methodName, argCount, argTypes);
         }
         return List.of();
     }
@@ -663,9 +713,9 @@ public class DefinitionProvider {
         if (!locations.isEmpty()) {
             return locations;
         }
-        var stub = openStubTypeSource(ownerType);
-        if (stub.isPresent()) {
-            return findFieldLocations(stub.get(), fieldName);
+        var decompiled = openDecompiledTypeSource(ownerType);
+        if (decompiled.isPresent()) {
+            return findFieldLocations(decompiled.get(), fieldName);
         }
         LOG.fine(String.format("[perf] definition_field_not_found owner=%s field=%s", ownerType, fieldName));
         return List.of();
@@ -719,9 +769,9 @@ public class DefinitionProvider {
         if (!locations.isEmpty()) {
             return locations;
         }
-        var stub = openStubTypeSource(qualifiedType);
-        if (stub.isPresent()) {
-            return findTypeLocation(stub.get(), labelName);
+        var decompiled = openDecompiledTypeSource(qualifiedType);
+        if (decompiled.isPresent()) {
+            return findTypeLocation(decompiled.get(), labelName);
         }
         return List.of();
     }
@@ -769,9 +819,9 @@ public class DefinitionProvider {
                 return Optional.of(new TypeSource(parse, classPath.get()));
             }
         }
-        var stubSource = completionIndex.externalStubSourcePath(qualifiedType);
-        if (stubSource.isPresent()) {
-            var parse = compiler.parse(stubSource.get());
+        var decompiledSource = completionIndex.externalDecompiledSourcePath(qualifiedType);
+        if (decompiledSource.isPresent()) {
+            var parse = compiler.parse(decompiledSource.get());
             var classPath = findClassPath(parse, qualifiedType);
             if (classPath.isPresent()) {
                 return Optional.of(new TypeSource(parse, classPath.get()));
@@ -780,12 +830,12 @@ public class DefinitionProvider {
         return Optional.empty();
     }
 
-    private Optional<TypeSource> openStubTypeSource(String qualifiedType) {
-        var stubSource = completionIndex.externalStubSourcePath(qualifiedType);
-        if (stubSource.isEmpty()) {
+    private Optional<TypeSource> openDecompiledTypeSource(String qualifiedType) {
+        var decompiledSource = completionIndex.externalDecompiledSourcePath(qualifiedType);
+        if (decompiledSource.isEmpty()) {
             return Optional.empty();
         }
-        var parse = compiler.parse(stubSource.get());
+        var parse = compiler.parse(decompiledSource.get());
         var classPath = findClassPath(parse, qualifiedType);
         if (classPath.isEmpty()) {
             return Optional.empty();
