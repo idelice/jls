@@ -6,11 +6,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
 import org.javacs.ParseTask;
 import org.javacs.lsp.*;
 
 public class FoldProvider {
+    private static final Logger LOG = Logger.getLogger("main");
 
     final CompilerProvider compiler;
 
@@ -49,9 +51,16 @@ public class FoldProvider {
 
         // Merge import ranges
         if (!imports.isEmpty()) {
-            var merged = asFoldingRange(task, imports.get(0), FoldingRangeKind.Imports);
+            FoldingRange merged = null;
             for (var i : imports) {
                 var r = asFoldingRange(task, i, FoldingRangeKind.Imports);
+                if (r == null) {
+                    continue;
+                }
+                if (merged == null) {
+                    merged = r;
+                    continue;
+                }
                 if (r.startLine <= merged.endLine + 1) {
                     merged =
                             new FoldingRange(
@@ -65,15 +74,23 @@ public class FoldProvider {
                     merged = r;
                 }
             }
-            all.add(merged);
+            if (merged != null) {
+                all.add(merged);
+            }
         }
 
         // Convert blocks and comments
         for (var t : blocks) {
-            all.add(asFoldingRange(task, t, FoldingRangeKind.Region));
+            var range = asFoldingRange(task, t, FoldingRangeKind.Region);
+            if (range != null) {
+                all.add(range);
+            }
         }
         for (var t : comments) {
-            all.add(asFoldingRange(task, t, FoldingRangeKind.Region));
+            var range = asFoldingRange(task, t, FoldingRangeKind.Region);
+            if (range != null) {
+                all.add(range);
+            }
         }
 
         return all;
@@ -86,11 +103,24 @@ public class FoldProvider {
         var start = (int) pos.getStartPosition(t.getCompilationUnit(), t.getLeaf());
         var end = (int) pos.getEndPosition(t.getCompilationUnit(), t.getLeaf());
 
+        return rangeFromPositions(lines, start, end, t.getLeaf(), t.getCompilationUnit(), kind);
+    }
+
+    private static FoldingRange rangeFromPositions(
+            LineMap lines, int start, int end, Tree leaf, CompilationUnitTree root, String kind) {
+        if (start < 0 || end < 0) {
+            LOG.fine(
+                    String.format(
+                            "[fold] skipping invalid source positions start=%d end=%d kind=%s",
+                            start, end, kind));
+            return null;
+        }
+
         // If this is a class tree, adjust start position to '{'
-        if (t.getLeaf() instanceof ClassTree) {
+        if (leaf instanceof ClassTree) {
             CharSequence content;
             try {
-                content = t.getCompilationUnit().getSourceFile().getCharContent(true);
+                content = root.getSourceFile().getCharContent(true);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
@@ -109,7 +139,7 @@ public class FoldProvider {
         var endChar = (int) lines.getColumnNumber(end) - 1;
 
         // If this is a block, move end position back one line so we don't fold the '}'
-        if (t.getLeaf() instanceof ClassTree || t.getLeaf() instanceof BlockTree) {
+        if (leaf instanceof ClassTree || leaf instanceof BlockTree) {
             endLine--;
         }
 
