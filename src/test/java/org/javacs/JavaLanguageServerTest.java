@@ -10,6 +10,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -25,6 +26,7 @@ import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidChangeWatchedFilesParams;
+import org.javacs.lsp.DidCloseTextDocumentParams;
 import org.javacs.lsp.DidSaveTextDocumentParams;
 import org.javacs.lsp.Diagnostic;
 import org.javacs.lsp.DiagnosticSeverity;
@@ -215,10 +217,6 @@ public class JavaLanguageServerTest {
                     "didOpen should log workspace index install",
                     capture.countContaining("workspace index installed trigger=didOpenActiveBootstrap") > 0);
 
-            Assert.assertEquals(
-                    "initial didOpen diagnostics should not install the completion index",
-                    0,
-                    capture.countContaining("completion_index_refresh_shared trigger=async:didOpen"));
             Assert.assertTrue(
                     "didOpen should schedule a dedicated workspace completion bootstrap",
                     capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap") > 0);
@@ -268,9 +266,6 @@ public class JavaLanguageServerTest {
                     "lint should not synchronously install the initial completion index",
                     0,
                     capture.countContaining("completion_index_refresh_sync trigger=lintBootstrap"));
-            Assert.assertTrue(
-                    "lint bootstrap should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=lintBootstrap") > 0);
             Assert.assertTrue(
                     "lint bootstrap should initialize the completion index asynchronously",
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
@@ -388,7 +383,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeClearsPublishedDiagnosticsBeforeDebouncedRefresh() throws Exception {
+    public void didChangeKeepsPublishedDiagnosticsUntilDebouncedRefresh() throws Exception {
         var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
@@ -406,6 +401,7 @@ public class JavaLanguageServerTest {
         Assert.assertTrue(
                 "expected initial diagnostics on open",
                 client.awaitErrorMatching(file.toUri(), __ -> true, 10, TimeUnit.SECONDS));
+        var publishCountBeforeChange = client.diagnosticsPublishCount();
 
         var change = new DidChangeTextDocumentParams();
         change.textDocument.uri = file.toUri();
@@ -415,13 +411,18 @@ public class JavaLanguageServerTest {
         change.contentChanges.add(delta);
         server.didChangeTextDocument(change);
 
+        Thread.sleep(200);
+        Assert.assertEquals(
+                "didChange should not clear diagnostics before the debounced refresh runs",
+                publishCountBeforeChange,
+                client.diagnosticsPublishCount());
         Assert.assertTrue(
-                "didChange should clear stale diagnostics immediately",
-                client.awaitDiagnosticsCount(file.toUri(), 0, 2, TimeUnit.SECONDS));
+                "previous diagnostics should remain visible during the debounce window",
+                client.hasErrorMatching(file.toUri(), __ -> true));
     }
 
     @Test
-    public void didSaveCompilesOnceAndRefreshesIndexFromSharedResult() throws Exception {
+    public void didSaveCompilesDiagnosticsOnceAndRefreshesIndexSeparately() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/HelloWorld.java");
         var text = FileStore.contents(file);
@@ -464,14 +465,9 @@ public class JavaLanguageServerTest {
                     "didSave should compile diagnostics exactly once",
                     1,
                     capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
-            Assert.assertEquals(
-                    "didSave should rebuild completion index from the same compile",
-                    1,
-                    capture.countContaining("[perf] completion_index_refresh_shared trigger=didSave"));
-            Assert.assertEquals(
-                    "didSave should run one semantic compile",
-                    1L,
-                    CompileBatch.perfCounters().analyzeInvocations);
+            Assert.assertTrue(
+                    "didSave should schedule a dedicated completion-index refresh",
+                    capture.countContaining("[perf] completion_index_debounce trigger=didSave") > 0);
             Assert.assertEquals(
                     "pending didChange diagnostics should be canceled by save",
                     0,
@@ -584,10 +580,6 @@ public class JavaLanguageServerTest {
                     0,
                     capture.countContaining(
                             "[perf] diagnostics_active_fanout trigger=didChange file=ServiceTwo.java"));
-            Assert.assertEquals(
-                    "logging-only Lombok should not use shared completion-index refresh on didChange",
-                    0,
-                    capture.countContaining("[perf] completion_index_refresh_shared trigger=async:didChange"));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -658,14 +650,56 @@ public class JavaLanguageServerTest {
                             d -> containsAny(d.message, "getType()"),
                             10,
                             TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "didOpen should log active-type diagnostics relation for the consumer",
-                    capture.countContaining(
-                                    "[perf] diagnostics_active_related trigger=didOpen file=ServiceTwo.java")
-                            > 0);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void didOpenPublishesDiagnosticsOnlyForRequestedFileUri() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-requested-uri");
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+
+            var fooFile = pkg.resolve("Foo.java");
+            var serviceFile = pkg.resolve("Service.java");
+            Files.writeString(
+                    fooFile,
+                    "package p;\n"
+                            + "class Foo {\n"
+                            + "  private String unused = \"x\";\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package p;\n"
+                            + "class Service {\n"
+                            + "  Foo test() {\n"
+                            + "    return new Foo();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = serviceFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected diagnostics publication for the requested service file",
+                    client.awaitDiagnosticsCount(serviceFile.toUri(), 0, 10, TimeUnit.SECONDS));
+            Thread.sleep(300);
+            Assert.assertEquals(
+                    "didOpen should only publish diagnostics for the requested file URI",
+                    Set.of(serviceFile.toUri()),
+                    client.publishedUris());
+        } finally {
             deleteRecursively(workspace);
         }
     }
@@ -709,7 +743,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeEnumRefreshesDiagnosticsForActiveConsumerWithoutSave() throws Exception {
+    public void didChangeEnumMarksActiveConsumerDirtyUntilConsumerChanges() throws Exception {
         var workspace = Files.createTempDirectory("jls-enum-related-change");
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
@@ -780,18 +814,28 @@ public class JavaLanguageServerTest {
             enumChange.contentChanges.add(delta);
             server.didChangeTextDocument(enumChange);
 
+            Thread.sleep(300);
             Assert.assertTrue(
-                    "changing the enum should refresh active consumer diagnostics without save",
+                    "changing the enum should leave the consumer diagnostics stale until the consumer changes",
+                    client.hasErrorMatching(serviceFile.toUri(), d -> containsAny(d.message, "getType()")));
+            Assert.assertTrue(
+                    "enum change should mark other open files dirty without publishing consumer diagnostics immediately",
+                    capture.countContaining(
+                                    "[perf] diagnostics_dirty_open_files trigger=didChange file=MyEnum.java")
+                            > 0);
+
+            var serviceClose = new DidCloseTextDocumentParams();
+            serviceClose.textDocument.uri = serviceFile.toUri();
+            server.didCloseTextDocument(serviceClose);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "reopening the dirty consumer should refresh its diagnostics after the dependency changed",
                     client.awaitNoErrorMatching(
                             serviceFile.toUri(),
                             d -> containsAny(d.message, "getType()"),
                             10,
                             TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "didChange should log active-type diagnostics relation for the enum",
-                    capture.countContaining(
-                                    "[perf] diagnostics_active_related trigger=didChange file=MyEnum.java")
-                            > 0);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -869,7 +913,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeLombokModelRefreshesDiagnosticsForActiveConsumersWithoutSave() throws Exception {
+    public void didChangeLombokModelMarksConsumerDirtyUntilConsumerChanges() throws Exception {
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
@@ -920,17 +964,29 @@ public class JavaLanguageServerTest {
             change.contentChanges.add(delta);
             server.didChangeTextDocument(change);
 
+            Thread.sleep(300);
             Assert.assertTrue(
-                    "changing a Lombok model should refresh active consumer diagnostics without save",
+                    "changing a Lombok model should leave consumer diagnostics untouched until the consumer changes",
+                    !client.hasErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref(")));
+            Assert.assertTrue(
+                    "lombok model change should mark other open files dirty",
+                    capture.countContaining(
+                                    "[perf] diagnostics_dirty_open_files trigger=didChange file=ReproTxn.java")
+                            > 0);
+            var serviceClose = new DidCloseTextDocumentParams();
+            serviceClose.textDocument.uri = serviceFile.toUri();
+            server.didCloseTextDocument(serviceClose);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "reopening the dirty consumer should refresh diagnostics after the Lombok model changed",
                     client.awaitErrorMatching(
                             serviceFile.toUri(),
                             d -> containsAny(d.message, "getMsref()", "setMsref("),
                             10,
                             TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "lombok didChange should reuse the diagnostics compile for the completion index",
-                    capture.countContaining("[perf] completion_index_refresh_shared trigger=async:didChange")
-                            > 0);
 
             var revert = new DidChangeTextDocumentParams();
             revert.textDocument.uri = modelFile.toUri();
@@ -940,8 +996,11 @@ public class JavaLanguageServerTest {
             revert.contentChanges.add(revertDelta);
             server.didChangeTextDocument(revert);
 
+            server.didCloseTextDocument(serviceClose);
+            server.didOpenTextDocument(serviceOpen);
+
             Assert.assertTrue(
-                    "restoring the Lombok model should clear active consumer diagnostics without save",
+                    "restoring the Lombok model should clear consumer diagnostics when the consumer reopens",
                     client.awaitNoErrorMatching(
                             serviceFile.toUri(),
                             d -> containsAny(d.message, "getMsref()", "setMsref("),
@@ -1254,9 +1313,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "compilerRecreated diagnostics pass should use active files only, line=" + line,
                     line.matches(".*files=1\\b.*"));
-            Assert.assertTrue(
-                    "compilerRecreated diagnostics should not install the initial completion index, line=" + line,
-                    line.contains("shared_index=false"));
             Assert.assertEquals(
                     "compilerRecreated should not schedule a separate sync completion refresh when active files exist",
                     0,
@@ -1264,10 +1320,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "compilerRecreated should schedule a dedicated workspace completion bootstrap when active files exist",
                     capture.countContaining("completion_index_debounce trigger=compilerRecreated") > 0);
-            Assert.assertEquals(
-                    "compilerRecreated diagnostics should not refresh the index from the shared compile",
-                    0,
-                    capture.countContaining("completion_index_refresh_shared trigger=async:compilerRecreated"));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1742,11 +1794,6 @@ public class JavaLanguageServerTest {
                     0,
                     capture.countContaining(
                             "[perf] diagnostics_debounce trigger=didChangeWatchedFiles"));
-            Assert.assertTrue(
-                    "expected skip log for active-doc watched create",
-                    capture.lastLineContaining(
-                                    "[perf] watched_java_change_skip reason=active_document event=created")
-                            != null);
         } finally {
             logger.removeHandler(capture);
         }
@@ -1779,10 +1826,9 @@ public class JavaLanguageServerTest {
                         java.util.Collection.class,
                         JavaCompilerService.class,
                         String.class,
-                        long.class,
-                        boolean.class);
+                        long.class);
         compileAndPublish.setAccessible(true);
-        compileAndPublish.invoke(server, files, compiler, trigger, -1L, false);
+        compileAndPublish.invoke(server, files, compiler, trigger, -1L);
     }
 
     private void setLombokVerifyBypass(JavaLanguageServer server) throws Exception {
@@ -1882,7 +1928,7 @@ public class JavaLanguageServerTest {
             return false;
         }
 
-        private boolean hasErrorMatching(java.net.URI uri, Predicate<Diagnostic> predicate) {
+        boolean hasErrorMatching(java.net.URI uri, Predicate<Diagnostic> predicate) {
             var diagnostics = diagnosticsByUri.get(uri);
             if (diagnostics == null) {
                 return false;
@@ -1890,6 +1936,14 @@ public class JavaLanguageServerTest {
             return diagnostics.stream()
                     .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
                     .anyMatch(predicate);
+        }
+
+        int diagnosticsPublishCount() {
+            return diagnosticsPublishCount.get();
+        }
+
+        Set<java.net.URI> publishedUris() {
+            return Set.copyOf(diagnosticsByUri.keySet());
         }
 
         boolean awaitDiagnosticsCount(java.net.URI uri, int count, long timeout, TimeUnit unit)

@@ -80,16 +80,16 @@ class JavaLanguageServer extends LanguageServer {
     private final AtomicReference<ExternalBinaryTypeIndex> externalBinaryIndexRef =
             new AtomicReference<>(ExternalBinaryTypeIndex.EMPTY);
     private final AtomicLong completionIndexVersion = new AtomicLong();
+    private final Set<Path> dirtyDiagnosticsFiles = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private enum CompletionIndexRefreshMode {
         FULL_REBUILD,
         WORKSPACE_DECLARATION_MERGE
     }
 
-    private record ActiveDocumentChangeImpact(boolean refreshCompletionIndex, boolean fanoutDiagnostics) {}
+    private record ActiveDocumentChangeImpact(boolean refreshCompletionIndex) {}
 
-    private record ScheduledDiagnosticsRequest(
-            long scheduleRevision, long contentRevision, boolean updateCompletionIndex) {}
+    private record ScheduledDiagnosticsRequest(long scheduleRevision, long contentRevision) {}
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -160,7 +160,7 @@ class JavaLanguageServer extends LanguageServer {
         var active = normalizeJavaFiles(FileStore.activeDocuments());
         if (!active.isEmpty()) {
             cancelPendingDiagnostics("compilerRecreated");
-            scheduleDiagnostics(active, "compilerRecreated", 0, false);
+            scheduleDiagnostics(active, "compilerRecreated", 0);
             scheduleWorkspaceCompletionBootstrapIfNeeded("compilerRecreated", 0);
             return;
         }
@@ -171,7 +171,7 @@ class JavaLanguageServer extends LanguageServer {
         cancelPendingDiagnostics("foreground");
         cancelPendingCompletionIndex("foreground");
         var selection = selectDiagnosticsCompiler();
-        compileAndPublish(files, selection.compiler, "foreground", -1, false);
+        compileAndPublish(files, selection.compiler, "foreground", -1);
         if (completionIndexVersion.get() == 0 && !FileStore.activeDocuments().isEmpty()) {
             scheduleWorkspaceCompletionBootstrapIfNeeded("lintBootstrap", 0);
         }
@@ -181,8 +181,7 @@ class JavaLanguageServer extends LanguageServer {
             Collection<Path> files,
             JavaCompilerService diagnosticsCompiler,
             String trigger,
-            long expectedContentRevision,
-            boolean updateCompletionIndex) {
+            long expectedContentRevision) {
         var waitStarted = Instant.now();
         synchronized (diagnosticsCompileMutex) {
             var waited = Duration.between(waitStarted, Instant.now()).toMillis();
@@ -208,47 +207,22 @@ class JavaLanguageServer extends LanguageServer {
                     return;
                 }
                 verifyLombokSymbols(task, "diagnostics");
-                if (updateCompletionIndex) {
-                    if (completionIndexVersion.get() == 0) {
-                        LOG.fine(
-                                String.format(
-                                        "[perf] completion_index_refresh_shared_skip trigger=%s files=%d reason=workspace_bootstrap_required",
-                                        trigger, javaFiles.size()));
-                    } else {
-                        var indexStarted = Instant.now();
-                        var nextIndex = TypeMemberIndex.workspaceDeclarations(task);
-                        if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_index_build")) {
-                            return;
-                        }
-                        var indexVersion = nextIndexVersion();
-                        installMergedTypeMemberIndex(
-                                nextIndex,
-                                javaFiles,
-                                indexVersion,
-                                "index:" + trigger,
-                                Duration.between(indexStarted, Instant.now()));
-                        LOG.fine(
-                                String.format(
-                                        "[perf] completion_index_refresh_shared trigger=%s files=%d version=%d mode=%s took=%dms",
-                                        trigger,
-                                        javaFiles.size(),
-                                        indexVersion,
-                                        "workspace_declaration_merge",
-                                        Duration.between(indexStarted, Instant.now()).toMillis()));
-                        if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_index_install")) {
-                            return;
-                        }
-                    }
-                }
                 var publishStarted = Instant.now();
                 if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "pre_publish")) {
                     return;
                 }
                 var diagnosticsCount = 0;
                 var publishedUris = new HashSet<java.net.URI>();
+                var requestedUris = new HashSet<java.net.URI>();
+                for (var file : javaFiles) {
+                    requestedUris.add(file.toUri());
+                }
                 for (var errs : new ErrorProvider(task).errors()) {
                     if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_loop")) {
                         return;
+                    }
+                    if (!requestedUris.contains(errs.uri)) {
+                        continue;
                     }
                     client.publishDiagnostics(errs);
                     diagnosticsCount += errs.diagnostics.size();
@@ -271,6 +245,7 @@ class JavaLanguageServer extends LanguageServer {
                                 javaFiles.size(),
                                 diagnosticsCount,
                                 Duration.between(publishStarted, Instant.now()).toMillis()));
+                clearDirtyDiagnostics(javaFiles);
                 if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_publish")) {
                     return;
                 }
@@ -325,54 +300,6 @@ class JavaLanguageServer extends LanguageServer {
 
     private long nextIndexVersion() {
         return completionIndexVersion.incrementAndGet();
-    }
-
-    private void refreshProjectCompletionIndexNow(String trigger) {
-        refreshCompletionIndexNow(FileStore.all(), trigger, CompletionIndexRefreshMode.FULL_REBUILD);
-    }
-
-    private void refreshCompletionIndexNow(
-            Collection<Path> files, String trigger, CompletionIndexRefreshMode mode) {
-        var javaFiles = normalizeJavaFiles(files);
-        if (javaFiles.isEmpty()) {
-            return;
-        }
-        synchronized (completionIndexCompileMutex) {
-            var started = Instant.now();
-            CompileTask task = null;
-            try {
-                task = compiler().compile(javaFiles.toArray(Path[]::new));
-                var indexStarted = Instant.now();
-                var nextIndex = buildCompletionIndex(task, mode);
-                var indexVersion = nextIndexVersion();
-                installCompletionIndex(
-                        nextIndex,
-                        javaFiles,
-                        mode,
-                        indexVersion,
-                        "index:" + trigger,
-                        Duration.between(indexStarted, Instant.now()));
-                LOG.fine(
-                        String.format(
-                                "[perf] completion_index_refresh_sync trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
-                                trigger,
-                                javaFiles.size(),
-                                indexVersion,
-                                mode.name().toLowerCase(),
-                                Duration.between(started, indexStarted).toMillis(),
-                                Duration.between(started, Instant.now()).toMillis()));
-            } catch (Exception e) {
-                LOG.warning(
-                        String.format(
-                                "[completion] sync index refresh failed trigger=%s files=%d reason=%s",
-                                trigger, javaFiles.size(), e.getMessage()));
-                LOG.log(java.util.logging.Level.FINE, "", e);
-            } finally {
-                if (task != null) {
-                    task.close();
-                }
-            }
-        }
     }
 
     private void scheduleProjectCompletionIndexRefresh(String trigger, long delayMs) {
@@ -537,117 +464,41 @@ class JavaLanguageServer extends LanguageServer {
                                 + " reason=type_members");
             }
             return new ActiveDocumentChangeImpact(
-                    hasStructuralLombokType || (hasTypeMembers && !hasLoggingOnlyLombokType),
-                    hasStructuralLombokType);
+                    hasStructuralLombokType || (hasTypeMembers && !hasLoggingOnlyLombokType));
         } catch (RuntimeException e) {
             LOG.fine(
                     String.format(
                             "[perf] completion_index_didChange_gate file=%s reason=parse_failed detail=%s",
                             file.getFileName(), e.getMessage()));
         }
-        return new ActiveDocumentChangeImpact(false, false);
+        return new ActiveDocumentChangeImpact(false);
     }
 
-    private Collection<Path> diagnosticsTargetsForActiveDocumentChange(
-            Path file, String trigger, ActiveDocumentChangeImpact impact) {
+    private Collection<Path> otherActiveDocuments(Path file) {
         var activeJavaFiles = normalizeJavaFiles(FileStore.activeDocuments());
         if (activeJavaFiles.isEmpty() || !activeJavaFiles.contains(file)) {
-            return List.of(file);
+            return List.of();
         }
-        if (impact.fanoutDiagnostics()) {
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_active_fanout trigger=%s file=%s files=%d reason=lombok",
-                            trigger, file.getFileName(), activeJavaFiles.size()));
-            return activeJavaFiles;
-        }
-
-        var related = relatedActiveDocuments(file, activeJavaFiles, impact);
-        if (related.size() > 1) {
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_active_related trigger=%s file=%s files=%d reason=active_type_dependency",
-                            trigger, file.getFileName(), related.size()));
-        }
-        return related;
-    }
-
-    private Collection<Path> relatedActiveDocuments(
-            Path file, Collection<Path> activeJavaFiles, ActiveDocumentChangeImpact impact) {
-        var declarationsByFile = new LinkedHashMap<Path, Set<String>>();
-        for (var active : activeJavaFiles) {
-            declarationsByFile.put(active, topLevelQualifiedTypes(active));
-        }
-
-        var related = new LinkedHashSet<Path>();
-        related.add(file);
-        var currentTypes = declarationsByFile.getOrDefault(file, Set.of());
+        var others = new LinkedHashSet<Path>();
         for (var active : activeJavaFiles) {
             if (active.equals(file)) {
                 continue;
             }
-            var activeTypes = declarationsByFile.getOrDefault(active, Set.of());
-            if (referencesAnyType(file, activeTypes)
-                    || (impact.refreshCompletionIndex() && referencesAnyType(active, currentTypes))) {
-                related.add(active);
-            }
+            others.add(active);
         }
-        return List.copyOf(related);
-    }
-
-    private Set<String> topLevelQualifiedTypes(Path file) {
-        try {
-            var parse = compiler().parse(file);
-            var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
-            var result = new LinkedHashSet<String>();
-            for (var typeDecl : parse.root.getTypeDecls()) {
-                if (!(typeDecl instanceof ClassTree cls)) {
-                    continue;
-                }
-                var simpleName = cls.getSimpleName().toString();
-                if (simpleName.isBlank()) {
-                    continue;
-                }
-                result.add(packageName.isBlank() ? simpleName : packageName + "." + simpleName);
-            }
-            return result;
-        } catch (RuntimeException e) {
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_active_related_types file=%s status=failed reason=%s",
-                            file.getFileName(), e.getMessage()));
-            return Set.of();
-        }
-    }
-
-    private boolean referencesAnyType(Path file, Set<String> qualifiedTypes) {
-        if (qualifiedTypes.isEmpty()) {
-            return false;
-        }
-        var compiler = compiler();
-        for (var qualifiedType : qualifiedTypes) {
-            for (var candidate : compiler.findTypeReferences(qualifiedType)) {
-                if (file.equals(candidate)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return List.copyOf(others);
     }
 
     private void scheduleDiagnostics(Collection<Path> files, String trigger) {
-        scheduleDiagnostics(files, trigger, DIAGNOSTIC_DEBOUNCE_MS, false);
+        scheduleDiagnostics(files, trigger, DIAGNOSTIC_DEBOUNCE_MS);
     }
 
-    private void scheduleDiagnostics(
-            Collection<Path> files, String trigger, long delayMs, boolean updateCompletionIndex) {
+    private void scheduleDiagnostics(Collection<Path> files, String trigger, long delayMs) {
         var javaFiles = normalizeJavaFiles(files);
         if (javaFiles.isEmpty()) return;
         var request =
                 new ScheduledDiagnosticsRequest(
-                        diagnosticsRevision.incrementAndGet(),
-                        FileStore.contentRevision(),
-                        updateCompletionIndex);
+                        diagnosticsRevision.incrementAndGet(), FileStore.contentRevision());
         var filesBatch = List.copyOf(javaFiles);
         synchronized (this) {
             if (pendingDiagnostics != null) {
@@ -661,27 +512,58 @@ class JavaLanguageServer extends LanguageServer {
         }
         LOG.fine(
                 String.format(
-                        "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms revision=%d content_revision=%d shared_index=%s",
+                        "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms revision=%d content_revision=%d",
                         trigger,
                         filesBatch.size(),
                         delayMs,
                         request.scheduleRevision(),
-                        request.contentRevision(),
-                        request.updateCompletionIndex()));
+                        request.contentRevision()));
     }
 
-    private void clearDiagnostics(Collection<Path> files, String trigger) {
+    private void markDirtyDiagnostics(Path file, String trigger) {
+        if (dirtyDiagnosticsFiles.add(file)) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_dirty_mark trigger=%s file=%s",
+                            trigger, file.getFileName()));
+        }
+    }
+
+    private void markDirtyDiagnostics(Collection<Path> files, String trigger) {
         var javaFiles = normalizeJavaFiles(files);
         if (javaFiles.isEmpty()) {
             return;
         }
+        var marked = 0;
         for (var file : javaFiles) {
-            client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
+            if (dirtyDiagnosticsFiles.add(file)) {
+                marked++;
+            }
         }
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_clear trigger=%s files=%d",
-                        trigger, javaFiles.size()));
+        if (marked > 0) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_dirty_batch trigger=%s files=%d",
+                            trigger, marked));
+        }
+    }
+
+    private void markOtherActiveDiagnosticsDirty(Path file, String trigger) {
+        markDirtyDiagnostics(file, trigger);
+        var others = otherActiveDocuments(file);
+        if (!others.isEmpty()) {
+            markDirtyDiagnostics(others, trigger + ":openFiles");
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_dirty_open_files trigger=%s file=%s files=%d",
+                            trigger, file.getFileName(), others.size()));
+        }
+    }
+
+    private void clearDirtyDiagnostics(Collection<Path> files) {
+        for (var file : files) {
+            dirtyDiagnosticsFiles.remove(file);
+        }
     }
 
     private void cancelPendingDiagnostics(String reason) {
@@ -706,8 +588,7 @@ class JavaLanguageServer extends LanguageServer {
                     files,
                     selection.compiler,
                     "async:" + trigger,
-                    request.contentRevision(),
-                    request.updateCompletionIndex());
+                    request.contentRevision());
         } catch (Exception e) {
             LOG.warning("Async lint failed for " + files + ": " + e.getMessage());
             LOG.log(java.util.logging.Level.FINE, "", e);
@@ -1125,7 +1006,7 @@ class JavaLanguageServer extends LanguageServer {
                                 "[perf] diagnostics_watched_skip reason=active_document file="
                                         + file);
                     } else {
-                        scheduleDiagnostics(activeDocuments, "didChangeWatchedFiles");
+                        markDirtyDiagnostics(activeDocuments, "didChangeWatchedFiles");
                     }
                 }
                 return;
@@ -1391,16 +1272,11 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         preparseActiveDocument(file, "didOpen");
-        var impact = analyzeActiveDocumentChange(file);
         if (completionIndexVersion.get() == 0) {
             cancelPendingCompletionIndex("didOpenActiveBootstrap");
             scheduleWorkspaceCompletionBootstrapIfNeeded("didOpenActiveBootstrap", 0);
         }
-        scheduleDiagnostics(
-                diagnosticsTargetsForActiveDocumentChange(file, "didOpen", impact),
-                "didOpen",
-                DIAGNOSTIC_DEBOUNCE_MS,
-                shouldRefreshCompletionIndexForActiveDocumentChange(impact));
+            scheduleDiagnostics(List.of(file), "didOpen", DIAGNOSTIC_DEBOUNCE_MS);
     }
 
     @Override
@@ -1410,17 +1286,18 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         preparseActiveDocument(file, "didChange");
         var impact = analyzeActiveDocumentChange(file);
-        var targets = diagnosticsTargetsForActiveDocumentChange(file, "didChange", impact);
-        clearDiagnostics(targets, "didChange");
+        markOtherActiveDiagnosticsDirty(file, "didChange");
         if (completionIndexVersion.get() == 0) {
             cancelPendingCompletionIndex("didChangeActiveBootstrap");
             scheduleWorkspaceCompletionBootstrapIfNeeded("didChangeActiveBootstrap", 0);
+        } else if (shouldRefreshCompletionIndexForActiveDocumentChange(impact)) {
+            scheduleCompletionIndexRefresh(
+                    List.of(file),
+                    "didChange",
+                    COMPLETION_INDEX_DEBOUNCE_MS,
+                    CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
         }
-        scheduleDiagnostics(
-                targets,
-                "didChange",
-                DIAGNOSTIC_DEBOUNCE_MS,
-                shouldRefreshCompletionIndexForActiveDocumentChange(impact));
+        scheduleDiagnostics(List.of(file), "didChange", DIAGNOSTIC_DEBOUNCE_MS);
     }
 
     @Override
@@ -1428,6 +1305,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.close(params);
 
         if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
+            dirtyDiagnosticsFiles.remove(Paths.get(params.textDocument.uri));
             // Clear diagnostics
             client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
         }
@@ -1446,13 +1324,21 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
+            var file = Paths.get(params.textDocument.uri);
+            markDirtyDiagnostics(file, "didSave");
             cancelPendingDiagnostics("didSave");
             cancelPendingCompletionIndex("didSave");
-            var files = new LinkedHashSet<Path>();
-            files.addAll(FileStore.activeDocuments());
-            files.add(Paths.get(params.textDocument.uri));
             var selection = selectDiagnosticsCompiler();
-            compileAndPublish(files, selection.compiler, "didSave", -1, true);
+            compileAndPublish(List.of(file), selection.compiler, "didSave", -1);
+            if (completionIndexVersion.get() == 0 && !FileStore.activeDocuments().isEmpty()) {
+                scheduleWorkspaceCompletionBootstrapIfNeeded("didSaveBootstrap", 0);
+            } else {
+                scheduleCompletionIndexRefresh(
+                        List.of(file),
+                        "didSave",
+                        0,
+                        CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
+            }
         }
     }
 
