@@ -420,7 +420,11 @@ public class HoverProvider {
             return FindHelper.findField(task, data.className, data.memberName);
         }
         if (data.className != null) {
-            return FindHelper.findType(task, data.className);
+            var type = FindHelper.findType(task, data.className);
+            if (type != null) {
+                return type;
+            }
+            throw new RuntimeException("no type");
         }
         throw new RuntimeException("no className");
     }
