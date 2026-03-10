@@ -129,30 +129,66 @@ public class JavaLanguageServerTest {
 
     @Test
     public void completionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/LombokCrossTypeCompletion.java");
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/LombokCrossTypeCompletion.java");
 
-        Assert.assertEquals("expected empty completion index before bootstrap", 0L, completionIndexVersion(server));
+            Assert.assertEquals("expected empty completion index before bootstrap", 0L, completionIndexVersion(server));
 
-        var position =
-                new TextDocumentPositionParams(
-                        new TextDocumentIdentifier(file.toUri()), new Position(5, 14));
-        Optional<CompletionList> completion = server.completion(position);
+            var position =
+                    new TextDocumentPositionParams(
+                            new TextDocumentIdentifier(file.toUri()), new Position(5, 14));
+            Optional<CompletionList> initialCompletion = server.completion(position);
 
-        Assert.assertTrue("expected completion result after bootstrap", completion.isPresent());
-        var labels =
-                completion.get().items.stream().map(item -> item.label).collect(java.util.stream.Collectors.toSet());
-        Assert.assertTrue("expected getter completion after bootstrap", labels.contains("getName"));
-        Assert.assertTrue("expected setter completion after bootstrap", labels.contains("setName"));
-        Assert.assertTrue(
-                "completion should initialize the completion index",
-                completionIndexVersion(server) > 0);
+            Assert.assertTrue("expected completion result while bootstrap is pending", initialCompletion.isPresent());
+            Assert.assertTrue(
+                    "completion should schedule async workspace bootstrap when the index is empty",
+                    capture.countContaining("completion_index_debounce trigger=completionBootstrap") > 0);
+            Assert.assertEquals(
+                    "completion should not do synchronous index rebuilds on cold start",
+                    0,
+                    capture.countContaining("completion_index_refresh_sync trigger=completionBootstrap"));
+            Assert.assertEquals(
+                    "completion should not perform a full workspace compile directly",
+                    0,
+                    capture.countContaining("compile request=completion mode=full"));
+
+            Assert.assertTrue(
+                    "completion bootstrap should initialize the completion index asynchronously",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "completion bootstrap should log workspace bootstrap start",
+                    capture.countContaining("workspace bootstrap started trigger=completionBootstrap") > 0);
+            Assert.assertTrue(
+                    "completion bootstrap should log workspace index install",
+                    capture.countContaining("workspace index installed trigger=completionBootstrap") > 0);
+
+            Optional<CompletionList> completion = server.completion(position);
+            Assert.assertTrue("expected completion result after bootstrap", completion.isPresent());
+            var labels =
+                    completion.get().items.stream()
+                            .map(item -> item.label)
+                            .collect(java.util.stream.Collectors.toSet());
+            Assert.assertTrue("expected getter completion after bootstrap", labels.contains("getName"));
+            Assert.assertTrue("expected setter completion after bootstrap", labels.contains("setName"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
     }
 
     @Test
-    public void didOpenBuildsInitialCompletionIndexFromSharedDiagnosticsPass() throws Exception {
+    public void didOpenSchedulesWorkspaceCompletionBootstrapInsteadOfSharedDiagnosticsIndex() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -170,19 +206,22 @@ public class JavaLanguageServerTest {
             server.didOpenTextDocument(open);
 
             Assert.assertTrue(
-                    "didOpen should initialize the completion index from the shared diagnostics pass",
+                    "didOpen should initialize the completion index from workspace bootstrap",
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "didOpen should log workspace bootstrap start",
+                    capture.countContaining("workspace bootstrap started trigger=didOpenActiveBootstrap") > 0);
+            Assert.assertTrue(
+                    "didOpen should log workspace index install",
+                    capture.countContaining("workspace index installed trigger=didOpenActiveBootstrap") > 0);
 
-            var debounce = capture.lastLineContaining("[perf] diagnostics_debounce trigger=didOpen");
-            Assert.assertNotNull("expected didOpen diagnostics debounce log", debounce);
+            Assert.assertEquals(
+                    "initial didOpen diagnostics should not install the completion index",
+                    0,
+                    capture.countContaining("completion_index_refresh_shared trigger=async:didOpen"));
             Assert.assertTrue(
-                    "initial didOpen should reuse the diagnostics compile to build the index, line=" + debounce,
-                    debounce.contains("shared_index=true"));
-            Assert.assertTrue(
-                    "initial shared diagnostics pass should install a full bootstrap index",
-                    capture.countContaining("completion_index_refresh_shared trigger=async:didOpen files=1 version=") > 0);
-            var shared = capture.lastLineContaining("completion_index_refresh_shared trigger=async:didOpen");
-            Assert.assertTrue("expected full bootstrap mode, line=" + shared, shared.contains("mode=full_bootstrap"));
+                    "didOpen should schedule a dedicated workspace completion bootstrap",
+                    capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap") > 0);
             Assert.assertEquals(
                     "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
                     0,
@@ -193,6 +232,54 @@ public class JavaLanguageServerTest {
                     capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void lintSchedulesWorkspaceBootstrapInsteadOfInstallingInitialIndex() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+            var text = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            FileStore.open(open);
+
+            cancelPendingCompletionIndex(server, "test");
+            setCompletionIndexVersion(server, 0);
+
+            server.lint(List.of(file));
+
+            Assert.assertTrue(
+                    "lint should schedule a dedicated workspace bootstrap when the initial index is empty",
+                    capture.countContaining("completion_index_debounce trigger=lintBootstrap") > 0);
+            Assert.assertEquals(
+                    "lint should not synchronously install the initial completion index",
+                    0,
+                    capture.countContaining("completion_index_refresh_sync trigger=lintBootstrap"));
+            Assert.assertTrue(
+                    "lint bootstrap should log workspace bootstrap start",
+                    capture.countContaining("workspace bootstrap started trigger=lintBootstrap") > 0);
+            Assert.assertTrue(
+                    "lint bootstrap should initialize the completion index asynchronously",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "lint bootstrap should log workspace index install",
+                    capture.countContaining("workspace index installed trigger=lintBootstrap") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -255,6 +342,52 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didOpenWorkspaceBootstrapIncludesSplitInheritedDotCompletion() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/SplitInheritedFooDot.java");
+        var text = FileStore.contents(file);
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = text;
+        server.didOpenTextDocument(open);
+
+        Assert.assertTrue(
+                "didOpen should initialize the completion index",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+        CompileBatch.resetPerfCounters();
+        var completion =
+                server.completion(
+                                new TextDocumentPositionParams(
+                                        new TextDocumentIdentifier(file.toUri()),
+                                        new Position(4, 25)))
+                        .orElseThrow();
+        var labels =
+                completion.items.stream()
+                        .map(item -> item.label)
+                        .collect(java.util.stream.Collectors.toSet());
+        Assert.assertTrue(
+                "split-file inherited dot completion should work without opening the superclass first",
+                labels.contains("perform"));
+        Assert.assertEquals(
+                "completion should not use full compile after workspace bootstrap",
+                0L,
+                CompileBatch.perfCounters().fullBatches);
+        Assert.assertEquals(
+                "completion should not analyze after workspace bootstrap",
+                0L,
+                CompileBatch.perfCounters().analyzeInvocations);
+        Assert.assertEquals(
+                "completion should not run annotation processing after workspace bootstrap",
+                0L,
+                CompileBatch.perfCounters().apEnabledBatches);
+    }
+
+    @Test
     public void didChangeClearsPublishedDiagnosticsBeforeDebouncedRefresh() throws Exception {
         var client = new RecordingDiagnosticsClient();
         var server =
@@ -303,6 +436,8 @@ public class JavaLanguageServerTest {
         Thread.sleep(900);
 
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -343,6 +478,7 @@ public class JavaLanguageServerTest {
                     capture.countContaining("[perf] diagnostics_compile trigger=async:didChange"));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -1084,7 +1220,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compilerRecreatedRefreshUsesSharedDiagnosticsPassForActiveFiles() throws Exception {
+    public void compilerRecreatedSchedulesWorkspaceBootstrapForActiveFiles() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
@@ -1097,6 +1233,8 @@ public class JavaLanguageServerTest {
         server.didOpenTextDocument(open);
 
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -1114,22 +1252,25 @@ public class JavaLanguageServerTest {
             var line = capture.lastLineContaining("[perf] diagnostics_debounce trigger=compilerRecreated");
             Assert.assertTrue("expected compilerRecreated diagnostics debounce log", line != null);
             Assert.assertTrue(
-                    "compilerRecreated shared diagnostics pass should use active files only, line=" + line,
+                    "compilerRecreated diagnostics pass should use active files only, line=" + line,
                     line.matches(".*files=1\\b.*"));
             Assert.assertTrue(
-                    "compilerRecreated active-file startup pass should refresh the index from shared compile, line="
-                            + line,
-                    line.contains("shared_index=true"));
+                    "compilerRecreated diagnostics should not install the initial completion index, line=" + line,
+                    line.contains("shared_index=false"));
             Assert.assertEquals(
                     "compilerRecreated should not schedule a separate sync completion refresh when active files exist",
                     0,
                     capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
+            Assert.assertTrue(
+                    "compilerRecreated should schedule a dedicated workspace completion bootstrap when active files exist",
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated") > 0);
             Assert.assertEquals(
-                    "compilerRecreated should not schedule a separate deferred completion refresh when active files exist",
+                    "compilerRecreated diagnostics should not refresh the index from the shared compile",
                     0,
-                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+                    capture.countContaining("completion_index_refresh_shared trigger=async:compilerRecreated"));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -1137,6 +1278,8 @@ public class JavaLanguageServerTest {
     public void startupCompilerRecreatedRefreshIsLazyWhenNoActiveDocs() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -1181,6 +1324,7 @@ public class JavaLanguageServerTest {
             server.shutdown();
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -1253,7 +1397,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didOpenRefreshesInlayHintsAfterInitialIndexInstall() throws Exception {
+    public void didOpenDoesNotRefreshInlayHintsAfterInitialIndexInstall() throws Exception {
         FileStore.reset();
         var client = new RecordingInlayHintClient();
         var server = new JavaLanguageServer(client);
@@ -1283,9 +1427,10 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "expected completion index to advance after open",
                     awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "expected one inlay hint refresh after index install",
-                    client.awaitRefreshCountAtLeast(1, 10, TimeUnit.SECONDS));
+            Assert.assertEquals(
+                    "didOpen should not request inlay hint refresh after index install",
+                    0,
+                    client.refreshCount.get());
         } finally {
             server.shutdown();
         }
@@ -1312,6 +1457,110 @@ public class JavaLanguageServerTest {
             server.didOpenTextDocument(open);
 
             Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    public void didChangeDoesNotRefreshInlayHintsAfterIncrementalIndexUpdate() throws Exception {
+        FileStore.reset();
+        var client = new RecordingInlayHintClient();
+        var server = new JavaLanguageServer(client);
+        var init = new InitializeParams();
+        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+        var capabilities = new JsonObject();
+        var workspace = new JsonObject();
+        var inlayHint = new JsonObject();
+        inlayHint.addProperty("refreshSupport", true);
+        workspace.add("inlayHint", inlayHint);
+        capabilities.add("workspace", workspace);
+        init.capabilities = capabilities;
+        server.initialize(init);
+        server.initialized();
+
+        try {
+            var file = FindResource.path("org/javacs/example/LombokCrossTypeModel.java");
+            var original = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = original;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected completion index to initialize before didChange check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
+
+            var before = completionIndexVersion(server);
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = file.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = original.replace("private String name;", "private String title;");
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Assert.assertTrue(
+                    "didChange should still refresh completion index",
+                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+            Assert.assertEquals(
+                    "didChange should not request inlay hint refresh after incremental index update",
+                    0,
+                    client.refreshCount.get());
+        } finally {
+            server.shutdown();
+        }
+    }
+
+    @Test
+    public void didSaveDoesNotRefreshInlayHintsAfterSharedIndexUpdate() throws Exception {
+        FileStore.reset();
+        var client = new RecordingInlayHintClient();
+        var server = new JavaLanguageServer(client);
+        var init = new InitializeParams();
+        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+        var capabilities = new JsonObject();
+        var workspace = new JsonObject();
+        var inlayHint = new JsonObject();
+        inlayHint.addProperty("refreshSupport", true);
+        workspace.add("inlayHint", inlayHint);
+        capabilities.add("workspace", workspace);
+        init.capabilities = capabilities;
+        server.initialize(init);
+        server.initialized();
+
+        try {
+            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+            var text = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected completion index to initialize before didSave check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
+
+            var before = completionIndexVersion(server);
+            var save = new DidSaveTextDocumentParams();
+            save.textDocument = new TextDocumentIdentifier(file.toUri());
+            server.didSaveTextDocument(save);
+
+            Assert.assertTrue(
+                    "didSave should still refresh completion index",
+                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+            Assert.assertEquals(
+                    "didSave should not request inlay hint refresh after shared index update",
+                    0,
+                    client.refreshCount.get());
         } finally {
             server.shutdown();
         }
@@ -1507,6 +1756,18 @@ public class JavaLanguageServerTest {
         var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
         field.setAccessible(true);
         return ((AtomicLong) field.get(server)).get();
+    }
+
+    private void setCompletionIndexVersion(JavaLanguageServer server, long value) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
+        field.setAccessible(true);
+        ((AtomicLong) field.get(server)).set(value);
+    }
+
+    private void cancelPendingCompletionIndex(JavaLanguageServer server, String reason) throws Exception {
+        var method = JavaLanguageServer.class.getDeclaredMethod("cancelPendingCompletionIndex", String.class);
+        method.setAccessible(true);
+        method.invoke(server, reason);
     }
 
     private void invokeCompileAndPublish(

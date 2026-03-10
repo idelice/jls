@@ -71,9 +71,10 @@ class JavaLanguageServer extends LanguageServer {
     private ScheduledFuture<?> pendingCompletionIndex;
     private static final long DIAGNOSTIC_DEBOUNCE_MS = 750;
     private static final long COMPLETION_INDEX_DEBOUNCE_MS = 100;
+    private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 200;
+    private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private boolean lombokVerifiedForCurrentCompiler;
     private boolean lombokEnabledForCurrentCompiler = true;
-    private boolean clientSupportsInlayHintRefresh;
     private final AtomicReference<TypeMemberIndex> completionIndexRef =
             new AtomicReference<>(TypeMemberIndex.EMPTY);
     private final AtomicReference<ExternalBinaryTypeIndex> externalBinaryIndexRef =
@@ -159,7 +160,8 @@ class JavaLanguageServer extends LanguageServer {
         var active = normalizeJavaFiles(FileStore.activeDocuments());
         if (!active.isEmpty()) {
             cancelPendingDiagnostics("compilerRecreated");
-            scheduleDiagnostics(active, "compilerRecreated", 0, true);
+            scheduleDiagnostics(active, "compilerRecreated", 0, false);
+            scheduleWorkspaceCompletionBootstrapIfNeeded("compilerRecreated", 0);
             return;
         }
         LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
@@ -171,7 +173,7 @@ class JavaLanguageServer extends LanguageServer {
         var selection = selectDiagnosticsCompiler();
         compileAndPublish(files, selection.compiler, "foreground", -1, false);
         if (completionIndexVersion.get() == 0 && !FileStore.activeDocuments().isEmpty()) {
-            refreshProjectCompletionIndexNow("lintBootstrap");
+            scheduleWorkspaceCompletionBootstrapIfNeeded("lintBootstrap", 0);
         }
     }
 
@@ -207,40 +209,35 @@ class JavaLanguageServer extends LanguageServer {
                 }
                 verifyLombokSymbols(task, "diagnostics");
                 if (updateCompletionIndex) {
-                    var indexStarted = Instant.now();
-                    var bootstrapFullIndex = completionIndexVersion.get() == 0;
-                    var nextIndex =
-                            bootstrapFullIndex
-                                    ? TypeMemberIndex.from(task)
-                                    : TypeMemberIndex.workspaceDeclarations(task);
-                    if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_index_build")) {
-                        return;
-                    }
-                    var indexVersion = nextIndexVersion();
-                    if (bootstrapFullIndex) {
-                        installTypeMemberIndex(
-                                nextIndex,
-                                indexVersion,
-                                "index:" + trigger,
-                                Duration.between(indexStarted, Instant.now()));
+                    if (completionIndexVersion.get() == 0) {
+                        LOG.fine(
+                                String.format(
+                                        "[perf] completion_index_refresh_shared_skip trigger=%s files=%d reason=workspace_bootstrap_required",
+                                        trigger, javaFiles.size()));
                     } else {
+                        var indexStarted = Instant.now();
+                        var nextIndex = TypeMemberIndex.workspaceDeclarations(task);
+                        if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_index_build")) {
+                            return;
+                        }
+                        var indexVersion = nextIndexVersion();
                         installMergedTypeMemberIndex(
                                 nextIndex,
                                 javaFiles,
                                 indexVersion,
                                 "index:" + trigger,
                                 Duration.between(indexStarted, Instant.now()));
-                    }
-                    LOG.fine(
-                        String.format(
-                                "[perf] completion_index_refresh_shared trigger=%s files=%d version=%d mode=%s took=%dms",
-                                trigger,
-                                javaFiles.size(),
-                                indexVersion,
-                                bootstrapFullIndex ? "full_bootstrap" : "workspace_declaration_merge",
-                                Duration.between(indexStarted, Instant.now()).toMillis()));
-                    if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_index_install")) {
-                        return;
+                        LOG.fine(
+                                String.format(
+                                        "[perf] completion_index_refresh_shared trigger=%s files=%d version=%d mode=%s took=%dms",
+                                        trigger,
+                                        javaFiles.size(),
+                                        indexVersion,
+                                        "workspace_declaration_merge",
+                                        Duration.between(indexStarted, Instant.now()).toMillis()));
+                        if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_index_install")) {
+                            return;
+                        }
                     }
                 }
                 var publishStarted = Instant.now();
@@ -304,9 +301,6 @@ class JavaLanguageServer extends LanguageServer {
                 String.format(
                         "[perf] completion_type_index trigger=%s version=%d types=%d took=%dms",
                         trigger, indexVersion, rebuilt.size(), took.toMillis()));
-        if (!FileStore.activeDocuments().isEmpty()) {
-            refreshInlayHints(trigger);
-        }
     }
 
     private void installMergedTypeMemberIndex(
@@ -327,9 +321,6 @@ class JavaLanguageServer extends LanguageServer {
                 String.format(
                         "[perf] completion_type_index_merge trigger=%s version=%d types=%d files=%d took=%dms",
                         trigger, indexVersion, merged.size(), replacedFiles.size(), took.toMillis()));
-        if (!FileStore.activeDocuments().isEmpty()) {
-            refreshInlayHints(trigger);
-        }
     }
 
     private long nextIndexVersion() {
@@ -388,6 +379,13 @@ class JavaLanguageServer extends LanguageServer {
         scheduleCompletionIndexRefresh(FileStore.all(), trigger, delayMs, CompletionIndexRefreshMode.FULL_REBUILD);
     }
 
+    private void scheduleWorkspaceCompletionBootstrapIfNeeded(String trigger, long delayMs) {
+        if (completionIndexVersion.get() != 0) {
+            return;
+        }
+        scheduleProjectCompletionIndexRefresh(trigger, delayMs);
+    }
+
     private void scheduleCompletionIndexRefresh(
             Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
         var javaFiles = normalizeJavaFiles(files);
@@ -417,10 +415,17 @@ class JavaLanguageServer extends LanguageServer {
         if (revision != completionIndexRevision.get()) {
             return;
         }
+        var workspaceBootstrap = mode == CompletionIndexRefreshMode.FULL_REBUILD && completionIndexVersion.get() == 0;
         synchronized (completionIndexCompileMutex) {
             var started = Instant.now();
             CompileTask task = null;
             try {
+                if (workspaceBootstrap) {
+                    LOG.info(
+                            String.format(
+                                    "[perf] workspace bootstrap started trigger=%s files=%d",
+                                    trigger, files.size()));
+                }
                 task = compiler().compile(files.toArray(Path[]::new));
                 if (revision != completionIndexRevision.get()) {
                     LOG.fine(
@@ -446,6 +451,12 @@ class JavaLanguageServer extends LanguageServer {
                         indexVersion,
                         "index:" + trigger,
                         Duration.between(indexStarted, Instant.now()));
+                if (workspaceBootstrap) {
+                    LOG.info(
+                            String.format(
+                                    "[perf] workspace index installed trigger=%s version=%d types=%d",
+                                    trigger, indexVersion, nextIndex == null ? 0 : nextIndex.size()));
+                }
                 LOG.fine(
                         String.format(
                                 "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
@@ -736,6 +747,18 @@ class JavaLanguageServer extends LanguageServer {
         LOG.fine("[perf] completion_index_cancel reason=" + reason);
     }
 
+    private void awaitCompletionBootstrap(long initialIndexVersion, long timeoutMs) {
+        var deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (completionIndexVersion.get() == initialIndexVersion && System.nanoTime() < deadline) {
+            try {
+                Thread.sleep(COMPLETION_BOOTSTRAP_POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
     private boolean shouldSkipStaleDiagnostics(long expectedContentRevision, String trigger, String phase) {
         var current = FileStore.contentRevision();
         if (!isStaleDiagnosticsContent(expectedContentRevision, current)) {
@@ -753,7 +776,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private boolean shouldRefreshCompletionIndexForActiveDocumentChange(ActiveDocumentChangeImpact impact) {
-        return impact.refreshCompletionIndex() || completionIndexVersion.get() == 0;
+        return impact.refreshCompletionIndex();
     }
 
     private void verifyLombokSymbols(CompileTask task, String phase) {
@@ -957,7 +980,6 @@ class JavaLanguageServer extends LanguageServer {
     public InitializeResult initialize(InitializeParams params) {
         this.workspaceRoot = Paths.get(params.rootUri);
         FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
-        clientSupportsInlayHintRefresh = supportsInlayHintRefresh(params.capabilities);
 
         var c = new JsonObject();
         c.addProperty("textDocumentSync", 2); // Incremental
@@ -1123,14 +1145,14 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         var file = Paths.get(params.textDocument.uri);
         compiler();
-        if (completionIndexVersion.get() == 0) {
-            cancelPendingCompletionIndex("completionBootstrap");
+        var initialIndexVersion = completionIndexVersion.get();
+        if (initialIndexVersion == 0) {
             LOG.fine(
                     String.format(
                             "[perf] completion_index_bootstrap trigger=completion file=%s",
                             file.getFileName()));
-            refreshCompletionIndexNow(
-                    FileStore.all(), "completionBootstrap", CompletionIndexRefreshMode.FULL_REBUILD);
+            scheduleWorkspaceCompletionBootstrapIfNeeded("completionBootstrap", 0);
+            awaitCompletionBootstrap(initialIndexVersion, COMPLETION_BOOTSTRAP_WAIT_MS);
         }
         var completionIndex = typeIndex();
         var indexVersion = completionIndexVersion.get();
@@ -1372,6 +1394,7 @@ class JavaLanguageServer extends LanguageServer {
         var impact = analyzeActiveDocumentChange(file);
         if (completionIndexVersion.get() == 0) {
             cancelPendingCompletionIndex("didOpenActiveBootstrap");
+            scheduleWorkspaceCompletionBootstrapIfNeeded("didOpenActiveBootstrap", 0);
         }
         scheduleDiagnostics(
                 diagnosticsTargetsForActiveDocumentChange(file, "didOpen", impact),
@@ -1391,6 +1414,7 @@ class JavaLanguageServer extends LanguageServer {
         clearDiagnostics(targets, "didChange");
         if (completionIndexVersion.get() == 0) {
             cancelPendingCompletionIndex("didChangeActiveBootstrap");
+            scheduleWorkspaceCompletionBootstrapIfNeeded("didChangeActiveBootstrap", 0);
         }
         scheduleDiagnostics(
                 targets,
@@ -1434,29 +1458,5 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void doAsyncWork() {}
-
-    private void refreshInlayHints(String trigger) {
-        if (!clientSupportsInlayHintRefresh) {
-            return;
-        }
-        LOG.info("[perf] inlay_hint_refresh trigger=" + trigger);
-        client.refreshInlayHints();
-    }
-
-    private boolean supportsInlayHintRefresh(JsonElement capabilities) {
-        if (capabilities == null || !capabilities.isJsonObject()) {
-            return false;
-        }
-        var root = capabilities.getAsJsonObject();
-        if (!root.has("workspace") || !root.get("workspace").isJsonObject()) {
-            return false;
-        }
-        var workspace = root.getAsJsonObject("workspace");
-        if (!workspace.has("inlayHint") || !workspace.get("inlayHint").isJsonObject()) {
-            return false;
-        }
-        var inlayHint = workspace.getAsJsonObject("inlayHint");
-        return inlayHint.has("refreshSupport") && inlayHint.get("refreshSupport").getAsBoolean();
-    }
 
 }

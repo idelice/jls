@@ -253,6 +253,10 @@ final class ParseTypeResolver {
         if (variable.isPresent()) {
             return variable;
         }
+        var inheritedField = resolveInheritedFieldMember(identifier);
+        if (inheritedField.isPresent()) {
+            return returnTypeOf(inheritedField.get());
+        }
         var nested = resolveNestedTypeInEnclosingScopes(identifier);
         if (nested.isPresent()) {
             return Optional.of(new TypeResolution(nested.get(), true, false));
@@ -345,6 +349,18 @@ final class ParseTypeResolver {
 
         if (best[0] == null) return Optional.empty();
         return Optional.of(best[0].resolution);
+    }
+
+    Optional<TypeMemberIndex.Member> resolveInheritedFieldMember(String identifier) {
+        var owner = resolveThisType();
+        if (owner.isEmpty()) {
+            return Optional.empty();
+        }
+        var member = index.member(owner.get().qualifiedType, identifier, false);
+        if (member.isEmpty() || member.get().kind != org.javacs.lsp.CompletionItemKind.Field) {
+            return Optional.empty();
+        }
+        return member;
     }
 
     private Optional<TypeResolution> resolveVariableType(VariableTree variableTree, int depth) {

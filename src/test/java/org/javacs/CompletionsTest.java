@@ -5,11 +5,18 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
+import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
+import javax.tools.JavaFileObject;
 import org.javacs.completion.CompletionProvider;
+import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.hover.HoverProvider;
 import org.javacs.lsp.*;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -123,6 +130,21 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void inheritedPojoFieldMembers() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        var suggestions = filterText(file, 5, 26);
+        assertThat(suggestions, hasItem("perform"));
+    }
+
+    @Test
+    public void lombokInheritedPojoFieldMembers() {
+        refreshServer();
+        var file = "/org/javacs/example/LombokInheritedPojoMembers.java";
+        var suggestions = filterText(file, 8, 26);
+        assertThat(suggestions, hasItem("perform"));
+    }
+
+    @Test
     @Ignore("Fast completion intentionally avoids full Lombok analysis")
     public void lombokBuilderMemberCompletion() {
         var file = "/org/javacs/example/LombokBuilderCompletion.java";
@@ -166,6 +188,91 @@ public class CompletionsTest extends CompletionsBase {
         }
         var resolved = resolve(getter);
         assertThat(resolved.label, equalTo("getName"));
+    }
+
+    @Test
+    public void simpleClassCompletionResolveDoesNotCrash() {
+        var item = new CompletionItem();
+        item.label = "Goto";
+        var data = new CompletionData();
+        data.className = "Goto";
+        item.data = JsonHelper.GSON.toJsonTree(data);
+        var source = new SourceFileObject(FindResource.path("/org/javacs/example/Goto.java"));
+        var delegate = LanguageServerFixture.getCompilerProvider();
+        var provider =
+                new HoverProvider(
+                        new CompilerProvider() {
+                            @Override
+                            public Set<String> imports() {
+                                return delegate.imports();
+                            }
+
+                            @Override
+                            public List<String> publicTopLevelTypes() {
+                                return delegate.publicTopLevelTypes();
+                            }
+
+                            @Override
+                            public Set<Path> classPathRoots() {
+                                return delegate.classPathRoots();
+                            }
+
+                            @Override
+                            public List<String> packagePrivateTopLevelTypes(String packageName) {
+                                return delegate.packagePrivateTopLevelTypes(packageName);
+                            }
+
+                            @Override
+                            public Iterable<Path> search(String query) {
+                                return delegate.search(query);
+                            }
+
+                            @Override
+                            public Optional<JavaFileObject> findAnywhere(String className) {
+                                if ("Goto".equals(className)) {
+                                    return Optional.of(source);
+                                }
+                                return delegate.findAnywhere(className);
+                            }
+
+                            @Override
+                            public Path findTypeDeclaration(String className) {
+                                return delegate.findTypeDeclaration(className);
+                            }
+
+                            @Override
+                            public Path[] findTypeReferences(String className) {
+                                return delegate.findTypeReferences(className);
+                            }
+
+                            @Override
+                            public Path[] findMemberReferences(String className, String memberName) {
+                                return delegate.findMemberReferences(className, memberName);
+                            }
+
+                            @Override
+                            public ParseTask parse(Path file) {
+                                return delegate.parse(file);
+                            }
+
+                            @Override
+                            public ParseTask parse(JavaFileObject file) {
+                                return delegate.parse(file);
+                            }
+
+                            @Override
+                            public CompileTask compile(Path... files) {
+                                return delegate.compile(files);
+                            }
+
+                            @Override
+                            public CompileTask compile(Collection<? extends JavaFileObject> sources) {
+                                return delegate.compile(sources);
+                            }
+                        },
+                        CompositeTypeIndex.EMPTY);
+        provider.resolveCompletionItem(item);
+        assertThat(item.label, equalTo("Goto"));
     }
 
     @Test

@@ -98,6 +98,18 @@ public class FindReferencesTest {
                 contains("StaticImportCrossPackageUsage.java(11)"));
     }
 
+    @Test
+    public void inheritedFieldReferencesFromDeclaration() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(items(file, 10, 19), contains("InheritedPojoMembers.java(5)"));
+    }
+
+    @Test
+    public void inheritedFieldReferencesFromUsage() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(items(file, 5, 10), contains("InheritedPojoMembers.java(5)"));
+    }
+
     private static ReferenceContext referenceContext() {
         var workspaceRoot = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT;
         FileStore.reset();

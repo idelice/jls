@@ -138,6 +138,11 @@ public class DefinitionProvider {
                 return new ResolvedSymbol(List.of(location), owner, name, false, null, name);
             }
         }
+        var inheritedField = types.resolveInheritedFieldMember(name);
+        if (inheritedField.isPresent()) {
+            LOG.fine(String.format("[perf] definition_inherited_field owner=%s member=%s", inheritedField.get().ownerType, name));
+            return resolveFieldFromMember(inheritedField.get().ownerType, name, inheritedField.get());
+        }
 
         var typeParameter = findTypeParameterInEnclosingScopes(path, name);
         if (typeParameter.isPresent()) {

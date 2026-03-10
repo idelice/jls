@@ -216,6 +216,30 @@ public class GotoTest {
         assertThat(doGoto(file, 11, 18), hasItem("GotoSwitchCaseEnum.java:5"));
     }
 
+    @Test
+    public void gotoInheritedField() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(doGoto(file, 5, 10), hasItem("InheritedPojoMembers.java:10"));
+    }
+
+    @Test
+    public void gotoInheritedFieldMemberMethod() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(doGoto(file, 5, 27), hasItem("InheritedPojoMembers.java:14"));
+    }
+
+    @Test
+    public void gotoLombokInheritedFieldMemberMethod() {
+        var file = "/org/javacs/example/LombokInheritedPojoMembers.java";
+        assertThat(doGoto(file, 8, 27), hasItem("LombokInheritedPojoMembers.java:18"));
+    }
+
+    @Test
+    public void gotoLombokInheritedField() {
+        var file = "/org/javacs/example/LombokInheritedPojoMembers.java";
+        assertThat(doGoto(file, 8, 10), hasItem("LombokInheritedPojoMembers.java:14"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {
