@@ -566,7 +566,9 @@ public class CompletionProvider {
             if (select instanceof IdentifierTree identifier) {
                 var current = resolveThisType();
                 if (current.isEmpty()) return Optional.empty();
-                var method = index.member(current.get().qualifiedType, identifier.getName().toString(), false);
+                var method =
+                        resolveMemberFromIndexOrSource(
+                                current.get().qualifiedType, identifier.getName().toString(), false);
                 if (method.isEmpty()) return Optional.empty();
                 return returnTypeOf(method.get());
             }
@@ -574,7 +576,7 @@ public class CompletionProvider {
                 var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
                 if (receiver.isEmpty()) return Optional.empty();
                 var method =
-                        index.member(
+                        resolveMemberFromIndexOrSource(
                                 receiver.get().qualifiedType,
                                 memberSelectTree.getIdentifier().toString(),
                                 receiver.get().staticContext);
@@ -597,7 +599,7 @@ public class CompletionProvider {
                 return Optional.of(new TypeResolution("java.lang.Class", false, false));
             }
             var member =
-                    index.member(
+                    resolveMemberFromIndexOrSource(
                             receiver.get().qualifiedType,
                             memberSelectTree.getIdentifier().toString(),
                             receiver.get().staticContext);
@@ -622,6 +624,10 @@ public class CompletionProvider {
             if (implicitLogger.isPresent()) {
                 return implicitLogger;
             }
+            var enclosingField = resolveEnclosingField(identifier);
+            if (enclosingField.isPresent()) {
+                return enclosingField;
+            }
             var nested = resolveNestedTypeInEnclosingScopes(identifier);
             if (nested.isPresent()) {
                 return Optional.of(new TypeResolution(nested.get(), true, false));
@@ -629,6 +635,104 @@ public class CompletionProvider {
             var type = index.resolveTypeName(identifier, root);
             if (type.isPresent()) {
                 return Optional.of(new TypeResolution(type.get(), true, false));
+            }
+            return Optional.empty();
+        }
+
+        private Optional<TypeResolution> resolveEnclosingField(String identifier) {
+            if (identifier == null || identifier.isBlank()) {
+                return Optional.empty();
+            }
+            var current = resolveThisType();
+            if (current.isEmpty()) {
+                return Optional.empty();
+            }
+            var field = resolveMemberFromIndexOrSource(current.get().qualifiedType, identifier, false);
+            if (field.isEmpty() || field.get().kind != CompletionItemKind.Field) {
+                return Optional.empty();
+            }
+            return returnTypeOf(field.get());
+        }
+
+        private Optional<TypeMemberIndex.Member> resolveMemberFromIndexOrSource(
+                String ownerType, String memberName, boolean staticContext) {
+            var indexed = index.member(ownerType, memberName, staticContext);
+            if (indexed.isPresent()) {
+                return indexed;
+            }
+            return resolveSourceMember(ownerType, memberName, staticContext);
+        }
+
+        private Optional<TypeMemberIndex.Member> resolveSourceMember(
+                String ownerType, String memberName, boolean staticContext) {
+            var classPath = declaredClassPath(ownerType);
+            if (classPath == null || !(classPath.getLeaf() instanceof ClassTree classTree)) {
+                return Optional.empty();
+            }
+            for (var member : classTree.getMembers()) {
+                if (member instanceof VariableTree field) {
+                    if (!field.getName().contentEquals(memberName)) {
+                        continue;
+                    }
+                    var isStatic =
+                            field.getModifiers() != null
+                                    && field.getModifiers().getFlags().contains(Modifier.STATIC);
+                    if (isStatic != staticContext) {
+                        continue;
+                    }
+                    var fieldType = resolveTypeTree(field.getType(), false);
+                    if (fieldType.isEmpty()) {
+                        continue;
+                    }
+                    return Optional.of(
+                            new TypeMemberIndex.Member(
+                                    ownerType,
+                                    memberName,
+                                    CompletionItemKind.Field,
+                                    isStatic,
+                                    field.getModifiers() != null
+                                            && field.getModifiers().getFlags().contains(Modifier.PRIVATE),
+                                    0,
+                                    field.getType() + " " + memberName,
+                                    fieldType.get().qualifiedType,
+                                    null,
+                                    null));
+                }
+                if (member instanceof MethodTree method) {
+                    if (!method.getName().contentEquals(memberName)) {
+                        continue;
+                    }
+                    var isStatic =
+                            method.getModifiers() != null
+                                    && method.getModifiers().getFlags().contains(Modifier.STATIC);
+                    if (isStatic != staticContext) {
+                        continue;
+                    }
+                    var returnType =
+                            method.getReturnType() == null
+                                    ? Optional.<TypeResolution>empty()
+                                    : resolveTypeTree(method.getReturnType(), false);
+                    var parameterNames = new String[method.getParameters().size()];
+                    var erasedParameterTypes = new String[method.getParameters().size()];
+                    for (int i = 0; i < method.getParameters().size(); i++) {
+                        var parameter = method.getParameters().get(i);
+                        parameterNames[i] = parameter.getName().toString();
+                        erasedParameterTypes[i] = parameter.getType().toString();
+                    }
+                    return Optional.of(
+                            new TypeMemberIndex.Member(
+                                    ownerType,
+                                    memberName,
+                                    CompletionItemKind.Method,
+                                    isStatic,
+                                    method.getModifiers() != null
+                                            && method.getModifiers().getFlags().contains(Modifier.PRIVATE),
+                                    0,
+                                    method.toString(),
+                                    returnType.map(type -> type.qualifiedType).orElse(null),
+                                    parameterNames,
+                                    erasedParameterTypes));
+                }
             }
             return Optional.empty();
         }
@@ -664,7 +768,7 @@ public class CompletionProvider {
             for (var classPath = enclosingClassPath(); classPath != null; classPath = parentClassPath(classPath.getParentPath())) {
                 var owner = qualifiedClassName(classPath);
                 var candidate = owner + "." + simpleName;
-                if (index.containsType(candidate)) {
+                if (index.containsType(candidate) || declaredClassPath(candidate) != null) {
                     return Optional.of(candidate);
                 }
             }
@@ -771,6 +875,9 @@ public class CompletionProvider {
             }
             var typeName = tree.toString();
             var resolved = index.resolveTypeName(typeName, root);
+            if (resolved.isEmpty()) {
+                resolved = resolveTypeNameInCurrentSource(typeName);
+            }
             return resolved.map(type -> new TypeResolution(type, staticContext, false));
         }
 
@@ -781,9 +888,6 @@ public class CompletionProvider {
             var classPath = enclosingClassPath();
             if (classPath == null) return Optional.empty();
             var qualified = qualifiedClassName(classPath);
-            if (!index.containsType(qualified)) {
-                return Optional.empty();
-            }
             thisType = new TypeResolution(qualified, false, false);
             return Optional.of(thisType);
         }
@@ -861,7 +965,60 @@ public class CompletionProvider {
                 type = type.substring(0, type.length() - 2);
             }
             var resolved = index.resolveTypeName(type, root);
+            if (resolved.isEmpty()) {
+                resolved = resolveTypeNameInCurrentSource(type);
+            }
             return resolved.map(next -> new TypeResolution(next, false, isArray));
+        }
+
+        private Optional<String> resolveTypeNameInCurrentSource(String typeName) {
+            if (typeName == null || typeName.isBlank()) {
+                return Optional.empty();
+            }
+            var raw = typeName.replace('$', '.');
+            if (raw.contains(".") && declaredClassPath(raw) != null) {
+                return Optional.of(raw);
+            }
+            final String[] match = new String[1];
+            final boolean[] ambiguous = {false};
+            new TreePathScanner<Void, Void>() {
+                @Override
+                public Void visitClass(ClassTree classTree, Void unused) {
+                    var qualified = qualifiedClassName(getCurrentPath());
+                    var simple = classTree.getSimpleName().toString();
+                    if (!simple.equals(raw)) {
+                        return super.visitClass(classTree, unused);
+                    }
+                    if (match[0] == null) {
+                        match[0] = qualified;
+                    } else if (!match[0].equals(qualified)) {
+                        ambiguous[0] = true;
+                    }
+                    return super.visitClass(classTree, unused);
+                }
+            }.scan(root, null);
+            if (ambiguous[0]) {
+                return Optional.empty();
+            }
+            return Optional.ofNullable(match[0]);
+        }
+
+        private TreePath declaredClassPath(String qualifiedType) {
+            if (qualifiedType == null || qualifiedType.isBlank()) {
+                return null;
+            }
+            final TreePath[] match = new TreePath[1];
+            new TreePathScanner<Void, Void>() {
+                @Override
+                public Void visitClass(ClassTree classTree, Void unused) {
+                    if (qualifiedType.equals(qualifiedClassName(getCurrentPath()))) {
+                        match[0] = getCurrentPath();
+                        return null;
+                    }
+                    return super.visitClass(classTree, unused);
+                }
+            }.scan(root, null);
+            return match[0];
         }
 
         private Optional<TypeResolution> literalType(LiteralTree literal) {

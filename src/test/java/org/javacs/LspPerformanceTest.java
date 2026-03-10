@@ -744,6 +744,35 @@ public class LspPerformanceTest {
     }
 
     @Test
+    public void inheritedFieldReceiverStillResolvesMembers() {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var text =
+                "package org.javacs.example;\n"
+                        + "\n"
+                        + "class ReceiverType {\n"
+                        + "    String value() { return \"\"; }\n"
+                        + "}\n"
+                        + "\n"
+                        + "class BaseHolder {\n"
+                        + "    protected ReceiverType model = new ReceiverType();\n"
+                        + "}\n"
+                        + "\n"
+                        + "public class AutocompleteMember extends BaseHolder {\n"
+                        + "    void test() {\n"
+                        + "        model.\n"
+                        + "    }\n"
+                        + "}\n";
+        open(server, MEMBER_FILE, 1, text);
+        server.lint(List.of(MEMBER_FILE));
+
+        var completion = server.completion(completionPosition(MEMBER_FILE, 13, 14));
+        assertTrue(completion.isPresent());
+        assertTrue(
+                "expected inherited field receiver member completion",
+                completion.get().items.stream().anyMatch(item -> "value".equals(item.label)));
+    }
+
+    @Test
     public void lombokTypedMemberPrefixRemainsStableDuringRapidChanges() {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var original = FileStore.contents(LOMBOK_MEMBER_FILE);
