@@ -762,8 +762,20 @@ class JavaLanguageServer extends LanguageServer {
         javaEndProgress();
         LOG.info("[perf] lombok_setting enabled=" + lombokEnabled);
         return new CompilerSet(
-                new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs, lombokEnabled),
-                new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs, lombokEnabled),
+                new JavaCompilerService(
+                        classPath,
+                        resolvedDocPath,
+                        addExports,
+                        extraArgs,
+                        lombokEnabled,
+                        "interactive"),
+                new JavaCompilerService(
+                        classPath,
+                        resolvedDocPath,
+                        addExports,
+                        extraArgs,
+                        lombokEnabled,
+                        "diagnostics"),
                 lombokEnabled);
     }
 

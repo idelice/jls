@@ -32,6 +32,7 @@ class JavaCompilerService implements CompilerProvider {
     final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
     final boolean lombokConfiguredEnabled;
     final boolean lombokPresentOnClasspath;
+    final String compilerRole;
     private volatile boolean lombokApEnabled;
     // Diagnostics from the last compilation task
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
@@ -40,7 +41,7 @@ class JavaCompilerService implements CompilerProvider {
     final SourceFileManager fileManager;
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
-        this(classPath, docPath, addExports, extraArgs, true);
+        this(classPath, docPath, addExports, extraArgs, true, "standalone");
     }
 
     JavaCompilerService(
@@ -49,6 +50,16 @@ class JavaCompilerService implements CompilerProvider {
             Set<String> addExports,
             Set<String> extraArgs,
             boolean lombokConfiguredEnabled) {
+        this(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, "standalone");
+    }
+
+    JavaCompilerService(
+            Set<Path> classPath,
+            Set<Path> docPath,
+            Set<String> addExports,
+            Set<String> extraArgs,
+            boolean lombokConfiguredEnabled,
+            String compilerRole) {
         // System.err.println("Class path:");
         // for (var p : classPath) {
         //     System.err.println("  " + p);
@@ -66,6 +77,7 @@ class JavaCompilerService implements CompilerProvider {
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
         this.lombokConfiguredEnabled = lombokConfiguredEnabled;
         this.lombokPresentOnClasspath = hasLombokJar(classPath);
+        this.compilerRole = compilerRole;
         this.lombokApEnabled = this.lombokPresentOnClasspath && this.lombokConfiguredEnabled;
         LOG.info(
                 String.format(
@@ -116,8 +128,7 @@ class JavaCompilerService implements CompilerProvider {
     };
     private long cachedFastCompileNoApContentRevision = -1;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
-    private static final Map<Path, ParsedUnit> SHARED_PARSED_UNITS = new ConcurrentHashMap<>();
-    final Map<Path, ParsedUnit> parsedUnits = SHARED_PARSED_UNITS;
+    final Map<Path, ParsedUnit> parsedUnits = new ConcurrentHashMap<>();
     private volatile long lombokTypeIndexContentRevision = -1;
     private volatile LombokTypeIndex lombokTypeIndex = LombokTypeIndex.empty();
 
@@ -1010,6 +1021,19 @@ class JavaCompilerService implements CompilerProvider {
         var currentFingerprint = fingerprint(file);
         var cached = parsedUnits.get(filePath);
         if (cached != null && currentFingerprint.equals(cached.fingerprint)) {
+            if ("diagnostics".equals(compilerRole)) {
+                LOG.fine(
+                        String.format(
+                                "[perf] diagnostics_parse_owner compiler=%s file=%s",
+                                compilerRole, filePath.getFileName()));
+                LOG.fine(
+                        String.format(
+                                "[perf] diagnostics_cache_hit compiler=%s file=%s version=%d modified=%d",
+                                compilerRole,
+                                filePath.getFileName(),
+                                currentFingerprint.version,
+                                currentFingerprint.modifiedMillis));
+            }
             LOG.fine(
                     String.format(
                             "[perf] parse_cache_hit file=%s version=%d modified=%d",
@@ -1021,6 +1045,19 @@ class JavaCompilerService implements CompilerProvider {
         var parser = Parser.parseJavaFileObject(file);
         var task = new ParseTask(parser.task, parser.root);
         parsedUnits.put(filePath, new ParsedUnit(task, currentFingerprint));
+        if ("diagnostics".equals(compilerRole)) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_parse_owner compiler=%s file=%s",
+                            compilerRole, filePath.getFileName()));
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_cache_store compiler=%s file=%s version=%d modified=%d",
+                            compilerRole,
+                            filePath.getFileName(),
+                            currentFingerprint.version,
+                            currentFingerprint.modifiedMillis));
+        }
         LOG.fine(
                 String.format(
                         "[perf] parse_cache_store file=%s version=%d modified=%d",

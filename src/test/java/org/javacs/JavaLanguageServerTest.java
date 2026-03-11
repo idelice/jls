@@ -743,6 +743,246 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void openingDependencyAfterConsumerDoesNotChangeConsumerDiagnosticsOutcome() throws Exception {
+        var client = new RecordingDiagnosticsClient();
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+        var serviceFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        var modelFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/model/ReproTxn.java");
+
+        var serviceOpen = new DidOpenTextDocumentParams();
+        serviceOpen.textDocument.uri = serviceFile.toUri();
+        serviceOpen.textDocument.version = 1;
+        serviceOpen.textDocument.languageId = "java";
+        serviceOpen.textDocument.text = Files.readString(serviceFile);
+        server.didOpenTextDocument(serviceOpen);
+
+        Assert.assertTrue(
+                "expected clean consumer diagnostics before dependency is opened",
+                client.awaitNoErrorMatching(
+                        serviceFile.toUri(),
+                        d -> containsAny(d.message, "getMsref()", "setMsref("),
+                        10,
+                        TimeUnit.SECONDS));
+
+        var modelOpen = new DidOpenTextDocumentParams();
+        modelOpen.textDocument.uri = modelFile.toUri();
+        modelOpen.textDocument.version = 1;
+        modelOpen.textDocument.languageId = "java";
+        modelOpen.textDocument.text = Files.readString(modelFile);
+        server.didOpenTextDocument(modelOpen);
+
+        Assert.assertTrue(
+                "opening the dependency should not change the consumer diagnostics outcome",
+                client.awaitNoErrorMatching(
+                        serviceFile.toUri(),
+                        d -> containsAny(d.message, "getMsref()", "setMsref("),
+                        10,
+                        TimeUnit.SECONDS));
+    }
+
+    @Test
+    public void completionOnDependencyDoesNotWarmDiagnosticsParseCache() throws Exception {
+        var client = new RecordingDiagnosticsClient();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+
+        var consumerFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        var dependencyFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/model/ReproTxn.java");
+        try {
+            server.completion(
+                    new TextDocumentPositionParams(
+                            new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
+
+            var consumerOpen = new DidOpenTextDocumentParams();
+            consumerOpen.textDocument.uri = consumerFile.toUri();
+            consumerOpen.textDocument.version = 1;
+            consumerOpen.textDocument.languageId = "java";
+            consumerOpen.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(consumerOpen);
+
+            Assert.assertTrue(
+                    "expected clean consumer diagnostics after dependency completion warmup",
+                    client.awaitNoErrorMatching(
+                            consumerFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "expected interactive completion request to parse the dependency first",
+                    capture.countContaining("[perf] parse_cache_store file=ReproTxn.java") > 0);
+            Assert.assertTrue(
+                    "diagnostics compiler should parse its own dependency state instead of reusing interactive parse warmup",
+                    capture.countContaining(
+                                    "[perf] diagnostics_cache_store compiler=diagnostics file=ReproTxn.java")
+                            > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void didOpenConsumerIncludesActiveUnsavedTransitiveLombokDependency() throws Exception {
+        var workspace = Files.createTempDirectory("jls-lombok-transitive-active");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/p/model");
+            var service = workspace.resolve("src/p/service");
+            Files.createDirectories(model);
+            Files.createDirectories(service);
+
+            var fooFile = model.resolve("Foo.java");
+            var barFile = model.resolve("Bar.java");
+            var serviceFile = service.resolve("Service.java");
+            Files.writeString(
+                    fooFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  private Bar bar;\n"
+                            + "}\n");
+            Files.writeString(
+                    barFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Bar {\n"
+                            + "  private String biz;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package p.service;\n"
+                            + "import p.model.Foo;\n"
+                            + "public class Service {\n"
+                            + "  void run(Foo foo) {\n"
+                            + "    var bar = foo.getBar();\n"
+                            + "    var biz = bar.getBiz();\n"
+                            + "    biz.length();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var classPath = new com.google.gson.JsonArray();
+            classPath.add(Paths.get("lib/lombok-1.18.30.jar").toAbsolutePath().toString());
+            java.add("classPath", classPath);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            var fooOpen = new DidOpenTextDocumentParams();
+            fooOpen.textDocument.uri = fooFile.toUri();
+            fooOpen.textDocument.version = 1;
+            fooOpen.textDocument.languageId = "java";
+            fooOpen.textDocument.text =
+                    Files.readString(fooFile)
+                            + "\n// keep Foo active and unsaved so diagnostics must use in-memory dependency content\n";
+            server.didOpenTextDocument(fooOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "consumer diagnostics should include active unsaved Lombok dependencies transitively",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getBar()", "getBiz()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "didOpen should expand diagnostics compile with the transitive Lombok dependency chain",
+                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=3") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void repeatedDidOpenAcrossDifferentLombokConsumersKeepsDiagnosticsResolved() throws Exception {
+        var client = new RecordingDiagnosticsClient();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+
+        var firstFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        var secondFile = FindResource.path("org/javacs/example/LombokNestedDiagnostics.java");
+        try {
+            var firstOpen = new DidOpenTextDocumentParams();
+            firstOpen.textDocument.uri = firstFile.toUri();
+            firstOpen.textDocument.version = 1;
+            firstOpen.textDocument.languageId = "java";
+            firstOpen.textDocument.text = Files.readString(firstFile);
+            server.didOpenTextDocument(firstOpen);
+
+            Assert.assertTrue(
+                    "first Lombok consumer diagnostics should stay resolved",
+                    client.awaitNoErrorMatching(
+                            firstFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+
+            var secondOpen = new DidOpenTextDocumentParams();
+            secondOpen.textDocument.uri = secondFile.toUri();
+            secondOpen.textDocument.version = 1;
+            secondOpen.textDocument.languageId = "java";
+            secondOpen.textDocument.text = Files.readString(secondFile);
+            server.didOpenTextDocument(secondOpen);
+
+            Assert.assertTrue(
+                    "second Lombok consumer diagnostics should stay resolved after reusing diagnostics compiler",
+                    client.awaitNoErrorMatching(
+                            secondFile.toUri(),
+                            d -> containsAny(d.message, "getBar()", "getName()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertEquals(
+                    "repeated Lombok diagnostics should not disable annotation processing",
+                    0,
+                    capture.countContaining("[perf] lombok_ap disabled=true"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
     public void didChangeEnumMarksActiveConsumerDirtyUntilConsumerChanges() throws Exception {
         var workspace = Files.createTempDirectory("jls-enum-related-change");
         var logger = Logger.getLogger("main");
