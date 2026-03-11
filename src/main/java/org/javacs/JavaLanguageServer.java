@@ -695,11 +695,13 @@ class JavaLanguageServer extends LanguageServer {
             return;
         }
         var trees = Trees.instance(task.task);
+        var sawLombokAnnotatedClass = false;
         for (var root : task.roots) {
             for (var typeDecl : root.getTypeDecls()) {
                 if (!(typeDecl instanceof ClassTree)) continue;
                 var cls = (ClassTree) typeDecl;
                 if (!LombokAnnotations.hasLombokAnnotation(cls.getModifiers())) continue;
+                sawLombokAnnotatedClass = true;
                 var path = trees.getPath(root, cls);
                 if (path == null) continue;
                 var element = trees.getElement(path);
@@ -733,13 +735,11 @@ class JavaLanguageServer extends LanguageServer {
                                 typeElement.getQualifiedName(),
                                 String.join(",", expectedGeneratedList),
                                 visibleGenerated.isEmpty() ? "-" : String.join(",", visibleGenerated)));
-                if (generatedVisible) {
-                    lombokVerifiedForCurrentCompiler = true;
-                }
-                return;
             }
         }
-        LOG.fine("[perf] lombok_verify phase=" + phase + " skipped=no_lombok_annotated_class");
+        if (!sawLombokAnnotatedClass) {
+            LOG.fine("[perf] lombok_verify phase=" + phase + " skipped=no_lombok_annotated_class");
+        }
         lombokVerifiedForCurrentCompiler = true;
     }
 
@@ -1330,7 +1330,7 @@ class JavaLanguageServer extends LanguageServer {
             cancelPendingCompletionIndex("didOpenActiveBootstrap");
             scheduleWorkspaceCompletionBootstrapIfNeeded("didOpenActiveBootstrap", 0);
         }
-            scheduleDiagnostics(List.of(file), "didOpen", DIAGNOSTIC_DEBOUNCE_MS);
+        scheduleDiagnostics(List.of(file), "didOpen", DIAGNOSTIC_DEBOUNCE_MS);
     }
 
     @Override

@@ -1114,6 +1114,16 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "expected lombok source expansion for consumer diagnostics",
                     capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
+            Assert.assertTrue(
+                    "Lombok diagnostics should use a fresh compile path for the consumer batch",
+                    capture.countContaining("[perf] diagnostics_lombok_mode fresh=true requested=1") > 0);
+            var verifyBar =
+                    capture.lastLineContaining(
+                            "[perf] lombok_verify_members phase=diagnostics class=p.model.Bar");
+            Assert.assertNotNull("expected Lombok verification for Bar during diagnostics", verifyBar);
+            Assert.assertTrue(
+                    "Bar diagnostics verification should report visible generated members",
+                    !verifyBar.contains("visible_generated=-"));
             Assert.assertEquals(
                     "diagnostics repro should keep annotation processing enabled",
                     0,
@@ -1755,6 +1765,11 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "expected consumer compile set to include referenced Lombok model",
                     capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=2") > 0);
+            Assert.assertTrue(
+                    "Lombok diagnostics should use a fresh compile path before dependency open",
+                    capture.countContaining("[perf] diagnostics_lombok_mode fresh=true requested=1 expanded=2") > 0);
+
+            var baselineDiagnostics = diagnosticFingerprints(client.diagnostics(serviceFile.toUri()));
 
             var modelOpen = new DidOpenTextDocumentParams();
             modelOpen.textDocument.uri = modelFile.toUri();
@@ -1762,6 +1777,12 @@ public class JavaLanguageServerTest {
             modelOpen.textDocument.languageId = "java";
             modelOpen.textDocument.text = Files.readString(modelFile);
             server.didOpenTextDocument(modelOpen);
+
+            Thread.sleep(300);
+            Assert.assertEquals(
+                    "opening an unchanged Lombok dependency should not change consumer diagnostics",
+                    baselineDiagnostics,
+                    diagnosticFingerprints(client.diagnostics(serviceFile.toUri())));
 
             var modelSave = new DidSaveTextDocumentParams();
             modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
@@ -1781,6 +1802,10 @@ public class JavaLanguageServerTest {
                             d -> containsAny(d.message, "getMsref()", "setMsref("),
                             10,
                             TimeUnit.SECONDS));
+            Assert.assertEquals(
+                    "saving an unchanged Lombok dependency should not change consumer diagnostics",
+                    baselineDiagnostics,
+                    diagnosticFingerprints(client.diagnostics(serviceFile.toUri())));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1870,6 +1895,113 @@ public class JavaLanguageServerTest {
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void watchedLombokDependencyChangeRefreshesOpenConsumerDiagnosticsWithoutOpeningDependency()
+            throws Exception {
+        var workspace = Files.createTempDirectory("jls-watched-lombok-dependency-refresh");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var service = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(model);
+            Files.createDirectories(service);
+
+            var fooFile = model.resolve("Foo.java");
+            var barFile = model.resolve("Bar.java");
+            var bizFile = model.resolve("Biz.java");
+            var serviceFile = service.resolve("Service.java");
+            Files.writeString(
+                    fooFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  private Bar bar = new Bar();\n"
+                            + "}\n");
+            Files.writeString(
+                    barFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Bar {\n"
+                            + "  private Biz biz = new Biz();\n"
+                            + "}\n");
+            Files.writeString(
+                    bizFile,
+                    "package p.model;\n"
+                            + "public class Biz {\n"
+                            + "  public String value() {\n"
+                            + "    return \"ok\";\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package p.service;\n"
+                            + "import p.model.Foo;\n"
+                            + "class Service {\n"
+                            + "  String run(Foo foo) {\n"
+                            + "    return foo.getBar().getBiz().value();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            configureLombokClasspath(server);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "consumer diagnostics should resolve against an unopened Lombok dependency on disk",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> true,
+                            10,
+                            TimeUnit.SECONDS));
+
+            Files.writeString(
+                    fooFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  private Bar bar = new Bar();\n"
+                            + "  // watched dependency change\n"
+                            + "}\n");
+            var changed = new FileEvent();
+            changed.uri = fooFile.toUri();
+            changed.type = FileChangeType.Changed;
+            var watched = new DidChangeWatchedFilesParams();
+            watched.changes = List.of(changed);
+            server.didChangeWatchedFiles(watched);
+
+            Assert.assertTrue(
+                    "watched Lombok dependency changes should re-run diagnostics without opening the dependency",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> true,
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "watched Lombok dependency refresh should keep diagnostics on the consumer batch",
+                    capture.countContaining(
+                                    "[perf] diagnostics_batch trigger=didChangeWatchedFiles requested=1 dirty_open=0 files=1")
+                            > 0);
+            Assert.assertTrue(
+                    "watched Lombok dependency refresh should stay on the fresh diagnostics compile path",
+                    capture.countContaining("[perf] diagnostics_lombok_mode fresh=true requested=1") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
         }
     }
 
@@ -3009,6 +3141,20 @@ public class JavaLanguageServerTest {
             Thread.sleep(20);
         }
         return false;
+    }
+
+    private static List<String> diagnosticFingerprints(List<Diagnostic> diagnostics) {
+        return diagnostics.stream()
+                .map(
+                        d ->
+                                String.format(
+                                        "%s|%s|%s|%d:%d",
+                                        d.severity,
+                                        d.code,
+                                        d.message,
+                                        d.range.start.line,
+                                        d.range.start.character))
+                .toList();
     }
 
     private static boolean containsAny(String text, String... needles) {

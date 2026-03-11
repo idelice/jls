@@ -69,8 +69,17 @@ public class CompileBatch implements AutoCloseable {
             Collection<? extends JavaFileObject> files,
             boolean allowAP,
             AnalysisMode analysisMode) {
+        this(parent, files, allowAP, analysisMode, parent.compiler);
+    }
+
+    CompileBatch(
+            JavaCompilerService parent,
+            Collection<? extends JavaFileObject> files,
+            boolean allowAP,
+            AnalysisMode analysisMode,
+            ReusableCompiler compiler) {
         this.parent = parent;
-        this.borrow = batchTask(parent, files, allowAP, analysisMode);
+        this.borrow = batchTask(parent, files, allowAP, analysisMode, compiler);
         this.task = borrow.task;
         this.trees = Trees.instance(borrow.task);
         this.elements = borrow.task.getElements();
@@ -359,7 +368,8 @@ public class CompileBatch implements AutoCloseable {
             JavaCompilerService parent,
             Collection<? extends JavaFileObject> sources,
             boolean allowAP,
-            AnalysisMode mode) {
+            AnalysisMode mode,
+            ReusableCompiler compiler) {
         parent.diags.clear();
         var options =
                 allowAP
@@ -368,7 +378,7 @@ public class CompileBatch implements AutoCloseable {
                                         parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath)
                                 : options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath))
                         : optionsWithoutAP(parent.classPath, parent.addExports, parent.extraArgs);
-        return parent.compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
+        return compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
     }
 
     /** Combine source path or class path entries using the system separator, for example ':' in unix */

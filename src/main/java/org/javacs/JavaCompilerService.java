@@ -12,6 +12,7 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import java.io.IOException;
 import java.nio.file.*;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
@@ -185,6 +186,12 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
+    private record ExpandedSources(
+            Collection<? extends JavaFileObject> sources,
+            boolean lombokExpansionUsed,
+            int requestedCount,
+            int expandedCount) {}
+
     private SourceFingerprint fingerprint(JavaFileObject file) {
         var version = -1;
         if (file instanceof SourceFileObject sourceFileObject) {
@@ -333,7 +340,21 @@ class JavaCompilerService implements CompilerProvider {
                         sources.size(),
                         requestStack()));
         boolean useAP = allowAP && lombokApEnabled;
-        var effectiveSources = expandSourcesForLombokAP(sources, useAP);
+        var expandedSources = expandSourcesForLombokAP(sources, useAP);
+        var effectiveSources = expandedSources.sources();
+        var useFreshDiagnosticsLombokCompile =
+                shouldUseFreshDiagnosticsLombokCompile(mode, useAP, expandedSources.lombokExpansionUsed());
+        if ("diagnostics".equals(compilerRole) && mode == CompileBatch.AnalysisMode.FULL) {
+            LOG.fine(
+                    String.format(
+                            "[perf] diagnostics_lombok_mode fresh=%s requested=%d expanded=%d",
+                            useFreshDiagnosticsLombokCompile,
+                            expandedSources.requestedCount(),
+                            expandedSources.expandedCount()));
+        }
+        if (useFreshDiagnosticsLombokCompile) {
+            return new CompileBatch(this, freezeSourcesForBatch(effectiveSources), useAP, mode, new ReusableCompiler());
+        }
         var attrWithoutAp = mode == CompileBatch.AnalysisMode.ATTR && !useAP;
         var modifiedCache =
                 mode == CompileBatch.AnalysisMode.FULL
@@ -363,14 +384,42 @@ class JavaCompilerService implements CompilerProvider {
                 : attrWithoutAp ? cachedFastCompileNoAp : cachedFastCompile;
     }
 
-    private Collection<? extends JavaFileObject> expandSourcesForLombokAP(
+    private boolean shouldUseFreshDiagnosticsLombokCompile(
+            CompileBatch.AnalysisMode mode, boolean useAP, boolean lombokExpansionUsed) {
+        return "diagnostics".equals(compilerRole)
+                && mode == CompileBatch.AnalysisMode.FULL
+                && useAP
+                && lombokExpansionUsed;
+    }
+
+    private Collection<? extends JavaFileObject> freezeSourcesForBatch(
+            Collection<? extends JavaFileObject> sources) {
+        var frozen = new ArrayList<JavaFileObject>(sources.size());
+        for (var source : sources) {
+            if (source instanceof SourceFileObject sourceFile) {
+                frozen.add(freezeSourceFile(sourceFile));
+            } else {
+                frozen.add(source);
+            }
+        }
+        return frozen;
+    }
+
+    private JavaFileObject freezeSourceFile(SourceFileObject sourceFile) {
+        var contents = sourceFile.getCharContent(false).toString();
+        var modifiedMillis = sourceFile.getLastModified();
+        var modified = modifiedMillis > 0 ? Instant.ofEpochMilli(modifiedMillis) : Instant.EPOCH;
+        return new SourceFileObject(sourceFile.path, contents, modified, sourceFile.contentVersion());
+    }
+
+    private ExpandedSources expandSourcesForLombokAP(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
         LOG.fine(
                 String.format(
                         "[perf] compile_trigger entry=expandSourcesForLombokAP request=%s allow_ap=%s sources=%d stack=%s",
                         requestType(), allowAP, sources.size(), requestStack()));
         if (!allowAP || !lombokPresentOnClasspath) {
-            return sources;
+            return new ExpandedSources(sources, false, sources.size(), sources.size());
         }
 
         var requestedHasLombokAnnotations = requestedSourcesUseLombokAnnotations(sources);
@@ -380,7 +429,7 @@ class JavaCompilerService implements CompilerProvider {
                     String.format(
                             "[perf] lombok_ap_sources requested=%d expanded=%d reason=no_lombok_annotations_or_references",
                             sources.size(), sources.size()));
-            return sources;
+            return new ExpandedSources(sources, false, sources.size(), sources.size());
         }
 
         var expanded = new LinkedHashMap<Path, JavaFileObject>();
@@ -410,7 +459,7 @@ class JavaCompilerService implements CompilerProvider {
                     String.format(
                             "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
                             sources.size(), sources.size(), reason));
-            return sources;
+            return new ExpandedSources(sources, true, sources.size(), sources.size());
         }
 
         LOG.fine(
@@ -428,7 +477,7 @@ class JavaCompilerService implements CompilerProvider {
                 String.format(
                         "[perf] lombok_ap_source_files compiler=%s requested_files=%s expanded_files=%s",
                         compilerRole, fileNames(sources), fileNames(result)));
-        return result;
+        return new ExpandedSources(result, true, sources.size(), result.size());
     }
 
     private String fileNames(Collection<? extends JavaFileObject> sources) {
