@@ -5,7 +5,9 @@ import com.sun.source.util.*;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.tools.Diagnostic;
@@ -17,6 +19,16 @@ import org.javacs.lsp.*;
 public class ErrorProvider {
     final CompileTask task;
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final Set<String> SYNTAX_BLOCKING_CODES =
+            Set.of(
+                    "compiler.err.expected",
+                    "compiler.err.expected2",
+                    "compiler.err.not.stmt",
+                    "compiler.err.illegal.start.of.expr",
+                    "compiler.err.illegal.start.of.stmt");
+
+    private record DiagnosticFilterResult(
+            List<org.javacs.lsp.Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
 
     public ErrorProvider(CompileTask task) {
         this.task = task;
@@ -34,9 +46,12 @@ public class ErrorProvider {
                 LOG.fine("Skipping diagnostics for JAR source: " + uri);
                 continue;
             }
-            result[i].diagnostics.addAll(compilerErrors(root));
-            result[i].diagnostics.addAll(unusedWarnings(root));
-            result[i].diagnostics.addAll(notThrownWarnings(root));
+            var filtered = filterCompilerDiagnostics(compilerErrors(root), root);
+            result[i].diagnostics.addAll(filtered.compilerDiagnostics());
+            if (!filtered.syntaxSuppressed()) {
+                result[i].diagnostics.addAll(unusedWarnings(root));
+                result[i].diagnostics.addAll(notThrownWarnings(root));
+            }
         }
         // TODO hint fields that could be final
 
@@ -66,6 +81,90 @@ public class ErrorProvider {
             result.add(lspDiagnostic(d, root.getLineMap()));
         }
         return result;
+    }
+
+    private DiagnosticFilterResult filterCompilerDiagnostics(
+            List<org.javacs.lsp.Diagnostic> compilerDiagnostics, CompilationUnitTree root) {
+        var deduped = dedupeDiagnostics(compilerDiagnostics);
+        var firstSyntaxLine = firstSyntaxBlockingLine(deduped);
+        if (firstSyntaxLine == -1) {
+            logDiagnosticsShape(root, false, -1, compilerDiagnostics.size(), deduped.size(), 0);
+            return new DiagnosticFilterResult(deduped, false, compilerDiagnostics.size() - deduped.size());
+        }
+
+        org.javacs.lsp.Diagnostic primarySyntaxDiagnostic = null;
+        for (var diagnostic : deduped) {
+            if (diagnostic.severity == null || diagnostic.severity != DiagnosticSeverity.Error) {
+                continue;
+            }
+            if (diagnostic.range.start.line == firstSyntaxLine && isSyntaxBlockingDiagnostic(diagnostic)) {
+                primarySyntaxDiagnostic = diagnostic;
+                break;
+            }
+        }
+        var filtered = new ArrayList<org.javacs.lsp.Diagnostic>();
+        if (primarySyntaxDiagnostic != null) {
+            filtered.add(primarySyntaxDiagnostic);
+        }
+        logDiagnosticsShape(
+                root,
+                true,
+                firstSyntaxLine,
+                compilerDiagnostics.size(),
+                filtered.size(),
+                compilerDiagnostics.size() - filtered.size());
+        return new DiagnosticFilterResult(filtered, true, compilerDiagnostics.size() - filtered.size());
+    }
+
+    private List<org.javacs.lsp.Diagnostic> dedupeDiagnostics(List<org.javacs.lsp.Diagnostic> diagnostics) {
+        var unique = new LinkedHashMap<String, org.javacs.lsp.Diagnostic>();
+        for (var diagnostic : diagnostics) {
+            unique.putIfAbsent(diagnosticKey(diagnostic), diagnostic);
+        }
+        return new ArrayList<>(unique.values());
+    }
+
+    private int firstSyntaxBlockingLine(List<org.javacs.lsp.Diagnostic> diagnostics) {
+        var firstLine = Integer.MAX_VALUE;
+        for (var diagnostic : diagnostics) {
+            if (!isSyntaxBlockingDiagnostic(diagnostic)) {
+                continue;
+            }
+            firstLine = Math.min(firstLine, diagnostic.range.start.line);
+        }
+        return firstLine == Integer.MAX_VALUE ? -1 : firstLine;
+    }
+
+    private boolean isSyntaxBlockingDiagnostic(org.javacs.lsp.Diagnostic diagnostic) {
+        return diagnostic.code != null && SYNTAX_BLOCKING_CODES.contains(diagnostic.code);
+    }
+
+    private String diagnosticKey(org.javacs.lsp.Diagnostic diagnostic) {
+        return diagnostic.code
+                + "|"
+                + diagnostic.message
+                + "|"
+                + diagnostic.range.start.line
+                + ":"
+                + diagnostic.range.start.character
+                + "|"
+                + diagnostic.range.end.line
+                + ":"
+                + diagnostic.range.end.character;
+    }
+
+    private void logDiagnosticsShape(
+            CompilationUnitTree root,
+            boolean syntaxSuppressed,
+            int suppressionStartLine,
+            int before,
+            int after,
+            int dropped) {
+        var file = Paths.get(root.getSourceFile().toUri()).getFileName();
+        LOG.fine(
+                String.format(
+                        "[perf] diagnostics_shape file=%s syntax_suppressed=%s suppression_start_line=%d before=%d after=%d dropped=%d",
+                        file, syntaxSuppressed, suppressionStartLine, before, after, dropped));
     }
 
     private List<org.javacs.lsp.Diagnostic> unusedWarnings(CompilationUnitTree root) {

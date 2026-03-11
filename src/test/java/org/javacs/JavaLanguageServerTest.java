@@ -506,8 +506,8 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void slf4jDidChangeDoesNotFanoutDiagnosticsAcrossActiveDocuments() throws Exception {
-        var workspace = Files.createTempDirectory("jls-slf4j-no-fanout");
+    public void didChangeSchedulesDirtyOpenFilesInDiagnosticsBatch() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-open-batch");
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
@@ -573,13 +573,13 @@ public class JavaLanguageServerTest {
 
             Assert.assertNotNull("expected didChange diagnostics debounce log", didChangeDebounce);
             Assert.assertTrue(
-                    "logging-only Lombok should stay on single-file diagnostics path",
-                    didChangeDebounce.contains("files=1"));
+                    "didChange should include other dirty open files in the diagnostics batch",
+                    didChangeDebounce.contains("files=2"));
             Assert.assertEquals(
-                    "logging-only Lombok should not fan diagnostics out across active docs",
-                    0,
+                    "expected one dirty-open file to be included alongside the requested file",
+                    1,
                     capture.countContaining(
-                            "[perf] diagnostics_active_fanout trigger=didChange file=ServiceTwo.java"));
+                            "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2"));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1053,8 +1053,8 @@ public class JavaLanguageServerTest {
                             10,
                             TimeUnit.SECONDS));
             Assert.assertTrue(
-                    "expected current-file diagnostics compile",
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:didOpen files=1") > 0);
+                    "expected an async diagnostics compile for the consumer",
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:") > 0);
             Assert.assertTrue(
                     "expected lombok source expansion for consumer diagnostics",
                     capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
@@ -1140,8 +1140,8 @@ public class JavaLanguageServerTest {
                             10,
                             TimeUnit.SECONDS));
             Assert.assertTrue(
-                    "expected diagnostics compile for requested file only",
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:didOpen files=1") > 0);
+                    "expected an async diagnostics compile for the setter variant",
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:") > 0);
             Assert.assertTrue(
                     "expected lombok source expansion for setter variant",
                     capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
@@ -1475,7 +1475,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeEnumMarksActiveConsumerDirtyUntilConsumerChanges() throws Exception {
+    public void didChangeEnumRefreshesActiveConsumerDiagnostics() throws Exception {
         var workspace = Files.createTempDirectory("jls-enum-related-change");
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
@@ -1546,19 +1546,106 @@ public class JavaLanguageServerTest {
             enumChange.contentChanges.add(delta);
             server.didChangeTextDocument(enumChange);
 
-            Thread.sleep(300);
             Assert.assertTrue(
-                    "changing the enum should leave the consumer diagnostics stale until the consumer changes",
-                    client.hasErrorMatching(serviceFile.toUri(), d -> containsAny(d.message, "getType()")));
+                    "changing the enum should refresh the open consumer diagnostics without a reopen",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getType()"),
+                            10,
+                            TimeUnit.SECONDS));
             Assert.assertTrue(
-                    "enum change should mark other open files dirty without publishing consumer diagnostics immediately",
+                    "enum change should include the dirty open consumer in the next diagnostics batch",
                     capture.countContaining(
-                                    "[perf] diagnostics_dirty_open_files trigger=didChange file=MyEnum.java")
+                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2")
                             > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void didChangeEnumKeepsClosedConsumerDirtyUntilReopen() throws Exception {
+        var workspace = Files.createTempDirectory("jls-enum-related-reopen");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.getType();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text = Files.readString(enumFile);
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "baseline should show the missing enum member error before the unsaved enum change",
+                    client.awaitErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getType()"),
+                            10,
+                            TimeUnit.SECONDS));
 
             var serviceClose = new DidCloseTextDocumentParams();
             serviceClose.textDocument.uri = serviceFile.toUri();
             server.didCloseTextDocument(serviceClose);
+
+            var enumChange = new DidChangeTextDocumentParams();
+            enumChange.textDocument.uri = enumFile.toUri();
+            enumChange.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text =
+                    "package com.example.demo.models;\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST;\n"
+                            + "  public String getType() {\n"
+                            + "    return name();\n"
+                            + "  }\n"
+                            + "}\n";
+            enumChange.contentChanges.add(delta);
+            server.didChangeTextDocument(enumChange);
+
+            Assert.assertTrue(
+                    "changing the enum with the consumer closed should keep the diagnostics batch on the requested file only",
+                    capture.countContaining(
+                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=0 files=1")
+                            > 0);
             server.didOpenTextDocument(serviceOpen);
 
             Assert.assertTrue(
@@ -1645,7 +1732,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeLombokModelMarksConsumerDirtyUntilConsumerChanges() throws Exception {
+    public void didChangeLombokModelRefreshesOpenConsumerDiagnostics() throws Exception {
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
@@ -1696,29 +1783,18 @@ public class JavaLanguageServerTest {
             change.contentChanges.add(delta);
             server.didChangeTextDocument(change);
 
-            Thread.sleep(300);
             Assert.assertTrue(
-                    "changing a Lombok model should leave consumer diagnostics untouched until the consumer changes",
-                    !client.hasErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref(")));
-            Assert.assertTrue(
-                    "lombok model change should mark other open files dirty",
-                    capture.countContaining(
-                                    "[perf] diagnostics_dirty_open_files trigger=didChange file=ReproTxn.java")
-                            > 0);
-            var serviceClose = new DidCloseTextDocumentParams();
-            serviceClose.textDocument.uri = serviceFile.toUri();
-            server.didCloseTextDocument(serviceClose);
-            server.didOpenTextDocument(serviceOpen);
-
-            Assert.assertTrue(
-                    "reopening the dirty consumer should refresh diagnostics after the Lombok model changed",
+                    "changing a Lombok model should refresh consumer diagnostics without a reopen",
                     client.awaitErrorMatching(
                             serviceFile.toUri(),
                             d -> containsAny(d.message, "getMsref()", "setMsref("),
                             10,
                             TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "lombok model change should include the dirty open consumer in the next diagnostics batch",
+                    capture.countContaining(
+                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2")
+                            > 0);
 
             var revert = new DidChangeTextDocumentParams();
             revert.textDocument.uri = modelFile.toUri();
@@ -1728,11 +1804,8 @@ public class JavaLanguageServerTest {
             revert.contentChanges.add(revertDelta);
             server.didChangeTextDocument(revert);
 
-            server.didCloseTextDocument(serviceClose);
-            server.didOpenTextDocument(serviceOpen);
-
             Assert.assertTrue(
-                    "restoring the Lombok model should clear consumer diagnostics when the consumer reopens",
+                    "restoring the Lombok model should clear the open consumer diagnostics without a reopen",
                     client.awaitNoErrorMatching(
                             serviceFile.toUri(),
                             d -> containsAny(d.message, "getMsref()", "setMsref("),
@@ -1741,6 +1814,294 @@ public class JavaLanguageServerTest {
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void incompleteStatementPublishesOnlyPrimarySyntaxDiagnostic() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-incomplete-statement");
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var serviceFile = pkg.resolve("Service.java");
+            Files.writeString(
+                    serviceFile,
+                    "package p;\n"
+                            + "class Foo {\n"
+                            + "  String getBar() {\n"
+                            + "    return \"bar\";\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class Service {\n"
+                            + "  void test() {\n"
+                            + "    var foo = new Foo();\n"
+                            + "    foo\n"
+                            + "    foo.getBar();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = serviceFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected a single primary syntax diagnostic for the incomplete statement",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics ->
+                                    diagnostics.size() == 1
+                                            && isSyntaxBlockingDiagnostic(diagnostics.get(0))
+                                            && !containsAny(
+                                                    diagnostics.get(0).code,
+                                                    "compiler.err.cant.resolve.location",
+                                                    "compiler.err.already.defined"),
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void missingSemicolonSuppressesRecoveryDiagnosticsUntilFixed() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-missing-semicolon");
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var serviceFile = pkg.resolve("Service.java");
+            var brokenText =
+                    "package p;\n"
+                            + "class Foo {\n"
+                            + "  String getBar() {\n"
+                            + "    return \"bar\";\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class Service {\n"
+                            + "  void test() {\n"
+                            + "    var foo = new Foo();\n"
+                            + "    foo.getAsd()\n"
+                            + "    foo.getBar();\n"
+                            + "  }\n"
+                            + "}\n";
+            Files.writeString(serviceFile, brokenText);
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = serviceFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = brokenText;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected the missing semicolon to suppress downstream recovery diagnostics",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics -> diagnostics.size() == 1 && isSyntaxBlockingDiagnostic(diagnostics.get(0)),
+                            10,
+                            TimeUnit.SECONDS));
+
+            var fixedText = brokenText.replace("foo.getAsd()\n", "foo.getAsd();\n");
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = serviceFile.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = fixedText;
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Assert.assertTrue(
+                    "after fixing syntax, semantic diagnostics should return without downstream recovery fallout",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics ->
+                                    diagnostics.size() == 1
+                                            && diagnostics.get(0).code != null
+                                            && diagnostics.get(0).code.equals("compiler.err.cant.resolve.location.args")
+                                            && diagnostics.get(0).message.contains("getAsd")
+                                            && diagnostics.stream()
+                                                    .noneMatch(d -> d.message != null && d.message.contains("getBar")),
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void missingDelimiterSuppressesSyntaxCascadeBeyondPrimaryLine() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-missing-delimiter");
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var serviceFile = pkg.resolve("Service.java");
+            Files.writeString(
+                    serviceFile,
+                    "package p;\n"
+                            + "class Service {\n"
+                            + "  void test(boolean ok) {\n"
+                            + "    if (ok {\n"
+                            + "      var value = 1;\n"
+                            + "      value++;\n"
+                            + "    }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = serviceFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected missing delimiter diagnostics to stay near the primary broken line",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics ->
+                                    diagnostics.size() == 1
+                                            && diagnostics.stream().allMatch(JavaLanguageServerTest::isSyntaxBlockingDiagnostic)
+                                            && diagnostics.stream()
+                                                    .mapToInt(d -> d.range.start.line)
+                                                    .max()
+                                                    .orElse(-1)
+                                                    <= 3,
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void missingClosingParenthesisPublishesOnlyPrimarySyntaxDiagnostic() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-missing-closing-paren");
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var serviceFile = pkg.resolve("Service.java");
+            Files.writeString(
+                    serviceFile,
+                    "package p;\n"
+                            + "class Service {\n"
+                            + "  boolean ok() {\n"
+                            + "    return true;\n"
+                            + "  }\n"
+                            + "  void test() {\n"
+                            + "    if (ok( {\n"
+                            + "      var value = 1;\n"
+                            + "      value++;\n"
+                            + "    }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = serviceFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected missing closing parenthesis diagnostics to collapse to a single primary syntax error",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics ->
+                                    diagnostics.size() == 1
+                                            && isSyntaxBlockingDiagnostic(diagnostics.get(0))
+                                            && diagnostics.get(0).range.start.line == 6,
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void syntaxInvalidFileSuppressesUnrelatedSemanticErrorsUntilFixed() throws Exception {
+        var workspace = Files.createTempDirectory("jls-diagnostics-syntax-only");
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var serviceFile = pkg.resolve("Service.java");
+            var brokenText =
+                    "package p;\n"
+                            + "class Foo {\n"
+                            + "  String getBar() {\n"
+                            + "    return \"bar\";\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class Service {\n"
+                            + "  void test(boolean ok, Foo foo) {\n"
+                            + "    foo.getMissing();\n"
+                            + "    if (ok {\n"
+                            + "      foo.getBar();\n"
+                            + "    }\n"
+                            + "  }\n"
+                            + "}\n";
+            Files.writeString(serviceFile, brokenText);
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = serviceFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = brokenText;
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "while syntax is invalid, publish only primary syntax diagnostics",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics ->
+                                    !diagnostics.isEmpty()
+                                            && diagnostics.stream().allMatch(JavaLanguageServerTest::isSyntaxBlockingDiagnostic)
+                                            && diagnostics.stream()
+                                                    .mapToInt(d -> d.range.start.line)
+                                                    .distinct()
+                                                    .count()
+                                                    == 1,
+                            10,
+                            TimeUnit.SECONDS));
+
+            var fixedText = brokenText.replace("if (ok {\n", "if (ok) {\n");
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = serviceFile.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = fixedText;
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Assert.assertTrue(
+                    "after fixing syntax, the underlying semantic error should return",
+                    client.awaitDiagnosticsMatching(
+                            serviceFile.toUri(),
+                            diagnostics ->
+                                    diagnostics.size() == 1
+                                            && diagnostics.get(0).code != null
+                                            && diagnostics.get(0).code.equals("compiler.err.cant.resolve.location.args")
+                                            && diagnostics.get(0).message.contains("getMissing"),
+                            10,
+                            TimeUnit.SECONDS));
+        } finally {
+            deleteRecursively(workspace);
         }
     }
 
@@ -2606,6 +2967,20 @@ public class JavaLanguageServerTest {
         return false;
     }
 
+    private static boolean isSyntaxBlockingDiagnostic(Diagnostic diagnostic) {
+        if (diagnostic == null || diagnostic.code == null) {
+            return false;
+        }
+        return switch (diagnostic.code) {
+            case "compiler.err.expected",
+                    "compiler.err.expected2",
+                    "compiler.err.not.stmt",
+                    "compiler.err.illegal.start.of.expr",
+                    "compiler.err.illegal.start.of.stmt" -> true;
+            default -> false;
+        };
+    }
+
     private static void configureLombokClasspath(JavaLanguageServer server) {
         var settings = new JsonObject();
         var java = new JsonObject();
@@ -2701,6 +3076,24 @@ public class JavaLanguageServerTest {
                 Thread.sleep(25);
             }
             return false;
+        }
+
+        boolean awaitDiagnosticsMatching(
+                java.net.URI uri, Predicate<List<Diagnostic>> predicate, long timeout, TimeUnit unit)
+                throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (System.nanoTime() < deadline) {
+                var diagnostics = diagnosticsByUri.get(uri);
+                if (diagnostics != null && predicate.test(diagnostics)) {
+                    return true;
+                }
+                Thread.sleep(25);
+            }
+            return false;
+        }
+
+        List<Diagnostic> diagnostics(java.net.URI uri) {
+            return diagnosticsByUri.getOrDefault(uri, List.of());
         }
     }
 

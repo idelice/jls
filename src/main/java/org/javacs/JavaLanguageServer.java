@@ -69,7 +69,7 @@ class JavaLanguageServer extends LanguageServer {
     private final Object completionIndexCompileMutex = new Object();
     private ScheduledFuture<?> pendingDiagnostics;
     private ScheduledFuture<?> pendingCompletionIndex;
-    private static final long DIAGNOSTIC_DEBOUNCE_MS = 750;
+    private static final long DIAGNOSTIC_DEBOUNCE_MS = 50;
     private static final long COMPLETION_INDEX_DEBOUNCE_MS = 100;
     private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 200;
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
@@ -90,6 +90,8 @@ class JavaLanguageServer extends LanguageServer {
     private record ActiveDocumentChangeImpact(boolean refreshCompletionIndex) {}
 
     private record ScheduledDiagnosticsRequest(long scheduleRevision, long contentRevision) {}
+
+    private record DiagnosticsBatch(List<Path> files, int requestedCount, int dirtyOpenCount) {}
 
     synchronized JavaCompilerService compiler() {
         if (needsCompiler()) {
@@ -494,12 +496,12 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void scheduleDiagnostics(Collection<Path> files, String trigger, long delayMs) {
-        var javaFiles = normalizeJavaFiles(files);
-        if (javaFiles.isEmpty()) return;
+        var batch = resolveDiagnosticsBatch(files, trigger);
+        if (batch.files().isEmpty()) return;
         var request =
                 new ScheduledDiagnosticsRequest(
                         diagnosticsRevision.incrementAndGet(), FileStore.contentRevision());
-        var filesBatch = List.copyOf(javaFiles);
+        var filesBatch = batch.files();
         synchronized (this) {
             if (pendingDiagnostics != null) {
                 pendingDiagnostics.cancel(false);
@@ -576,6 +578,31 @@ class JavaLanguageServer extends LanguageServer {
             pendingDiagnostics = null;
         }
         LOG.fine("[perf] diagnostics_cancel reason=" + reason);
+    }
+
+    private DiagnosticsBatch resolveDiagnosticsBatch(Collection<Path> files, String trigger) {
+        var requested = normalizeJavaFiles(files);
+        if (requested.isEmpty()) {
+            return new DiagnosticsBatch(List.of(), 0, 0);
+        }
+        var batch = new LinkedHashSet<Path>(requested);
+        var activeJavaFiles = new LinkedHashSet<>(normalizeJavaFiles(FileStore.activeDocuments()));
+        var dirtyOpenCount = 0;
+        if (!activeJavaFiles.isEmpty()) {
+            for (var dirty : dirtyDiagnosticsFiles) {
+                if (!activeJavaFiles.contains(dirty) || batch.contains(dirty)) {
+                    continue;
+                }
+                batch.add(dirty);
+                dirtyOpenCount++;
+            }
+        }
+        var filesBatch = List.copyOf(batch);
+        LOG.fine(
+                String.format(
+                        "[perf] diagnostics_batch trigger=%s requested=%d dirty_open=%d files=%d",
+                        trigger, requested.size(), dirtyOpenCount, filesBatch.size()));
+        return new DiagnosticsBatch(filesBatch, requested.size(), dirtyOpenCount);
     }
 
     private void runDiagnostics(List<Path> files, ScheduledDiagnosticsRequest request, String trigger) {
@@ -1019,6 +1046,7 @@ class JavaLanguageServer extends LanguageServer {
                                         + file);
                     } else {
                         markDirtyDiagnostics(activeDocuments, "didChangeWatchedFiles");
+                        scheduleDiagnostics(activeDocuments, "didChangeWatchedFiles", DIAGNOSTIC_DEBOUNCE_MS);
                     }
                 }
                 return;
@@ -1337,11 +1365,12 @@ class JavaLanguageServer extends LanguageServer {
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
             var file = Paths.get(params.textDocument.uri);
-            markDirtyDiagnostics(file, "didSave");
+            markOtherActiveDiagnosticsDirty(file, "didSave");
             cancelPendingDiagnostics("didSave");
             cancelPendingCompletionIndex("didSave");
             var selection = selectDiagnosticsCompiler();
-            compileAndPublish(List.of(file), selection.compiler, "didSave", -1);
+            var batch = resolveDiagnosticsBatch(List.of(file), "didSave");
+            compileAndPublish(batch.files(), selection.compiler, "didSave", -1);
             if (completionIndexVersion.get() == 0 && !FileStore.activeDocuments().isEmpty()) {
                 scheduleWorkspaceCompletionBootstrapIfNeeded("didSaveBootstrap", 0);
             } else {
