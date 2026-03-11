@@ -983,6 +983,498 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void enterpriseStyleLombokDiagnosticsResolveGeneratedGetterChain() throws Exception {
+        var workspace = Files.createTempDirectory("jls-enterprise-lombok-getter-chain");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var service = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(model);
+            Files.createDirectories(service);
+
+            var fooFile = model.resolve("Foo.java");
+            var barFile = model.resolve("Bar.java");
+            var bizFile = model.resolve("Biz.java");
+            var consumerFile = service.resolve("FooService.java");
+            Files.writeString(
+                    fooFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  private Bar bar;\n"
+                            + "}\n");
+            Files.writeString(
+                    barFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Bar {\n"
+                            + "  private Biz biz = new Biz();\n"
+                            + "}\n");
+            Files.writeString(
+                    bizFile,
+                    "package p.model;\n"
+                            + "public class Biz {\n"
+                            + "  public String value() {\n"
+                            + "    return \"ok\";\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    consumerFile,
+                    "package p.service;\n"
+                            + "import p.model.Foo;\n"
+                            + "public class FooService {\n"
+                            + "  String use(Foo foo) {\n"
+                            + "    var bar = foo.getBar();\n"
+                            + "    var biz = bar.getBiz();\n"
+                            + "    return biz.value();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            configureLombokClasspath(server);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "generated getter chain should not produce diagnostics in consumer",
+                    client.awaitNoErrorMatching(
+                            consumerFile.toUri(),
+                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "expected current-file diagnostics compile",
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:didOpen files=1") > 0);
+            Assert.assertTrue(
+                    "expected lombok source expansion for consumer diagnostics",
+                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
+            Assert.assertEquals(
+                    "diagnostics repro should keep annotation processing enabled",
+                    0,
+                    capture.countContaining("[perf] lombok_ap disabled=true"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void enterpriseStyleLombokDiagnosticsResolveFieldSetterVariant() throws Exception {
+        var workspace = Files.createTempDirectory("jls-enterprise-lombok-setter-variant");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var service = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(model);
+            Files.createDirectories(service);
+
+            var fooFile = model.resolve("Foo.java");
+            var barFile = model.resolve("Bar.java");
+            var bizFile = model.resolve("Biz.java");
+            var consumerFile = service.resolve("FooService.java");
+            Files.writeString(
+                    fooFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  @lombok.Setter private Bar bar;\n"
+                            + "}\n");
+            Files.writeString(
+                    barFile,
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Bar {\n"
+                            + "  private Biz biz = new Biz();\n"
+                            + "}\n");
+            Files.writeString(
+                    bizFile,
+                    "package p.model;\n"
+                            + "public class Biz {\n"
+                            + "  public String value() {\n"
+                            + "    return \"ok\";\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    consumerFile,
+                    "package p.service;\n"
+                            + "import p.model.Foo;\n"
+                            + "public class FooService {\n"
+                            + "  String use(Foo foo) {\n"
+                            + "    var bar = foo.getBar();\n"
+                            + "    var biz = bar.getBiz();\n"
+                            + "    return biz.value();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            configureLombokClasspath(server);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "field-level setter variant should still resolve generated getter chain",
+                    client.awaitNoErrorMatching(
+                            consumerFile.toUri(),
+                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "expected diagnostics compile for requested file only",
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:didOpen files=1") > 0);
+            Assert.assertTrue(
+                    "expected lombok source expansion for setter variant",
+                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void enterpriseStyleLombokDiagnosticsResolveSplitPackageGetterChain() throws Exception {
+        var workspace = Files.createTempDirectory("jls-enterprise-lombok-split-package");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var nested = workspace.resolve("src/main/java/p/nested");
+            var service = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(model);
+            Files.createDirectories(nested);
+            Files.createDirectories(service);
+
+            var fooFile = model.resolve("Foo.java");
+            var barFile = nested.resolve("Bar.java");
+            var bizFile = nested.resolve("Biz.java");
+            var consumerFile = service.resolve("FooService.java");
+            Files.writeString(
+                    fooFile,
+                    "package p.model;\n"
+                            + "import p.nested.Bar;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  private Bar bar;\n"
+                            + "}\n");
+            Files.writeString(
+                    barFile,
+                    "package p.nested;\n"
+                            + "@lombok.Data\n"
+                            + "public class Bar {\n"
+                            + "  private Biz biz = new Biz();\n"
+                            + "}\n");
+            Files.writeString(
+                    bizFile,
+                    "package p.nested;\n"
+                            + "public class Biz {\n"
+                            + "  public String value() {\n"
+                            + "    return \"ok\";\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    consumerFile,
+                    "package p.service;\n"
+                            + "import p.model.Foo;\n"
+                            + "public class FooService {\n"
+                            + "  String use(Foo foo) {\n"
+                            + "    var bar = foo.getBar();\n"
+                            + "    var biz = bar.getBiz();\n"
+                            + "    return biz.value();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var client = new RecordingDiagnosticsClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            configureLombokClasspath(server);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "split-package getter chain should not produce diagnostics in consumer",
+                    client.awaitNoErrorMatching(
+                            consumerFile.toUri(),
+                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
+                            10,
+                            TimeUnit.SECONDS));
+            Assert.assertTrue(
+                    "expected lombok source expansion for split-package consumer diagnostics",
+                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInTestSourceResolvesMainSourceMemberChain() throws Exception {
+        var workspace = Files.createTempDirectory("jls-test-source-main-member-chain");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var tests = workspace.resolve("src/test/java/p/test");
+            Files.createDirectories(model);
+            Files.createDirectories(tests);
+
+            Files.writeString(
+                    model.resolve("Foo.java"),
+                    "package p.model;\n"
+                            + "public class Foo {\n"
+                            + "  public Bar getBar() {\n"
+                            + "    return new Bar();\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    model.resolve("Bar.java"),
+                    "package p.model;\n"
+                            + "public class Bar {\n"
+                            + "  public String getHello() {\n"
+                            + "    return \"hello\";\n"
+                            + "  }\n"
+                            + "}\n");
+            var testFile = tests.resolve("FooIntegrationTest.java");
+            Files.writeString(
+                    testFile,
+                    "package p.test;\n"
+                            + "import p.model.Foo;\n"
+                            + "class FooIntegrationTest {\n"
+                            + "  void test(Foo foo) {\n"
+                            + "    foo.getBar().\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = testFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(testFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before test-file completion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var completion =
+                    server.completion(
+                                    new TextDocumentPositionParams(
+                                            new TextDocumentIdentifier(testFile.toUri()),
+                                            new Position(4, 17)))
+                            .orElseThrow();
+            var labels =
+                    completion.items.stream()
+                            .map(item -> item.label)
+                            .collect(java.util.stream.Collectors.toSet());
+            Assert.assertTrue(
+                    "test-source completion should resolve workspace member chain from main sources",
+                    labels.contains("getHello"));
+            Assert.assertEquals(
+                    "workspace source types in test completion should not fall through to external binary lookup",
+                    0,
+                    capture.countContaining("[external-binary] miss type=p.model.Bar"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInTestSourceResolvesMainSourceLocalVarChain() throws Exception {
+        var workspace = Files.createTempDirectory("jls-test-source-local-var-chain");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var tests = workspace.resolve("src/test/java/p/test");
+            Files.createDirectories(model);
+            Files.createDirectories(tests);
+
+            Files.writeString(
+                    model.resolve("Foo.java"),
+                    "package p.model;\n"
+                            + "public class Foo {\n"
+                            + "  public Bar getBar() {\n"
+                            + "    return new Bar();\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    model.resolve("Bar.java"),
+                    "package p.model;\n"
+                            + "public class Bar {\n"
+                            + "  public String getHello() {\n"
+                            + "    return \"hello\";\n"
+                            + "  }\n"
+                            + "}\n");
+            var testFile = tests.resolve("FooIntegrationTest.java");
+            Files.writeString(
+                    testFile,
+                    "package p.test;\n"
+                            + "import p.model.Foo;\n"
+                            + "class FooIntegrationTest {\n"
+                            + "  void test(Foo foo) {\n"
+                            + "    var bar = foo.getBar();\n"
+                            + "    bar.\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = testFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(testFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before local-var completion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var completion =
+                    server.completion(
+                                    new TextDocumentPositionParams(
+                                            new TextDocumentIdentifier(testFile.toUri()),
+                                            new Position(5, 8)))
+                            .orElseThrow();
+            var labels =
+                    completion.items.stream()
+                            .map(item -> item.label)
+                            .collect(java.util.stream.Collectors.toSet());
+            Assert.assertTrue(
+                    "test-source completion should resolve local var receiver type from main sources",
+                    labels.contains("getHello"));
+            Assert.assertEquals(
+                    "local var receiver in test completion should stay on workspace resolution path",
+                    0,
+                    capture.countContaining("[external-binary] miss type=p.model.Bar"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInTestSourceResolvesLombokNestedMemberChain() throws Exception {
+        var workspace = Files.createTempDirectory("jls-test-source-lombok-member-chain");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var model = workspace.resolve("src/main/java/p/model");
+            var tests = workspace.resolve("src/test/java/p/test");
+            Files.createDirectories(model);
+            Files.createDirectories(tests);
+
+            Files.writeString(
+                    model.resolve("Foo.java"),
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Foo {\n"
+                            + "  private Bar bar = new Bar();\n"
+                            + "}\n");
+            Files.writeString(
+                    model.resolve("Bar.java"),
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Bar {\n"
+                            + "  private String hello = \"hello\";\n"
+                            + "}\n");
+            var testFile = tests.resolve("FooIntegrationTest.java");
+            Files.writeString(
+                    testFile,
+                    "package p.test;\n"
+                            + "import p.model.Foo;\n"
+                            + "class FooIntegrationTest {\n"
+                            + "  void test(Foo foo) {\n"
+                            + "    foo.getBar().\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = testFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(testFile);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before Lombok test-file completion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var completion =
+                    server.completion(
+                                    new TextDocumentPositionParams(
+                                            new TextDocumentIdentifier(testFile.toUri()),
+                                            new Position(4, 17)))
+                            .orElseThrow();
+            var labels =
+                    completion.items.stream()
+                            .map(item -> item.label)
+                            .collect(java.util.stream.Collectors.toSet());
+            Assert.assertTrue(
+                    "test-source completion should resolve Lombok-backed workspace member chain",
+                    labels.contains("getHello"));
+            Assert.assertEquals(
+                    "Lombok workspace source types in test completion should not fall through to external binary lookup",
+                    0,
+                    capture.countContaining("[external-binary] miss type=p.model.Bar"));
+            Assert.assertEquals(
+                    "Lombok workspace source types in test completion should not be mis-resolved to the test package",
+                    0,
+                    capture.countContaining("[external-binary] miss type=p.test.Bar"));
+            Assert.assertEquals(
+                    "Lombok workspace source types in test completion should not fall back to java.lang",
+                    0,
+                    capture.countContaining("[external-binary] miss type=java.lang.Bar"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void didChangeEnumMarksActiveConsumerDirtyUntilConsumerChanges() throws Exception {
         var workspace = Files.createTempDirectory("jls-enum-related-change");
         var logger = Logger.getLogger("main");
@@ -2112,6 +2604,18 @@ public class JavaLanguageServerTest {
             }
         }
         return false;
+    }
+
+    private static void configureLombokClasspath(JavaLanguageServer server) {
+        var settings = new JsonObject();
+        var java = new JsonObject();
+        var classPath = new com.google.gson.JsonArray();
+        classPath.add(Paths.get("lib/lombok-1.18.30.jar").toAbsolutePath().toString());
+        java.add("classPath", classPath);
+        settings.add("java", java);
+        var change = new DidChangeConfigurationParams();
+        change.settings = settings;
+        server.didChangeConfiguration(change);
     }
 
     private static class RecordingDiagnosticsClient implements LanguageClient {

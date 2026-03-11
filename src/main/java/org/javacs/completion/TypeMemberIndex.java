@@ -667,6 +667,22 @@ public class TypeMemberIndex {
                 continue;
             }
             var fieldType = variable.getType() == null ? "java.lang.Object" : variable.getType().toString();
+            for (var existing : seen.values()) {
+                if (existing.kind != CompletionItemKind.Field) {
+                    continue;
+                }
+                if (existing.isStatic) {
+                    continue;
+                }
+                if (!fieldName.equals(existing.name)) {
+                    continue;
+                }
+                if (existing.returnType == null || existing.returnType.isBlank()) {
+                    continue;
+                }
+                fieldType = existing.returnType;
+                break;
+            }
             var getterEnabled = classGetter || hasLombokAnnotation(variable.getModifiers(), "Getter");
             var setterEnabled = classSetter || hasLombokAnnotation(variable.getModifiers(), "Setter");
             var suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
