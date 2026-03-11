@@ -838,6 +838,62 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didOpenConsumerLogsLombokDiagnosticsExpansionDetails() throws Exception {
+        var client = new RecordingDiagnosticsClient();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var server =
+                LanguageServerFixture.getJavaLanguageServer(
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+
+        var serviceFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        try {
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "expected clean consumer diagnostics for the Lombok repro service",
+                    client.awaitNoErrorMatching(
+                            serviceFile.toUri(),
+                            d -> containsAny(d.message, "getMsref()", "setMsref("),
+                            10,
+                            TimeUnit.SECONDS));
+
+            var sourceFilesLog = capture.lastLineContaining("[perf] lombok_ap_source_files compiler=diagnostics");
+            Assert.assertNotNull("expected a compact Lombok source expansion log", sourceFilesLog);
+            Assert.assertTrue(
+                    "expected the diagnostics expansion log to include the requested consumer file",
+                    sourceFilesLog.contains("ReproService.java"));
+            Assert.assertTrue(
+                    "expected the diagnostics expansion log to include the referenced Lombok model",
+                    sourceFilesLog.contains("ReproTxn.java"));
+
+            var verifyMembersLog =
+                    capture.lastLineContaining(
+                            "[perf] lombok_verify_members phase=diagnostics class=org.javacs.repro.model.ReproTxn");
+            Assert.assertNotNull("expected Lombok generated member visibility details", verifyMembersLog);
+            Assert.assertTrue(
+                    "expected generated getter names to be listed for investigation",
+                    verifyMembersLog.contains("getMsref"));
+            Assert.assertTrue(
+                    "expected generated setter names to be listed for investigation",
+                    verifyMembersLog.contains("setMsref"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
     public void didOpenConsumerIncludesActiveUnsavedTransitiveLombokDependency() throws Exception {
         var workspace = Files.createTempDirectory("jls-lombok-transitive-active");
         var logger = Logger.getLogger("main");

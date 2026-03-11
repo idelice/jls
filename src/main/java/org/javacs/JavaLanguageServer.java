@@ -711,6 +711,13 @@ class JavaLanguageServer extends LanguageServer {
                                 .map(e -> e.getSimpleName().toString())
                                 .collect(java.util.stream.Collectors.toSet());
                 var expectedGenerated = expectedLombokMethodNames(cls);
+                var visibleGenerated =
+                        visibleMethods.stream()
+                                .filter(expectedGenerated::contains)
+                                .sorted()
+                                .collect(java.util.stream.Collectors.toList());
+                var expectedGeneratedList = new java.util.ArrayList<>(expectedGenerated);
+                java.util.Collections.sort(expectedGeneratedList);
                 var generatedVisible = visibleMethods.stream().anyMatch(expectedGenerated::contains);
                 LOG.fine(
                         String.format(
@@ -719,6 +726,13 @@ class JavaLanguageServer extends LanguageServer {
                                 typeElement.getQualifiedName(),
                                 generatedVisible,
                                 typeElement.getEnclosedElements().size()));
+                LOG.fine(
+                        String.format(
+                                "[perf] lombok_verify_members phase=%s class=%s expected_generated=%s visible_generated=%s",
+                                phase,
+                                typeElement.getQualifiedName(),
+                                String.join(",", expectedGeneratedList),
+                                visibleGenerated.isEmpty() ? "-" : String.join(",", visibleGenerated)));
                 if (generatedVisible) {
                     lombokVerifiedForCurrentCompiler = true;
                 }

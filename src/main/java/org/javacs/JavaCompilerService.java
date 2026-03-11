@@ -424,7 +424,22 @@ class JavaCompilerService implements CompilerProvider {
                 String.format(
                         "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
                         sources.size(), result.size(), reason));
+        LOG.fine(
+                String.format(
+                        "[perf] lombok_ap_source_files compiler=%s requested_files=%s expanded_files=%s",
+                        compilerRole, fileNames(sources), fileNames(result)));
         return result;
+    }
+
+    private String fileNames(Collection<? extends JavaFileObject> sources) {
+        var names = new ArrayList<String>();
+        for (var source : sources) {
+            var path = sourcePath(source);
+            if (path != null && path.getFileName() != null) {
+                names.add(path.getFileName().toString());
+            }
+        }
+        return names.isEmpty() ? "-" : String.join(",", names);
     }
 
     private Set<Path> referencedLombokSources(Collection<? extends JavaFileObject> sources) {
