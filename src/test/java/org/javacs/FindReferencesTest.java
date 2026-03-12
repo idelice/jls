@@ -36,7 +36,9 @@ public class FindReferencesTest {
 
     @Test
     public void findInterfaceReference() {
-        assertThat(items("/org/javacs/example/GotoImplementation.java", 9, 21), contains("GotoImplementation.java(5)"));
+        assertThat(
+                items("/org/javacs/example/GotoImplementation.java", 9, 21),
+                contains("GotoImplementation.java(5)", "GotoImplementation.java(14)"));
     }
 
     @Test
@@ -108,6 +110,41 @@ public class FindReferencesTest {
     public void inheritedFieldReferencesFromUsage() {
         var file = "/org/javacs/example/InheritedPojoMembers.java";
         assertThat(items(file, 5, 10), contains("InheritedPojoMembers.java(5)"));
+    }
+
+    @Test
+    public void lombokFieldReferencesIncludeGeneratedAccessors() {
+        var file = "/org/javacs/example/LombokFieldReferences.java";
+        assertThat(
+                items(file, 7, 20),
+                contains(
+                        "LombokFieldReferences.java(10)",
+                        "LombokFieldReferences.java(11)",
+                        "LombokFieldReferences.java(12)",
+                        "LombokFieldReferences.java(13)"));
+    }
+
+    @Test
+    public void lombokAccessorReferencesIncludeFieldReadsAndWrites() {
+        var file = "/org/javacs/example/LombokFieldReferences.java";
+        assertThat(
+                items(file, 10, 13),
+                contains(
+                        "LombokFieldReferences.java(10)",
+                        "LombokFieldReferences.java(11)",
+                        "LombokFieldReferences.java(12)",
+                        "LombokFieldReferences.java(13)"));
+    }
+
+    @Test
+    public void abstractMethodReferencesIncludeOverridesAndCallSites() {
+        var file = "/org/javacs/example/OverrideHierarchy.java";
+        assertThat(
+                items(file, 4, 21),
+                contains(
+                        "OverrideHierarchy.java(9)",
+                        "OverrideHierarchy.java(16)",
+                        "OverrideHierarchy.java(16)"));
     }
 
     private static ReferenceContext referenceContext() {

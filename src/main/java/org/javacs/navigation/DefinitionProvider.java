@@ -26,6 +26,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.FindNameAt;
 import org.javacs.ParseTask;
+import org.javacs.TypeLookupBoundary;
 import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.CompletionItemKind;
@@ -34,6 +35,7 @@ import org.javacs.lsp.Location;
 public class DefinitionProvider {
     private final CompilerProvider compiler;
     private final CompositeTypeIndex completionIndex;
+    private final TypeLookupBoundary typeLookup;
     private final Path file;
     private final int line;
     private final int column;
@@ -56,6 +58,7 @@ public class DefinitionProvider {
     public DefinitionProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, Path file, int line, int column) {
         this.compiler = compiler;
         this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
+        this.typeLookup = new TypeLookupBoundary(compiler, this.completionIndex);
         this.file = file;
         this.line = line;
         this.column = column;
@@ -135,7 +138,7 @@ public class DefinitionProvider {
             var location = FindHelper.location(parse, field.get(), name);
             if (location != null) {
                 var owner = qualifiedClassName(parse, nearestClass(field.get()));
-                return new ResolvedSymbol(List.of(location), owner, name, false, null, name);
+                return resolvedFieldSymbol(owner, name, List.of(location));
             }
         }
         var inheritedField = types.resolveInheritedFieldMember(name);
@@ -180,7 +183,7 @@ public class DefinitionProvider {
 
         var receiver = types.resolveExpression(memberSelect.getExpression());
         if (receiver.isPresent()) {
-            var member = completionIndex.member(receiver.get().qualifiedType, name, receiver.get().staticContext);
+            var member = lookupMember(receiver.get().qualifiedType, name, receiver.get().staticContext);
             if (member.isPresent()) {
                 var selected = member.get();
                 if (selected.kind == CompletionItemKind.Method || selected.kind == CompletionItemKind.Constructor) {
@@ -195,10 +198,7 @@ public class DefinitionProvider {
             }
 
             var nestedType = receiver.get().qualifiedType + "." + name;
-            if (completionIndex.containsType(nestedType)) {
-                return resolveTypeName(nestedType, name);
-            }
-            if (compiler.findAnywhere(nestedType).isPresent()) {
+            if (typeLookup.resolveWorkspaceNestedType(receiver.get().qualifiedType, name).isPresent()) {
                 return resolveTypeName(nestedType, name);
             }
         }
@@ -231,7 +231,10 @@ public class DefinitionProvider {
         var argTypes = resolveArgumentTypes(invocation.getArguments(), types);
         var owner = types.currentEnclosingTypeName();
         if (owner.isPresent()) {
-            var resolved = resolveMethod(owner.get(), methodName, invocation.getArguments().size(), argTypes, null);
+            var member =
+                    lookupMember(owner.get(), methodName, false, argTypes.toArray(String[]::new))
+                            .orElse(null);
+            var resolved = resolveMethod(owner.get(), methodName, invocation.getArguments().size(), argTypes, member);
             if (!resolved.locations().isEmpty()) {
                 return resolved;
             }
@@ -253,7 +256,14 @@ public class DefinitionProvider {
             return new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName);
         }
         var argTypes = resolveArgumentTypes(arguments, types);
-        var member = completionIndex.member(receiver.get().qualifiedType, methodName, receiver.get().staticContext).orElse(null);
+        var member =
+                lookupMember(
+                                receiver.get().qualifiedType,
+                                methodName,
+                                receiver.get().staticContext,
+                                argTypes.toArray(String[]::new))
+                        .or(() -> lookupMember(receiver.get().qualifiedType, methodName, receiver.get().staticContext))
+                        .orElse(null);
         var ownerType = member != null ? member.ownerType : receiver.get().qualifiedType;
         return resolveMethod(ownerType, methodName, arguments.size(), argTypes, member);
     }
@@ -264,6 +274,12 @@ public class DefinitionProvider {
     }
 
     private ResolvedSymbol resolveFieldFromMember(String ownerType, String fieldName, TypeMemberIndex.Member member) {
+        if (member != null && member.backingFieldName != null && !member.backingFieldName.isBlank()) {
+            var linked = resolveLinkedField(member);
+            if (linked != null) {
+                return linked;
+            }
+        }
         var locations = findFieldLocations(ownerType, fieldName);
         if (!locations.isEmpty()) {
             return new ResolvedSymbol(locations, ownerType, fieldName, false, member, fieldName);
@@ -277,6 +293,19 @@ public class DefinitionProvider {
 
     private ResolvedSymbol resolveMethod(
             String ownerType, String methodName, int argCount, List<String> argTypes, TypeMemberIndex.Member member) {
+        if (member != null && member.backingFieldName != null && !member.backingFieldName.isBlank()) {
+            var linked = resolveLinkedField(member);
+            if (linked != null) {
+                return linked;
+            }
+            if (isWorkspaceType(member.ownerType)) {
+                LOG.fine(
+                        String.format(
+                                "[perf] definition_lombok_workspace_field_missing owner=%s accessor=%s field=%s",
+                                member.ownerType, member.name, member.backingFieldName));
+                return new ResolvedSymbol(NOT_SUPPORTED, member.ownerType, member.backingFieldName, false, member, member.backingFieldName);
+            }
+        }
         var locations = findMethodLocations(ownerType, methodName, argCount, argTypes);
         if (!locations.isEmpty()) {
             return new ResolvedSymbol(locations, ownerType, methodName, true, member, methodName);
@@ -325,7 +354,11 @@ public class DefinitionProvider {
     }
 
     private boolean isJarBackedType(String ownerType) {
-        var source = compiler.findAnywhere(ownerType);
+        var workspaceSource = typeLookup.findWorkspaceDeclaration(ownerType);
+        if (workspaceSource != null && !workspaceSource.equals(CompilerProvider.NOT_FOUND)) {
+            return false;
+        }
+        var source = typeLookup.findExternalSource(ownerType, "isJarBackedType");
         if (source.isEmpty()) {
             return false;
         }
@@ -351,7 +384,7 @@ public class DefinitionProvider {
     private Optional<ResolvedSymbol> resolveStaticImportField(ParseTask parse, String fieldName) {
         ResolvedSymbol match = null;
         for (var ownerType : TypeMemberIndex.staticImportOwnerTypes(fieldName, parse.root)) {
-            var member = completionIndex.member(ownerType, fieldName, true).orElse(null);
+            var member = lookupMember(ownerType, fieldName, true).orElse(null);
             var resolved =
                     member != null
                             ? resolveFieldFromMember(ownerType, fieldName, member)
@@ -371,7 +404,7 @@ public class DefinitionProvider {
             com.sun.source.tree.CompilationUnitTree root, String methodName, int argCount, List<String> argTypes) {
         ResolvedSymbol match = null;
         for (var ownerType : TypeMemberIndex.staticImportOwnerTypes(methodName, root)) {
-            var member = completionIndex.member(ownerType, methodName, true).orElse(null);
+            var member = lookupMember(ownerType, methodName, true).orElse(null);
             var resolved = resolveMethod(ownerType, methodName, argCount, argTypes, member);
             if (resolved.locations().isEmpty()) {
                 continue;
@@ -414,8 +447,8 @@ public class DefinitionProvider {
         }
 
         var member =
-                completionIndex.member(ownerType.get(), fieldName, true)
-                        .or(() -> completionIndex.member(ownerType.get(), fieldName, false))
+                lookupMember(ownerType.get(), fieldName, true)
+                        .or(() -> lookupMember(ownerType.get(), fieldName, false))
                         .orElse(null);
         var resolved = member != null
                 ? resolveFieldFromMember(ownerType.get(), fieldName, member)
@@ -477,11 +510,26 @@ public class DefinitionProvider {
         var simpleName = method.getName().contentEquals("<init>")
                 ? classPath != null ? ((ClassTree) classPath.getLeaf()).getSimpleName().toString() : method.getName().toString()
                 : method.getName().toString();
+        if (ownerType != null && !method.getName().contentEquals("<init>")) {
+            var indexed = findIndexedMethod(parse, ownerType, simpleName, method);
+            if (indexed.isPresent()) {
+                var overridden = findOverriddenDeclaration(indexed.get());
+                if (!overridden.locations().isEmpty()) {
+                    return overridden;
+                }
+            }
+        }
         var location = FindHelper.location(parse, path, simpleName);
         if (location == null) {
             return new ResolvedSymbol(NOT_SUPPORTED, ownerType, simpleName, true, null, simpleName);
         }
-        return new ResolvedSymbol(List.of(location), ownerType, simpleName, true, null, simpleName);
+        return new ResolvedSymbol(
+                List.of(location),
+                ownerType,
+                simpleName,
+                true,
+                findIndexedMethod(parse, ownerType, simpleName, method).orElse(null),
+                simpleName);
     }
 
     private ResolvedSymbol variableDeclaration(ParseTask parse, TreePath path, VariableTree variable) {
@@ -491,6 +539,9 @@ public class DefinitionProvider {
         var location = FindHelper.location(parse, path, variable.getName());
         if (location == null) {
             return new ResolvedSymbol(NOT_SUPPORTED, ownerType, variable.getName().toString(), false, null, variable.getName().toString());
+        }
+        if (memberField && ownerType != null) {
+            return resolvedFieldSymbol(ownerType, variable.getName().toString(), List.of(location));
         }
         return new ResolvedSymbol(List.of(location), ownerType, variable.getName().toString(), false, null, variable.getName().toString());
     }
@@ -578,6 +629,103 @@ public class DefinitionProvider {
         return result;
     }
 
+    private ResolvedSymbol resolvedFieldSymbol(String ownerType, String fieldName, List<Location> locations) {
+        var member = lookupMember(ownerType, fieldName, false).or(() -> lookupMember(ownerType, fieldName, true)).orElse(null);
+        return new ResolvedSymbol(locations, ownerType, fieldName, false, member, fieldName);
+    }
+
+    private Optional<TypeMemberIndex.Member> findIndexedMethod(
+            ParseTask parse, String ownerType, String methodName, MethodTree method) {
+        if (ownerType == null) {
+            return Optional.empty();
+        }
+        var erasedParameterTypes = new String[method.getParameters().size()];
+        for (int i = 0; i < method.getParameters().size(); i++) {
+            var parameter = method.getParameters().get(i);
+            if (parameter.getType() == null) {
+                return Optional.empty();
+            }
+            erasedParameterTypes[i] =
+                    canonicalType(resolveTypeName(parse, parameter.getType().toString()).orElse(parameter.getType().toString()));
+        }
+        return lookupMember(ownerType, methodName, false, erasedParameterTypes)
+                .or(() -> lookupMember(ownerType, methodName, true, erasedParameterTypes));
+    }
+
+    private ResolvedSymbol findOverriddenDeclaration(TypeMemberIndex.Member method) {
+        var pending = new java.util.ArrayDeque<String>(completionIndex.directSupertypes(method.ownerType));
+        var visited = new java.util.LinkedHashSet<String>();
+        while (!pending.isEmpty()) {
+            var superType = pending.removeFirst();
+            if (!visited.add(superType)) {
+                continue;
+            }
+            var override =
+                    lookupMember(superType, method.name, false, method.erasedParameterTypes)
+                            .or(() -> lookupMember(superType, method.name, true, method.erasedParameterTypes));
+            if (override.isPresent()) {
+                var locations =
+                        findMethodLocations(
+                                override.get().ownerType,
+                                override.get().name,
+                                override.get().erasedParameterTypes == null ? -1 : override.get().erasedParameterTypes.length,
+                                override.get().erasedParameterTypes == null
+                                        ? List.of()
+                                        : java.util.Arrays.stream(override.get().erasedParameterTypes)
+                                                .map(type -> canonicalType(type))
+                                                .toList());
+                if (!locations.isEmpty()) {
+                    return new ResolvedSymbol(
+                            locations,
+                            override.get().ownerType,
+                            override.get().name,
+                            true,
+                            override.get(),
+                            override.get().name);
+                }
+            }
+            pending.addAll(completionIndex.directSupertypes(superType));
+        }
+        return new ResolvedSymbol(NOT_SUPPORTED, method.ownerType, method.name, true, method, method.name);
+    }
+
+    private ResolvedSymbol resolveLinkedField(TypeMemberIndex.Member member) {
+        var fieldName = member.backingFieldName;
+        if (fieldName == null || fieldName.isBlank()) {
+            return null;
+        }
+        var locations = findFieldLocations(member.ownerType, fieldName);
+        if (!locations.isEmpty()) {
+            LOG.fine(
+                    String.format(
+                            "[perf] definition_lombok_field_link owner=%s accessor=%s field=%s",
+                            member.ownerType, member.name, fieldName));
+            return resolvedFieldSymbol(member.ownerType, fieldName, locations);
+        }
+        return null;
+    }
+
+    private boolean isWorkspaceType(String qualifiedType) {
+        return completionIndex.workspace().typeInfo(qualifiedType)
+                .map(info -> info.sourcePath != null)
+                .orElse(false);
+    }
+
+    private Optional<TypeMemberIndex.Member> lookupMember(String ownerType, String memberName, boolean staticContext) {
+        if (completionIndex.isWorkspaceOwnedType(ownerType, compiler)) {
+            return completionIndex.workspace().member(ownerType, memberName, staticContext);
+        }
+        return completionIndex.member(ownerType, memberName, staticContext);
+    }
+
+    private Optional<TypeMemberIndex.Member> lookupMember(
+            String ownerType, String memberName, boolean staticContext, String[] erasedParameterTypes) {
+        if (completionIndex.isWorkspaceOwnedType(ownerType, compiler)) {
+            return completionIndex.workspace().member(ownerType, memberName, staticContext, erasedParameterTypes);
+        }
+        return completionIndex.member(ownerType, memberName, staticContext, erasedParameterTypes);
+    }
+
     private List<Location> findMethodLocations(String ownerType, String methodName, int argCount, List<String> argTypes) {
         var source = openTypeSource(ownerType);
         if (source.isEmpty()) {
@@ -648,64 +796,7 @@ public class DefinitionProvider {
     }
 
     private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
-        if (typeName == null || typeName.isBlank()) {
-            return Optional.empty();
-        }
-        var indexed = completionIndex.resolveTypeName(typeName, parse.root);
-        if (indexed.isPresent()) {
-            return indexed;
-        }
-        var raw = typeName.trim();
-        while (raw.endsWith("[]")) {
-            raw = raw.substring(0, raw.length() - 2);
-        }
-        var genericStart = raw.indexOf('<');
-        if (genericStart >= 0) {
-            raw = raw.substring(0, genericStart);
-        }
-        if (raw.startsWith("? extends ")) {
-            raw = raw.substring("? extends ".length()).trim();
-        } else if (raw.startsWith("? super ")) {
-            raw = raw.substring("? super ".length()).trim();
-        } else if ("?".equals(raw)) {
-            return Optional.empty();
-        }
-        if (raw.isBlank()) {
-            return Optional.empty();
-        }
-        if (TypeMemberIndex.isPrimitiveTypeName(raw)) {
-            return Optional.of(raw);
-        }
-        if (raw.contains(".")) {
-            if (compiler.findAnywhere(raw).isPresent()) {
-                return Optional.of(raw);
-            }
-        }
-        var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            var candidate = packageName + "." + raw;
-            if (compiler.findAnywhere(candidate).isPresent()) {
-                return Optional.of(candidate);
-            }
-        }
-        for (var importTree : parse.root.getImports()) {
-            if (importTree.isStatic()) continue;
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + raw) && compiler.findAnywhere(imported).isPresent()) {
-                return Optional.of(imported);
-            }
-            if (imported.endsWith(".*")) {
-                var candidate = imported.substring(0, imported.length() - 1) + raw;
-                if (compiler.findAnywhere(candidate).isPresent()) {
-                    return Optional.of(candidate);
-                }
-            }
-        }
-        var javaLang = "java.lang." + raw;
-        if (compiler.findAnywhere(javaLang).isPresent()) {
-            return Optional.of(javaLang);
-        }
-        return Optional.empty();
+        return typeLookup.resolveTypeName(typeName, parse.root);
     }
 
     private List<Location> findFieldLocations(String ownerType, String fieldName) {
@@ -794,7 +885,7 @@ public class DefinitionProvider {
     }
 
     private Optional<TypeSource> openTypeSource(String qualifiedType) {
-        var type = completionIndex.typeInfo(qualifiedType).orElse(null);
+        var type = completionIndex.workspace().typeInfo(qualifiedType).orElse(null);
         if (type != null && type.sourcePath != null) {
             var parse = compiler.parse(type.sourcePath);
             var classPath = findClassPath(parse, qualifiedType);
@@ -803,7 +894,16 @@ public class DefinitionProvider {
             }
         }
 
-        var anywhere = compiler.findAnywhere(qualifiedType);
+        var workspaceSource = typeLookup.findWorkspaceDeclaration(qualifiedType);
+        if (workspaceSource != null && !workspaceSource.equals(CompilerProvider.NOT_FOUND)) {
+            var parse = compiler.parse(workspaceSource);
+            var classPath = findClassPath(parse, qualifiedType);
+            if (classPath.isPresent()) {
+                return Optional.of(new TypeSource(parse, classPath.get()));
+            }
+        }
+
+        var anywhere = typeLookup.findExternalSource(qualifiedType, "openTypeSource");
         if (anywhere.isPresent()) {
             var parse = compiler.parse(anywhere.get());
             var classPath = findClassPath(parse, qualifiedType);
@@ -814,7 +914,15 @@ public class DefinitionProvider {
 
         for (var i = qualifiedType.lastIndexOf('.'); i > 0; i = qualifiedType.lastIndexOf('.', i - 1)) {
             var outer = qualifiedType.substring(0, i);
-            var outerSource = compiler.findAnywhere(outer);
+            var workspaceOuter = typeLookup.findWorkspaceDeclaration(outer);
+            if (workspaceOuter != null && !workspaceOuter.equals(CompilerProvider.NOT_FOUND)) {
+                var parse = compiler.parse(workspaceOuter);
+                var classPath = findClassPath(parse, qualifiedType);
+                if (classPath.isPresent()) {
+                    return Optional.of(new TypeSource(parse, classPath.get()));
+                }
+            }
+            var outerSource = typeLookup.findExternalSource(outer, "openTypeSourceOuter");
             if (outerSource.isEmpty()) {
                 continue;
             }

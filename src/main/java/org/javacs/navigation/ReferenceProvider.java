@@ -13,10 +13,12 @@ import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
@@ -64,12 +66,12 @@ public class ReferenceProvider {
                             target.qualifiedType()));
             return findTypeReferences(definitions, target);
         }
-        if (!target.method()) {
+        if (fieldLogicalKey(target).isPresent()) {
             LOG.info(
                     String.format(
-                            "[perf] references_request mode=parse_index kind=field owner=%s member=%s",
+                            "[perf] references_request mode=parse_index kind=field_linked owner=%s member=%s",
                             target.qualifiedType(), target.memberName()));
-            return findFieldReferencesScoped(definitions, target);
+            return findFieldReferencesScoped(definitions, target, fieldLogicalKey(target).get());
         }
         LOG.info(
                 String.format(
@@ -98,20 +100,20 @@ public class ReferenceProvider {
         var names = new java.util.LinkedHashSet<String>();
         names.add(target.memberName());
         names.add(target.simpleName());
+        var relatedMethodKeys = relatedMethodKeys(target, targetParameterTypes);
         return scan(
                 files,
                 names,
                 target,
-                (parse, path) -> matchesMemberReference(definitions, parse, path, target, targetParameterTypes));
+                (parse, path) ->
+                        matchesMemberReference(definitions, parse, path, target, targetParameterTypes, relatedMethodKeys));
     }
 
     private List<Location> findFieldReferencesScoped(
-            DefinitionProvider definitions, DefinitionProvider.ResolvedSymbol target) {
+            DefinitionProvider definitions, DefinitionProvider.ResolvedSymbol target, String logicalKey) {
         var files = includeDeclarationFile(target.qualifiedType(), compiler.findTypeReferences(target.qualifiedType()));
-        var names = new java.util.LinkedHashSet<String>();
-        names.add(target.memberName());
-        names.addAll(accessorNames(target.memberName()));
-        return scan(files, names, target, (parse, path) -> matchesFieldReference(definitions, parse, path, target));
+        var names = relatedLogicalNames(target, logicalKey);
+        return scan(files, names, target, (parse, path) -> matchesFieldReference(definitions, parse, path, logicalKey));
     }
 
     private List<Location> findLocalReferences(
@@ -145,6 +147,14 @@ public class ReferenceProvider {
                 public Void visitMemberReference(MemberReferenceTree tree, Void unused) {
                     maybeAdd(parse, getCurrentPath(), tree.getName().toString());
                     return super.visitMemberReference(tree, unused);
+                }
+
+                @Override
+                public Void visitMethod(MethodTree tree, Void unused) {
+                    if (tree.getName() != null && !tree.getName().contentEquals("<init>")) {
+                        maybeAdd(parse, getCurrentPath(), tree.getName().toString());
+                    }
+                    return super.visitMethod(tree, unused);
                 }
 
                 @Override
@@ -186,7 +196,8 @@ public class ReferenceProvider {
             ParseTask parse,
             TreePath path,
             DefinitionProvider.ResolvedSymbol target,
-            List<String> targetParameterTypes) {
+            List<String> targetParameterTypes,
+            Set<String> relatedMethodKeys) {
         var resolved = resolveOccurrence(definitions, parse, path);
         if (isConstructorTarget(target)
                 && Objects.equals(target.qualifiedType(), resolved.qualifiedType())
@@ -195,22 +206,17 @@ public class ReferenceProvider {
                 && signatureMatches(targetParameterTypes, occurrenceParameterTypes(parse, path))) {
             return true;
         }
+        var resolvedKey = methodCanonicalKey(resolved, parse, path);
         return resolved.method()
-                && Objects.equals(target.qualifiedType(), resolved.qualifiedType())
-                && Objects.equals(target.memberName(), resolved.memberName())
+                && resolvedKey != null
+                && relatedMethodKeys.contains(resolvedKey)
                 && signatureMatches(targetParameterTypes, occurrenceParameterTypes(parse, path));
     }
 
     private boolean matchesFieldReference(
-            DefinitionProvider definitions, ParseTask parse, TreePath path, DefinitionProvider.ResolvedSymbol target) {
+            DefinitionProvider definitions, ParseTask parse, TreePath path, String logicalKey) {
         var resolved = resolveOccurrence(definitions, parse, path);
-        if (!Objects.equals(target.qualifiedType(), resolved.qualifiedType())) {
-            return false;
-        }
-        if (!resolved.method() && Objects.equals(target.memberName(), resolved.memberName())) {
-            return true;
-        }
-        return resolved.method() && accessorNames(target.memberName()).contains(resolved.memberName());
+        return Objects.equals(logicalKey, logicalKey(resolved));
     }
 
     private boolean matchesLocalReference(
@@ -331,6 +337,96 @@ public class ReferenceProvider {
     private String key(Location location) {
         return location.uri + ":" + location.range.start.line + ":" + location.range.start.character + ":"
                 + location.range.end.line + ":" + location.range.end.character;
+    }
+
+    private Set<String> relatedMethodKeys(
+            DefinitionProvider.ResolvedSymbol target, List<String> targetParameterTypes) {
+        if (target.indexMember() != null) {
+            if (completionIndex.isWorkspaceOwnedType(target.indexMember().ownerType, compiler)) {
+                return completionIndex.workspace().relatedMethodKeys(
+                        target.indexMember().ownerType,
+                        target.indexMember().name,
+                        target.indexMember().erasedParameterTypes == null
+                                ? new String[0]
+                                : target.indexMember().erasedParameterTypes);
+            }
+            return completionIndex.relatedMethodKeys(
+                    target.indexMember().ownerType,
+                    target.indexMember().name,
+                    target.indexMember().erasedParameterTypes == null
+                            ? new String[0]
+                            : target.indexMember().erasedParameterTypes);
+        }
+        if (completionIndex.isWorkspaceOwnedType(target.qualifiedType(), compiler)) {
+            return completionIndex.workspace().relatedMethodKeys(
+                    target.qualifiedType(), target.memberName(), targetParameterTypes.toArray(String[]::new));
+        }
+        return completionIndex.relatedMethodKeys(
+                target.qualifiedType(), target.memberName(), targetParameterTypes.toArray(String[]::new));
+    }
+
+    private Optional<String> fieldLogicalKey(DefinitionProvider.ResolvedSymbol target) {
+        if (target == null || target.qualifiedType() == null || target.memberName() == null) {
+            return Optional.empty();
+        }
+        if (target.indexMember() != null && target.indexMember().logicalKey != null) {
+            if (!Objects.equals(target.indexMember().logicalKey, target.indexMember().canonicalKey)
+                    || !target.method()) {
+                return Optional.of(target.indexMember().logicalKey);
+            }
+        }
+        if (!target.method()) {
+            return Optional.of(
+                    TypeMemberIndex.canonicalMemberKey(
+                            target.qualifiedType(), org.javacs.lsp.CompletionItemKind.Field, target.memberName(), null));
+        }
+        return Optional.empty();
+    }
+
+    private Set<String> relatedLogicalNames(DefinitionProvider.ResolvedSymbol target, String logicalKey) {
+        var names = new LinkedHashSet<String>();
+        if (target.memberName() != null) {
+            names.add(target.memberName());
+            names.addAll(accessorNames(target.memberName()));
+        }
+        completionIndex.typeInfo(target.qualifiedType())
+                .ifPresent(
+                        info ->
+                                info.members.stream()
+                                        .filter(member -> Objects.equals(logicalKey, member.logicalKey))
+                                        .forEach(member -> names.add(member.name)));
+        return names;
+    }
+
+    private String logicalKey(DefinitionProvider.ResolvedSymbol symbol) {
+        if (symbol.indexMember() != null && symbol.indexMember().logicalKey != null) {
+            return symbol.indexMember().logicalKey;
+        }
+        if (!symbol.method() && symbol.qualifiedType() != null && symbol.memberName() != null) {
+            return TypeMemberIndex.canonicalMemberKey(
+                    symbol.qualifiedType(), org.javacs.lsp.CompletionItemKind.Field, symbol.memberName(), null);
+        }
+        return null;
+    }
+
+    private String methodCanonicalKey(
+            DefinitionProvider.ResolvedSymbol resolved, ParseTask parse, TreePath path) {
+        if (resolved.indexMember() != null && resolved.indexMember().canonicalKey != null) {
+            return resolved.indexMember().canonicalKey;
+        }
+        if (!resolved.method() || resolved.qualifiedType() == null || resolved.memberName() == null) {
+            return null;
+        }
+        List<String> parameterTypes;
+        if (path.getLeaf() instanceof MethodTree method) {
+            parameterTypes = declaredParameterTypes(parse, path, method);
+        } else if (path.getParentPath() != null && path.getParentPath().getLeaf() instanceof MethodTree method) {
+            parameterTypes = declaredParameterTypes(parse, path.getParentPath(), method);
+        } else {
+            parameterTypes = occurrenceParameterTypes(parse, path);
+        }
+        return TypeMemberIndex.canonicalMemberKey(
+                resolved.qualifiedType(), org.javacs.lsp.CompletionItemKind.Method, resolved.memberName(), parameterTypes.toArray(String[]::new));
     }
 
     private Path[] includeDeclarationFile(String qualifiedType, Path[] files) {

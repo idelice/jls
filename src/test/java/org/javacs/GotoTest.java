@@ -240,6 +240,30 @@ public class GotoTest {
         assertThat(doGoto(file, 8, 10), hasItem("LombokInheritedPojoMembers.java:14"));
     }
 
+    @Test
+    public void gotoWorkspaceLombokAccessorResolvesToBackingField() {
+        var file = "/org/javacs/example/LombokFieldReferences.java";
+        assertThat(doGoto(file, 10, 13), hasItem("LombokFieldReferences.java:7"));
+    }
+
+    @Test
+    public void gotoInheritedLombokAccessorResolvesToBaseField() {
+        var file = "/org/javacs/example/LombokInheritedAccessorNavigation.java";
+        assertThat(doGoto(file, 15, 13), hasItem("LombokInheritedAccessorNavigation.java:7"));
+    }
+
+    @Test
+    public void gotoImplementationMethodDeclarationResolvesToInterfaceDeclaration() {
+        var file = "/org/javacs/example/GotoImplementation.java";
+        assertThat(doGoto(file, 14, 21), hasItem("GotoImplementation.java:9"));
+    }
+
+    @Test
+    public void gotoOverrideMethodDeclarationResolvesToAbstractBaseDeclaration() {
+        var file = "/org/javacs/example/OverrideHierarchy.java";
+        assertThat(doGoto(file, 9, 12), hasItem("OverrideHierarchy.java:4"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

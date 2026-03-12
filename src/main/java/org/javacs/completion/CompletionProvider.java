@@ -56,7 +56,6 @@ import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.type.TypeVariable;
-import org.javacs.CompileBatch;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
@@ -65,6 +64,7 @@ import org.javacs.JsonHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
+import org.javacs.TypeLookupBoundary;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
@@ -171,7 +171,6 @@ public class CompletionProvider {
 
     public CompletionList complete(Path file, int line, int column, int fileVersionSeen) {
         var started = Instant.now();
-        var countersBefore = CompileBatch.perfCounters();
         var parseStarted = Instant.now();
         var task = compiler.parse(file);
         LOG.info("[perf] completion_parse file=" + file.getFileName() + " took=" + Duration.between(parseStarted, Instant.now()).toMillis() + "ms");
@@ -212,18 +211,14 @@ public class CompletionProvider {
         addTopLevelSnippets(task, list);
         sortCompletionItems(list.items);
         logCompletionTiming(started, list.items, list.isIncomplete);
-        var countersAfter = CompileBatch.perfCounters();
-        var enterDelta = countersAfter.fullBatches - countersBefore.fullBatches;
-        var analyzeDelta = countersAfter.analyzeInvocations - countersBefore.analyzeInvocations;
-        var apDelta = countersAfter.apEnabledBatches - countersBefore.apEnabledBatches;
         LOG.info(
                 String.format(
                         "[perf] completion_flow file=%s mode=%s sources=1 enter=%d analyze=%d ap=%d index_version=%d took=%dms",
                         file.getFileName(),
                         mode,
-                        enterDelta,
-                        analyzeDelta,
-                        apDelta,
+                        0,
+                        0,
+                        0,
                         completionIndexVersion,
                         Duration.between(started, Instant.now()).toMillis()));
         return list;
@@ -259,7 +254,7 @@ public class CompletionProvider {
         }
         var index = completionIndex;
         var started = Instant.now();
-        var resolver = new ParseTypeResolver(parseTask, index, cursor);
+        var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
         var expression = memberReceiverExpression(parsePath);
         var resolved = resolver.resolve(expression, memberAccess.receiver);
         if (resolved.isEmpty()) {
@@ -486,17 +481,21 @@ public class CompletionProvider {
         private final ParseTask parseTask;
         private final CompilationUnitTree root;
         private final SourcePositions positions;
+        private final CompilerProvider compiler;
+        private final TypeLookupBoundary typeLookup;
         private final CompositeTypeIndex index;
         private final long cursor;
         private final TreePath cursorPath;
         private TypeResolution thisType;
         private TypeResolution superType;
 
-        ParseTypeResolver(ParseTask parseTask, CompositeTypeIndex index, long cursor) {
+        ParseTypeResolver(ParseTask parseTask, CompilerProvider compiler, CompositeTypeIndex index, long cursor) {
             this.parseTask = parseTask;
             this.root = parseTask.root;
             this.positions = Trees.instance(parseTask.task).getSourcePositions();
+            this.compiler = compiler;
             this.index = index;
+            this.typeLookup = new TypeLookupBoundary(compiler, index);
             this.cursor = cursor;
             this.cursorPath = new FindCompletionsAt(parseTask.task).scan(parseTask.root, cursor);
         }
@@ -632,7 +631,7 @@ public class CompletionProvider {
             if (nested.isPresent()) {
                 return Optional.of(new TypeResolution(nested.get(), true, false));
             }
-            var type = index.resolveTypeName(identifier, root);
+            var type = typeLookup.resolveTypeName(identifier, root);
             if (type.isPresent()) {
                 return Optional.of(new TypeResolution(type.get(), true, false));
             }
@@ -656,7 +655,10 @@ public class CompletionProvider {
 
         private Optional<TypeMemberIndex.Member> resolveMemberFromIndexOrSource(
                 String ownerType, String memberName, boolean staticContext) {
-            var indexed = index.member(ownerType, memberName, staticContext);
+            var indexed =
+                    index.isWorkspaceOwnedType(ownerType, compiler)
+                            ? index.workspace().member(ownerType, memberName, staticContext)
+                            : index.member(ownerType, memberName, staticContext);
             if (indexed.isPresent()) {
                 return indexed;
             }
@@ -696,7 +698,11 @@ public class CompletionProvider {
                                     field.getType() + " " + memberName,
                                     fieldType.get().qualifiedType,
                                     null,
-                                    null));
+                                    null,
+                                    TypeMemberIndex.canonicalMemberKey(ownerType, CompletionItemKind.Field, memberName, null),
+                                    TypeMemberIndex.canonicalMemberKey(ownerType, CompletionItemKind.Field, memberName, null),
+                                    null,
+                                    false));
                 }
                 if (member instanceof MethodTree method) {
                     if (!method.getName().contentEquals(memberName)) {
@@ -731,7 +737,13 @@ public class CompletionProvider {
                                     method.toString(),
                                     returnType.map(type -> type.qualifiedType).orElse(null),
                                     parameterNames,
-                                    erasedParameterTypes));
+                                    erasedParameterTypes,
+                                    TypeMemberIndex.canonicalMemberKey(
+                                            ownerType, CompletionItemKind.Method, memberName, erasedParameterTypes),
+                                    TypeMemberIndex.canonicalMemberKey(
+                                            ownerType, CompletionItemKind.Method, memberName, erasedParameterTypes),
+                                    null,
+                                    false));
                 }
             }
             return Optional.empty();
@@ -750,9 +762,15 @@ public class CompletionProvider {
                 return Optional.empty();
             }
             var ownerType = qualifiedClassName(classPath);
-            var loggerMember = index.member(ownerType, "log", false);
+            var loggerMember =
+                    index.isWorkspaceOwnedType(ownerType, compiler)
+                            ? index.workspace().member(ownerType, "log", false)
+                            : index.member(ownerType, "log", false);
             if (loggerMember.isEmpty()) {
-                loggerMember = index.member(ownerType, "log", true);
+                loggerMember =
+                        index.isWorkspaceOwnedType(ownerType, compiler)
+                                ? index.workspace().member(ownerType, "log", true)
+                                : index.member(ownerType, "log", true);
             }
             if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
                 return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
@@ -768,7 +786,7 @@ public class CompletionProvider {
             for (var classPath = enclosingClassPath(); classPath != null; classPath = parentClassPath(classPath.getParentPath())) {
                 var owner = qualifiedClassName(classPath);
                 var candidate = owner + "." + simpleName;
-                if (index.containsType(candidate) || declaredClassPath(candidate) != null) {
+                if (index.workspace().containsType(candidate) || declaredClassPath(candidate) != null) {
                     return Optional.of(candidate);
                 }
             }
@@ -874,7 +892,7 @@ public class CompletionProvider {
                 return Optional.of(new TypeResolution(component.get().qualifiedType, staticContext, true));
             }
             var typeName = tree.toString();
-            var resolved = index.resolveTypeName(typeName, root);
+            var resolved = typeLookup.resolveTypeName(typeName, root);
             if (resolved.isEmpty()) {
                 resolved = resolveTypeNameInCurrentSource(typeName);
             }
@@ -964,7 +982,7 @@ public class CompletionProvider {
             if (isArray) {
                 type = type.substring(0, type.length() - 2);
             }
-            var resolved = index.resolveTypeName(type, root);
+            var resolved = typeLookup.resolveTypeName(type, root);
             if (resolved.isEmpty()) {
                 resolved = resolveTypeNameInCurrentSource(type);
             }

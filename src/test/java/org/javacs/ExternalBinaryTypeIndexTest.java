@@ -270,7 +270,7 @@ public class ExternalBinaryTypeIndexTest {
     }
 
     @Test
-    public void gotoDefinitionUsesDecompiledSourceForExternalLombokMethod() throws Exception {
+    public void gotoDefinitionUsesAttachedSourceFieldForExternalLombokMethod() throws Exception {
         var fixture =
                 createFixture(
                         true,
@@ -289,7 +289,38 @@ public class ExternalBinaryTypeIndexTest {
                                 + "  }\n"
                                 + "}\n");
         try {
-            var locations = definitionLocations(fixture, "getName()");
+            var locations = definitionLocations(fixture, true, "getName()");
+            assertThat(locations, not(empty()));
+            var uri = locations.get(0).uri.toString();
+            assertThat(uri, containsString("jls-jar-sources"));
+            assertThat(uri, containsString("ExternalLombokPojo.java"));
+            assertThat(locations.get(0).range.start.line, is(4));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void gotoDefinitionFallsBackWhenExternalLombokFieldSourceIsUnavailable() throws Exception {
+        var fixture =
+                createFixture(
+                        true,
+                        "package ext;\n"
+                                + "import lombok.Data;\n"
+                                + "@Data\n"
+                                + "public class ExternalLombokPojo {\n"
+                                + "  private String name;\n"
+                                + "}\n",
+                        "package app;\n"
+                                + "import ext.ExternalLombokPojo;\n"
+                                + "class UseExternalLombok {\n"
+                                + "  void test() {\n"
+                                + "    ExternalLombokPojo user = new ExternalLombokPojo();\n"
+                                + "    user.getName();\n"
+                                + "  }\n"
+                                + "}\n");
+        try {
+            var locations = definitionLocations(fixture, false, "getName()");
             assertThat(locations, not(empty()));
             var uri = locations.get(0).uri.toString();
             assertThat(uri, containsString("jls-binary-decompiled"));
@@ -433,9 +464,15 @@ public class ExternalBinaryTypeIndexTest {
 
     private static List<org.javacs.lsp.Location> definitionLocations(Fixture fixture, String needle)
             throws Exception {
+        return definitionLocations(fixture, true, needle);
+    }
+
+    private static List<org.javacs.lsp.Location> definitionLocations(
+            Fixture fixture, boolean includeSourceJar, String needle)
+            throws Exception {
         var index = fixture.index();
         var cursor = positionAt(fixture.consumerFile, needle);
-        return new DefinitionProvider(fixture.compiler(true), index, fixture.consumerFile, cursor.line, cursor.character)
+        return new DefinitionProvider(fixture.compiler(includeSourceJar), index, fixture.consumerFile, cursor.line, cursor.character)
                 .find();
     }
 

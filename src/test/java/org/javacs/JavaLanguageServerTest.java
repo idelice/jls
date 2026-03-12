@@ -22,6 +22,8 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.completion.ExternalBinaryTypeIndex;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -38,6 +40,7 @@ import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
+import org.javacs.lsp.ReferenceParams;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.ShowMessageParams;
 import org.javacs.lsp.TextDocumentIdentifier;
@@ -183,6 +186,41 @@ public class JavaLanguageServerTest {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
         }
+    }
+
+    @Test
+    public void definitionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/LombokFieldReferences.java");
+
+        Assert.assertEquals("expected empty completion index before definition bootstrap", 0L, completionIndexVersion(server));
+
+        var result =
+                server.gotoDefinition(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()),
+                                new Position(9, 12)));
+
+        Assert.assertTrue("expected definition result after bootstrap", result.isPresent());
+        Assert.assertTrue("expected definition bootstrap to initialize completion index", completionIndexVersion(server) > 0);
+    }
+
+    @Test
+    public void referencesBootstrapInitialCompletionIndexWhenStillEmpty() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/GotoImplementation.java");
+
+        Assert.assertEquals("expected empty completion index before references bootstrap", 0L, completionIndexVersion(server));
+
+        var params = new ReferenceParams();
+        params.textDocument = new TextDocumentIdentifier(file.toUri());
+        params.position = new Position(8, 20);
+        var result = server.findReferences(params);
+
+        Assert.assertTrue("expected references result after bootstrap", result.isPresent());
+        Assert.assertTrue("expected references bootstrap to initialize completion index", completionIndexVersion(server) > 0);
     }
 
     @Test
@@ -2348,6 +2386,584 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void completionUsesPublishedSnapshotWhileIncrementalRefreshBuildsNextVersion() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+            var original = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = original;
+            server.didOpenTextDocument(open);
+            Assert.assertTrue(
+                    "expected completion index bootstrap before snapshot publication check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var before = completionIndexVersion(server);
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = file.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text =
+                    original.replace(
+                            "    public String testFields;\n",
+                            "    public String testFields;\n    public String refreshedField;\n");
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            var completion =
+                    server.completion(
+                            new TextDocumentPositionParams(
+                                    new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+            Assert.assertTrue("expected completion result during incremental refresh", completion.isPresent());
+            Assert.assertTrue(
+                    "completion should keep serving published members while refresh builds the next snapshot",
+                    completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
+            Assert.assertEquals(
+                    "completion should return before the refreshed snapshot is published",
+                    before,
+                    completionIndexVersion(server));
+
+            var completionFlow = capture.lastLineContaining("[perf] completion_flow file=AutocompleteMember.java");
+            Assert.assertNotNull("expected completion flow log for snapshot publication check", completionFlow);
+            Assert.assertTrue(
+                    "completion should log the currently published snapshot version",
+                    completionFlow.contains("index_version=" + before));
+            Assert.assertTrue(
+                    "completion flow metrics should stay isolated from compiler phases",
+                    completionFlow.contains("enter=0 analyze=0 ap=0"));
+
+            Assert.assertTrue(
+                    "expected incremental refresh to publish a newer snapshot after completion returns",
+                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+            var mergeLog = capture.lastLineContaining("[perf] completion_type_index_merge trigger=index:didChange");
+            Assert.assertNotNull("expected incremental index merge log", mergeLog);
+            Assert.assertTrue(
+                    "incremental refresh should log the published base snapshot version",
+                    mergeLog.contains("base_version=" + before));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void completionFlowMetricsStayZeroWhileDiagnosticsCompileRuns() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var completionFile = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var diagnosticsFile = FindResource.path("org/javacs/example/LargeFile.java");
+
+        var openCompletion = new DidOpenTextDocumentParams();
+        openCompletion.textDocument.uri = completionFile.toUri();
+        openCompletion.textDocument.version = 1;
+        openCompletion.textDocument.languageId = "java";
+        openCompletion.textDocument.text = FileStore.contents(completionFile);
+        server.didOpenTextDocument(openCompletion);
+
+        var diagnosticsOriginal = FileStore.contents(diagnosticsFile);
+        var openDiagnostics = new DidOpenTextDocumentParams();
+        openDiagnostics.textDocument.uri = diagnosticsFile.toUri();
+        openDiagnostics.textDocument.version = 1;
+        openDiagnostics.textDocument.languageId = "java";
+        openDiagnostics.textDocument.text = diagnosticsOriginal;
+        server.didOpenTextDocument(openDiagnostics);
+
+        Assert.assertTrue(
+                "expected initial completion index bootstrap before diagnostics isolation check",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = diagnosticsFile.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text =
+                    diagnosticsOriginal.replace(
+                            "        return version(\"release\");  // mm.nn.oo[-milestone]\n",
+                            "        return version(\"release\");  // mm.nn.oo[-milestone] diagnostics-only-change\n");
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Thread.sleep(300);
+            for (int i = 0; i < 3; i++) {
+                var completion =
+                        server.completion(
+                                new TextDocumentPositionParams(
+                                        new TextDocumentIdentifier(completionFile.toUri()),
+                                        new Position(4, 13)));
+                Assert.assertTrue("expected completion result while diagnostics compile runs", completion.isPresent());
+            }
+
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (capture.countContaining("[perf] diagnostics_compile trigger=async:didChange") == 0
+                    && System.nanoTime() < deadline) {
+                Thread.sleep(25);
+            }
+
+            Assert.assertTrue(
+                    "expected async didChange diagnostics compile during completion isolation check",
+                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange") > 0);
+            Assert.assertTrue(
+                    "expected completion flow logs during diagnostics isolation check",
+                    capture.countContaining("[perf] completion_flow file=AutocompleteMember.java") > 0);
+            Assert.assertEquals(
+                    "completion should never report non-zero enter counters",
+                    0,
+                    capture.countMatching(".*\\[perf\\] completion_flow .*enter=[1-9][0-9]*.*"));
+            Assert.assertEquals(
+                    "completion should never report non-zero analyze counters",
+                    0,
+                    capture.countMatching(".*\\[perf\\] completion_flow .*analyze=[1-9][0-9]*.*"));
+            Assert.assertEquals(
+                    "completion should never report non-zero annotation-processing counters",
+                    0,
+                    capture.countMatching(".*\\[perf\\] completion_flow .*ap=[1-9][0-9]*.*"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void gotoDefinitionPrefersWorkspaceTypeBeforeExternalBinaryLookup() throws Exception {
+        var workspace = Files.createTempDirectory("jls-workspace-first-definition");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Getter;\n"
+                            + "@Getter\n"
+                            + "@AllArgsConstructor\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST(\"asd\");\n"
+                            + "  private final String type;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.getType();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text = Files.readString(enumFile);
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before workspace-first definition check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var found =
+                    server.gotoDefinition(
+                            new TextDocumentPositionParams(
+                                    new TextDocumentIdentifier(serviceFile.toUri()),
+                                    new Position(4, 26)));
+
+            Assert.assertTrue("expected Lombok-backed definition result", found.isPresent());
+            Assert.assertFalse("expected at least one definition location", found.get().isEmpty());
+            Assert.assertEquals(
+                    "definition should resolve to workspace source instead of an external binary candidate",
+                    enumFile.toUri(),
+                    found.get().get(0).uri);
+            Assert.assertEquals(
+                    "definition on the Lombok accessor should resolve to the backing field line",
+                    7,
+                    found.get().get(0).range.start.line);
+            Assert.assertTrue(
+                    "expected explicit Lombok field-link log",
+                    capture.countContaining(
+                                    "[perf] definition_lombok_field_link owner=com.example.demo.models.MyEnum accessor=getType field=type")
+                            > 0);
+            Assert.assertEquals(
+                    "workspace definition should not speculate through the enclosing service type in the external-binary index",
+                    0,
+                    capture.countMatching(
+                            ".*\\[external-binary\\].*type=com\\.example\\.demo\\.service\\.ServiceTwo\\.MyEnum.*"));
+            Assert.assertEquals(
+                    "workspace definition should not hit external-binary for the workspace enum type",
+                    0,
+                    capture.countMatching(
+                            ".*\\[external-binary\\].*type=com\\.example\\.demo\\.models\\.MyEnum.*"));
+            Assert.assertEquals(
+                    "workspace definition should not leak workspace candidates into external lookup",
+                    0,
+                    capture.countContaining("[workspace-boundary] external_leak"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void referencesOnWorkspaceEnumDoNotProbeExternalBinary() throws Exception {
+        var workspace = Files.createTempDirectory("jls-workspace-first-references");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Getter;\n"
+                            + "@Getter\n"
+                            + "@AllArgsConstructor\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST(\"asd\");\n"
+                            + "  private final String type;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.getType();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text = Files.readString(enumFile);
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before workspace references check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var params = new ReferenceParams();
+            params.textDocument = new TextDocumentIdentifier(serviceFile.toUri());
+            params.position = new Position(4, 11);
+            var found = server.findReferences(params);
+
+            Assert.assertTrue("expected references result", found.isPresent());
+            Assert.assertFalse("expected at least one reference location", found.get().isEmpty());
+            Assert.assertEquals(
+                    "workspace references should not probe the enclosing service type in the external-binary index",
+                    0,
+                    capture.countMatching(
+                            ".*\\[external-binary\\].*type=com\\.example\\.demo\\.service\\.ServiceTwo\\.MyEnum.*"));
+            Assert.assertEquals(
+                    "workspace references should not hit external-binary for the workspace enum type: "
+                            + capture.linesMatching(".*\\[external-binary\\].*type=com\\.example\\.demo\\.models\\.MyEnum.*"),
+                    0,
+                    capture.countMatching(
+                            ".*\\[external-binary\\].*type=com\\.example\\.demo\\.models\\.MyEnum.*"));
+            Assert.assertEquals(
+                    "workspace references should not leak workspace candidates into external lookup: "
+                            + capture.linesMatching(".*\\[workspace-boundary\\] external_leak.*"),
+                    0,
+                    capture.countContaining("[workspace-boundary] external_leak"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void referencesOnWorkspaceEnumDeclarationDoNotLeakToExternalBinary() throws Exception {
+        var workspace = Files.createTempDirectory("jls-workspace-enum-declaration-references");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Getter;\n"
+                            + "@Getter\n"
+                            + "@AllArgsConstructor\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST(\"asd\");\n"
+                            + "  private final String type;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.getType();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text = Files.readString(enumFile);
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before enum declaration references check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var params = new ReferenceParams();
+            params.textDocument = new TextDocumentIdentifier(enumFile.toUri());
+            params.position = new Position(6, 2);
+            params.context = new org.javacs.lsp.ReferenceContext();
+            params.context.includeDeclaration = true;
+            var found = server.findReferences(params);
+
+            Assert.assertTrue("expected references result on enum declaration", found.isPresent());
+            Assert.assertFalse("expected at least one enum declaration reference", found.get().isEmpty());
+            Assert.assertEquals(
+                    "enum declaration references should not hit external-binary for the workspace enum type: "
+                            + capture.linesMatching(".*com\\.example\\.demo\\.models\\.MyEnum.*"),
+                    0,
+                    capture.countMatching(
+                            ".*\\[external-binary\\].*type=com\\.example\\.demo\\.models\\.MyEnum.*"));
+            Assert.assertEquals(
+                    "enum declaration references should not leak workspace enum ownership into external lookup: "
+                            + capture.linesMatching(".*\\[workspace-boundary\\] external_leak.*"),
+                    0,
+                    capture.countMatching(
+                            ".*\\[workspace-boundary\\] external_leak.*candidate=com\\.example\\.demo\\.models\\.MyEnum.*"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionOnWorkspaceOwnedReceiverDoesNotLeakToExternalBinary() throws Exception {
+        var workspace = Files.createTempDirectory("jls-workspace-owned-receiver-completion");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var models = workspace.resolve("src/com/example/demo/models");
+            var service = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(models);
+            Files.createDirectories(service);
+
+            var enumFile = models.resolve("MyEnum.java");
+            var serviceFile = service.resolve("ServiceTwo.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo.models;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Getter;\n"
+                            + "@Getter\n"
+                            + "@AllArgsConstructor\n"
+                            + "public enum MyEnum {\n"
+                            + "  FIRST(\"asd\");\n"
+                            + "  private final String type;\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.models.MyEnum;\n"
+                            + "class ServiceTwo {\n"
+                            + "  String test() {\n"
+                            + "    return MyEnum.FIRST.\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+
+            var enumOpen = new DidOpenTextDocumentParams();
+            enumOpen.textDocument.uri = enumFile.toUri();
+            enumOpen.textDocument.version = 1;
+            enumOpen.textDocument.languageId = "java";
+            enumOpen.textDocument.text = Files.readString(enumFile);
+            server.didOpenTextDocument(enumOpen);
+
+            var serviceOpen = new DidOpenTextDocumentParams();
+            serviceOpen.textDocument.uri = serviceFile.toUri();
+            serviceOpen.textDocument.version = 1;
+            serviceOpen.textDocument.languageId = "java";
+            serviceOpen.textDocument.text = Files.readString(serviceFile);
+            server.didOpenTextDocument(serviceOpen);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before workspace-owned receiver completion check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var completion =
+                    server.completion(
+                                    new TextDocumentPositionParams(
+                                            new TextDocumentIdentifier(serviceFile.toUri()),
+                                            new Position(4, 24)))
+                            .orElseThrow();
+
+            var labels =
+                    completion.items.stream()
+                            .map(item -> item.label)
+                            .collect(java.util.stream.Collectors.toSet());
+            Assert.assertTrue(
+                    "workspace-owned receiver completion should expose Lombok accessor members",
+                    labels.contains("getType"));
+            Assert.assertEquals(
+                    "workspace-owned receiver completion should not hit external-binary for the enclosing workspace owner: "
+                            + capture.linesMatching(".*ServiceTwo.*"),
+                    0,
+                    capture.countMatching(
+                            ".*\\[external-binary\\].*type=com\\.example\\.demo\\.service\\.ServiceTwo.*"));
+            Assert.assertEquals(
+                    "workspace-owned receiver completion should not leak workspace owner lookup into external lookup: "
+                            + capture.linesMatching(".*\\[workspace-boundary\\] external_leak.*"),
+                    0,
+                    capture.countMatching(
+                            ".*\\[workspace-boundary\\] external_leak.*candidate=com\\.example\\.demo\\.service\\.ServiceTwo.*"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void typeLookupBoundaryBlocksWorkspaceLeakAndStillResolvesExternalDependency() throws Exception {
+        var workspace = Files.createTempDirectory("jls-type-lookup-boundary");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var pkg = workspace.resolve("src/p");
+            Files.createDirectories(pkg);
+            var workspaceType = pkg.resolve("A.java");
+            var useFile = pkg.resolve("Use.java");
+            Files.writeString(workspaceType, "package p;\nclass A {}\n");
+            Files.writeString(
+                    useFile,
+                    "package p;\n"
+                            + "import java.util.ArrayList;\n"
+                            + "class Use {\n"
+                            + "  A local;\n"
+                            + "  ArrayList<String> values;\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
+            var boundary =
+                    new TypeLookupBoundary(
+                            server.compiler(),
+                            new CompositeTypeIndex(
+                                    org.javacs.completion.WorkspaceTypeIndex.EMPTY,
+                                    new ExternalBinaryTypeIndex(server.compiler())));
+            var parse = server.compiler().parse(useFile);
+
+            Assert.assertEquals(
+                    Optional.of("p.A"),
+                    boundary.resolveWorkspaceType("A", parse.root));
+            Assert.assertTrue(
+                    "workspace-owned candidates must not reach external lookup",
+                    boundary.findExternalSource("p.A", "unitTest").isEmpty());
+            Assert.assertTrue(
+                    "expected explicit workspace-boundary bug log for blocked external workspace lookup",
+                    capture.countContaining("[workspace-boundary] external_leak candidate=p.A reason=unitTest") > 0);
+            Assert.assertEquals(
+                    Optional.of("java.util.ArrayList"),
+                    boundary.resolveTypeName("ArrayList", parse.root));
+            Assert.assertEquals(
+                    "dependency/JDK lookup should not be reported as workspace leakage",
+                    0,
+                    capture.countContaining("[workspace-boundary] external_leak candidate=java.util.ArrayList"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void compileAndPublishSerializesConcurrentDiagnosticsCompiles() throws Exception {
         var workspace = Files.createTempDirectory("jls-compile-lock");
         var a = workspace.resolve("A.java");
@@ -3383,6 +3999,20 @@ public class JavaLanguageServerTest {
                 }
             }
             return count;
+        }
+
+        List<String> linesMatching(String pattern) {
+            var result = new java.util.ArrayList<String>();
+            for (var line : lines) {
+                if (line != null && line.matches(pattern)) {
+                    result.add(line);
+                }
+            }
+            return result;
+        }
+
+        void clear() {
+            lines.clear();
         }
     }
 

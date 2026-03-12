@@ -23,8 +23,8 @@ import org.javacs.FindNameAt;
 import org.javacs.JsonHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
+import org.javacs.TypeLookupBoundary;
 import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.MarkupContent;
@@ -36,6 +36,7 @@ public class HoverProvider {
 
     final CompilerProvider compiler;
     final CompositeTypeIndex completionIndex;
+    final TypeLookupBoundary typeLookup;
 
     public HoverProvider(CompilerProvider compiler) {
         this(compiler, CompositeTypeIndex.EMPTY);
@@ -44,6 +45,7 @@ public class HoverProvider {
     public HoverProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex) {
         this.compiler = compiler;
         this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
+        this.typeLookup = new TypeLookupBoundary(compiler, this.completionIndex);
     }
 
     public MarkupContent hover(Path file, int line, int column) {
@@ -302,62 +304,7 @@ public class HoverProvider {
     }
 
     private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
-        if (typeName == null || typeName.isBlank()) {
-            return Optional.empty();
-        }
-        var indexed = completionIndex.resolveTypeName(typeName, parse.root);
-        if (indexed.isPresent()) {
-            return indexed;
-        }
-        var raw = typeName.trim();
-        while (raw.endsWith("[]")) {
-            raw = raw.substring(0, raw.length() - 2);
-        }
-        var genericStart = raw.indexOf('<');
-        if (genericStart >= 0) {
-            raw = raw.substring(0, genericStart);
-        }
-        if (raw.startsWith("? extends ")) {
-            raw = raw.substring("? extends ".length()).trim();
-        } else if (raw.startsWith("? super ")) {
-            raw = raw.substring("? super ".length()).trim();
-        } else if ("?".equals(raw)) {
-            return Optional.empty();
-        }
-        if (raw.isBlank()) {
-            return Optional.empty();
-        }
-        if (TypeMemberIndex.isPrimitiveTypeName(raw)) {
-            return Optional.of(raw);
-        }
-        if (raw.contains(".") && compiler.findAnywhere(raw).isPresent()) {
-            return Optional.of(raw);
-        }
-        var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            var candidate = packageName + "." + raw;
-            if (compiler.findAnywhere(candidate).isPresent()) {
-                return Optional.of(candidate);
-            }
-        }
-        for (var importTree : parse.root.getImports()) {
-            if (importTree.isStatic()) continue;
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + raw) && compiler.findAnywhere(imported).isPresent()) {
-                return Optional.of(imported);
-            }
-            if (imported.endsWith(".*")) {
-                var candidate = imported.substring(0, imported.length() - 1) + raw;
-                if (compiler.findAnywhere(candidate).isPresent()) {
-                    return Optional.of(candidate);
-                }
-            }
-        }
-        var javaLang = "java.lang." + raw;
-        if (compiler.findAnywhere(javaLang).isPresent()) {
-            return Optional.of(javaLang);
-        }
-        return Optional.empty();
+        return typeLookup.resolveTypeName(typeName, parse.root);
     }
 
     private String joinModifiers(List<String> modifiers) {

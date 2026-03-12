@@ -44,6 +44,15 @@ public final class WorkspaceTypeIndex {
         return delegate.member(qualifiedName, name, staticContext);
     }
 
+    public Optional<TypeMemberIndex.Member> member(
+            String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
+        return delegate.member(qualifiedName, name, staticContext, erasedParameterTypes);
+    }
+
+    public Optional<TypeMemberIndex.Member> memberByCanonicalKey(String canonicalKey) {
+        return delegate.memberByCanonicalKey(canonicalKey);
+    }
+
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
         return delegate.resolveTypeName(typeName, root);
     }
@@ -54,6 +63,18 @@ public final class WorkspaceTypeIndex {
 
     public Optional<TypeMemberIndex.TypeInfo> typeInfo(String qualifiedName) {
         return Optional.ofNullable(delegate.types().get(qualifiedName));
+    }
+
+    public Set<String> subtypes(String qualifiedName) {
+        return delegate.subtypes(qualifiedName);
+    }
+
+    public Set<String> directSupertypes(String qualifiedName) {
+        return delegate.directSupertypes(qualifiedName);
+    }
+
+    public Set<String> relatedMethodKeys(String ownerType, String memberName, String[] erasedParameterTypes) {
+        return delegate.relatedMethodKeys(ownerType, memberName, erasedParameterTypes);
     }
 
     public WorkspaceTypeIndex replaceWorkspaceDeclarations(WorkspaceTypeIndex updates, Set<Path> replacedFiles) {

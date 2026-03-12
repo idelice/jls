@@ -105,7 +105,9 @@ public class CompileBatch implements AutoCloseable {
                 var analyzeStarted = System.nanoTime();
                 borrow.task.analyze();
                 analyzeNanos = System.nanoTime() - analyzeStarted;
-                ANALYZE_INVOCATIONS.incrementAndGet();
+                if (analysisMode == AnalysisMode.FULL) {
+                    ANALYZE_INVOCATIONS.incrementAndGet();
+                }
             } else {
                 var enterStarted = System.nanoTime();
                 invokeEnter(borrow.task);
@@ -116,7 +118,9 @@ public class CompileBatch implements AutoCloseable {
                 var analyzeStarted = System.nanoTime();
                 borrow.task.analyze();
                 analyzeNanos = System.nanoTime() - analyzeStarted;
-                ANALYZE_INVOCATIONS.incrementAndGet();
+                if (analysisMode == AnalysisMode.FULL) {
+                    ANALYZE_INVOCATIONS.incrementAndGet();
+                }
             }
         } catch (IOException e) {
             try {
@@ -146,9 +150,6 @@ public class CompileBatch implements AutoCloseable {
             throw new RuntimeException("Compilation failed: " + e.getMessage(), e);
         } finally {
             if (analysisMode == AnalysisMode.FULL) {
-                FULL_BATCHES.incrementAndGet();
-            } else {
-                // ATTR mode
                 FULL_BATCHES.incrementAndGet();
             }
             if (allowAP) {

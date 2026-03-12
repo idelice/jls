@@ -27,6 +27,7 @@ import java.util.Collections;
 import java.util.Optional;
 import org.javacs.CompilerProvider;
 import org.javacs.ParseTask;
+import org.javacs.TypeLookupBoundary;
 import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 
@@ -49,6 +50,7 @@ final class ParseTypeResolver {
     private final SourcePositions positions;
     private final CompilerProvider compiler;
     private final CompositeTypeIndex index;
+    private final TypeLookupBoundary typeLookup;
     private final long cursor;
     private TypeResolution thisType;
     private TypeResolution superType;
@@ -58,6 +60,7 @@ final class ParseTypeResolver {
         this.positions = Trees.instance(parseTask.task).getSourcePositions();
         this.compiler = compiler;
         this.index = index == null ? CompositeTypeIndex.EMPTY : index;
+        this.typeLookup = new TypeLookupBoundary(compiler, this.index);
         this.cursor = cursor;
     }
 
@@ -201,7 +204,7 @@ final class ParseTypeResolver {
         if (select instanceof IdentifierTree identifier) {
             var current = resolveThisType();
             if (current.isEmpty()) return Optional.empty();
-            var method = index.member(current.get().qualifiedType, identifier.getName().toString(), false);
+            var method = resolveMember(current.get().qualifiedType, identifier.getName().toString(), false);
             if (method.isEmpty()) return Optional.empty();
             return returnTypeOf(method.get());
         }
@@ -209,7 +212,7 @@ final class ParseTypeResolver {
             var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
             if (receiver.isEmpty()) return Optional.empty();
             var method =
-                    index.member(
+                    resolveMember(
                             receiver.get().qualifiedType,
                             memberSelectTree.getIdentifier().toString(),
                             receiver.get().staticContext);
@@ -232,7 +235,7 @@ final class ParseTypeResolver {
             return Optional.of(new TypeResolution("java.lang.Class", false, false));
         }
         var member =
-                index.member(
+                resolveMember(
                         receiver.get().qualifiedType,
                         memberSelectTree.getIdentifier().toString(),
                         receiver.get().staticContext);
@@ -261,13 +264,9 @@ final class ParseTypeResolver {
         if (nested.isPresent()) {
             return Optional.of(new TypeResolution(nested.get(), true, false));
         }
-        var type = index.resolveTypeName(identifier, root);
+        var type = typeLookup.resolveTypeName(identifier, root);
         if (type.isPresent()) {
             return Optional.of(new TypeResolution(type.get(), true, false));
-        }
-        var fallback = resolveTypeNameFallback(identifier);
-        if (fallback.isPresent()) {
-            return Optional.of(new TypeResolution(fallback.get(), true, false));
         }
         return Optional.empty();
     }
@@ -356,11 +355,22 @@ final class ParseTypeResolver {
         if (owner.isEmpty()) {
             return Optional.empty();
         }
-        var member = index.member(owner.get().qualifiedType, identifier, false);
+        var member = resolveMember(owner.get().qualifiedType, identifier, false);
         if (member.isEmpty() || member.get().kind != org.javacs.lsp.CompletionItemKind.Field) {
             return Optional.empty();
         }
         return member;
+    }
+
+    private Optional<TypeMemberIndex.Member> resolveMember(String ownerType, String name, boolean staticContext) {
+        var workspaceMember = index.workspace().member(ownerType, name, staticContext);
+        if (workspaceMember.isPresent()) {
+            return workspaceMember;
+        }
+        if (index.isWorkspaceOwnedType(ownerType, compiler)) {
+            return Optional.empty();
+        }
+        return index.external().member(ownerType, name, staticContext);
     }
 
     private Optional<TypeResolution> resolveVariableType(VariableTree variableTree, int depth) {
@@ -435,16 +445,44 @@ final class ParseTypeResolver {
     }
 
     private Optional<String> resolveTypeName(String typeName) {
-        var indexed = index.resolveTypeName(typeName, root);
-        if (indexed.isPresent()) {
-            return indexed;
+        var workspace = typeLookup.resolveWorkspaceType(typeName, root);
+        if (workspace.isPresent()) {
+            return workspace;
         }
-        return resolveTypeNameFallback(typeName);
+        var nested = resolveNestedTypeFallback(nestedLookupName(typeName));
+        if (nested.isPresent()) {
+            return nested;
+        }
+        return typeLookup.resolveExternalDependencyType(typeName, root);
     }
 
     private Optional<String> resolveTypeNameFallback(String typeName) {
+        return typeLookup.resolveExternalDependencyType(typeName, root);
+    }
+
+    private Optional<String> resolveNestedTypeFallback(String simpleName) {
+        for (var classPath = enclosingClassPath();
+                classPath != null;
+                classPath = parentClassPath(classPath.getParentPath())) {
+            var owner = qualifiedClassName(classPath);
+            var candidate = typeLookup.resolveWorkspaceNestedType(owner, simpleName);
+            if (candidate.isPresent()) {
+                return candidate;
+            }
+            var nestedCandidate = owner + "." + simpleName;
+            var classTree = (ClassTree) classPath.getLeaf();
+            for (var member : classTree.getMembers()) {
+                if (!(member instanceof ClassTree nested)) continue;
+                if (!nested.getSimpleName().contentEquals(simpleName)) continue;
+                return Optional.of(nestedCandidate);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private String nestedLookupName(String typeName) {
         if (typeName == null || typeName.isBlank()) {
-            return Optional.empty();
+            return "";
         }
         var raw = typeName.trim();
         while (raw.endsWith("[]")) {
@@ -459,72 +497,10 @@ final class ParseTypeResolver {
         } else if (raw.startsWith("? super ")) {
             raw = raw.substring("? super ".length()).trim();
         } else if ("?".equals(raw)) {
-            return Optional.empty();
+            return "";
         }
-        if (raw.isBlank()) {
-            return Optional.empty();
-        }
-        if (TypeMemberIndex.isPrimitiveTypeName(raw)) {
-            return Optional.of(raw);
-        }
-        if (raw.contains(".")) {
-            if (compiler.findAnywhere(raw).isPresent()) {
-                return Optional.of(raw);
-            }
-        }
-        var nested = resolveNestedTypeFallback(raw);
-        if (nested.isPresent()) {
-            return nested;
-        }
-
-        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            var candidate = packageName + "." + raw;
-            if (compiler.findAnywhere(candidate).isPresent()) {
-                return Optional.of(candidate);
-            }
-        }
-
-        for (var importTree : root.getImports()) {
-            if (importTree.isStatic()) continue;
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + raw)) {
-                if (compiler.findAnywhere(imported).isPresent()) {
-                    return Optional.of(imported);
-                }
-            }
-            if (imported.endsWith(".*")) {
-                var candidate = imported.substring(0, imported.length() - 1) + raw;
-                if (compiler.findAnywhere(candidate).isPresent()) {
-                    return Optional.of(candidate);
-                }
-            }
-        }
-
-        var javaLang = "java.lang." + raw;
-        if (compiler.findAnywhere(javaLang).isPresent()) {
-            return Optional.of(javaLang);
-        }
-        return Optional.empty();
-    }
-
-    private Optional<String> resolveNestedTypeFallback(String simpleName) {
-        for (var classPath = enclosingClassPath();
-                classPath != null;
-                classPath = parentClassPath(classPath.getParentPath())) {
-            var owner = qualifiedClassName(classPath);
-            var candidate = owner + "." + simpleName;
-            if (index.containsType(candidate) || compiler.findAnywhere(candidate).isPresent()) {
-                return Optional.of(candidate);
-            }
-            var classTree = (ClassTree) classPath.getLeaf();
-            for (var member : classTree.getMembers()) {
-                if (!(member instanceof ClassTree nested)) continue;
-                if (!nested.getSimpleName().contentEquals(simpleName)) continue;
-                return Optional.of(candidate);
-            }
-        }
-        return Optional.empty();
+        raw = raw.replace('$', '.').trim();
+        return raw.contains(".") ? "" : raw;
     }
 
     private Optional<TypeResolution> literalType(LiteralTree literal) {

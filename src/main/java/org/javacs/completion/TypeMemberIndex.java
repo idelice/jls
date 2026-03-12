@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
@@ -47,7 +48,7 @@ import org.javacs.lsp.CompletionItemKind;
 
 public class TypeMemberIndex {
     public static final TypeMemberIndex EMPTY =
-            new TypeMemberIndex(Map.of(), Map.of());
+            new TypeMemberIndex(Map.of(), Map.of(), Map.of(), Map.of());
     private static final Set<String> PRIMITIVE_TYPE_NAMES =
             Set.of("boolean", "byte", "short", "int", "long", "float", "double", "char", "void");
     private static final Set<String> LOMBOK_ACCESSOR_ANNOTATIONS =
@@ -63,6 +64,10 @@ public class TypeMemberIndex {
         public final String returnType;
         public final String[] parameterNames;
         public final String[] erasedParameterTypes;
+        public final String canonicalKey;
+        public final String logicalKey;
+        public final String backingFieldName;
+        public final boolean synthetic;
 
         Member(
                 String ownerType,
@@ -74,7 +79,11 @@ public class TypeMemberIndex {
                 String detail,
                 String returnType,
                 String[] parameterNames,
-                String[] erasedParameterTypes) {
+                String[] erasedParameterTypes,
+                String canonicalKey,
+                String logicalKey,
+                String backingFieldName,
+                boolean synthetic) {
             this.ownerType = ownerType;
             this.name = name;
             this.kind = kind;
@@ -85,6 +94,10 @@ public class TypeMemberIndex {
             this.returnType = returnType;
             this.parameterNames = parameterNames;
             this.erasedParameterTypes = erasedParameterTypes;
+            this.canonicalKey = canonicalKey;
+            this.logicalKey = logicalKey;
+            this.backingFieldName = backingFieldName;
+            this.synthetic = synthetic;
         }
     }
 
@@ -94,26 +107,38 @@ public class TypeMemberIndex {
         public final List<Member> members;
         public final boolean fromCompiledRoot;
         public final Path sourcePath;
+        public final String superclass;
+        public final List<String> interfaces;
 
         TypeInfo(
                 String qualifiedName,
                 String simpleName,
                 List<Member> members,
                 boolean fromCompiledRoot,
-                Path sourcePath) {
+                Path sourcePath,
+                String superclass,
+                List<String> interfaces) {
             this.qualifiedName = qualifiedName;
             this.simpleName = simpleName;
             this.members = Collections.unmodifiableList(new ArrayList<>(members));
             this.fromCompiledRoot = fromCompiledRoot;
             this.sourcePath = sourcePath;
+            this.superclass = superclass;
+            this.interfaces = Collections.unmodifiableList(new ArrayList<>(interfaces));
         }
     }
 
     private final Map<String, TypeInfo> typesByQualifiedName;
     private final Map<Path, Set<String>> workspaceTypesByFile;
+    private final Map<String, Set<String>> workspaceSupertypesByType;
+    private final Map<String, Set<String>> subtypesByType;
     private static final Logger LOG = Logger.getLogger("main");
 
-    private TypeMemberIndex(Map<String, TypeInfo> typesByQualifiedName, Map<Path, Set<String>> workspaceTypesByFile) {
+    private TypeMemberIndex(
+            Map<String, TypeInfo> typesByQualifiedName,
+            Map<Path, Set<String>> workspaceTypesByFile,
+            Map<String, Set<String>> workspaceSupertypesByType,
+            Map<String, Set<String>> subtypesByType) {
         var verified = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
         for (var entry : typesByQualifiedName.entrySet()) {
             var key = entry.getKey();
@@ -132,6 +157,16 @@ public class TypeMemberIndex {
                     Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(entry.getValue())));
         }
         this.workspaceTypesByFile = Collections.unmodifiableMap(verifiedWorkspaceTypes);
+        this.workspaceSupertypesByType = immutableSetMap(workspaceSupertypesByType);
+        this.subtypesByType = immutableSetMap(subtypesByType);
+    }
+
+    private static Map<String, Set<String>> immutableSetMap(Map<String, Set<String>> source) {
+        var copy = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+        for (var entry : source.entrySet()) {
+            copy.put(entry.getKey(), Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(entry.getValue())));
+        }
+        return Collections.unmodifiableMap(copy);
     }
 
     public Map<String, TypeInfo> types() {
@@ -142,6 +177,45 @@ public class TypeMemberIndex {
         return typesByQualifiedName.size();
     }
 
+    public TypeMemberIndex filterTypes(Predicate<TypeInfo> keep) {
+        var nextTypes = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
+        for (var entry : typesByQualifiedName.entrySet()) {
+            if (keep.test(entry.getValue())) {
+                nextTypes.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        var nextWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
+        for (var entry : workspaceTypesByFile.entrySet()) {
+            var kept = new ObjectLinkedOpenHashSet<String>();
+            for (var qualifiedName : entry.getValue()) {
+                if (nextTypes.containsKey(qualifiedName)) {
+                    kept.add(qualifiedName);
+                }
+            }
+            if (!kept.isEmpty()) {
+                nextWorkspaceTypes.put(entry.getKey(), kept);
+            }
+        }
+
+        var nextWorkspaceSupertypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+        for (var entry : workspaceSupertypesByType.entrySet()) {
+            if (!nextTypes.containsKey(entry.getKey())) {
+                continue;
+            }
+            var kept = new ObjectLinkedOpenHashSet<String>();
+            for (var superType : entry.getValue()) {
+                if (nextTypes.containsKey(superType)) {
+                    kept.add(superType);
+                }
+            }
+            nextWorkspaceSupertypes.put(entry.getKey(), kept);
+        }
+
+        var nextSubtypes = invertSubtypeMap(nextWorkspaceSupertypes);
+        return new TypeMemberIndex(nextTypes, nextWorkspaceTypes, nextWorkspaceSupertypes, nextSubtypes);
+    }
+
     public TypeMemberIndex replaceWorkspaceDeclarations(TypeMemberIndex updates, Set<Path> replacedFiles) {
         if ((updates == null || updates.workspaceTypesByFile.isEmpty()) && (replacedFiles == null || replacedFiles.isEmpty())) {
             return this;
@@ -150,6 +224,14 @@ public class TypeMemberIndex {
         var nextWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
         for (var entry : workspaceTypesByFile.entrySet()) {
             nextWorkspaceTypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
+        }
+        var nextWorkspaceSupertypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+        for (var entry : workspaceSupertypesByType.entrySet()) {
+            nextWorkspaceSupertypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
+        }
+        var nextSubtypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+        for (var entry : subtypesByType.entrySet()) {
+            nextSubtypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
         }
 
         var filesToReplace = new ObjectLinkedOpenHashSet<Path>();
@@ -166,6 +248,7 @@ public class TypeMemberIndex {
                 continue;
             }
             for (var qualifiedName : previousTypes) {
+                removeWorkspaceHierarchy(qualifiedName, nextWorkspaceSupertypes, nextSubtypes);
                 var existing = nextTypes.get(qualifiedName);
                 if (existing != null && file.equals(existing.sourcePath)) {
                     nextTypes.remove(qualifiedName);
@@ -183,11 +266,38 @@ public class TypeMemberIndex {
                     if (typeInfo != null) {
                         nextTypes.put(qualifiedName, typeInfo);
                     }
+                    var supertypes =
+                            new ObjectLinkedOpenHashSet<>(
+                                    updates.workspaceSupertypesByType.getOrDefault(qualifiedName, Set.of()));
+                    nextWorkspaceSupertypes.put(qualifiedName, supertypes);
+                    for (var superType : supertypes) {
+                        nextSubtypes
+                                .computeIfAbsent(superType, __ -> new ObjectLinkedOpenHashSet<>())
+                                .add(qualifiedName);
+                    }
                 }
             }
         }
 
-        return new TypeMemberIndex(nextTypes, nextWorkspaceTypes);
+        return new TypeMemberIndex(nextTypes, nextWorkspaceTypes, nextWorkspaceSupertypes, nextSubtypes);
+    }
+
+    private void removeWorkspaceHierarchy(
+            String qualifiedName, Map<String, Set<String>> supertypesByType, Map<String, Set<String>> subtypesByType) {
+        var previousSupertypes = supertypesByType.remove(qualifiedName);
+        if (previousSupertypes == null) {
+            return;
+        }
+        for (var superType : previousSupertypes) {
+            var subtypes = subtypesByType.get(superType);
+            if (subtypes == null) {
+                continue;
+            }
+            subtypes.remove(qualifiedName);
+            if (subtypes.isEmpty()) {
+                subtypesByType.remove(superType);
+            }
+        }
     }
 
     public List<Member> members(String qualifiedName, boolean staticContext) {
@@ -196,12 +306,9 @@ public class TypeMemberIndex {
             return List.of();
         }
         var list = new ArrayList<Member>();
-        for (var member : type.members) {
-            if (staticContext != member.isStatic) {
-                continue;
-            }
-            list.add(member);
-        }
+        var seen = new ObjectLinkedOpenHashSet<String>();
+        addDirectMembers(type, staticContext, list, seen);
+        addInheritedSyntheticMembers(qualifiedName, staticContext, list, seen);
         return list;
     }
 
@@ -210,6 +317,135 @@ public class TypeMemberIndex {
         if (type == null) {
             return Optional.empty();
         }
+        var direct = directMember(type, name, staticContext);
+        if (direct.isPresent()) {
+            return direct;
+        }
+        return inheritedSyntheticMember(qualifiedName, name, staticContext, null);
+    }
+
+    public Optional<Member> member(String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
+        var type = typesByQualifiedName.get(qualifiedName);
+        if (type == null) {
+            return Optional.empty();
+        }
+        var targetKey = canonicalMemberKey(qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
+        var direct = directMethodMember(type, staticContext, targetKey);
+        if (direct.isPresent()) {
+            return direct;
+        }
+        return inheritedSyntheticMember(qualifiedName, name, staticContext, targetKey);
+    }
+
+    public Optional<Member> memberByCanonicalKey(String canonicalKey) {
+        if (canonicalKey == null || canonicalKey.isBlank()) {
+            return Optional.empty();
+        }
+        var split = canonicalKey.indexOf('#');
+        if (split <= 0) {
+            return Optional.empty();
+        }
+        var ownerType = canonicalKey.substring(0, split);
+        var type = typesByQualifiedName.get(ownerType);
+        if (type == null) {
+            return Optional.empty();
+        }
+        for (var member : type.members) {
+            if (Objects.equals(member.canonicalKey, canonicalKey)) {
+                return Optional.of(member);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public Set<String> subtypes(String qualifiedName) {
+        var subtypes = subtypesByType.get(qualifiedName);
+        if (subtypes == null) {
+            return Set.of();
+        }
+        return subtypes;
+    }
+
+    public Set<String> directSupertypes(String qualifiedName) {
+        var type = typesByQualifiedName.get(qualifiedName);
+        if (type == null) {
+            return Set.of();
+        }
+        var result = new ObjectLinkedOpenHashSet<String>();
+        if (type.superclass != null && !type.superclass.isBlank()) {
+            result.add(type.superclass);
+        }
+        result.addAll(type.interfaces);
+        return result;
+    }
+
+    public Set<String> relatedMethodKeys(String ownerType, String methodName, String[] erasedParameterTypes) {
+        var parameterTypes = erasedParameterTypes == null ? new String[0] : erasedParameterTypes;
+        var keys = new ObjectLinkedOpenHashSet<String>();
+        var visitedTypes = new ObjectLinkedOpenHashSet<String>();
+        var pending = new java.util.ArrayDeque<String>();
+        pending.add(ownerType);
+        while (!pending.isEmpty()) {
+            var current = pending.removeFirst();
+            if (!visitedTypes.add(current)) {
+                continue;
+            }
+            member(current, methodName, false, parameterTypes).ifPresent(member -> keys.add(member.canonicalKey));
+            member(current, methodName, true, parameterTypes).ifPresent(member -> keys.add(member.canonicalKey));
+            for (var superType : directSupertypes(current)) {
+                if (!superType.isBlank()) {
+                    pending.addLast(superType);
+                }
+            }
+            for (var subtype : subtypes(current)) {
+                pending.addLast(subtype);
+            }
+        }
+        return keys;
+    }
+
+    private void addDirectMembers(
+            TypeInfo type, boolean staticContext, List<Member> members, Set<String> seenStorageKeys) {
+        for (var member : type.members) {
+            if (staticContext != member.isStatic) {
+                continue;
+            }
+            var storageKey = memberStorageKey(member);
+            if (!seenStorageKeys.add(storageKey)) {
+                continue;
+            }
+            members.add(member);
+        }
+    }
+
+    private void addInheritedSyntheticMembers(
+            String qualifiedName, boolean staticContext, List<Member> members, Set<String> seenStorageKeys) {
+        var visited = new ObjectLinkedOpenHashSet<String>();
+        var pending = new java.util.ArrayDeque<String>(directSupertypes(qualifiedName));
+        while (!pending.isEmpty()) {
+            var superType = pending.removeFirst();
+            if (!visited.add(superType)) {
+                continue;
+            }
+            var type = typesByQualifiedName.get(superType);
+            if (type == null) {
+                continue;
+            }
+            for (var member : type.members) {
+                if (!member.synthetic || staticContext != member.isStatic) {
+                    continue;
+                }
+                var storageKey = memberStorageKey(member);
+                if (!seenStorageKeys.add(storageKey)) {
+                    continue;
+                }
+                members.add(member);
+            }
+            pending.addAll(directSupertypes(superType));
+        }
+    }
+
+    private Optional<Member> directMember(TypeInfo type, String name, boolean staticContext) {
         for (var member : type.members) {
             if (staticContext != member.isStatic) {
                 continue;
@@ -220,6 +456,64 @@ public class TypeMemberIndex {
             return Optional.of(member);
         }
         return Optional.empty();
+    }
+
+    private Optional<Member> directMethodMember(TypeInfo type, boolean staticContext, String targetKey) {
+        for (var member : type.members) {
+            if (staticContext != member.isStatic) {
+                continue;
+            }
+            if (member.kind != CompletionItemKind.Method) {
+                continue;
+            }
+            if (Objects.equals(targetKey, member.canonicalKey)) {
+                return Optional.of(member);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private Optional<Member> inheritedSyntheticMember(
+            String qualifiedName, String name, boolean staticContext, String targetKey) {
+        var visited = new ObjectLinkedOpenHashSet<String>();
+        var pending = new java.util.ArrayDeque<String>(directSupertypes(qualifiedName));
+        while (!pending.isEmpty()) {
+            var superType = pending.removeFirst();
+            if (!visited.add(superType)) {
+                continue;
+            }
+            var type = typesByQualifiedName.get(superType);
+            if (type == null) {
+                continue;
+            }
+            for (var member : type.members) {
+                if (!member.synthetic || staticContext != member.isStatic) {
+                    continue;
+                }
+                if (targetKey != null) {
+                    if (member.kind != CompletionItemKind.Method) {
+                        continue;
+                    }
+                    if (Objects.equals(targetKey, member.canonicalKey)) {
+                        return Optional.of(member);
+                    }
+                    continue;
+                }
+                if (Objects.equals(name, member.name)) {
+                    return Optional.of(member);
+                }
+            }
+            pending.addAll(directSupertypes(superType));
+        }
+        return Optional.empty();
+    }
+
+    public static String canonicalMemberKey(String ownerType, int kind, String name, String[] erasedParameterTypes) {
+        if (kind == CompletionItemKind.Method || kind == CompletionItemKind.Constructor) {
+            var params = erasedParameterTypes == null ? new String[0] : erasedParameterTypes;
+            return ownerType + "#" + name + "(" + String.join(",", params) + ")";
+        }
+        return ownerType + "#" + name;
     }
 
     public static List<String> staticImportOwnerTypes(String memberName, CompilationUnitTree root) {
@@ -430,6 +724,7 @@ public class TypeMemberIndex {
         }
 
         var typeEntries = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
+        var workspaceSupertypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
         for (var collected : collectedTypes.values()) {
             var qualifiedName = collected.getQualifiedName().toString();
             if (!isValidIndexKey(qualifiedName)) {
@@ -493,8 +788,12 @@ public class TypeMemberIndex {
                                 detail,
                                 returnType,
                                 parameterNames,
-                                erasedParameterTypes);
-                var key = next.kind + ":" + next.name + ":" + String.join(",", next.erasedParameterTypes == null ? new String[0] : next.erasedParameterTypes);
+                                erasedParameterTypes,
+                                canonicalMemberKey(ownerName, kind, member.getSimpleName().toString(), erasedParameterTypes),
+                                canonicalMemberKey(ownerName, kind, member.getSimpleName().toString(), erasedParameterTypes),
+                                null,
+                                false);
+                var key = memberStorageKey(next);
                 var existing = seen.get(key);
                 if (existing == null || next.priority < existing.priority) {
                     seen.put(key, next);
@@ -512,20 +811,33 @@ public class TypeMemberIndex {
 
             var sourcePath = rootDeclaredTypeSources.get(qualifiedName);
             var fromCompiledRoot = sourcePath != null;
+            var superclass = directSuperclass(type);
+            var interfaces = directInterfaces(type);
             var typeEntry =
                     new TypeInfo(
                             qualifiedName,
                             type.getSimpleName().toString(),
                             Collections.unmodifiableList(members),
                             fromCompiledRoot,
-                            sourcePath);
+                            sourcePath,
+                            superclass,
+                            interfaces);
             typeEntries.put(qualifiedName, typeEntry);
+            if (sourcePath != null) {
+                var supertypes = new ObjectLinkedOpenHashSet<String>();
+                if (superclass != null && !superclass.isBlank()) {
+                    supertypes.add(superclass);
+                }
+                supertypes.addAll(interfaces);
+                workspaceSupertypes.put(qualifiedName, supertypes);
+            }
         }
 
         var workspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
         for (var entry : rootDeclaredTypeSources.entrySet()) {
             workspaceTypes.computeIfAbsent(entry.getValue(), __ -> new ObjectLinkedOpenHashSet<>()).add(entry.getKey());
         }
+        var subtypes = invertSubtypeMap(workspaceSupertypes);
 
         if (!skippedInvalidTypeKeys.isEmpty()) {
             LOG.fine(
@@ -533,7 +845,40 @@ public class TypeMemberIndex {
                             "[completion] skipped non-fqn types while building index: %s",
                             skippedInvalidTypeKeys));
         }
-        return new TypeMemberIndex(Collections.unmodifiableMap(typeEntries), Collections.unmodifiableMap(workspaceTypes));
+        return new TypeMemberIndex(
+                Collections.unmodifiableMap(typeEntries),
+                Collections.unmodifiableMap(workspaceTypes),
+                Collections.unmodifiableMap(workspaceSupertypes),
+                Collections.unmodifiableMap(subtypes));
+    }
+
+    private static Map<String, Set<String>> invertSubtypeMap(Map<String, Set<String>> workspaceSupertypes) {
+        var subtypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+        for (var entry : workspaceSupertypes.entrySet()) {
+            for (var superType : entry.getValue()) {
+                subtypes.computeIfAbsent(superType, __ -> new ObjectLinkedOpenHashSet<>()).add(entry.getKey());
+            }
+        }
+        return subtypes;
+    }
+
+    private static String directSuperclass(TypeElement type) {
+        var mirror = type.getSuperclass();
+        if (mirror == null || mirror.getKind() == javax.lang.model.type.TypeKind.NONE) {
+            return null;
+        }
+        return typeName(mirror);
+    }
+
+    private static List<String> directInterfaces(TypeElement type) {
+        var result = new ArrayList<String>();
+        for (var iface : type.getInterfaces()) {
+            var resolved = typeName(iface);
+            if (resolved != null && !resolved.isBlank()) {
+                result.add(resolved);
+            }
+        }
+        return Collections.unmodifiableList(result);
     }
 
     private static Integer memberKind(Element member) {
@@ -689,6 +1034,7 @@ public class TypeMemberIndex {
             var booleanField = "boolean".equals(fieldType) || "java.lang.Boolean".equals(fieldType);
             if (getterEnabled) {
                 var getterName = (booleanField ? "is" : "get") + suffix;
+                var fieldKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
                 putSyntheticMethod(
                         seen,
                         new Member(
@@ -701,10 +1047,16 @@ public class TypeMemberIndex {
                                 fieldType + " " + getterName + "()",
                                 fieldType,
                                 new String[0],
-                                new String[0]));
+                                new String[0],
+                                canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Method, getterName, new String[0]),
+                                fieldKey,
+                                fieldName,
+                                true));
             }
             if (setterEnabled) {
                 var setterName = "set" + suffix;
+                var erasedParameterTypes = new String[] {normalizeTypeName(fieldType)};
+                var fieldKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
                 putSyntheticMethod(
                         seen,
                         new Member(
@@ -717,7 +1069,15 @@ public class TypeMemberIndex {
                                 "void " + setterName + "(" + fieldType + " " + fieldName + ")",
                                 "void",
                                 new String[] {fieldName},
-                                new String[] {normalizeTypeName(fieldType)}));
+                                erasedParameterTypes,
+                                canonicalMemberKey(
+                                        ownerQualifiedName,
+                                        CompletionItemKind.Method,
+                                        setterName,
+                                        erasedParameterTypes),
+                                fieldKey,
+                                fieldName,
+                                true));
             }
         }
     }
@@ -738,18 +1098,20 @@ public class TypeMemberIndex {
                         "org.slf4j.Logger log",
                         "org.slf4j.Logger",
                         null,
-                        null);
-        seen.putIfAbsent(next.kind + ":" + next.name + ":", next);
+                        null,
+                        canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
+                        canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
+                        null,
+                        true);
+        seen.putIfAbsent(memberStorageKey(next), next);
     }
 
     private static void putSyntheticMethod(Map<String, Member> seen, Member next) {
-        var key =
-                next.kind
-                        + ":"
-                        + next.name
-                        + ":"
-                        + String.join(",", next.erasedParameterTypes == null ? new String[0] : next.erasedParameterTypes);
-        seen.putIfAbsent(key, next);
+        seen.putIfAbsent(memberStorageKey(next), next);
+    }
+
+    private static String memberStorageKey(Member member) {
+        return canonicalMemberKey(member.ownerType, member.kind, member.name, member.erasedParameterTypes);
     }
 
     private static boolean hasAnyLombokAccessorAnnotation(ModifiersTree modifiers) {

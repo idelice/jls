@@ -7,6 +7,8 @@ import com.sun.tools.classfile.ClassFile;
 import com.sun.tools.classfile.ConstantPoolException;
 import com.sun.tools.classfile.Descriptor;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.ModifiersTree;
+import com.sun.source.tree.VariableTree;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
@@ -15,6 +17,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
@@ -25,8 +28,17 @@ import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import org.javacs.CompilerProvider;
+import org.javacs.FindHelper;
+import org.javacs.LombokAnnotations;
 import org.javacs.lsp.CompletionItemKind;
 
+/**
+ * Dependency-only type metadata backed by the classpath.
+ *
+ * <p>This index serves jars, JDK classes, and decompiled dependency sources. Workspace-owned
+ * candidates must be resolved before reaching this class. Any workspace hit here is a correctness
+ * bug. Vineflower support here is only for read-only dependency inspection and navigation.
+ */
 public final class ExternalBinaryTypeIndex {
     public static final ExternalBinaryTypeIndex EMPTY = new ExternalBinaryTypeIndex();
 
@@ -110,6 +122,36 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
+    public Optional<TypeMemberIndex.Member> member(
+            String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
+        var targetKey =
+                TypeMemberIndex.canonicalMemberKey(
+                        qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
+        for (var member : members(qualifiedName, staticContext)) {
+            if (Objects.equals(targetKey, member.canonicalKey)) {
+                return Optional.of(member);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public Optional<TypeMemberIndex.Member> memberByCanonicalKey(String canonicalKey) {
+        if (canonicalKey == null || canonicalKey.isBlank()) {
+            return Optional.empty();
+        }
+        var split = canonicalKey.indexOf('#');
+        if (split <= 0) {
+            return Optional.empty();
+        }
+        var ownerType = canonicalKey.substring(0, split);
+        return typeInfo(ownerType)
+                .flatMap(
+                        info ->
+                                info.members.stream()
+                                        .filter(member -> Objects.equals(member.canonicalKey, canonicalKey))
+                                        .findFirst());
+    }
+
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
         if (typeName == null || typeName.isBlank() || root == null || compiler == null) {
             return Optional.empty();
@@ -168,6 +210,14 @@ public final class ExternalBinaryTypeIndex {
     }
 
     private Optional<TypeMemberIndex.TypeInfo> loadTypeInfo(String qualifiedName) {
+        if (isWorkspaceOwnedCandidate(qualifiedName)) {
+            LOG.fine(
+                    String.format(
+                            "[workspace-boundary] external_leak candidate=%s reason=externalTypeInfo caller=%s",
+                            qualifiedName,
+                            callerSummary()));
+            return Optional.empty();
+        }
         try {
             var binaryClass = Class.forName(qualifiedName, false, classLoader);
             if (binaryClass.isArray()) {
@@ -192,7 +242,13 @@ public final class ExternalBinaryTypeIndex {
                                     field.getType().getTypeName() + " " + field.getName(),
                                     canonicalTypeName(field.getType()),
                                     null,
-                                    null);
+                                    null,
+                                    TypeMemberIndex.canonicalMemberKey(
+                                            declaring, CompletionItemKind.Field, field.getName(), null),
+                                    TypeMemberIndex.canonicalMemberKey(
+                                            declaring, CompletionItemKind.Field, field.getName(), null),
+                                    null,
+                                    false);
                     seen.putIfAbsent(memberKey(member), member);
                 } catch (TypeNotPresentException | LinkageError ex) {
                     LOG.fine(
@@ -237,7 +293,13 @@ public final class ExternalBinaryTypeIndex {
                                     detail,
                                     canonicalTypeName(method.getReturnType()),
                                     parameterNames,
-                                    erasedParameterTypes);
+                                    erasedParameterTypes,
+                                    TypeMemberIndex.canonicalMemberKey(
+                                            declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
+                                    TypeMemberIndex.canonicalMemberKey(
+                                            declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
+                                    null,
+                                    false);
                     var key = memberKey(member);
                     var existing = seen.get(key);
                     if (existing == null || member.priority < existing.priority) {
@@ -257,13 +319,13 @@ public final class ExternalBinaryTypeIndex {
                     java.util.Comparator.comparingInt((TypeMemberIndex.Member member) -> member.priority)
                             .thenComparing(member -> member.name, String.CASE_INSENSITIVE_ORDER)
                             .thenComparing(member -> member.detail));
-            return Optional.of(
-                    new TypeMemberIndex.TypeInfo(
-                            qualifiedName,
-                            binaryClass.getSimpleName(),
-                            members,
-                            false,
-                            null));
+            var superclass =
+                    binaryClass.getSuperclass() == null ? null : canonicalTypeName(binaryClass.getSuperclass());
+            var interfaces =
+                    java.util.Arrays.stream(binaryClass.getInterfaces())
+                            .map(this::canonicalTypeName)
+                            .collect(Collectors.toList());
+            return Optional.of(typeInfoWithSourceLinks(qualifiedName, binaryClass.getSimpleName(), members, superclass, interfaces));
         } catch (ClassNotFoundException | LinkageError ex) {
             LOG.fine(
                     String.format(
@@ -273,11 +335,54 @@ public final class ExternalBinaryTypeIndex {
             var fallback = classFileCache.get(qualifiedName, this::loadBinaryClassModel);
             if (fallback.isPresent()) {
                 LOG.fine(String.format("[external-binary] classfile fallback type=%s", qualifiedName));
-                return Optional.of(fallback.get().typeInfo());
+                return Optional.of(
+                        typeInfoWithSourceLinks(
+                                fallback.get().qualifiedName(),
+                                fallback.get().simpleName(),
+                                fallback.get().members(),
+                                null,
+                                List.of()));
             }
             LOG.fine(String.format("[external-binary] miss type=%s reason=%s", qualifiedName, ex.getClass().getSimpleName()));
             return Optional.empty();
         }
+    }
+
+    /**
+     * Workspace-owned candidates must not be treated as external dependencies, including nested
+     * names under workspace owners.
+     */
+    private boolean isWorkspaceOwnedCandidate(String qualifiedName) {
+        if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
+            return false;
+        }
+        if (compiler.findTypeDeclaration(qualifiedName) != org.javacs.CompilerProvider.NOT_FOUND) {
+            return true;
+        }
+        for (var i = qualifiedName.lastIndexOf('.'); i > 0; i = qualifiedName.lastIndexOf('.', i - 1)) {
+            var outer = qualifiedName.substring(0, i);
+            if (compiler.findTypeDeclaration(outer) != org.javacs.CompilerProvider.NOT_FOUND) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String callerSummary() {
+        var join = new StringJoiner(" > ");
+        for (var frame : Thread.currentThread().getStackTrace()) {
+            var className = frame.getClassName();
+            if (className == null
+                    || !className.startsWith("org.javacs.")
+                    || className.equals(ExternalBinaryTypeIndex.class.getName())) {
+                continue;
+            }
+            join.add(className + "#" + frame.getMethodName() + ":" + frame.getLineNumber());
+            if (join.length() > 120) {
+                break;
+            }
+        }
+        return join.length() == 0 ? "<unknown>" : join.toString();
     }
 
     private Optional<BinaryClassModel> loadBinaryClassModel(String qualifiedName) {
@@ -345,7 +450,11 @@ public final class ExternalBinaryTypeIndex {
                             type + " " + name,
                             type,
                             null,
-                            null);
+                            null,
+                            TypeMemberIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Field, name, null),
+                            TypeMemberIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Field, name, null),
+                            null,
+                            false);
             seenMembers.putIfAbsent(memberKey(member), member);
         }
 
@@ -389,7 +498,11 @@ public final class ExternalBinaryTypeIndex {
                             detail,
                             returnType,
                             parameterNames,
-                            parameterTypes);
+                            parameterTypes,
+                            TypeMemberIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Method, name, parameterTypes),
+                            TypeMemberIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Method, name, parameterTypes),
+                            null,
+                            false);
             var key = memberKey(member);
             var existing = seenMembers.get(key);
             if (existing == null || member.priority < existing.priority) {
@@ -416,11 +529,126 @@ public final class ExternalBinaryTypeIndex {
     }
 
     private String memberKey(TypeMemberIndex.Member member) {
-        return member.kind
-                + ":"
-                + member.name
-                + ":"
-                + String.join(",", member.erasedParameterTypes == null ? new String[0] : member.erasedParameterTypes);
+        return member.canonicalKey;
+    }
+
+    private TypeMemberIndex.TypeInfo typeInfoWithSourceLinks(
+            String qualifiedName, String simpleName, List<TypeMemberIndex.Member> members, String superclass, List<String> interfaces) {
+        var linkedMembers = applySourceFieldLinks(qualifiedName, members);
+        return new TypeMemberIndex.TypeInfo(qualifiedName, simpleName, linkedMembers, false, null, superclass, interfaces);
+    }
+
+    private List<TypeMemberIndex.Member> applySourceFieldLinks(String qualifiedName, List<TypeMemberIndex.Member> members) {
+        var sourceMetadata = sourceLombokMetadata(qualifiedName, members);
+        if (sourceMetadata.isEmpty()) {
+            return members;
+        }
+        var linked = new ArrayList<TypeMemberIndex.Member>(members.size());
+        for (var member : members) {
+            var fieldName = sourceMetadata.get().accessorToField.get(member.canonicalKey);
+            if (fieldName == null) {
+                linked.add(member);
+                continue;
+            }
+            var fieldKey =
+                    TypeMemberIndex.canonicalMemberKey(
+                            member.ownerType, CompletionItemKind.Field, fieldName, null);
+            linked.add(
+                    new TypeMemberIndex.Member(
+                            member.ownerType,
+                            member.name,
+                            member.kind,
+                            member.isStatic,
+                            member.isPrivate,
+                            member.priority,
+                            member.detail,
+                            member.returnType,
+                            member.parameterNames,
+                            member.erasedParameterTypes,
+                            member.canonicalKey,
+                            fieldKey,
+                            fieldName,
+                            member.synthetic));
+        }
+        return Collections.unmodifiableList(linked);
+    }
+
+    private Optional<SourceLombokMetadata> sourceLombokMetadata(
+            String qualifiedName, List<TypeMemberIndex.Member> members) {
+        if (compiler == null) {
+            return Optional.empty();
+        }
+        var source = compiler.findAnywhere(qualifiedName);
+        if (source.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            var parse = compiler.parse(source.get());
+            var declaration = FindHelper.findType(parse, qualifiedName);
+            if (declaration == null) {
+                return Optional.empty();
+            }
+            var accessorToField = new LinkedHashMap<String, String>();
+            var classGetter = hasLombokAnnotation(declaration.getModifiers(), "Data", "Getter", "Value");
+            var classSetter = hasLombokAnnotation(declaration.getModifiers(), "Data", "Setter");
+            if (!(classGetter || classSetter || hasAnyAccessorAnnotation(declaration.getModifiers()))) {
+                return Optional.empty();
+            }
+            for (var member : declaration.getMembers()) {
+                if (!(member instanceof VariableTree field)) {
+                    continue;
+                }
+                if (field.getModifiers().getFlags().contains(javax.lang.model.element.Modifier.STATIC)) {
+                    continue;
+                }
+                var fieldName = field.getName().toString();
+                if (fieldName.isBlank()) {
+                    continue;
+                }
+                var suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+                var fieldType = field.getType() == null ? "" : field.getType().toString();
+                var booleanField = "boolean".equals(fieldType) || "Boolean".equals(fieldType) || "java.lang.Boolean".equals(fieldType);
+                var getterEnabled = classGetter || hasLombokAnnotation(field.getModifiers(), "Getter");
+                var setterEnabled = classSetter || hasLombokAnnotation(field.getModifiers(), "Setter");
+                if (getterEnabled) {
+                    var getterName = (booleanField ? "is" : "get") + suffix;
+                    accessorToField.put(
+                            TypeMemberIndex.canonicalMemberKey(
+                                    qualifiedName, CompletionItemKind.Method, getterName, new String[0]),
+                            fieldName);
+                }
+                if (setterEnabled) {
+                    var setterName = "set" + suffix;
+                    for (var candidate : members) {
+                        if (candidate.kind != CompletionItemKind.Method || !Objects.equals(candidate.name, setterName)) {
+                            continue;
+                        }
+                        accessorToField.put(candidate.canonicalKey, fieldName);
+                    }
+                }
+            }
+            return accessorToField.isEmpty() ? Optional.empty() : Optional.of(new SourceLombokMetadata(accessorToField));
+        } catch (RuntimeException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    private boolean hasAnyAccessorAnnotation(ModifiersTree modifiers) {
+        return hasLombokAnnotation(modifiers, "Data", "Getter", "Setter", "Value");
+    }
+
+    private boolean hasLombokAnnotation(ModifiersTree modifiers, String... simpleNames) {
+        var allowed = Set.of(simpleNames);
+        for (var annotation : modifiers.getAnnotations()) {
+            var annotationType = annotation.getAnnotationType().toString();
+            if (!LombokAnnotations.isLombokAnnotationType(annotationType)) {
+                continue;
+            }
+            if (allowed.contains(LombokAnnotations.simpleName(annotationType))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String canonicalTypeName(Class<?> type) {
@@ -538,9 +766,7 @@ public final class ExternalBinaryTypeIndex {
 
     private record ParameterList(String[] parameterTypes, String[] parameterNames) {}
 
-    private record BinaryClassModel(String qualifiedName, String simpleName, List<TypeMemberIndex.Member> members) {
-        private TypeMemberIndex.TypeInfo typeInfo() {
-            return new TypeMemberIndex.TypeInfo(qualifiedName, simpleName, members, false, null);
-        }
-    }
+    private record BinaryClassModel(String qualifiedName, String simpleName, List<TypeMemberIndex.Member> members) {}
+
+    private record SourceLombokMetadata(java.util.Map<String, String> accessorToField) {}
 }
