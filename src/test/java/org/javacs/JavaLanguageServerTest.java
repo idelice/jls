@@ -273,6 +273,89 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didOpenSynchronouslyBootstrapsWorkspaceDiagnosticsAndIndex() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        var client = new RecordingDiagnosticsClient();
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+            var file = FindResource.path("org/javacs/example/HelloWorld.java");
+
+            Assert.assertEquals("expected empty completion index before didOpen bootstrap", 0L, completionIndexVersion(server));
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = FileStore.contents(file);
+            server.didOpenTextDocument(open);
+
+            Assert.assertTrue(
+                    "didOpen should synchronously install the workspace index before returning",
+                    completionIndexVersion(server) > 0);
+            Assert.assertTrue(
+                    "didOpen should publish diagnostics for the opened file",
+                    client.awaitDiagnosticsMatching(file.toUri(), diagnostics -> true, 10, TimeUnit.SECONDS));
+            Thread.sleep(300);
+            Assert.assertEquals("didOpen bootstrap should only publish the requested file URI", Set.of(file.toUri()), client.publishedUris());
+            Assert.assertEquals(
+                    "didOpen bootstrap should not schedule async didOpen diagnostics afterwards",
+                    0,
+                    capture.countContaining("diagnostics_debounce trigger=didOpen"));
+            Assert.assertEquals(
+                    "didOpen bootstrap should not schedule a separate completion bootstrap",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap"));
+            Assert.assertTrue(
+                    "didOpen bootstrap should log workspace bootstrap start",
+                    capture.countContaining("workspace bootstrap started trigger=didOpenBootstrap") > 0);
+            Assert.assertTrue(
+                    "didOpen bootstrap should log the synchronous diagnostics compile",
+                    capture.countContaining("diagnostics_compile trigger=didOpenBootstrap") > 0);
+            Assert.assertTrue(
+                    "didOpen bootstrap should log workspace index installation",
+                    capture.countContaining("workspace index installed trigger=didOpenBootstrap") > 0);
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void compilerRecreationKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var beforeVersion = completionIndexVersion(server);
+        var initialExternal = externalBinaryIndex(server);
+
+        Assert.assertNotSame("compiler initialization should create a non-empty external index", ExternalBinaryTypeIndex.EMPTY, initialExternal);
+
+        var settings = new JsonObject();
+        var java = new JsonObject();
+        var extraCompilerArgs = new com.google.gson.JsonArray();
+        extraCompilerArgs.add("-Xlint:deprecation");
+        java.add("extraCompilerArgs", extraCompilerArgs);
+        settings.add("java", java);
+        var change = new DidChangeConfigurationParams();
+        change.settings = settings;
+        server.didChangeConfiguration(change);
+
+        server.compiler();
+
+        var refreshedExternal = externalBinaryIndex(server);
+        Assert.assertNotSame("compiler recreation should refresh the external binary index", initialExternal, refreshedExternal);
+        Assert.assertNotSame("refreshed external index should remain usable", ExternalBinaryTypeIndex.EMPTY, refreshedExternal);
+        Assert.assertEquals(
+                "compiler recreation without opened files should not reset workspace index version",
+                beforeVersion,
+                completionIndexVersion(server));
+    }
+
+    @Test
     public void lintSchedulesWorkspaceBootstrapInsteadOfInstallingInitialIndex() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
@@ -863,12 +946,7 @@ public class JavaLanguageServerTest {
                             TimeUnit.SECONDS));
             Assert.assertTrue(
                     "expected interactive completion request to parse the dependency first",
-                    capture.countContaining("[perf] parse_cache_store file=ReproTxn.java") > 0);
-            Assert.assertTrue(
-                    "diagnostics compiler should parse its own dependency state instead of reusing interactive parse warmup",
-                    capture.countContaining(
-                                    "[perf] diagnostics_cache_store compiler=diagnostics file=ReproTxn.java")
-                            > 0);
+                    capture.countContaining("[perf] parse_cache_store compiler=interactive file=ReproTxn.java") > 0);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -2972,7 +3050,6 @@ public class JavaLanguageServerTest {
         Files.writeString(b, "class B {}\n");
 
         var server = new JavaLanguageServer(new RecordingDiagnosticsClient());
-        setLombokVerifyBypass(server);
         var compiler = new ConcurrencyTrackingCompiler();
 
         var start = new CountDownLatch(1);
@@ -3702,6 +3779,12 @@ public class JavaLanguageServerTest {
         return ((AtomicLong) field.get(server)).get();
     }
 
+    private ExternalBinaryTypeIndex externalBinaryIndex(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("externalBinaryIndexRef");
+        field.setAccessible(true);
+        return ((AtomicReference<ExternalBinaryTypeIndex>) field.get(server)).get();
+    }
+
     private void setCompletionIndexVersion(JavaLanguageServer server, long value) throws Exception {
         var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
         field.setAccessible(true);
@@ -3726,12 +3809,6 @@ public class JavaLanguageServerTest {
                         long.class);
         compileAndPublish.setAccessible(true);
         compileAndPublish.invoke(server, files, compiler, trigger, -1L);
-    }
-
-    private void setLombokVerifyBypass(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("lombokVerifiedForCurrentCompiler");
-        field.setAccessible(true);
-        field.setBoolean(server, true);
     }
 
     private static void deleteRecursively(Path root) throws IOException {

@@ -12,6 +12,10 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.*;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
 import org.junit.*;
 
@@ -258,6 +262,101 @@ public class JavaCompilerServiceTest {
         }
     }
 
+    @Test
+    public void fullWorkspaceCompileSkipsPackagePrivateRetryWhenWorkspaceAlreadyCovered() throws Exception {
+        var root = Files.createTempDirectory("workspace-covered-compile-");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var pkg = root.resolve("p");
+            Files.createDirectories(pkg);
+            var use = pkg.resolve("UseHidden.java");
+            var defs = pkg.resolve("Defs.java");
+            Files.writeString(
+                    use,
+                    "package p;\n"
+                            + "class UseHidden {\n"
+                            + "  Hidden hidden = new Hidden();\n"
+                            + "}\n");
+            Files.writeString(defs, "package p;\nclass Hidden {}\n");
+
+            FileStore.setWorkspaceRoots(Set.of(root));
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet());
+
+            try (var task = service.compile(use, defs)) {
+                assertThat(
+                        task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
+                        is(true));
+            }
+
+            assertThat(
+                    "full workspace compile should not do a second compile batch",
+                    capture.countContaining("compile_retry mode=full sources=2 additional=1 action=second_attempt"),
+                    is(0));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
+            deleteTree(root);
+        }
+    }
+
+    @Test
+    public void targetedFullCompileStillRetriesForPackagePrivateSourceRecovery() throws Exception {
+        var root = Files.createTempDirectory("targeted-retry-compile-");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var pkg = root.resolve("p");
+            Files.createDirectories(pkg);
+            var use = pkg.resolve("UseHidden.java");
+            var defs = pkg.resolve("Defs.java");
+            Files.writeString(
+                    use,
+                    "package p;\n"
+                            + "class UseHidden {\n"
+                            + "  Hidden hidden = new Hidden();\n"
+                            + "}\n");
+            Files.writeString(defs, "package p;\nclass Hidden {}\n");
+
+            FileStore.setWorkspaceRoots(Set.of(root));
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet());
+
+            try (var task = service.compile(use)) {
+                assertThat(
+                        "targeted full compile should recover the package-private dependency",
+                        task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
+                        is(true));
+            }
+
+            assertThat(
+                    "targeted compile should still run a second batch when additional sources are needed",
+                    capture.countContaining("compile_retry mode=full sources=1 additional=1 action=second_attempt"),
+                    greaterThan(0));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
+            deleteTree(root);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static Map<List<String>, ?> reusableCompilerContexts(ReusableCompiler compiler) throws Exception {
         Field field = ReusableCompiler.class.getDeclaredField("contexts");
@@ -313,5 +412,32 @@ public class JavaCompilerServiceTest {
                         return FileVisitResult.CONTINUE;
                     }
                 });
+    }
+
+    private static final class TestLogCapture extends Handler {
+        private final List<String> lines = Collections.synchronizedList(new ArrayList<>());
+
+        @Override
+        public void publish(LogRecord record) {
+            lines.add(record.getMessage());
+        }
+
+        @Override
+        public void flush() {}
+
+        @Override
+        public void close() {}
+
+        int countContaining(String needle) {
+            synchronized (lines) {
+                var count = 0;
+                for (var line : lines) {
+                    if (line != null && line.contains(needle)) {
+                        count++;
+                    }
+                }
+                return count;
+            }
+        }
     }
 }

@@ -88,7 +88,6 @@ public class ErrorProvider {
         var deduped = dedupeDiagnostics(compilerDiagnostics);
         var firstSyntaxLine = firstSyntaxBlockingLine(deduped);
         if (firstSyntaxLine == -1) {
-            logDiagnosticsShape(root, false, -1, compilerDiagnostics.size(), deduped.size(), 0);
             return new DiagnosticFilterResult(deduped, false, compilerDiagnostics.size() - deduped.size());
         }
 
@@ -106,13 +105,6 @@ public class ErrorProvider {
         if (primarySyntaxDiagnostic != null) {
             filtered.add(primarySyntaxDiagnostic);
         }
-        logDiagnosticsShape(
-                root,
-                true,
-                firstSyntaxLine,
-                compilerDiagnostics.size(),
-                filtered.size(),
-                compilerDiagnostics.size() - filtered.size());
         return new DiagnosticFilterResult(filtered, true, compilerDiagnostics.size() - filtered.size());
     }
 
@@ -151,20 +143,6 @@ public class ErrorProvider {
                 + diagnostic.range.end.line
                 + ":"
                 + diagnostic.range.end.character;
-    }
-
-    private void logDiagnosticsShape(
-            CompilationUnitTree root,
-            boolean syntaxSuppressed,
-            int suppressionStartLine,
-            int before,
-            int after,
-            int dropped) {
-        var file = Paths.get(root.getSourceFile().toUri()).getFileName();
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_shape file=%s syntax_suppressed=%s suppression_start_line=%d before=%d after=%d dropped=%d",
-                        file, syntaxSuppressed, suppressionStartLine, before, after, dropped));
     }
 
     private List<org.javacs.lsp.Diagnostic> unusedWarnings(CompilationUnitTree root) {

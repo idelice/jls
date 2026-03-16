@@ -46,7 +46,7 @@ class JavaLanguageServer extends LanguageServer {
     private Path workspaceRoot;
     private final LanguageClient client;
     private JavaCompilerService cacheCompiler;
-    private JavaCompilerService cacheDiagnosticsCompilerPrimary;
+    private JavaCompilerService diagnosticsCompiler;
     private JsonObject cacheSettings;
     private JsonObject settings = new JsonObject();
     private boolean modifiedBuild = true;
@@ -75,7 +75,6 @@ class JavaLanguageServer extends LanguageServer {
     private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 700;
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private static final long NAVIGATION_BOOTSTRAP_WAIT_MS = 1500;
-    private boolean lombokVerifiedForCurrentCompiler;
     private boolean lombokEnabledForCurrentCompiler = true;
     private final AtomicReference<TypeMemberIndex> completionIndexRef =
             new AtomicReference<>(TypeMemberIndex.EMPTY);
@@ -115,7 +114,7 @@ class JavaLanguageServer extends LanguageServer {
                 long version,
                 CompletionIndexScope scope) {
             var safeWorkspace = workspaceIndex == null ? TypeMemberIndex.EMPTY : workspaceIndex;
-            var safeExternal = externalIndex == null ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
+            var safeExternal = externalIndex == null  ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
             var safeScope = scope == null ? CompletionIndexScope.EMPTY : scope;
             return new CompletionSnapshot(
                     safeWorkspace,
@@ -143,15 +142,9 @@ class JavaLanguageServer extends LanguageServer {
         if (needsCompiler()) {
             var compilers = createCompilers();
             cacheCompiler = compilers.interactive;
-            cacheDiagnosticsCompilerPrimary = compilers.diagnosticsPrimary;
+            diagnosticsCompiler = compilers.diagnosticsPrimary;
             lombokEnabledForCurrentCompiler = compilers.lombokEnabled;
-            lombokVerifiedForCurrentCompiler = false;
-            publishCompletionSnapshot(
-                    TypeMemberIndex.EMPTY,
-                    new ExternalBinaryTypeIndex(cacheCompiler),
-                    0,
-                    CompletionIndexScope.EMPTY);
-            completionIndexRevision.incrementAndGet();
+            refreshExternalBinaryIndex(cacheCompiler);
             cancelPendingCompletionIndex("compilerRecreated");
             cacheSettings = compilerSettingsSnapshot(settings);
             modifiedBuild = false;
@@ -177,9 +170,18 @@ class JavaLanguageServer extends LanguageServer {
         completionSnapshotRef.set(snapshot);
     }
 
+    private void refreshExternalBinaryIndex(JavaCompilerService compiler) {
+        var currentSnapshot = completionSnapshot();
+        publishCompletionSnapshot(
+                currentSnapshot.workspaceIndex(),
+                new ExternalBinaryTypeIndex(compiler),
+                currentSnapshot.version(),
+                currentSnapshot.scope());
+    }
+
     private DiagnosticsCompilerSelection selectDiagnosticsCompiler() {
         compiler();
-        return new DiagnosticsCompilerSelection(cacheDiagnosticsCompilerPrimary);
+        return new DiagnosticsCompilerSelection(diagnosticsCompiler);
     }
 
     private boolean needsCompiler() {
@@ -222,7 +224,7 @@ class JavaLanguageServer extends LanguageServer {
         if (!active.isEmpty()) {
             cancelPendingDiagnostics("compilerRecreated");
             scheduleDiagnostics(active, "compilerRecreated", 0);
-            scheduleActiveCompletionBootstrapIfNeeded("compilerRecreated", 0);
+            scheduleProjectCompletionIndexRefresh("compilerRecreated", 0);
             return;
         }
         LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
@@ -267,46 +269,7 @@ class JavaLanguageServer extends LanguageServer {
                 if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_compile")) {
                     return;
                 }
-                verifyLombokSymbols(task, "diagnostics");
-                var publishStarted = Instant.now();
-                if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "pre_publish")) {
-                    return;
-                }
-                var diagnosticsCount = 0;
-                var publishedUris = new HashSet<java.net.URI>();
-                var requestedUris = new HashSet<java.net.URI>();
-                for (var file : javaFiles) {
-                    requestedUris.add(file.toUri());
-                }
-                for (var errs : new ErrorProvider(task).errors()) {
-                    if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_loop")) {
-                        return;
-                    }
-                    if (!requestedUris.contains(errs.uri)) {
-                        continue;
-                    }
-                    client.publishDiagnostics(errs);
-                    diagnosticsCount += errs.diagnostics.size();
-                    publishedUris.add(errs.uri);
-                }
-                // Always clear diagnostics for requested files that did not produce any root in this compile.
-                for (var file : javaFiles) {
-                    if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_clear_loop")) {
-                        return;
-                    }
-                    if (!FileStore.isJavaFile(file)) continue;
-                    var uri = file.toUri();
-                    if (publishedUris.contains(uri)) continue;
-                    client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
-                }
-                LOG.fine(
-                        String.format(
-                                "[perf] diagnostics_publish trigger=%s files=%d diagnostics=%d took=%dms",
-                                trigger,
-                                javaFiles.size(),
-                                diagnosticsCount,
-                                Duration.between(publishStarted, Instant.now()).toMillis()));
-                clearDirtyDiagnostics(javaFiles);
+                publishDiagnosticsFromTask(task, javaFiles, trigger, expectedContentRevision);
                 if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_publish")) {
                     return;
                 }
@@ -316,6 +279,55 @@ class JavaLanguageServer extends LanguageServer {
                 }
             }
         }
+    }
+
+    private void publishDiagnosticsFromTask(
+            CompileTask task,
+            Collection<Path> requestedFiles,
+            String trigger,
+            long expectedContentRevision) {
+        var requestedJavaFiles = normalizeJavaFiles(requestedFiles);
+        if (requestedJavaFiles.isEmpty()) {
+            return;
+        }
+        var publishStarted = Instant.now();
+        if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "pre_publish")) {
+            return;
+        }
+        var diagnosticsCount = 0;
+        var publishedUris = new HashSet<java.net.URI>();
+        var requestedUris = new HashSet<java.net.URI>();
+        for (var file : requestedJavaFiles) {
+            requestedUris.add(file.toUri());
+        }
+        for (var errs : new ErrorProvider(task).errors()) {
+            if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_loop")) {
+                return;
+            }
+            if (!requestedUris.contains(errs.uri)) {
+                continue;
+            }
+            client.publishDiagnostics(errs);
+            diagnosticsCount += errs.diagnostics.size();
+            publishedUris.add(errs.uri);
+        }
+        for (var file : requestedJavaFiles) {
+            if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_clear_loop")) {
+                return;
+            }
+            if (!FileStore.isJavaFile(file)) continue;
+            var uri = file.toUri();
+            if (publishedUris.contains(uri)) continue;
+            client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
+        }
+        LOG.fine(
+                String.format(
+                        "[perf] diagnostics_publish trigger=%s files=%d diagnostics=%d took=%dms",
+                        trigger,
+                        requestedJavaFiles.size(),
+                        diagnosticsCount,
+                        Duration.between(publishStarted, Instant.now()).toMillis()));
+        clearDirtyDiagnostics(requestedJavaFiles);
     }
 
     private List<Path> normalizeJavaFiles(Collection<Path> files) {
@@ -334,7 +346,7 @@ class JavaLanguageServer extends LanguageServer {
             String trigger,
             Duration took,
             CompletionIndexScope scope) {
-        var rebuilt = nextIndex == null ? TypeMemberIndex.EMPTY : nextIndex;
+        var rebuilt = (nextIndex == null || nextIndex.size() == 0) ? TypeMemberIndex.EMPTY : nextIndex;
         var currentSnapshot = completionSnapshot();
         publishCompletionSnapshot(
                 rebuilt,
@@ -538,7 +550,7 @@ class JavaLanguageServer extends LanguageServer {
             var hasStructuralLombokType = shapes.stream().anyMatch(DeclaredTypeShape::structuralLombok);
             if (hasStructuralLombokType) {
                 LOG.fine(
-                        "[perf] completion_index_didChange_gate file="
+                        "[perf] completion_index_didChange_refresh file="
                                 + file.getFileName()
                                 + " reason=structural_lombok");
                 return new ActiveDocumentChangeImpact(true);
@@ -546,20 +558,15 @@ class JavaLanguageServer extends LanguageServer {
             var declarationDrift = hasDeclarationDrift(file, shapes);
             if (declarationDrift) {
                 LOG.fine(
-                        "[perf] completion_index_didChange_gate file="
+                        "[perf] completion_index_didChange_refresh file="
                                 + file.getFileName()
                                 + " reason=declaration_drift");
-            } else {
-                LOG.fine(
-                        "[perf] completion_index_didChange_gate file="
-                                + file.getFileName()
-                                + " reason=body_only_change");
             }
             return new ActiveDocumentChangeImpact(declarationDrift);
         } catch (RuntimeException e) {
             LOG.fine(
                     String.format(
-                            "[perf] completion_index_didChange_gate file=%s reason=parse_failed detail=%s",
+                            "[perf] completion_index_didChange_skip file=%s reason=parse_failed detail=%s",
                             file.getFileName(), e.getMessage()));
         }
         return new ActiveDocumentChangeImpact(false);
@@ -632,13 +639,15 @@ class JavaLanguageServer extends LanguageServer {
             if (indexed == null) {
                 return true;
             }
-            if (!Objects.equals(shape.superclass(), indexed.superclass)) {
+            if (!Objects.equals(normalizeSuperclass(shape.superclass()), normalizeSuperclass(indexed.superclass))) {
                 return true;
             }
             if (!Objects.equals(shape.interfaces(), indexed.interfaces)) {
                 return true;
             }
-            if (!Objects.equals(shape.directMemberSignatures(), indexedDirectMemberSignatures(indexed))) {
+            if (!Objects.equals(
+                    sortedSignatures(shape.directMemberSignatures()),
+                    sortedSignatures(indexedDirectMemberSignatures(indexed)))) {
                 return true;
             }
             var indexedStructuralLombok =
@@ -648,6 +657,10 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         return false;
+    }
+
+    private String normalizeSuperclass(String superclass) {
+        return superclass == null || "java.lang.Object".equals(superclass) ? null : superclass;
     }
 
     private List<String> indexedDirectMemberSignatures(TypeMemberIndex.TypeInfo type) {
@@ -669,6 +682,12 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         return List.copyOf(signatures);
+    }
+
+    private List<String> sortedSignatures(List<String> signatures) {
+        var sorted = new ArrayList<>(signatures);
+        Collections.sort(sorted);
+        return sorted;
     }
 
     private String fieldSignature(VariableTree field) {
@@ -819,24 +838,48 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
-    private void preparseActiveDocument(Path file, String trigger) {
-        try {
-            var interactive = compiler();
-            interactive.parse(file);
-            var parsedCompilers = 1;
-            if (cacheDiagnosticsCompilerPrimary != null && cacheDiagnosticsCompilerPrimary != interactive) {
-                cacheDiagnosticsCompilerPrimary.parse(file);
-                parsedCompilers++;
+    private void bootstrapWorkspaceOnDidOpen(Path file) {
+        var selection = selectDiagnosticsCompiler();
+        var workspaceFiles = normalizeJavaFiles(FileStore.all());
+        if (workspaceFiles.isEmpty()) {
+            return;
+        }
+        cancelPendingDiagnostics("didOpenBootstrap");
+        cancelPendingCompletionIndex("didOpenBootstrap");
+        var started = Instant.now();
+        LOG.info(
+                String.format(
+                        "[perf] workspace bootstrap started trigger=didOpenBootstrap files=%d",
+                        workspaceFiles.size()));
+        CompileTask task = null;
+        synchronized (diagnosticsCompileMutex) {
+            try {
+                task = selection.compiler.compile(workspaceFiles.toArray(Path[]::new));
+                var compiled = Instant.now();
+                LOG.info(
+                        String.format(
+                                "[perf] diagnostics_compile trigger=didOpenBootstrap files=%d took=%dms",
+                                workspaceFiles.size(), Duration.between(started, compiled).toMillis()));
+                publishDiagnosticsFromTask(task, List.of(file), "didOpenBootstrap", -1);
+                var indexStarted = Instant.now();
+                var nextIndex = TypeMemberIndex.workspaceDeclarations(task);
+                var indexVersion = nextIndexVersion();
+                installCompletionIndex(
+                        nextIndex,
+                        workspaceFiles,
+                        CompletionIndexRefreshMode.FULL_REBUILD,
+                        indexVersion,
+                        "didOpenBootstrap",
+                        Duration.between(indexStarted, Instant.now()));
+                LOG.info(
+                        String.format(
+                                "[perf] workspace index installed trigger=didOpenBootstrap version=%d types=%d",
+                                indexVersion, nextIndex == null ? 0 : nextIndex.size()));
+            } finally {
+                if (task != null) {
+                    task.close();
+                }
             }
-            LOG.fine(
-                    String.format(
-                            "[perf] parse_lifecycle trigger=%s file=%s compilers=%d",
-                            trigger, file.getFileName(), parsedCompilers));
-        } catch (RuntimeException e) {
-            LOG.fine(
-                    String.format(
-                            "[perf] parse_lifecycle trigger=%s file=%s status=failed reason=%s",
-                            trigger, file.getFileName(), e.getMessage()));
         }
     }
 
@@ -903,81 +946,6 @@ class JavaLanguageServer extends LanguageServer {
 
     private boolean shouldRefreshCompletionIndexForActiveDocumentChange(ActiveDocumentChangeImpact impact) {
         return impact.refreshCompletionIndex();
-    }
-
-    private void verifyLombokSymbols(CompileTask task, String phase) {
-        if (lombokVerifiedForCurrentCompiler) return;
-        if (!lombokEnabledForCurrentCompiler) {
-            LOG.fine("[perf] lombok_verify phase=" + phase + " skipped=disabled_by_setting");
-            lombokVerifiedForCurrentCompiler = true;
-            return;
-        }
-        var trees = Trees.instance(task.task);
-        var sawLombokAnnotatedClass = false;
-        for (var root : task.roots) {
-            for (var typeDecl : root.getTypeDecls()) {
-                if (!(typeDecl instanceof ClassTree)) continue;
-                var cls = (ClassTree) typeDecl;
-                if (!LombokAnnotations.hasLombokAnnotation(cls.getModifiers())) continue;
-                sawLombokAnnotatedClass = true;
-                var path = trees.getPath(root, cls);
-                if (path == null) continue;
-                var element = trees.getElement(path);
-                if (!(element instanceof TypeElement)) continue;
-                var typeElement = (TypeElement) element;
-                var visibleMethods =
-                        typeElement.getEnclosedElements().stream()
-                                .filter(e -> e.getKind() == ElementKind.METHOD)
-                                .map(e -> e.getSimpleName().toString())
-                                .collect(java.util.stream.Collectors.toSet());
-                var expectedGenerated = expectedLombokMethodNames(cls);
-                var visibleGenerated =
-                        visibleMethods.stream()
-                                .filter(expectedGenerated::contains)
-                                .sorted()
-                                .collect(java.util.stream.Collectors.toList());
-                var expectedGeneratedList = new java.util.ArrayList<>(expectedGenerated);
-                java.util.Collections.sort(expectedGeneratedList);
-                var generatedVisible = visibleMethods.stream().anyMatch(expectedGenerated::contains);
-                LOG.fine(
-                        String.format(
-                                "[perf] lombok_verify phase=%s class=%s generated_members_visible=%s enclosed_count=%d",
-                                phase,
-                                typeElement.getQualifiedName(),
-                                generatedVisible,
-                                typeElement.getEnclosedElements().size()));
-                LOG.fine(
-                        String.format(
-                                "[perf] lombok_verify_members phase=%s class=%s expected_generated=%s visible_generated=%s",
-                                phase,
-                                typeElement.getQualifiedName(),
-                                String.join(",", expectedGeneratedList),
-                                visibleGenerated.isEmpty() ? "-" : String.join(",", visibleGenerated)));
-            }
-        }
-        if (!sawLombokAnnotatedClass) {
-            LOG.fine("[perf] lombok_verify phase=" + phase + " skipped=no_lombok_annotated_class");
-        }
-        lombokVerifiedForCurrentCompiler = true;
-    }
-
-    private Set<String> expectedLombokMethodNames(ClassTree cls) {
-        var names = new HashSet<String>();
-        names.add("equals");
-        names.add("hashCode");
-        names.add("toString");
-        names.add("canEqual");
-        for (Tree member : cls.getMembers()) {
-            if (member instanceof VariableTree variable) {
-                var raw = variable.getName().toString();
-                if (raw == null || raw.isBlank()) continue;
-                var suffix = Character.toUpperCase(raw.charAt(0)) + raw.substring(1);
-                names.add("get" + suffix);
-                names.add("is" + suffix);
-                names.add("set" + suffix);
-            }
-        }
-        return names;
     }
 
     private void javaStartProgress(JavaStartProgressParams params) {
@@ -1156,7 +1124,7 @@ class JavaLanguageServer extends LanguageServer {
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
-        c.addProperty("inlayHintProvider", true);
+        // c.addProperty("inlayHintProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
@@ -1409,11 +1377,12 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<InlayHint> inlayHint(InlayHintParams params) {
-        if (params == null || params.textDocument == null || !FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
             return List.of();
-        }
-        var file = Paths.get(params.textDocument.uri);
-        return new InlayHintService(compiler(), completionSnapshot().workspaceIndex()).inlayHints(file, params.range);
+        // if (params == null || params.textDocument == null || !FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
+        //     return List.of();
+        // }
+        // var file = Paths.get(params.textDocument.uri);
+        // return new InlayHintService(compiler(), completionSnapshot().workspaceIndex()).inlayHints(file, params.range);
     }
 
     @Override
@@ -1539,9 +1508,9 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        preparseActiveDocument(file, "didOpen");
         if (completionSnapshot().version() == 0) {
-            scheduleActiveCompletionBootstrapIfNeeded("didOpenActiveBootstrap", 0);
+            bootstrapWorkspaceOnDidOpen(file);
+            return;
         }
         scheduleDiagnostics(List.of(file), "didOpen", DIAGNOSTIC_DEBOUNCE_MS);
     }
@@ -1551,7 +1520,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.change(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        preparseActiveDocument(file, "didChange");
+//        preparseActiveDocument(file, "didChange");
         var impact = analyzeActiveDocumentChange(file);
         markOtherActiveDiagnosticsDirty(file, "didChange");
         if (completionSnapshot().version() == 0) {

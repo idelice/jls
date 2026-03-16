@@ -240,6 +240,10 @@ class JavaCompilerService implements CompilerProvider {
         }
 
         if (mode == CompileBatch.AnalysisMode.ATTR) {
+            LOG.fine(
+                    String.format(
+                            "[perf] compile_retry mode=%s sources=%d additional=0 action=return_first_attempt",
+                            mode.name().toLowerCase(), sources.size()));
             return firstAttempt;
         }
 
@@ -252,7 +256,13 @@ class JavaCompilerService implements CompilerProvider {
             throw e;
         }
 
-        if (addFiles.isEmpty()) return firstAttempt;
+        if (addFiles.isEmpty()) {
+            LOG.fine(
+                    String.format(
+                            "[perf] compile_retry mode=%s sources=%d additional=0 action=return_first_attempt",
+                            mode.name().toLowerCase(), sources.size()));
+            return firstAttempt;
+        }
 
         // If the compiler needs additional source files that contain package-private files
         LOG.info("...need to recompile with " + addFiles);
@@ -280,6 +290,10 @@ class JavaCompilerService implements CompilerProvider {
             throw e;
         }
 
+        LOG.fine(
+                String.format(
+                        "[perf] compile_retry mode=%s sources=%d additional=%d action=second_attempt",
+                        mode.name().toLowerCase(), sources.size(), addFiles.size()));
         return secondAttempt;
     }
 
@@ -414,10 +428,6 @@ class JavaCompilerService implements CompilerProvider {
 
     private ExpandedSources expandSourcesForLombokAP(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
-        LOG.fine(
-                String.format(
-                        "[perf] compile_trigger entry=expandSourcesForLombokAP request=%s allow_ap=%s sources=%d stack=%s",
-                        requestType(), allowAP, sources.size(), requestStack()));
         if (!allowAP || !lombokPresentOnClasspath) {
             return new ExpandedSources(sources, false, sources.size(), sources.size());
         }
@@ -425,10 +435,6 @@ class JavaCompilerService implements CompilerProvider {
         var requestedHasLombokAnnotations = requestedSourcesUseLombokAnnotations(sources);
         var referencedLombokSources = referencedLombokSources(sources);
         if (!requestedHasLombokAnnotations && referencedLombokSources.isEmpty()) {
-            LOG.fine(
-                    String.format(
-                            "[perf] lombok_ap_sources requested=%d expanded=%d reason=no_lombok_annotations_or_references",
-                            sources.size(), sources.size()));
             return new ExpandedSources(sources, false, sources.size(), sources.size());
         }
 
@@ -455,40 +461,16 @@ class JavaCompilerService implements CompilerProvider {
                         : "referenced_lombok_types";
 
         if (expanded.size() + nonFileSources.size() == sources.size()) {
-            LOG.fine(
-                    String.format(
-                            "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
-                            sources.size(), sources.size(), reason));
             return new ExpandedSources(sources, true, sources.size(), sources.size());
         }
-
-        LOG.fine(
-                String.format(
-                        "[perf] lombok_ap_references requested=%d referenced=%d",
-                        sources.size(), referencedLombokSources.size()));
 
         var result = new ArrayList<JavaFileObject>(expanded.values());
         result.addAll(nonFileSources);
         LOG.fine(
                 String.format(
-                        "[perf] lombok_ap_sources requested=%d expanded=%d reason=%s",
-                        sources.size(), result.size(), reason));
-        LOG.fine(
-                String.format(
-                        "[perf] lombok_ap_source_files compiler=%s requested_files=%s expanded_files=%s",
-                        compilerRole, fileNames(sources), fileNames(result)));
+                        "[perf] lombok_ap_expand compiler=%s requested=%d expanded=%d reason=%s",
+                        compilerRole, sources.size(), result.size(), reason));
         return new ExpandedSources(result, true, sources.size(), result.size());
-    }
-
-    private String fileNames(Collection<? extends JavaFileObject> sources) {
-        var names = new ArrayList<String>();
-        for (var source : sources) {
-            var path = sourcePath(source);
-            if (path != null && path.getFileName() != null) {
-                names.add(path.getFileName().toString());
-            }
-        }
-        return names.isEmpty() ? "-" : String.join(",", names);
     }
 
     private Set<Path> referencedLombokSources(Collection<? extends JavaFileObject> sources) {
@@ -1085,49 +1067,20 @@ class JavaCompilerService implements CompilerProvider {
         var currentFingerprint = fingerprint(file);
         var cached = parsedUnits.get(filePath);
         if (cached != null && currentFingerprint.equals(cached.fingerprint)) {
-            if ("diagnostics".equals(compilerRole)) {
-                LOG.fine(
-                        String.format(
-                                "[perf] diagnostics_parse_owner compiler=%s file=%s",
-                                compilerRole, filePath.getFileName()));
-                LOG.fine(
-                        String.format(
-                                "[perf] diagnostics_cache_hit compiler=%s file=%s version=%d modified=%d",
-                                compilerRole,
-                                filePath.getFileName(),
-                                currentFingerprint.version,
-                                currentFingerprint.modifiedMillis));
-            }
-            LOG.fine(
-                    String.format(
-                            "[perf] parse_cache_hit file=%s version=%d modified=%d",
-                            filePath.getFileName(),
-                            currentFingerprint.version,
-                            currentFingerprint.modifiedMillis));
             return cached.task;
         }
         var parser = Parser.parseJavaFileObject(file);
         var task = new ParseTask(parser.task, parser.root);
         parsedUnits.put(filePath, new ParsedUnit(task, currentFingerprint));
-        if ("diagnostics".equals(compilerRole)) {
+        if (currentFingerprint.version >= 0) {
             LOG.fine(
                     String.format(
-                            "[perf] diagnostics_parse_owner compiler=%s file=%s",
-                            compilerRole, filePath.getFileName()));
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_cache_store compiler=%s file=%s version=%d modified=%d",
+                            "[perf] parse_cache_store compiler=%s file=%s version=%d modified=%d",
                             compilerRole,
                             filePath.getFileName(),
                             currentFingerprint.version,
                             currentFingerprint.modifiedMillis));
         }
-        LOG.fine(
-                String.format(
-                        "[perf] parse_cache_store file=%s version=%d modified=%d",
-                        filePath.getFileName(),
-                        currentFingerprint.version,
-                        currentFingerprint.modifiedMillis));
         return task;
     }
 

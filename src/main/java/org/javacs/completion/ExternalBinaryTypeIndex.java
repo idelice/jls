@@ -88,6 +88,10 @@ public final class ExternalBinaryTypeIndex {
         this.decompiler = new ExternalBinaryDecompiler(this.classPathRoots, this.classPathFingerprint, this.classLoader);
     }
 
+    public int size() {
+        return (int)typeCache.estimatedSize();
+    }
+
     public Optional<TypeMemberIndex.TypeInfo> typeInfo(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
