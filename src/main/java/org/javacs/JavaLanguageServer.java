@@ -75,7 +75,6 @@ class JavaLanguageServer extends LanguageServer {
     private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 700;
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private static final long NAVIGATION_BOOTSTRAP_WAIT_MS = 1500;
-    private boolean lombokEnabledForCurrentCompiler = true;
     private final AtomicReference<TypeMemberIndex> completionIndexRef =
             new AtomicReference<>(TypeMemberIndex.EMPTY);
     private final AtomicReference<ExternalBinaryTypeIndex> externalBinaryIndexRef =
@@ -143,7 +142,6 @@ class JavaLanguageServer extends LanguageServer {
             var compilers = createCompilers();
             cacheCompiler = compilers.interactive;
             diagnosticsCompiler = compilers.diagnosticsPrimary;
-            lombokEnabledForCurrentCompiler = compilers.lombokEnabled;
             refreshExternalBinaryIndex(cacheCompiler);
             cancelPendingCompletionIndex("compilerRecreated");
             cacheSettings = compilerSettingsSnapshot(settings);
@@ -1520,7 +1518,6 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.change(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-//        preparseActiveDocument(file, "didChange");
         var impact = analyzeActiveDocumentChange(file);
         markOtherActiveDiagnosticsDirty(file, "didChange");
         if (completionSnapshot().version() == 0) {

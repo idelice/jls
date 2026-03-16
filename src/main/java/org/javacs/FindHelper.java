@@ -189,20 +189,9 @@ public class FindHelper {
                 end = start + name.length();
             } else if (strictNameMatch) {
                 return null;
-            } else {
-                LOG.fine(
-                        String.format(
-                                "Missing name `%s` in source span [%d,%d], using enclosing tree location fallback",
-                                name, start, end));
             }
         }
         if (start < 0 || end < start) {
-            LOG.fine(
-                    String.format(
-                            "Skipping location for invalid source span [%d,%d] in %s",
-                            start,
-                            end,
-                            path.getCompilationUnit().getSourceFile().toUri()));
             return null;
         }
         var startLine = (int) lines.getLineNumber(start);

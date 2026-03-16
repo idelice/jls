@@ -256,16 +256,20 @@ public class DefinitionProvider {
             return new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName);
         }
         var argTypes = resolveArgumentTypes(arguments, types);
-        var member =
+        var ownerType = receiver.get().qualifiedType;
+        var memberWithArgs =
                 lookupMember(
-                                receiver.get().qualifiedType,
-                                methodName,
-                                receiver.get().staticContext,
-                                argTypes.toArray(String[]::new))
-                        .or(() -> lookupMember(receiver.get().qualifiedType, methodName, receiver.get().staticContext))
-                        .orElse(null);
-        var ownerType = member != null ? member.ownerType : receiver.get().qualifiedType;
-        return resolveMethod(ownerType, methodName, arguments.size(), argTypes, member);
+                        ownerType,
+                        methodName,
+                        receiver.get().staticContext,
+                        argTypes.toArray(String[]::new));
+        var memberWithoutArgs =
+                memberWithArgs.isPresent()
+                        ? Optional.<TypeMemberIndex.Member>empty()
+                        : lookupMember(ownerType, methodName, receiver.get().staticContext);
+        var member = memberWithArgs.or(() -> memberWithoutArgs).orElse(null);
+        var resolvedOwnerType = member != null ? member.ownerType : ownerType;
+        return resolveMethod(resolvedOwnerType, methodName, arguments.size(), argTypes, member);
     }
 
     private ResolvedSymbol resolveMethodFromMember(
@@ -299,10 +303,6 @@ public class DefinitionProvider {
                 return linked;
             }
             if (isWorkspaceType(member.ownerType)) {
-                LOG.fine(
-                        String.format(
-                                "[perf] definition_lombok_workspace_field_missing owner=%s accessor=%s field=%s",
-                                member.ownerType, member.name, member.backingFieldName));
                 return new ResolvedSymbol(NOT_SUPPORTED, member.ownerType, member.backingFieldName, false, member, member.backingFieldName);
             }
         }
@@ -696,10 +696,6 @@ public class DefinitionProvider {
         }
         var locations = findFieldLocations(member.ownerType, fieldName);
         if (!locations.isEmpty()) {
-            LOG.fine(
-                    String.format(
-                            "[perf] definition_lombok_field_link owner=%s accessor=%s field=%s",
-                            member.ownerType, member.name, fieldName));
             return resolvedFieldSymbol(member.ownerType, fieldName, locations);
         }
         return null;
@@ -826,6 +822,12 @@ public class DefinitionProvider {
             if (!variable.getName().contentEquals(fieldName)) continue;
             var path = new TreePath(classPath, variable);
             var location = FindHelper.location(parse, path, fieldName);
+            if (location != null) {
+                return List.of(location);
+            }
+        }
+        if (classTree.getKind() == Tree.Kind.RECORD) {
+            var location = FindHelper.locationStrict(parse, classPath, fieldName);
             if (location != null) {
                 return List.of(location);
             }

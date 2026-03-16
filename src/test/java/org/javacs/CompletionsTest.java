@@ -2,6 +2,7 @@ package org.javacs;
 
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
@@ -81,6 +82,15 @@ public class CompletionsTest extends CompletionsBase {
         var file = "/org/javacs/example/CompleteImports.java";
         var suggestions = filterText(file, 3, 18);
         assertThat(suggestions, hasSize(greaterThan(CompletionProvider.MAX_COMPLETION_ITEMS)));
+    }
+
+    @Test
+    public void directlyImportedTypeIsNotDuplicatedInCompletion() {
+        refreshServer();
+        var file = "/org/javacs/example/DuplicateImportedTypeCompletion.java";
+        var suggestions = label(file, 7, 35);
+        var matches = suggestions.stream().filter("ImportedType"::equals).count();
+        assertEquals("expected directly imported type to appear once", 1L, matches);
     }
 
     @Test

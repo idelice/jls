@@ -1645,9 +1645,25 @@ public class CompletionProvider {
             CompilationUnitTree root, SourcePositions sourcePositions, String partial, CompletionList list) {
         var packageName = Objects.toString(root.getPackageName(), "");
         var uniques = new HashSet<String>();
+        for (var item : list.items) {
+            if (item == null) {
+                continue;
+            }
+            if (!Objects.equals(item.kind, CompletionItemKind.Class)
+                    && !Objects.equals(item.kind, CompletionItemKind.Interface)
+                    && !Objects.equals(item.kind, CompletionItemKind.Enum)) {
+                continue;
+            }
+            if (item.detail != null && !item.detail.isBlank()) {
+                uniques.add(item.detail);
+            }
+        }
         var previousSize = list.items.size();
         for (var className : compiler.packagePrivateTopLevelTypes(packageName)) {
             if (!StringSearch.matchesPartialName(className, partial)) continue;
+            if (!uniques.add(className)) {
+                continue;
+            }
             var item = classItem(className);
             applyClassSortPriority(root, className, item);
             if (hasImportConflict(root, className)) {
@@ -1660,11 +1676,12 @@ public class CompletionProvider {
                 }
             }
             list.items.add(item);
-            uniques.add(className);
         }
         for (var className : compiler.publicTopLevelTypes()) {
             if (!StringSearch.matchesPartialName(simpleName(className), partial)) continue;
-            if (uniques.contains(className)) continue;
+            if (!uniques.add(className)) {
+                continue;
+            }
             if (list.items.size() > MAX_COMPLETION_ITEMS) {
                 list.isIncomplete = true;
                 break;
@@ -1681,7 +1698,6 @@ public class CompletionProvider {
                 }
             }
             list.items.add(item);
-            uniques.add(className);
         }
         LOG.info("...found " + (list.items.size() - previousSize) + " class names");
     }

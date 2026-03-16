@@ -253,6 +253,12 @@ public class GotoTest {
     }
 
     @Test
+    public void gotoRecordAccessorResolvesToRecordComponent() {
+        var file = "/org/javacs/example/GotoRecordAccessor.java";
+        assertThat(doGoto(file, 5, 9), hasItem("GotoRecordAccessor.java:3"));
+    }
+
+    @Test
     public void gotoImplementationMethodDeclarationResolvesToInterfaceDeclaration() {
         var file = "/org/javacs/example/GotoImplementation.java";
         assertThat(doGoto(file, 14, 21), hasItem("GotoImplementation.java:9"));

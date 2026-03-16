@@ -24,6 +24,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.ExternalBinaryTypeIndex;
+import org.javacs.completion.TypeMemberIndex;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -221,6 +222,31 @@ public class JavaLanguageServerTest {
 
         Assert.assertTrue("expected references result after bootstrap", result.isPresent());
         Assert.assertTrue("expected references bootstrap to initialize completion index", completionIndexVersion(server) > 0);
+    }
+
+    @Test
+    public void didOpenBootstrapPreservesLombokAccessorBackingFieldMetadata() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        configureLombokClasspath(server);
+        var file = FindResource.path("org/javacs/example/LombokFieldReferences.java");
+
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = Files.readString(file);
+        server.didOpenTextDocument(open);
+
+        Assert.assertTrue(
+                "expected completion index bootstrap before Lombok accessor metadata check",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+        var member =
+                workspaceIndex(server)
+                        .member("org.javacs.example.LombokFieldReferences", "getBar", false, new String[0]);
+        Assert.assertTrue("expected indexed Lombok accessor after didOpen bootstrap", member.isPresent());
+        Assert.assertEquals("bar", member.get().backingFieldName);
     }
 
     @Test
@@ -3783,6 +3809,15 @@ public class JavaLanguageServerTest {
         var field = JavaLanguageServer.class.getDeclaredField("externalBinaryIndexRef");
         field.setAccessible(true);
         return ((AtomicReference<ExternalBinaryTypeIndex>) field.get(server)).get();
+    }
+
+    private TypeMemberIndex workspaceIndex(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
+        field.setAccessible(true);
+        var snapshot = ((AtomicReference<?>) field.get(server)).get();
+        var method = snapshot.getClass().getDeclaredMethod("workspaceIndex");
+        method.setAccessible(true);
+        return (TypeMemberIndex) method.invoke(snapshot);
     }
 
     private void setCompletionIndexVersion(JavaLanguageServer server, long value) throws Exception {

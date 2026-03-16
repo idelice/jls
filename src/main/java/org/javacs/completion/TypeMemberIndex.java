@@ -800,6 +800,7 @@ public class TypeMemberIndex {
                 }
             }
             var declaredTree = rootDeclaredTypeTrees.get(qualifiedName);
+            addRecordComponentAccessors(qualifiedName, type, seen);
             addSyntheticLombokAccessors(qualifiedName, declaredTree, seen);
             addSyntheticSlf4jLoggerField(qualifiedName, declaredTree, seen);
 
@@ -1107,11 +1108,83 @@ public class TypeMemberIndex {
     }
 
     private static void putSyntheticMethod(Map<String, Member> seen, Member next) {
-        seen.putIfAbsent(memberStorageKey(next), next);
+        var key = memberStorageKey(next);
+        var existing = seen.get(key);
+        if (existing == null) {
+            seen.put(key, next);
+            return;
+        }
+        if ((existing.backingFieldName == null || existing.backingFieldName.isBlank())
+                && next.backingFieldName != null
+                && !next.backingFieldName.isBlank()) {
+            seen.put(key, mergeLombokFieldLink(existing, next));
+        }
+    }
+
+    private static void addRecordComponentAccessors(
+            String ownerQualifiedName, TypeElement type, Map<String, Member> seen) {
+        for (var component : type.getRecordComponents()) {
+            var accessor = component.getAccessor();
+            if (accessor == null) {
+                continue;
+            }
+            var accessorName = accessor.getSimpleName().toString();
+            var key = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Method, accessorName, new String[0]);
+            var existing = seen.get(key);
+            var logicalKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, component.getSimpleName().toString(), null);
+            if (existing == null) {
+                seen.put(
+                        key,
+                        new Member(
+                                ownerQualifiedName,
+                                accessorName,
+                                CompletionItemKind.Method,
+                                accessor.getModifiers().contains(Modifier.STATIC),
+                                accessor.getModifiers().contains(Modifier.PRIVATE),
+                                0,
+                                accessor.getReturnType() + " " + accessorName + "()",
+                                typeName(accessor.getReturnType()),
+                                new String[0],
+                                new String[0],
+                                key,
+                                logicalKey,
+                                component.getSimpleName().toString(),
+                                false));
+                continue;
+            }
+            if (existing.backingFieldName == null || existing.backingFieldName.isBlank()) {
+                seen.put(key, mergeFieldLink(existing, logicalKey, component.getSimpleName().toString(), false));
+            }
+        }
     }
 
     private static String memberStorageKey(Member member) {
         return canonicalMemberKey(member.ownerType, member.kind, member.name, member.erasedParameterTypes);
+    }
+
+    private static Member mergeLombokFieldLink(Member existing, Member synthetic) {
+        return mergeFieldLink(existing, synthetic.logicalKey, synthetic.backingFieldName, synthetic.synthetic);
+    }
+
+    private static Member mergeFieldLink(
+            Member existing, String logicalKey, String backingFieldName, boolean synthetic) {
+        return new Member(
+                existing.ownerType,
+                existing.name,
+                existing.kind,
+                existing.isStatic,
+                existing.isPrivate,
+                existing.priority,
+                existing.detail,
+                existing.returnType,
+                existing.parameterNames,
+                existing.erasedParameterTypes,
+                existing.canonicalKey,
+                logicalKey != null && !logicalKey.isBlank()
+                        ? logicalKey
+                        : existing.logicalKey,
+                backingFieldName,
+                existing.synthetic || synthetic);
     }
 
     private static boolean hasAnyLombokAccessorAnnotation(ModifiersTree modifiers) {
