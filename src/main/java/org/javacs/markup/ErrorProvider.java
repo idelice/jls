@@ -6,6 +6,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -30,32 +31,66 @@ public class ErrorProvider {
     private record DiagnosticFilterResult(
             List<org.javacs.lsp.Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
 
+    public record ErrorReport(
+            List<PublishDiagnosticsParams> diagnostics,
+            int compiledRoots,
+            int requestedRoots,
+            int processedRoots,
+            int compilerDiagnosticsCount,
+            int warningDiagnosticsCount,
+            long convertMs,
+            long warningMs) {}
+
     public ErrorProvider(CompileTask task) {
         this.task = task;
     }
 
-    public PublishDiagnosticsParams[] errors() {
-        var result = new PublishDiagnosticsParams[task.roots.size()];
-        for (var i = 0; i < task.roots.size(); i++) {
-            var root = task.roots.get(i);
+    public ErrorReport errors(Set<java.net.URI> requestedUris) {
+        var requested = requestedUris == null ? Set.<java.net.URI>of() : new LinkedHashSet<>(requestedUris);
+        var result = new ArrayList<PublishDiagnosticsParams>();
+        long convertNanos = 0;
+        long warningNanos = 0;
+        var processedRoots = 0;
+        var compilerDiagnosticsCount = 0;
+        var warningDiagnosticsCount = 0;
+        for (var root : task.roots) {
             var uri = root.getSourceFile().toUri();
-            result[i] = new PublishDiagnosticsParams();
-            result[i].uri = uri;
+            if (!requested.isEmpty() && !requested.contains(uri)) {
+                continue;
+            }
+            var params = new PublishDiagnosticsParams();
+            params.uri = uri;
+            result.add(params);
             // Skip diagnostics for JAR-based files (they are not user code)
             if (isJarOrCachedSource(uri)) {
                 LOG.fine("Skipping diagnostics for JAR source: " + uri);
                 continue;
             }
+            processedRoots++;
+            var convertStarted = System.nanoTime();
             var filtered = filterCompilerDiagnostics(compilerErrors(root), root);
-            result[i].diagnostics.addAll(filtered.compilerDiagnostics());
+            convertNanos += System.nanoTime() - convertStarted;
+            params.diagnostics.addAll(filtered.compilerDiagnostics());
+            compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
-                result[i].diagnostics.addAll(unusedWarnings(root));
-                result[i].diagnostics.addAll(notThrownWarnings(root));
+                var warningStarted = System.nanoTime();
+                var unused = unusedWarnings(root);
+                var notThrown = notThrownWarnings(root);
+                warningNanos += System.nanoTime() - warningStarted;
+                params.diagnostics.addAll(unused);
+                params.diagnostics.addAll(notThrown);
+                warningDiagnosticsCount += unused.size() + notThrown.size();
             }
         }
-        // TODO hint fields that could be final
-
-        return result;
+        return new ErrorReport(
+                List.copyOf(result),
+                task.roots.size(),
+                requested.size(),
+                processedRoots,
+                compilerDiagnosticsCount,
+                warningDiagnosticsCount,
+                convertNanos / 1_000_000,
+                warningNanos / 1_000_000);
     }
 
     private boolean isJarOrCachedSource(java.net.URI uri) {

@@ -122,7 +122,6 @@ class ReusableCompiler {
         var key = List.copyOf(opts);
         var state = contexts.get(key);
         if (state == null) {
-            LOG.info(String.format("[perf] compiler_context_create options=%s", opts));
             state = new ReusableContextState(new ReusableContext(opts));
             contexts.put(key, state);
         }

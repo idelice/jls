@@ -20,7 +20,6 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.ParseTask;
@@ -35,7 +34,6 @@ public class ReferenceProvider {
     private final int line, column;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
-    private static final Logger LOG = Logger.getLogger("main");
 
     public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
         this(compiler, CompositeTypeIndex.EMPTY, file, line, column);
@@ -56,27 +54,14 @@ public class ReferenceProvider {
             return NOT_SUPPORTED;
         }
         if (target.qualifiedType() == null) {
-            LOG.info(String.format("[perf] references_request mode=parse_index kind=local file=%s", file));
             return findLocalReferences(definitions, target);
         }
         if (target.memberName() == null) {
-            LOG.info(
-                    String.format(
-                            "[perf] references_request mode=parse_index kind=type owner=%s",
-                            target.qualifiedType()));
             return findTypeReferences(definitions, target);
         }
         if (fieldLogicalKey(target).isPresent()) {
-            LOG.info(
-                    String.format(
-                            "[perf] references_request mode=parse_index kind=field_linked owner=%s member=%s",
-                            target.qualifiedType(), target.memberName()));
             return findFieldReferencesScoped(definitions, target, fieldLogicalKey(target).get());
         }
-        LOG.info(
-                String.format(
-                        "[perf] references_request mode=parse_index kind=member owner=%s member=%s",
-                        target.qualifiedType(), target.memberName()));
         return findMemberReferences(definitions, target, targetParameterTypes(target));
     }
 
@@ -178,7 +163,6 @@ public class ReferenceProvider {
                 }
             }.scan(parse.root, null);
         }
-        LOG.info(String.format("[perf] references_result_count=%d", dedup.size()));
         return new ArrayList<>(dedup.values());
     }
 

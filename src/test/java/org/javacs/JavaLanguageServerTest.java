@@ -25,6 +25,7 @@ import java.util.logging.Logger;
 import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.ExternalBinaryTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
+import org.javacs.markup.ErrorProvider;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -612,6 +613,16 @@ public class JavaLanguageServerTest {
                     "didSave should compile diagnostics exactly once",
                     1,
                     capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
+            var publishLine = capture.lastLineContaining("[perf] diagnostics_publish trigger=didSave");
+            Assert.assertNotNull("expected diagnostics publish timing log for didSave", publishLine);
+            Assert.assertTrue("publish log should include convert timing", publishLine.contains("convert="));
+            Assert.assertTrue("publish log should include warning timing", publishLine.contains("warnings="));
+            Assert.assertTrue("publish log should include materialize timing", publishLine.contains("materialize="));
+            Assert.assertTrue("publish log should include client timing", publishLine.contains("client="));
+            var summaryLine = capture.lastLineContaining("[perf] diagnostics_summary trigger=didSave");
+            Assert.assertNotNull("expected diagnostics summary log for didSave", summaryLine);
+            Assert.assertTrue("summary should report requested roots", summaryLine.contains("requested=1"));
+            Assert.assertTrue("summary should report batch size", summaryLine.contains("batch=1"));
             Assert.assertTrue(
                     "didSave should schedule a dedicated completion-index refresh",
                     capture.countContaining("[perf] completion_index_debounce trigger=didSave") > 0);
@@ -2625,6 +2636,17 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "expected completion flow logs during diagnostics isolation check",
                     capture.countContaining("[perf] completion_flow file=AutocompleteMember.java") > 0);
+            var completionFlow = capture.lastLineContaining("[perf] completion_flow file=AutocompleteMember.java");
+            Assert.assertNotNull("expected detailed completion flow line", completionFlow);
+            Assert.assertTrue("completion flow should include parse timing", completionFlow.contains("parse="));
+            Assert.assertTrue("completion flow should include resolve timing", completionFlow.contains("resolve="));
+            Assert.assertTrue("completion flow should include member cache state", completionFlow.contains("member_cache="));
+            var completionRequest = capture.lastLineContaining("[perf] completion_request file=AutocompleteMember.java");
+            Assert.assertNotNull("expected completion request timing line", completionRequest);
+            Assert.assertTrue("completion request should include wait timing", completionRequest.contains("wait="));
+            Assert.assertTrue(
+                    "completion request should include diagnostics activity state",
+                    completionRequest.contains("diagnostics_active="));
             Assert.assertEquals(
                     "completion should never report non-zero enter counters",
                     0,
@@ -2640,6 +2662,25 @@ public class JavaLanguageServerTest {
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void diagnosticsPublishSkipsNonRequestedExpandedRoots() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var serviceFile =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+                        "src/org/javacs/repro/service/ReproService.java");
+        try (var task = server.compiler().compile(serviceFile)) {
+            var report = new ErrorProvider(task).errors(Set.of(serviceFile.toUri()));
+            Assert.assertTrue(
+                    "expected diagnostics compile to include referenced Lombok sources",
+                    report.compiledRoots() > report.requestedRoots());
+            Assert.assertEquals("expected one explicitly requested diagnostics root", 1, report.requestedRoots());
+            Assert.assertEquals(
+                    "non-requested expanded roots should not be processed for diagnostics materialization",
+                    1,
+                    report.processedRoots());
         }
     }
 
@@ -3758,6 +3799,32 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void asyncDiagnosticsYieldWhileDidSaveIsInFlight() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        Assert.assertFalse(
+                "didSave priority gate should not affect foreground diagnostics",
+                invokeShouldYieldToDidSaveDiagnostics(server, "didSave", "pre_lock"));
+        Assert.assertFalse(
+                "didSave priority gate should not affect async diagnostics when no save is active",
+                invokeShouldYieldToDidSaveDiagnostics(server, "async:didChange", "pre_lock"));
+
+        var field = JavaLanguageServer.class.getDeclaredField("didSaveDiagnosticsInFlight");
+        field.setAccessible(true);
+        var inFlight = (AtomicInteger) field.get(server);
+        inFlight.incrementAndGet();
+        try {
+            Assert.assertTrue(
+                    "async diagnostics should yield once didSave has taken foreground priority",
+                    invokeShouldYieldToDidSaveDiagnostics(server, "async:didChange", "pre_lock"));
+            Assert.assertFalse(
+                    "foreground didSave diagnostics should continue running",
+                    invokeShouldYieldToDidSaveDiagnostics(server, "didSave", "pre_lock"));
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    @Test
     public void watchedCreatedForActiveJavaFileSkipsDuplicateWork() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
@@ -3841,9 +3908,20 @@ public class JavaLanguageServerTest {
                         java.util.Collection.class,
                         JavaCompilerService.class,
                         String.class,
-                        long.class);
+                        long.class,
+                        int.class,
+                        int.class);
         compileAndPublish.setAccessible(true);
-        compileAndPublish.invoke(server, files, compiler, trigger, -1L);
+        compileAndPublish.invoke(server, files, compiler, trigger, -1L, files.size(), 0);
+    }
+
+    private boolean invokeShouldYieldToDidSaveDiagnostics(
+            JavaLanguageServer server, String trigger, String phase) throws Exception {
+        var method =
+                JavaLanguageServer.class.getDeclaredMethod(
+                        "shouldYieldToDidSaveDiagnostics", String.class, String.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(server, trigger, phase);
     }
 
     private static void deleteRecursively(Path root) throws IOException {

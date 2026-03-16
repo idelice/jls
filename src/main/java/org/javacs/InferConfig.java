@@ -220,12 +220,10 @@ class InferConfig {
             var cacheKey = pomAbsolute + "|" + goal;
             var cached = MVN_DEPENDENCY_CACHE.get(cacheKey);
             if (cached != null && cached.pomLastModifiedMillis == pomLastModifiedMillis) {
-                LOG.fine(
-                        String.format(
-                                "[perf] maven_probe cache=hit goal=%s pom=%s deps=%d",
-                                goal, pomAbsolute, cached.dependencies.size()));
+                CacheAudit.hit("infer_config.maven_dependencies");
                 return cached.dependencies;
             }
+            CacheAudit.miss("infer_config.maven_dependencies");
 
             // TODO consider using mvn valide dependency:copy-dependencies -DoutputDirectory=??? instead
             // Run maven as a subprocess
@@ -262,10 +260,8 @@ class InferConfig {
             }
             var immutable = Set.copyOf(dependencies);
             MVN_DEPENDENCY_CACHE.put(cacheKey, new MavenDependencyCacheEntry(pomLastModifiedMillis, immutable));
-            LOG.fine(
-                    String.format(
-                            "[perf] maven_probe cache=miss goal=%s pom=%s deps=%d",
-                            goal, pomAbsolute, immutable.size()));
+            CacheAudit.load("infer_config.maven_dependencies");
+            CacheAudit.store("infer_config.maven_dependencies");
             return immutable;
         } catch (InterruptedException | IOException e) {
             throw new RuntimeException(e);

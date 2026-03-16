@@ -27,7 +27,9 @@ import java.util.StringJoiner;
 import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import java.util.function.Function;
 import org.javacs.CompilerProvider;
+import org.javacs.CacheAudit;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.lsp.CompletionItemKind;
@@ -48,6 +50,7 @@ public final class ExternalBinaryTypeIndex {
     private final String classPathFingerprint;
     private final Set<Path> classPathRoots;
     private final ClassLoader classLoader;
+    private final Cache<String, Optional<TypeMemberIndex.TypeInfo>> rawTypeCache;
     private final Cache<String, Optional<TypeMemberIndex.TypeInfo>> typeCache;
     private final Cache<String, Optional<Path>> decompiledSourceCache;
     private final Cache<String, Optional<BinaryClassModel>> classFileCache;
@@ -58,6 +61,7 @@ public final class ExternalBinaryTypeIndex {
         this.classPathFingerprint = "";
         this.classPathRoots = Set.of();
         this.classLoader = ExternalBinaryTypeIndex.class.getClassLoader();
+        this.rawTypeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.typeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.decompiledSourceCache = Caffeine.newBuilder().maximumSize(1).build();
         this.classFileCache = Caffeine.newBuilder().maximumSize(1).build();
@@ -70,6 +74,11 @@ public final class ExternalBinaryTypeIndex {
         this.classPathRoots = Set.copyOf(classPath);
         this.classPathFingerprint = fingerprint(classPath);
         this.classLoader = buildClassLoader(classPath);
+        this.rawTypeCache =
+                Caffeine.newBuilder()
+                        .maximumSize(20_000)
+                        .expireAfterAccess(Duration.ofMinutes(30))
+                        .build();
         this.typeCache =
                 Caffeine.newBuilder()
                         .maximumSize(20_000)
@@ -96,15 +105,15 @@ public final class ExternalBinaryTypeIndex {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
-        return typeCache.get(qualifiedName, this::loadTypeInfo);
+        return lookup(typeCache, qualifiedName, this::loadLinkedTypeInfo, "external_binary.type");
     }
 
     public boolean containsType(String qualifiedName) {
-        return typeInfo(qualifiedName).isPresent();
+        return rawTypeInfo(qualifiedName).isPresent();
     }
 
     public List<TypeMemberIndex.Member> members(String qualifiedName, boolean staticContext) {
-        var type = typeInfo(qualifiedName);
+        var type = rawTypeInfo(qualifiedName);
         if (type.isEmpty()) {
             return List.of();
         }
@@ -118,7 +127,7 @@ public final class ExternalBinaryTypeIndex {
     }
 
     public Optional<TypeMemberIndex.Member> member(String qualifiedName, String name, boolean staticContext) {
-        for (var member : members(qualifiedName, staticContext)) {
+        for (var member : linkedMembers(qualifiedName, staticContext)) {
             if (Objects.equals(name, member.name)) {
                 return Optional.of(member);
             }
@@ -127,6 +136,28 @@ public final class ExternalBinaryTypeIndex {
     }
 
     public Optional<TypeMemberIndex.Member> member(
+            String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
+        var targetKey =
+                TypeMemberIndex.canonicalMemberKey(
+                        qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
+        for (var member : linkedMembers(qualifiedName, staticContext)) {
+            if (Objects.equals(targetKey, member.canonicalKey)) {
+                return Optional.of(member);
+            }
+        }
+        return Optional.empty();
+    }
+
+    Optional<TypeMemberIndex.Member> rawMember(String qualifiedName, String name, boolean staticContext) {
+        for (var member : members(qualifiedName, staticContext)) {
+            if (Objects.equals(name, member.name)) {
+                return Optional.of(member);
+            }
+        }
+        return Optional.empty();
+    }
+
+    Optional<TypeMemberIndex.Member> rawMember(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var targetKey =
                 TypeMemberIndex.canonicalMemberKey(
@@ -156,6 +187,16 @@ public final class ExternalBinaryTypeIndex {
                                         .findFirst());
     }
 
+    private List<TypeMemberIndex.Member> linkedMembers(String qualifiedName, boolean staticContext) {
+        return typeInfo(qualifiedName)
+                .map(
+                        info ->
+                                info.members.stream()
+                                        .filter(member -> member.isStatic == staticContext)
+                                        .toList())
+                .orElse(List.of());
+    }
+
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
         if (typeName == null || typeName.isBlank() || root == null || compiler == null) {
             return Optional.empty();
@@ -172,13 +213,6 @@ public final class ExternalBinaryTypeIndex {
         }
 
         var candidates = new java.util.LinkedHashSet<String>();
-        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            var samePackage = packageName + "." + raw;
-            if (containsType(samePackage)) {
-                candidates.add(samePackage);
-            }
-        }
 
         for (var importTree : root.getImports()) {
             if (importTree.isStatic()) {
@@ -200,6 +234,13 @@ public final class ExternalBinaryTypeIndex {
         if (containsType(javaLang)) {
             candidates.add(javaLang);
         }
+        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+        if (!packageName.isBlank()) {
+            var samePackage = packageName + "." + raw;
+            if (containsType(samePackage)) {
+                candidates.add(samePackage);
+            }
+        }
         if (candidates.size() == 1) {
             return Optional.of(candidates.iterator().next());
         }
@@ -210,10 +251,29 @@ public final class ExternalBinaryTypeIndex {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
-        return decompiledSourceCache.get(qualifiedName, decompiler::decompileSourcePath);
+        return lookup(
+                decompiledSourceCache,
+                qualifiedName,
+                decompiler::decompileSourcePath,
+                "external_binary.decompiled_source");
     }
 
-    private Optional<TypeMemberIndex.TypeInfo> loadTypeInfo(String qualifiedName) {
+    private Optional<TypeMemberIndex.TypeInfo> rawTypeInfo(String qualifiedName) {
+        if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
+            return Optional.empty();
+        }
+        return lookup(rawTypeCache, qualifiedName, this::loadRawTypeInfo, "external_binary.type_raw");
+    }
+
+    private Optional<TypeMemberIndex.TypeInfo> loadLinkedTypeInfo(String qualifiedName) {
+        var raw = rawTypeInfo(qualifiedName);
+        if (raw.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(applySourceLinks(raw.get()));
+    }
+
+    private Optional<TypeMemberIndex.TypeInfo> loadRawTypeInfo(String qualifiedName) {
         if (isWorkspaceOwnedCandidate(qualifiedName)) {
             LOG.fine(
                     String.format(
@@ -227,8 +287,9 @@ public final class ExternalBinaryTypeIndex {
             if (binaryClass.isArray()) {
                 return Optional.empty();
             }
+            var publicFields = binaryClass.getFields();
             var seen = new LinkedHashMap<String, TypeMemberIndex.Member>();
-            for (var field : binaryClass.getFields()) {
+            for (var field : publicFields) {
                 try {
                     if (field.isSynthetic()) {
                         continue;
@@ -260,10 +321,11 @@ public final class ExternalBinaryTypeIndex {
                                     "[external-binary] skip field owner=%s field=%s reason=%s",
                                     qualifiedName,
                                     field.getName(),
-                                    ex.getClass().getSimpleName()));
+                            ex.getClass().getSimpleName()));
                 }
             }
-            for (var method : binaryClass.getMethods()) {
+            var publicMethods = binaryClass.getMethods();
+            for (var method : publicMethods) {
                 try {
                     if (method.isSynthetic() || method.isBridge()) {
                         continue;
@@ -315,7 +377,7 @@ public final class ExternalBinaryTypeIndex {
                                     "[external-binary] skip method owner=%s method=%s reason=%s",
                                     qualifiedName,
                                     method.getName(),
-                                    ex.getClass().getSimpleName()));
+                            ex.getClass().getSimpleName()));
                 }
             }
             var members = new ArrayList<>(seen.values());
@@ -329,27 +391,53 @@ public final class ExternalBinaryTypeIndex {
                     java.util.Arrays.stream(binaryClass.getInterfaces())
                             .map(this::canonicalTypeName)
                             .collect(Collectors.toList());
-            return Optional.of(typeInfoWithSourceLinks(qualifiedName, binaryClass.getSimpleName(), members, superclass, interfaces));
+            var linked = new TypeMemberIndex.TypeInfo(qualifiedName, binaryClass.getSimpleName(), members, false, null, superclass, interfaces);
+            return Optional.of(linked);
         } catch (ClassNotFoundException | LinkageError ex) {
             LOG.fine(
                     String.format(
                             "[external-binary] reflect miss type=%s reason=%s",
                             qualifiedName,
                             ex.getClass().getSimpleName()));
-            var fallback = classFileCache.get(qualifiedName, this::loadBinaryClassModel);
+            var fallback =
+                    lookup(
+                            classFileCache,
+                            qualifiedName,
+                            this::loadBinaryClassModel,
+                            "external_binary.classfile");
             if (fallback.isPresent()) {
                 LOG.fine(String.format("[external-binary] classfile fallback type=%s", qualifiedName));
                 return Optional.of(
-                        typeInfoWithSourceLinks(
+                        new TypeMemberIndex.TypeInfo(
                                 fallback.get().qualifiedName(),
                                 fallback.get().simpleName(),
                                 fallback.get().members(),
+                                false,
+                                null,
                                 null,
                                 List.of()));
             }
             LOG.fine(String.format("[external-binary] miss type=%s reason=%s", qualifiedName, ex.getClass().getSimpleName()));
             return Optional.empty();
         }
+    }
+
+    private <T> Optional<T> lookup(
+            Cache<String, Optional<T>> cache,
+            String key,
+            Function<String, Optional<T>> loader,
+            String metricName) {
+        var cached = cache.getIfPresent(key);
+        if (cached != null) {
+            CacheAudit.hit(metricName);
+            return cached;
+        }
+        CacheAudit.miss(metricName);
+        var loaded = loader.apply(key);
+        cache.put(key, loaded);
+        CacheAudit.load(metricName);
+        CacheAudit.store(metricName);
+        return loaded;
     }
 
     /**
@@ -536,10 +624,19 @@ public final class ExternalBinaryTypeIndex {
         return member.canonicalKey;
     }
 
-    private TypeMemberIndex.TypeInfo typeInfoWithSourceLinks(
-            String qualifiedName, String simpleName, List<TypeMemberIndex.Member> members, String superclass, List<String> interfaces) {
-        var linkedMembers = applySourceFieldLinks(qualifiedName, members);
-        return new TypeMemberIndex.TypeInfo(qualifiedName, simpleName, linkedMembers, false, null, superclass, interfaces);
+    private TypeMemberIndex.TypeInfo applySourceLinks(TypeMemberIndex.TypeInfo raw) {
+        var linkedMembers = applySourceFieldLinks(raw.qualifiedName, raw.members);
+        if (linkedMembers == raw.members) {
+            return raw;
+        }
+        return new TypeMemberIndex.TypeInfo(
+                raw.qualifiedName,
+                raw.simpleName,
+                linkedMembers,
+                raw.fromCompiledRoot,
+                raw.sourcePath,
+                raw.superclass,
+                raw.interfaces);
     }
 
     private List<TypeMemberIndex.Member> applySourceFieldLinks(String qualifiedName, List<TypeMemberIndex.Member> members) {

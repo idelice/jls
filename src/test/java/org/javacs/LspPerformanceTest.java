@@ -3,6 +3,7 @@ package org.javacs;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.lessThan;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.google.gson.JsonElement;
@@ -1169,6 +1170,13 @@ public class LspPerformanceTest {
             var completion = server.completion(completionPosition(MEMBER_FILE, 7, 20));
             assertTrue(completion.isPresent());
             assertTrue("expected at least one completion item", !completion.get().items.isEmpty());
+            assertFalse(
+                    "did not expect synthetic local StringUtils item",
+                    completion.get().items.stream()
+                            .anyMatch(
+                                    item ->
+                                            "StringUtils".equals(item.label)
+                                                    && "local".equals(item.detail)));
             var first = completion.get().items.get(0);
             assertTrue("expected StringUtils to rank first", "StringUtils".equals(first.label));
             assertTrue(

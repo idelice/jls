@@ -190,10 +190,6 @@ public final class TypeLookupBoundary {
 
     private LinkedHashSet<String> scopedCandidates(String raw, CompilationUnitTree root) {
         var candidates = new LinkedHashSet<String>();
-        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            candidates.add(packageName + "." + raw);
-        }
         for (var importTree : root.getImports()) {
             if (importTree.isStatic()) {
                 continue;
@@ -205,6 +201,10 @@ public final class TypeLookupBoundary {
             if (imported.endsWith(".*")) {
                 candidates.add(imported.substring(0, imported.length() - 1) + raw);
             }
+        }
+        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+        if (!packageName.isBlank()) {
+            candidates.add(packageName + "." + raw);
         }
         return candidates;
     }

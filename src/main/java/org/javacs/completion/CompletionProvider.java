@@ -56,6 +56,7 @@ import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.type.TypeVariable;
+import org.javacs.CacheAudit;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
@@ -159,6 +160,8 @@ public class CompletionProvider {
             boolean endsWithParen,
             String currentType) {}
 
+    private record IndexedCompletionResult(CompletionList list, long resolveMs, String cacheState) {}
+
     public CompletionProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, long completionIndexVersion) {
         this.compiler = compiler;
         this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
@@ -173,7 +176,7 @@ public class CompletionProvider {
         var started = Instant.now();
         var parseStarted = Instant.now();
         var task = compiler.parse(file);
-        LOG.info("[perf] completion_parse file=" + file.getFileName() + " took=" + Duration.between(parseStarted, Instant.now()).toMillis() + "ms");
+        var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
         var cursor = task.root.getLineMap().getPosition(line, column);
         var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
         var endOfLine = endOfLine(contents, (int) cursor);
@@ -183,18 +186,23 @@ public class CompletionProvider {
         var parsePath = new FindCompletionsAt(task.task).scan(task.root, cursor);
         CompletionList list;
         String mode;
+        long resolveMs = 0;
+        String memberCacheState = "n/a";
         if (memberAccess != null && isImportOrPackageContext(parsePath)) {
             // `import foo.bar.` should stay on the import completion path.
             list = completeParseOnly(task, pruned, cursor, memberAccess.partial);
             mode = "import_parse";
         } else if (memberAccess != null) {
-            list =
+            var indexed =
                     completeParseAndIndex(
                             task,
                             parsePath,
                             cursor,
                             memberAccess,
                             endsWithParen(pruned, (int) cursor));
+            list = indexed.list();
+            resolveMs = indexed.resolveMs();
+            memberCacheState = indexed.cacheState();
             mode = "member_index";
         } else {
             list = completeParseOnly(task, pruned, cursor, partialIdentifier(pruned, (int) cursor));
@@ -210,16 +218,18 @@ public class CompletionProvider {
         }
         addTopLevelSnippets(task, list);
         sortCompletionItems(list.items);
-        logCompletionTiming(started, list.items, list.isIncomplete);
         LOG.info(
                 String.format(
-                        "[perf] completion_flow file=%s mode=%s sources=1 enter=%d analyze=%d ap=%d index_version=%d took=%dms",
+                        "[perf] completion_flow file=%s mode=%s sources=1 enter=%d analyze=%d ap=%d index_version=%d parse=%dms resolve=%dms member_cache=%s took=%dms",
                         file.getFileName(),
                         mode,
                         0,
                         0,
                         0,
                         completionIndexVersion,
+                        parseMs,
+                        resolveMs,
+                        memberCacheState,
                         Duration.between(started, Instant.now()).toMillis()));
         return list;
     }
@@ -233,7 +243,7 @@ public class CompletionProvider {
         return cursor;
     }
 
-    private CompletionList completeParseAndIndex(
+    private IndexedCompletionResult completeParseAndIndex(
             ParseTask parseTask,
             TreePath parsePath,
             long cursor,
@@ -242,52 +252,39 @@ public class CompletionProvider {
         return completeMembersUsingIndex(parseTask, parsePath, cursor, memberAccess, endsWithParen);
     }
 
-    private CompletionList completeMembersUsingIndex(
+    private IndexedCompletionResult completeMembersUsingIndex(
             ParseTask parseTask,
             TreePath parsePath,
             long cursor,
             MemberAccessContext memberAccess,
             boolean endsWithParen) {
         if (completionIndex == null) {
-            LOG.fine("[perf] completion_member_index state=miss reason=index_empty receiver=" + memberAccess.receiver);
-            return EMPTY;
+            return new IndexedCompletionResult(EMPTY, 0, "index_empty");
         }
         var index = completionIndex;
         var started = Instant.now();
         var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
         var expression = memberReceiverExpression(parsePath);
+        var resolveStarted = Instant.now();
         var resolved = resolver.resolve(expression, memberAccess.receiver);
+        var resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
         if (resolved.isEmpty()) {
-            LOG.info("[completion] unresolved receiver at position " + cursor + ", no fallback used");
-            LOG.fine(
-                    "[perf] completion_member_index state=miss receiver="
-                            + memberAccess.receiver
-                            + " reason=unresolved_type");
-            return EMPTY;
+            return new IndexedCompletionResult(EMPTY, resolveMs, "unresolved_type");
         }
         var target = resolved.get();
         if (!target.arrayType && !isQualifiedTypeName(target.qualifiedType)) {
-            LOG.info("[completion] unresolved receiver at position " + cursor + ", no fallback used");
-            LOG.fine(
-                    "[perf] completion_member_index state=miss receiver="
-                            + memberAccess.receiver
-                            + " reason=non_fqn_type type="
-                            + target.qualifiedType);
-            return EMPTY;
+            return new IndexedCompletionResult(EMPTY, resolveMs, "non_fqn_type");
         }
         var currentType = resolver.currentEnclosingTypeName();
         if (target.arrayType) {
-            return completeArrayMemberSelect(target.staticContext);
+            return new IndexedCompletionResult(
+                    completeArrayMemberSelect(target.staticContext), resolveMs, "array_type");
         }
+        var membersStarted = Instant.now();
         var members = index.members(target.qualifiedType, target.staticContext);
+        var membersMs = Duration.between(membersStarted, Instant.now()).toMillis();
         if (members.isEmpty()) {
-            LOG.fine(
-                    "[perf] completion_member_index state=miss receiver="
-                            + memberAccess.receiver
-                            + " type="
-                            + target.qualifiedType
-                            + " reason=no_members");
-            return EMPTY;
+            return new IndexedCompletionResult(EMPTY, resolveMs + membersMs, "no_members");
         }
         var cacheKey =
                 new MemberCompletionCacheKey(
@@ -299,13 +296,15 @@ public class CompletionProvider {
                         currentType.orElse(""));
         var cached = MEMBER_COMPLETION_CACHE.getIfPresent(cacheKey);
         if (cached != null) {
-            LOG.fine(
-                    String.format(
-                            "[perf] completion_member_index state=cache_hit receiver=%s type=%s items=%d",
-                            memberAccess.receiver, target.qualifiedType, cached.items.size()));
-            return copyCompletionList(cached);
+            CacheAudit.hit("completion.member");
+            return new IndexedCompletionResult(
+                    copyCompletionList(cached),
+                    Duration.between(started, Instant.now()).toMillis(),
+                    "hit");
         }
+        CacheAudit.miss("completion.member");
 
+        var buildStarted = Instant.now();
         var list = new ArrayList<CompletionItem>();
         var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();
         var methodPriority = new HashMap<String, Integer>();
@@ -334,29 +333,23 @@ public class CompletionProvider {
             }
         }
         var result = new CompletionList(false, list);
+        var buildMs = Duration.between(buildStarted, Instant.now()).toMillis();
         if (memberAccess.partial.isEmpty()
                 && !"java.lang.Object".equals(target.qualifiedType)
                 && isWeakObjectOnlyResult(result)) {
-            LOG.fine(
-                    "[perf] completion_member_index state=drop_weak_object_only receiver="
-                            + memberAccess.receiver
-                            + " type="
-                            + target.qualifiedType
-                            + " items="
-                            + list.size());
-            return EMPTY;
+            return new IndexedCompletionResult(
+                    EMPTY, resolveMs + membersMs + buildMs, "miss_drop_weak_object_only");
         }
+        var sortStarted = Instant.now();
         sortCompletionItems(list);
+        var sortMs = Duration.between(sortStarted, Instant.now()).toMillis();
         result = new CompletionList(false, list);
+        var cacheStoreStarted = Instant.now();
         MEMBER_COMPLETION_CACHE.put(cacheKey, freezeCompletionList(result));
-        LOG.info(
-                String.format(
-                        "[perf] completion_member_index state=hit receiver=%s type=%s items=%d took=%dms",
-                        memberAccess.receiver,
-                        target.qualifiedType,
-                        list.size(),
-                        Duration.between(started, Instant.now()).toMillis()));
-        return result;
+        CacheAudit.load("completion.member");
+        CacheAudit.store("completion.member");
+        return new IndexedCompletionResult(
+                result, Duration.between(started, Instant.now()).toMillis(), "miss");
     }
 
     private boolean isIndexMemberVisible(
@@ -655,14 +648,23 @@ public class CompletionProvider {
 
         private Optional<TypeMemberIndex.Member> resolveMemberFromIndexOrSource(
                 String ownerType, String memberName, boolean staticContext) {
-            var indexed =
-                    index.isWorkspaceOwnedType(ownerType, compiler)
-                            ? index.workspace().member(ownerType, memberName, staticContext)
-                            : index.member(ownerType, memberName, staticContext);
+            var indexed = resolveIndexedMember(ownerType, memberName, staticContext, null);
             if (indexed.isPresent()) {
                 return indexed;
             }
             return resolveSourceMember(ownerType, memberName, staticContext);
+        }
+
+        private Optional<TypeMemberIndex.Member> resolveIndexedMember(
+                String ownerType, String memberName, boolean staticContext, String[] erasedParameterTypes) {
+            if (index.isWorkspaceOwnedType(ownerType, compiler)) {
+                return erasedParameterTypes == null
+                        ? index.workspace().member(ownerType, memberName, staticContext)
+                        : index.workspace().member(ownerType, memberName, staticContext, erasedParameterTypes);
+            }
+            return erasedParameterTypes == null
+                    ? index.external().rawMember(ownerType, memberName, staticContext)
+                    : index.external().rawMember(ownerType, memberName, staticContext, erasedParameterTypes);
         }
 
         private Optional<TypeMemberIndex.Member> resolveSourceMember(
@@ -1238,7 +1240,6 @@ public class CompletionProvider {
     }
 
     private CompletionList completeIdentifier(CompileTask task, TreePath path, String partial, boolean endsWithParen) {
-        LOG.info("...complete identifiers");
         var list = new CompletionList();
         list.items = completeUsingScope(task, path, partial, endsWithParen);
         addStaticImports(task, path.getCompilationUnit(), partial, endsWithParen, list);
@@ -1364,12 +1365,22 @@ public class CompletionProvider {
                 var name = t.getName().toString();
                 if (name.isEmpty()) return super.visitVariable(t, null);
                 if (!StringSearch.matchesPartialName(name, partial)) return super.visitVariable(t, null);
+                if (isTypeLikeIdentifier(name)) {
+                    return super.visitVariable(t, null);
+                }
                 if (seen.add(name)) {
                     list.items.add(variable(name));
                 }
                 return super.visitVariable(t, null);
             }
         }.scan(task.root, null);
+    }
+
+    private boolean isTypeLikeIdentifier(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        return Character.isUpperCase(name.charAt(0));
     }
 
     private void addSlf4jLoggerIfAnnotated(
@@ -1545,7 +1556,6 @@ public class CompletionProvider {
         for (var overloads : methods.values()) {
             list.add(method(task, overloads, !endsWithParen));
         }
-        LOG.info("...found " + list.size() + " scope members");
         return list;
     }
 
@@ -1579,7 +1589,6 @@ public class CompletionProvider {
         for (var overloads : methods.values()) {
             list.items.add(method(task, overloads, !endsWithParen));
         }
-        LOG.info("...found " + (list.items.size() - previousSize) + " static imports");
     }
 
     private void addStaticImportsFromIndex(
@@ -1626,7 +1635,6 @@ public class CompletionProvider {
             method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
             list.items.add(method);
         }
-        LOG.info("...found " + (list.items.size() - previousSize) + " static imports from index");
     }
 
     private boolean importMatchesPartial(Name staticImport, String partial) {
@@ -1699,7 +1707,6 @@ public class CompletionProvider {
             }
             list.items.add(item);
         }
-        LOG.info("...found " + (list.items.size() - previousSize) + " class names");
     }
 
     private void applyClassSortPriority(CompilationUnitTree root, String className, CompletionItem item) {
@@ -1789,7 +1796,6 @@ public class CompletionProvider {
     private CompletionList completeMemberSelect(
             CompileTask task, TreePath path, String partial, boolean endsWithParen) {
         var select = (MemberSelectTree) path.getLeaf();
-        LOG.info("...complete members of " + select.getExpression());
         var expressionPath = new TreePath(path, select.getExpression());
         return completeMembersForExpression(task, expressionPath, select.getExpression(), partial, endsWithParen);
     }
@@ -1943,7 +1949,6 @@ public class CompletionProvider {
     private CompletionList completeMemberReference(CompileTask task, TreePath path, String partial) {
         var trees = Trees.instance(task.task);
         var select = (MemberReferenceTree) path.getLeaf();
-        LOG.info("...complete methods of " + select.getQualifierExpression());
         path = new TreePath(path, select.getQualifierExpression());
         var element = trees.getElement(path);
         var isStatic = element instanceof TypeElement;
@@ -2024,7 +2029,6 @@ public class CompletionProvider {
         var switchTree = (SwitchTree) path.getLeaf();
         var expressionPath = new TreePath(path, switchTree.getExpression());
         var type = resolveSwitchExpressionType(task, expressionPath);
-        LOG.info("...complete constants of type " + type);
         if (!(type instanceof DeclaredType)) {
             return NOT_SUPPORTED;
         }
@@ -2108,7 +2112,6 @@ public class CompletionProvider {
     }
 
     private CompletionList completeImport(String path) {
-        LOG.info("...complete import");
         var names = new HashSet<String>();
         var list = new CompletionList();
         for (var className : compiler.publicTopLevelTypes()) {
@@ -2440,13 +2443,6 @@ public class CompletionProvider {
             this.partial = partial;
             this.dotTrigger = dotTrigger;
         }
-    }
-
-    private void logCompletionTiming(Instant started, List<?> list, boolean isIncomplete) {
-        var elapsedMs = Duration.between(started, Instant.now()).toMillis();
-        if (isIncomplete)
-            LOG.fine(String.format("[perf] completion_total items=%d incomplete=true took=%dms", list.size(), elapsedMs));
-        else LOG.fine(String.format("[perf] completion_total items=%d incomplete=false took=%dms", list.size(), elapsedMs));
     }
 
     private CharSequence simpleName(String className) {

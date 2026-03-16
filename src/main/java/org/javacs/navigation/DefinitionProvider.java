@@ -83,7 +83,6 @@ public class DefinitionProvider {
 
     private ResolvedSymbol resolve(ParseTask parse, TreePath path, ParseTypeResolver types) {
         var leaf = path.getLeaf();
-        LOG.fine(String.format("[perf] definition_path kind=%s leaf=%s", leaf.getKind(), leaf));
         if (leaf instanceof ClassTree cls) {
             return typeDeclaration(parse, path, cls);
         }
@@ -143,7 +142,6 @@ public class DefinitionProvider {
         }
         var inheritedField = types.resolveInheritedFieldMember(name);
         if (inheritedField.isPresent()) {
-            LOG.fine(String.format("[perf] definition_inherited_field owner=%s member=%s", inheritedField.get().ownerType, name));
             return resolveFieldFromMember(inheritedField.get().ownerType, name, inheritedField.get());
         }
 
@@ -202,13 +200,6 @@ public class DefinitionProvider {
                 return resolveTypeName(nestedType, name);
             }
         }
-
-        LOG.fine(
-                String.format(
-                        "[perf] definition_member_unresolved expr=%s member=%s receiver=%s",
-                        memberSelect.getExpression(),
-                        name,
-                        receiver.map(r -> r.qualifiedType).orElse("<empty>")));
 
         return resolveTypeTree(parse, memberSelect, name);
     }
@@ -798,7 +789,6 @@ public class DefinitionProvider {
     private List<Location> findFieldLocations(String ownerType, String fieldName) {
         var source = openTypeSource(ownerType);
         if (source.isEmpty()) {
-            LOG.fine(String.format("[perf] definition_field_source_missing owner=%s field=%s", ownerType, fieldName));
             return List.of();
         }
         var locations = findFieldLocations(source.get(), fieldName);
@@ -809,7 +799,6 @@ public class DefinitionProvider {
         if (decompiled.isPresent()) {
             return findFieldLocations(decompiled.get(), fieldName);
         }
-        LOG.fine(String.format("[perf] definition_field_not_found owner=%s field=%s", ownerType, fieldName));
         return List.of();
     }
 

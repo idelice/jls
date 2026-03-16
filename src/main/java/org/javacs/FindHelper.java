@@ -208,7 +208,17 @@ public class FindHelper {
     private static URI normalizeUri(URI uri) {
         if (uri == null) return null;
         if (!"jar".equals(uri.getScheme())) return uri;
-        return jarUriCache.computeIfAbsent(uri, FindHelper::extractJarUri);
+        var cached = jarUriCache.get(uri);
+        if (cached != null) {
+            CacheAudit.hit("jar_source.extract");
+            return cached;
+        }
+        CacheAudit.miss("jar_source.extract");
+        var extracted = extractJarUri(uri);
+        jarUriCache.put(uri, extracted);
+        CacheAudit.load("jar_source.extract");
+        CacheAudit.store("jar_source.extract");
+        return extracted;
     }
 
     private static URI extractJarUri(URI uri) {

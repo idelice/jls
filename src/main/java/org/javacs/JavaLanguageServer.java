@@ -18,6 +18,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
@@ -85,6 +86,8 @@ class JavaLanguageServer extends LanguageServer {
     private final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
     private final Set<Path> dirtyDiagnosticsFiles = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final AtomicInteger diagnosticsCompilesInFlight = new AtomicInteger();
+    private final AtomicInteger didSaveDiagnosticsInFlight = new AtomicInteger();
 
     private enum CompletionIndexRefreshMode {
         ACTIVE_DOCUMENT_BOOTSTRAP,
@@ -126,9 +129,13 @@ class JavaLanguageServer extends LanguageServer {
 
     private record ActiveDocumentChangeImpact(boolean refreshCompletionIndex) {}
 
-    private record ScheduledDiagnosticsRequest(long scheduleRevision, long contentRevision) {}
+    private record ScheduledDiagnosticsRequest(
+            long scheduleRevision, long contentRevision, int requestedCount, int dirtyOpenCount) {}
 
     private record DiagnosticsBatch(List<Path> files, int requestedCount, int dirtyOpenCount) {}
+
+    private record TypeIndexAvailability(
+            long versionBefore, long versionAfter, CompletionIndexScope scopeBefore, CompletionIndexScope scopeAfter, long waitMs) {}
 
     private record DeclaredTypeShape(
             String qualifiedName,
@@ -232,7 +239,8 @@ class JavaLanguageServer extends LanguageServer {
         cancelPendingDiagnostics("foreground");
         cancelPendingCompletionIndex("foreground");
         var selection = selectDiagnosticsCompiler();
-        compileAndPublish(files, selection.compiler, "foreground", -1);
+        var javaFiles = normalizeJavaFiles(files);
+        compileAndPublish(files, selection.compiler, "foreground", -1, javaFiles.size(), 0);
         if (completionSnapshot().version() == 0 && !FileStore.activeDocuments().isEmpty()) {
             scheduleActiveCompletionBootstrapIfNeeded("lintBootstrap", 0);
         }
@@ -242,9 +250,17 @@ class JavaLanguageServer extends LanguageServer {
             Collection<Path> files,
             JavaCompilerService diagnosticsCompiler,
             String trigger,
-            long expectedContentRevision) {
+            long expectedContentRevision,
+            int requestedCount,
+            int dirtyOpenCount) {
+        if (shouldYieldToDidSaveDiagnostics(trigger, "pre_lock")) {
+            return;
+        }
         var waitStarted = Instant.now();
         synchronized (diagnosticsCompileMutex) {
+            if (shouldYieldToDidSaveDiagnostics(trigger, "post_lock")) {
+                return;
+            }
             var waited = Duration.between(waitStarted, Instant.now()).toMillis();
             if (waited > 0) {
                 LOG.fine(
@@ -258,12 +274,30 @@ class JavaLanguageServer extends LanguageServer {
             var started = Instant.now();
             CompileTask task = null;
             try {
+                diagnosticsCompilesInFlight.incrementAndGet();
                 task = diagnosticsCompiler.compile(javaFiles.toArray(Path[]::new));
                 var compiled = Instant.now();
+                var compileMs = Duration.between(started, compiled).toMillis();
+                var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
                 LOG.info(
                         String.format(
                                 "[perf] diagnostics_compile trigger=%s files=%d took=%dms",
-                                trigger, javaFiles.size(), Duration.between(started, compiled).toMillis()));
+                                trigger, javaFiles.size(), compileMs));
+                LOG.fine(
+                        String.format(
+                                "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s",
+                                trigger,
+                                requestedCount,
+                                dirtyOpenCount,
+                                javaFiles.size(),
+                                task.roots.size(),
+                                compileTelemetry.annotationProcessingEnabled,
+                                compileTelemetry.expandedSources,
+                                compileTelemetry.path,
+                                compileTelemetry.cacheName));
+                if (shouldYieldToDidSaveDiagnostics(trigger, "post_compile")) {
+                    return;
+                }
                 if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_compile")) {
                     return;
                 }
@@ -272,6 +306,7 @@ class JavaLanguageServer extends LanguageServer {
                     return;
                 }
             } finally {
+                diagnosticsCompilesInFlight.updateAndGet(current -> Math.max(0, current - 1));
                 if (task != null) {
                     task.close();
                 }
@@ -292,18 +327,22 @@ class JavaLanguageServer extends LanguageServer {
         if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "pre_publish")) {
             return;
         }
+        if (shouldYieldToDidSaveDiagnostics(trigger, "pre_publish")) {
+            return;
+        }
         var diagnosticsCount = 0;
         var publishedUris = new HashSet<java.net.URI>();
         var requestedUris = new HashSet<java.net.URI>();
         for (var file : requestedJavaFiles) {
             requestedUris.add(file.toUri());
         }
-        for (var errs : new ErrorProvider(task).errors()) {
+        var materializeStarted = Instant.now();
+        var report = new ErrorProvider(task).errors(requestedUris);
+        var materializeMs = Duration.between(materializeStarted, Instant.now()).toMillis();
+        var clientStarted = Instant.now();
+        for (var errs : report.diagnostics()) {
             if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_loop")) {
                 return;
-            }
-            if (!requestedUris.contains(errs.uri)) {
-                continue;
             }
             client.publishDiagnostics(errs);
             diagnosticsCount += errs.diagnostics.size();
@@ -317,13 +356,21 @@ class JavaLanguageServer extends LanguageServer {
             var uri = file.toUri();
             if (publishedUris.contains(uri)) continue;
             client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
+            publishedUris.add(uri);
         }
         LOG.fine(
                 String.format(
-                        "[perf] diagnostics_publish trigger=%s files=%d diagnostics=%d took=%dms",
+                        "[perf] diagnostics_publish trigger=%s requested_roots=%d compiled_roots=%d processed_roots=%d published_roots=%d diagnostics=%d convert=%dms warnings=%dms materialize=%dms client=%dms took=%dms",
                         trigger,
                         requestedJavaFiles.size(),
+                        report.compiledRoots(),
+                        report.processedRoots(),
+                        publishedUris.size(),
                         diagnosticsCount,
+                        report.convertMs(),
+                        report.warningMs(),
+                        materializeMs,
+                        Duration.between(clientStarted, Instant.now()).toMillis(),
                         Duration.between(publishStarted, Instant.now()).toMillis()));
         clearDirtyDiagnostics(requestedJavaFiles);
     }
@@ -714,7 +761,10 @@ class JavaLanguageServer extends LanguageServer {
         if (batch.files().isEmpty()) return;
         var request =
                 new ScheduledDiagnosticsRequest(
-                        diagnosticsRevision.incrementAndGet(), FileStore.contentRevision());
+                        diagnosticsRevision.incrementAndGet(),
+                        FileStore.contentRevision(),
+                        batch.requestedCount(),
+                        batch.dirtyOpenCount());
         var filesBatch = batch.files();
         synchronized (this) {
             if (pendingDiagnostics != null) {
@@ -794,6 +844,20 @@ class JavaLanguageServer extends LanguageServer {
         LOG.fine("[perf] diagnostics_cancel reason=" + reason);
     }
 
+    private boolean shouldYieldToDidSaveDiagnostics(String trigger, String phase) {
+        if (!trigger.startsWith("async:")) {
+            return false;
+        }
+        if (didSaveDiagnosticsInFlight.get() <= 0) {
+            return false;
+        }
+        LOG.fine(
+                String.format(
+                        "[perf] diagnostics_yield trigger=%s phase=%s reason=didSave_pending",
+                        trigger, phase));
+        return true;
+    }
+
     private DiagnosticsBatch resolveDiagnosticsBatch(Collection<Path> files, String trigger) {
         var requested = normalizeJavaFiles(files);
         if (requested.isEmpty()) {
@@ -829,7 +893,9 @@ class JavaLanguageServer extends LanguageServer {
                     files,
                     selection.compiler,
                     "async:" + trigger,
-                    request.contentRevision());
+                    request.contentRevision(),
+                    request.requestedCount(),
+                    request.dirtyOpenCount());
         } catch (Exception e) {
             LOG.warning("Async lint failed for " + files + ": " + e.getMessage());
             LOG.log(java.util.logging.Level.FINE, "", e);
@@ -893,26 +959,28 @@ class JavaLanguageServer extends LanguageServer {
         LOG.fine("[perf] completion_index_cancel reason=" + reason);
     }
 
-    private void awaitCompletionBootstrap(long initialIndexVersion, long timeoutMs) {
+    private long awaitCompletionBootstrap(long initialIndexVersion, long timeoutMs) {
+        var started = System.nanoTime();
         var deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         while (completionSnapshot().version() == initialIndexVersion && System.nanoTime() < deadline) {
             try {
                 Thread.sleep(COMPLETION_BOOTSTRAP_POLL_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return;
+                return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
             }
         }
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
     }
 
-    private void ensureTypeIndexReady(String trigger, long waitMs, boolean requireWorkspaceScope) {
+    private TypeIndexAvailability ensureTypeIndexReady(String trigger, long waitMs, boolean requireWorkspaceScope) {
         compiler();
         var snapshot = completionSnapshot();
         var initialIndexVersion = snapshot.version();
         var currentScope = snapshot.scope();
         if (initialIndexVersion != 0
                 && (!requireWorkspaceScope || currentScope == CompletionIndexScope.WORKSPACE)) {
-            return;
+            return new TypeIndexAvailability(initialIndexVersion, initialIndexVersion, currentScope, currentScope, 0);
         }
         LOG.fine(
                 String.format(
@@ -923,7 +991,14 @@ class JavaLanguageServer extends LanguageServer {
         } else {
             scheduleActiveCompletionBootstrapIfNeeded(trigger, 0);
         }
-        awaitCompletionBootstrap(initialIndexVersion, waitMs);
+        var waited = awaitCompletionBootstrap(initialIndexVersion, waitMs);
+        var updated = completionSnapshot();
+        return new TypeIndexAvailability(
+                initialIndexVersion,
+                updated.version(),
+                currentScope,
+                updated.scope(),
+                waited);
     }
 
     private boolean shouldSkipStaleDiagnostics(long expectedContentRevision, String trigger, String phase) {
@@ -1167,6 +1242,7 @@ class JavaLanguageServer extends LanguageServer {
         }
         diagnosticsExecutor.shutdownNow();
         completionIndexExecutor.shutdownNow();
+        CacheAudit.logSummary(LOG);
     }
 
     public JavaLanguageServer(LanguageClient client) {
@@ -1263,11 +1339,23 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<CompletionList> completion(TextDocumentPositionParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         var file = Paths.get(params.textDocument.uri);
-        ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
+        var started = Instant.now();
+        var readiness = ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
         var snapshot = completionSnapshot();
         var provider = new CompletionProvider(cacheCompiler, snapshot.typeIndex(), snapshot.version());
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1, -1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
+        LOG.fine(
+                String.format(
+                        "[perf] completion_request file=%s wait=%dms index_before=%d index_after=%d scope_before=%s scope_after=%s diagnostics_active=%s took=%dms",
+                        file.getFileName(),
+                        readiness.waitMs(),
+                        readiness.versionBefore(),
+                        readiness.versionAfter(),
+                        readiness.scopeBefore().name().toLowerCase(),
+                        readiness.scopeAfter().name().toLowerCase(),
+                        diagnosticsCompilesInFlight.get() > 0,
+                        Duration.between(started, Instant.now()).toMillis()));
         return Optional.of(list);
     }
 
@@ -1562,7 +1650,18 @@ class JavaLanguageServer extends LanguageServer {
             cancelPendingCompletionIndex("didSave");
             var selection = selectDiagnosticsCompiler();
             var batch = resolveDiagnosticsBatch(List.of(file), "didSave");
-            compileAndPublish(batch.files(), selection.compiler, "didSave", -1);
+            didSaveDiagnosticsInFlight.incrementAndGet();
+            try {
+                compileAndPublish(
+                        batch.files(),
+                        selection.compiler,
+                        "didSave",
+                        -1,
+                        batch.requestedCount(),
+                        batch.dirtyOpenCount());
+            } finally {
+                didSaveDiagnosticsInFlight.updateAndGet(current -> Math.max(0, current - 1));
+            }
             if (completionSnapshot().version() == 0 && !FileStore.activeDocuments().isEmpty()) {
                 scheduleActiveCompletionBootstrapIfNeeded("didSaveBootstrap", 0);
             } else {

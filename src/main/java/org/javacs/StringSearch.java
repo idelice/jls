@@ -331,7 +331,7 @@ public class StringSearch {
         }
     }
 
-    private static Cache<String, Boolean> cacheContainsClass = new Cache<>();
+    private static Cache<String, Boolean> cacheContainsClass = new Cache<>("string_search.contains_class");
 
     private static boolean containsClass(Path file, String simpleName) {
         if (cacheContainsClass.needs(file, simpleName)) {
@@ -341,7 +341,7 @@ public class StringSearch {
         return cacheContainsClass.get(file, simpleName);
     }
 
-    private static Cache<String, Boolean> cacheContainsInterface = new Cache<>();
+    private static Cache<String, Boolean> cacheContainsInterface = new Cache<>("string_search.contains_interface");
 
     private static boolean containsInterface(Path file, String simpleName) {
         if (cacheContainsInterface.needs(file, simpleName)) {

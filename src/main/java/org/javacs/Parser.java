@@ -53,7 +53,6 @@ class Parser {
     static Parser parseJavaFileObject(JavaFileObject file) {
         // Parse directly from the current SourceFileObject document contents.
         // This avoids cross-request stale AST races on shared global parse state.
-        LOG.fine("[perf] parser_parse file=" + file.getName());
         return new Parser(file);
     }
 
