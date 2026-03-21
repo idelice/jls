@@ -2008,7 +2008,7 @@ public class JavaLanguageServerTest {
                             10,
                             TimeUnit.SECONDS));
 
-            var brokenModel = originalModel.replace("msref", "title");
+            var brokenModel = originalModel.replace("mref", "title");
             var change = new DidChangeTextDocumentParams();
             change.textDocument.uri = modelFile.toUri();
             change.textDocument.version = 2;
