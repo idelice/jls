@@ -3,6 +3,7 @@ package org.javacs;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
+import java.util.List;
 import java.util.StringJoiner;
 import org.javacs.lsp.*;
 import org.junit.Test;
@@ -70,6 +71,13 @@ public class HoverTest {
                 containsString("Returns an unmodifiable list containing zero elements."));
     }
 
+    @Test
+    public void lombokGeneratedMethodInMultiRootCompile() {
+        assertThat(
+                symbolAt("/org/javacs/example/LombokCrossTypeDiagnostics.java", 7, 16),
+                containsString("getName()"));
+    }
+
     // Re-using the language server makes these tests go a lot faster, but it will potentially produce surprising output
     // if things go wrong
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
@@ -79,8 +87,13 @@ public class HoverTest {
                 new TextDocumentPositionParams(
                         new TextDocumentIdentifier(FindResource.uri(file)), new Position(line - 1, character - 1));
         var result = new StringJoiner("\n");
-        for (var h : server.hover(pos).get().contents) {
-            result.add(h.value);
+        var contents = server.hover(pos).get().contents;
+        if (contents instanceof List) {
+            for (var h : (List<MarkedString>) contents) {
+                result.add(h.value);
+            }
+        } else if (contents instanceof MarkupContent) {
+            result.add(((MarkupContent) contents).value);
         }
         return result.toString();
     }

@@ -13,6 +13,10 @@ public interface CompilerProvider {
 
     List<String> publicTopLevelTypes();
 
+    default Set<Path> classPathRoots() {
+        return Set.of();
+    }
+
     List<String> packagePrivateTopLevelTypes(String packageName);
 
     Iterable<Path> search(String query);
@@ -32,6 +36,22 @@ public interface CompilerProvider {
     CompileTask compile(Path... files);
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
+
+    default CompileTask compileFast(Path... files) {
+        return compile(files);
+    }
+
+    default CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
+        return compile(sources);
+    }
+
+    default CompileTask compileFastWithProcessors(Path... files) {
+        return compileFast(files);
+    }
+
+    default CompileTask compileFastWithProcessors(Collection<? extends JavaFileObject> sources) {
+        return compileFast(sources);
+    }
 
     Path NOT_FOUND = Paths.get("");
 }

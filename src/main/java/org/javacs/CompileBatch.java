@@ -7,14 +7,24 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.util.*;
 import javax.tools.*;
 
-class CompileBatch implements AutoCloseable {
+public class CompileBatch implements AutoCloseable {
     static final int MAX_COMPLETION_ITEMS = 50;
     private static final Logger LOG = Logger.getLogger("main");
+        private static final AtomicLong FULL_BATCHES = new AtomicLong();
+    private static final AtomicLong ANALYZE_INVOCATIONS = new AtomicLong();
+    private static final AtomicLong AP_ENABLED_BATCHES = new AtomicLong();
+
+    enum AnalysisMode {
+        ATTR,
+        FULL
+    }
 
     /**
      * Exception thrown when annotation processing fails.
@@ -36,9 +46,11 @@ class CompileBatch implements AutoCloseable {
     final Elements elements;
     final Types types;
     final List<CompilationUnitTree> roots;
+    final Map<Path, CompileTask.SourceStamp> sourceStamps;
+    final AnalysisMode analysisMode;
 
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
-        this(parent, files, true);  // Default: allow AP
+        this(parent, files, true, AnalysisMode.FULL);
     }
 
     /**
@@ -49,21 +61,67 @@ class CompileBatch implements AutoCloseable {
      * @param allowAP if false, uses non-AP options even if Lombok is present
      */
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean allowAP) {
+        this(parent, files, allowAP, AnalysisMode.FULL);
+    }
+
+    CompileBatch(
+            JavaCompilerService parent,
+            Collection<? extends JavaFileObject> files,
+            boolean allowAP,
+            AnalysisMode analysisMode) {
+        this(parent, files, allowAP, analysisMode, parent.compiler);
+    }
+
+    CompileBatch(
+            JavaCompilerService parent,
+            Collection<? extends JavaFileObject> files,
+            boolean allowAP,
+            AnalysisMode analysisMode,
+            ReusableCompiler compiler) {
         this.parent = parent;
-        this.borrow = batchTask(parent, files, allowAP);
+        this.borrow = batchTask(parent, files, allowAP, analysisMode, compiler);
         this.task = borrow.task;
         this.trees = Trees.instance(borrow.task);
         this.elements = borrow.task.getElements();
         this.types = borrow.task.getTypes();
         this.roots = new ArrayList<>();
+        this.sourceStamps = collectSourceStamps(files);
+        this.analysisMode = analysisMode;
+
+        long parseNanos = 0;
+        long enterNanos = 0;
+        long analyzeNanos = 0;
 
         try {
+            var parseStarted = System.nanoTime();
             for (var t : borrow.task.parse()) {
                 roots.add(t);
             }
-            // The results of borrow.task.analyze() are unreliable when errors are present
-            // You can get at `Element` values using `Trees`
-            borrow.task.analyze();
+            parseNanos = System.nanoTime() - parseStarted;
+
+            if (allowAP) {
+                // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
+                // Running enter() first can lock in pre-processor symbols (missing Lombok members).
+                var analyzeStarted = System.nanoTime();
+                borrow.task.analyze();
+                analyzeNanos = System.nanoTime() - analyzeStarted;
+                if (analysisMode == AnalysisMode.FULL) {
+                    ANALYZE_INVOCATIONS.incrementAndGet();
+                }
+            } else {
+                var enterStarted = System.nanoTime();
+                invokeEnter(borrow.task);
+                enterNanos = System.nanoTime() - enterStarted;
+
+                // The results of borrow.task.analyze() are unreliable when errors are present
+                // You can get at `Element` values using `Trees`
+                var analyzeStarted = System.nanoTime();
+                borrow.task.analyze();
+                analyzeNanos = System.nanoTime() - analyzeStarted;
+                if (analysisMode == AnalysisMode.FULL) {
+                    ANALYZE_INVOCATIONS.incrementAndGet();
+                }
+            }
         } catch (IOException e) {
             try {
                 borrow.close();
@@ -90,7 +148,84 @@ class CompileBatch implements AutoCloseable {
                 throw (RuntimeException) e;
             }
             throw new RuntimeException("Compilation failed: " + e.getMessage(), e);
+        } finally {
+            if (analysisMode == AnalysisMode.FULL) {
+                FULL_BATCHES.incrementAndGet();
+            }
+            if (allowAP) {
+                AP_ENABLED_BATCHES.incrementAndGet();
+            }
+            logPhaseTimings(files.size(), analysisMode, parseNanos, enterNanos, analyzeNanos);
         }
+    }
+
+    public static void resetPerfCounters() {
+        FULL_BATCHES.set(0);
+        ANALYZE_INVOCATIONS.set(0);
+        AP_ENABLED_BATCHES.set(0);
+    }
+
+    public static PerfCounters perfCounters() {
+        return new PerfCounters(
+                FULL_BATCHES.get(),
+                ANALYZE_INVOCATIONS.get(),
+                AP_ENABLED_BATCHES.get());
+    }
+
+    public static class PerfCounters {
+        public final long fullBatches;
+        public final long analyzeInvocations;
+        public final long apEnabledBatches;
+
+        PerfCounters(
+                long fullBatches,
+                long analyzeInvocations,
+                long apEnabledBatches) {
+            this.fullBatches = fullBatches;
+            this.analyzeInvocations = analyzeInvocations;
+            this.apEnabledBatches = apEnabledBatches;
+        }
+    }
+
+    private void logPhaseTimings(
+            int sourceCount, AnalysisMode mode, long parseNanos, long enterNanos, long analyzeNanos) {
+        LOG.fine(
+                String.format(
+                        "[perf] javac_phases mode=%s sources=%d parse=%dms enter=%dms analyze=%dms",
+                        mode.name().toLowerCase(),
+                        sourceCount,
+                        parseNanos / 1_000_000,
+                        enterNanos / 1_000_000,
+                        analyzeNanos / 1_000_000));
+    }
+
+    private void invokeEnter(JavacTask task) {
+        try {
+            var enter = task.getClass().getMethod("enter");
+            enter.invoke(task);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException("Failed to run javac enter phase", e);
+        }
+    }
+
+    private Map<Path, CompileTask.SourceStamp> collectSourceStamps(Collection<? extends JavaFileObject> files) {
+        var result = new HashMap<Path, CompileTask.SourceStamp>();
+        for (var file : files) {
+            var uri = file.toUri();
+            if (uri == null || !"file".equals(uri.getScheme())) continue;
+            Path path;
+            try {
+                path = Paths.get(uri);
+            } catch (RuntimeException ignored) {
+                continue;
+            }
+            var version = -1;
+            if (file instanceof SourceFileObject sourceFile) {
+                version = sourceFile.contentVersion();
+            }
+            result.put(path, new CompileTask.SourceStamp(file.getLastModified(), version));
+        }
+        return result;
     }
 
     /**
@@ -211,9 +346,13 @@ class CompileBatch implements AutoCloseable {
 
     private Path findPackagePrivateClass(String packageName, String className) {
         for (var file : FileStore.list(packageName)) {
-            var parse = Parser.parseFile(file);
-            for (var candidate : parse.packagePrivateClasses()) {
-                if (candidate.contentEquals(className)) {
+            var parse = parent.parse(file);
+            for (var declaration : parse.root.getTypeDecls()) {
+                if (!(declaration instanceof ClassTree)) continue;
+                var cls = (ClassTree) declaration;
+                var isPublic = cls.getModifiers().getFlags().contains(Modifier.PUBLIC);
+                if (isPublic) continue;
+                if (cls.getSimpleName().contentEquals(className)) {
                     return file;
                 }
             }
@@ -229,45 +368,47 @@ class CompileBatch implements AutoCloseable {
     private static ReusableCompiler.Borrow batchTask(
             JavaCompilerService parent,
             Collection<? extends JavaFileObject> sources,
-            boolean allowAP) {
+            boolean allowAP,
+            AnalysisMode mode,
+            ReusableCompiler compiler) {
         parent.diags.clear();
-        var options = allowAP
-                ? options(parent.classPath, parent.addExports, parent.extraArgs)
-                : optionsWithoutAP(parent.classPath, parent.addExports, parent.extraArgs);
-        return parent.compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
+        var options =
+                allowAP
+                        ? (mode == AnalysisMode.ATTR
+                                ? optionsForFastAp(
+                                        parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath)
+                                : options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath))
+                        : optionsWithoutAP(parent.classPath, parent.addExports, parent.extraArgs);
+        return compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
     }
 
     /** Combine source path or class path entries using the system separator, for example ':' in unix */
     private static String joinPath(Collection<Path> classOrSourcePath) {
-        return classOrSourcePath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
+        return classOrSourcePath.stream()
+                .map(Path::toString)
+                .sorted()
+                .collect(Collectors.joining(File.pathSeparator));
     }
 
-    /**
-     * Check if Lombok is present on the classpath.
-     * Looks for lombok.jar or the lombok-specific directory.
-     */
-    private static boolean isLombokPresent(Set<Path> classPath) {
-        return classPath.stream()
-                .anyMatch(
-                        p -> {
-                            var name = p.getFileName().toString().toLowerCase();
-                            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
-                        });
-    }
-
-    private static List<String> options(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs) {
+    private static List<String> options(
+            Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, boolean lombokPresent) {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
         Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         // Collections.addAll(list, "-verbose");
 
-        // Annotation processing is DISABLED by default due to javac AP infrastructure bugs.
-        // javac 21.0.9 has critical bugs when processing Lombok annotations (AssertionErrors, NPEs).
-        // Even with explicit processor specification, it fails frequently.
-        // Users can enable AP at their own risk by setting an environment variable or config.
-        // TODO: In a future JDK version with AP fixes, consider enabling this.
-        Collections.addAll(list, "-proc:none");
+        if (lombokPresent) {
+            // Bind AP directly to Lombok to avoid processor discovery work on each diagnostics run.
+            Collections.addAll(list, "-proc:full");
+            Collections.addAll(list, "-processor", "lombok.launch.AnnotationProcessorHider$AnnotationProcessor");
+            var processorPath = lombokProcessorPath(classPath);
+            if (!processorPath.isEmpty()) {
+                Collections.addAll(list, "-processorpath", processorPath);
+            }
+        } else {
+            Collections.addAll(list, "-proc:none");
+        }
 
         Collections.addAll(list, "-g");
         // You would think we could do -Xlint:all,
@@ -283,13 +424,39 @@ class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        list.addAll(extraArgs);
-        for (var export : addExports) {
+        var sortedExtraArgs = new ArrayList<>(extraArgs);
+        Collections.sort(sortedExtraArgs);
+        list.addAll(sortedExtraArgs);
+        var sortedExports = new ArrayList<>(addExports);
+        Collections.sort(sortedExports);
+        for (var export : sortedExports) {
             list.add("--add-exports");
             list.add(export + "=ALL-UNNAMED");
         }
 
         return list;
+    }
+
+    private static List<String> optionsForFastAp(
+            Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, boolean lombokPresent) {
+        var list = options(classPath, addExports, extraArgs, lombokPresent);
+        if (lombokPresent) {
+            // Run AP + attribution, but stop before FLOW so completion stays lightweight.
+            Collections.addAll(list, "-XDshould-stop.ifNoError=ATTR", "-XDshould-stop.ifError=ATTR");
+        }
+        return list;
+    }
+
+    private static String lombokProcessorPath(Set<Path> classPath) {
+        return classPath.stream()
+                .filter(CompileBatch::isLombokJar)
+                .map(Path::toString)
+                .collect(Collectors.joining(File.pathSeparator));
+    }
+
+    private static boolean isLombokJar(Path path) {
+        var name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
     }
 
     /**
@@ -313,8 +480,12 @@ class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        list.addAll(extraArgs);
-        for (var export : addExports) {
+        var sortedExtraArgs = new ArrayList<>(extraArgs);
+        Collections.sort(sortedExtraArgs);
+        list.addAll(sortedExtraArgs);
+        var sortedExports = new ArrayList<>(addExports);
+        Collections.sort(sortedExports);
+        for (var export : sortedExports) {
             list.add("--add-exports");
             list.add(export + "=ALL-UNNAMED");
         }

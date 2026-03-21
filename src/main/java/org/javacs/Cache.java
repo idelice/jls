@@ -39,7 +39,16 @@ class Cache<K, V> {
         }
     }
 
+    private final String name;
     private final Map<Key, Value> map = new HashMap<>();
+
+    Cache() {
+        this("cache");
+    }
+
+    Cache(String name) {
+        this.name = name;
+    }
 
     boolean has(Path file, K k) {
         return !needs(file, k);
@@ -48,14 +57,26 @@ class Cache<K, V> {
     boolean needs(Path file, K k) {
         // If key is not in map, it needs to be loaded
         var key = new Key<K>(file, k);
-        if (!map.containsKey(key)) return true;
+        if (!map.containsKey(key)) {
+            CacheAudit.miss(name);
+            return true;
+        }
 
         // If key was loaded before file was last modified, it needs to be reloaded
         var value = map.get(key);
         var modified = FileStore.modified(file);
-        if (modified == null) return true;
+        if (modified == null) {
+            CacheAudit.miss(name);
+            return true;
+        }
         // TODO remove all keys associated with file when file changes
-        return value.created.isBefore(modified);
+        var stale = value.created.isBefore(modified);
+        if (stale) {
+            CacheAudit.miss(name);
+            return true;
+        }
+        CacheAudit.hit(name);
+        return false;
     }
 
     void load(Path file, K k, V v) {
@@ -63,6 +84,8 @@ class Cache<K, V> {
         var key = new Key<K>(file, k);
         var value = new Value(v);
         map.put(key, value);
+        CacheAudit.load(name);
+        CacheAudit.store(name);
     }
 
     V get(Path file, K k) {

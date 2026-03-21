@@ -198,6 +198,78 @@ public class GotoTest {
         assertThat(doGoto(file, 7, 15, false), hasItem("Gson.java:105"));
     }
 
+    @Test
+    public void gotoStaticImportField() {
+        var file = "/org/javacs/example/GotoStaticImportField.java";
+        assertThat(doGoto(file, 7, 21), hasItem("StaticImportInterface.java:4"));
+    }
+
+    @Test
+    public void gotoStaticImportMethodCrossPackage() {
+        var file = "/org/javacs/example/service/StaticImportCrossPackageUsage.java";
+        assertThat(doGoto(file, 11, 16), hasItem("StaticImportCrossPackageInterface.java:6"));
+    }
+
+    @Test
+    public void gotoSwitchCaseEnumConstant() {
+        var file = "/org/javacs/example/GotoSwitchCaseEnum.java";
+        assertThat(doGoto(file, 11, 18), hasItem("GotoSwitchCaseEnum.java:5"));
+    }
+
+    @Test
+    public void gotoInheritedField() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(doGoto(file, 5, 10), hasItem("InheritedPojoMembers.java:10"));
+    }
+
+    @Test
+    public void gotoInheritedFieldMemberMethod() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(doGoto(file, 5, 27), hasItem("InheritedPojoMembers.java:14"));
+    }
+
+    @Test
+    public void gotoLombokInheritedFieldMemberMethod() {
+        var file = "/org/javacs/example/LombokInheritedPojoMembers.java";
+        assertThat(doGoto(file, 8, 27), hasItem("LombokInheritedPojoMembers.java:18"));
+    }
+
+    @Test
+    public void gotoLombokInheritedField() {
+        var file = "/org/javacs/example/LombokInheritedPojoMembers.java";
+        assertThat(doGoto(file, 8, 10), hasItem("LombokInheritedPojoMembers.java:14"));
+    }
+
+    @Test
+    public void gotoWorkspaceLombokAccessorResolvesToBackingField() {
+        var file = "/org/javacs/example/LombokFieldReferences.java";
+        assertThat(doGoto(file, 10, 13), hasItem("LombokFieldReferences.java:7"));
+    }
+
+    @Test
+    public void gotoInheritedLombokAccessorResolvesToBaseField() {
+        var file = "/org/javacs/example/LombokInheritedAccessorNavigation.java";
+        assertThat(doGoto(file, 15, 13), hasItem("LombokInheritedAccessorNavigation.java:7"));
+    }
+
+    @Test
+    public void gotoRecordAccessorResolvesToRecordComponent() {
+        var file = "/org/javacs/example/GotoRecordAccessor.java";
+        assertThat(doGoto(file, 5, 9), hasItem("GotoRecordAccessor.java:3"));
+    }
+
+    @Test
+    public void gotoImplementationMethodDeclarationResolvesToInterfaceDeclaration() {
+        var file = "/org/javacs/example/GotoImplementation.java";
+        assertThat(doGoto(file, 14, 21), hasItem("GotoImplementation.java:9"));
+    }
+
+    @Test
+    public void gotoOverrideMethodDeclarationResolvesToAbstractBaseDeclaration() {
+        var file = "/org/javacs/example/OverrideHierarchy.java";
+        assertThat(doGoto(file, 9, 12), hasItem("OverrideHierarchy.java:4"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

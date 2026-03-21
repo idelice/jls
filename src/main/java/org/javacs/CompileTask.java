@@ -4,18 +4,34 @@ import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.JavacTask;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.logging.Logger;
 import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 
 public class CompileTask implements AutoCloseable {
+    public static class SourceStamp {
+        public final long modifiedMillis;
+        public final int version;
+
+        public SourceStamp(long modifiedMillis, int version) {
+            this.modifiedMillis = modifiedMillis;
+            this.version = version;
+        }
+    }
+
     public final JavacTask task;
     public final List<CompilationUnitTree> roots;
     public final List<Diagnostic<? extends JavaFileObject>> diagnostics;
+    public final Map<Path, SourceStamp> sourceStamps;
     private final Runnable close;
 
     public CompilationUnitTree root() {
+        if (roots.isEmpty()) {
+            throw new RuntimeException("0");
+        }
         if (roots.size() != 1) {
-            throw new RuntimeException(Integer.toString(roots.size()));
+            LOG.fine(String.format("[perf] compile_root_ambiguous roots=%d using_first", roots.size()));
         }
         return roots.get(0);
     }
@@ -42,10 +58,12 @@ public class CompileTask implements AutoCloseable {
             JavacTask task,
             List<CompilationUnitTree> roots,
             List<Diagnostic<? extends JavaFileObject>> diagnostics,
+            Map<Path, SourceStamp> sourceStamps,
             Runnable close) {
         this.task = task;
         this.roots = roots;
         this.diagnostics = diagnostics;
+        this.sourceStamps = sourceStamps;
         this.close = close;
     }
 
@@ -53,4 +71,6 @@ public class CompileTask implements AutoCloseable {
     public void close() {
         close.run();
     }
+
+    private static final Logger LOG = Logger.getLogger("main");
 }

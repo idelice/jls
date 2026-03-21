@@ -2,6 +2,14 @@
 
 set -e
 
+runtime_missing_module() {
+    local release_file="$1"
+    if [ ! -e "$release_file" ]; then
+        return 0
+    fi
+    ! grep -q 'jdk.jdeps' "$release_file"
+}
+
 # Needed once
 # if [ ! -e node_modules ]; then
 #     npm install
@@ -14,13 +22,13 @@ fi
 if [ ! -e jdks/windows/jdk-21 ]; then
     ./scripts/download_windows_jdk.sh
 fi
-if [ ! -e dist/linux/bin/java ]; then
+if [ ! -e dist/linux/bin/java ] || runtime_missing_module dist/linux/release; then
     ./scripts/link_linux.sh
 fi
-if [ ! -e dist/windows/bin/java.exe ]; then
+if [ ! -e dist/windows/bin/java.exe ] || runtime_missing_module dist/windows/release; then
     ./scripts/link_windows.sh
 fi
-if [ ! -e dist/mac/bin/java ]; then
+if [ ! -e dist/mac/bin/java ] || runtime_missing_module dist/mac/release; then
     ./scripts/link_mac.sh
 fi
 

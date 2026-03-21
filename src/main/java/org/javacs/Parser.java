@@ -50,28 +50,10 @@ class Parser {
         return parseJavaFileObject(new SourceFileObject(file));
     }
 
-    private static Parser cachedParse;
-    private static long cachedModified = -1;
-
-    private static boolean needsParse(JavaFileObject file) {
-        if (cachedParse == null) return true;
-        if (!cachedParse.file.equals(file)) return true;
-        if (file.getLastModified() > cachedModified) return true;
-        return false;
-    }
-
-    private static void loadParse(JavaFileObject file) {
-        cachedParse = new Parser(file);
-        cachedModified = file.getLastModified();
-    }
-
     static Parser parseJavaFileObject(JavaFileObject file) {
-        if (needsParse(file)) {
-            loadParse(file);
-        } else {
-            LOG.info("...using cached parse");
-        }
-        return cachedParse;
+        // Parse directly from the current SourceFileObject document contents.
+        // This avoids cross-request stale AST races on shared global parse state.
+        return new Parser(file);
     }
 
     Set<Name> packagePrivateClasses() {
@@ -401,17 +383,17 @@ class Parser {
 
     static Optional<Path> declaringFile(Element e) {
         // Find top-level type surrounding `to`
-        LOG.info(String.format("...looking up declaring file of `%s`...", e));
+        LOG.fine(String.format("...looking up declaring file of `%s`...", e));
         var top = topLevelDeclaration(e);
         if (!top.isPresent()) {
             LOG.warning("...no top-level type!");
             return Optional.empty();
         }
         // Find file by looking at package and class name
-        LOG.info(String.format("...top-level type is %s", top.get()));
+        LOG.fine(String.format("...top-level type is %s", top.get()));
         var file = FileStore.findDeclaringFile(top.get());
         if (!file.isPresent()) {
-            LOG.info(String.format("...couldn't find declaring file for type"));
+            LOG.fine(String.format("...couldn't find declaring file for type"));
             return Optional.empty();
         }
         return file;

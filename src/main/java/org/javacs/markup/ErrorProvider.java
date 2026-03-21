@@ -5,7 +5,8 @@ import com.sun.source.util.*;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -14,41 +15,82 @@ import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.FileStore;
-import org.javacs.LombokMetadataCache;
-import org.javacs.LombokHandler;
 import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
-    private final LombokMetadataCache lombokCache;
     private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final Set<String> SYNTAX_BLOCKING_CODES =
+            Set.of(
+                    "compiler.err.expected",
+                    "compiler.err.expected2",
+                    "compiler.err.not.stmt",
+                    "compiler.err.illegal.start.of.expr",
+                    "compiler.err.illegal.start.of.stmt");
 
-    public ErrorProvider(CompileTask task, LombokMetadataCache lombokCache) {
+    private record DiagnosticFilterResult(
+            List<org.javacs.lsp.Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
+
+    public record ErrorReport(
+            List<PublishDiagnosticsParams> diagnostics,
+            int compiledRoots,
+            int requestedRoots,
+            int processedRoots,
+            int compilerDiagnosticsCount,
+            int warningDiagnosticsCount,
+            long convertMs,
+            long warningMs) {}
+
+    public ErrorProvider(CompileTask task) {
         this.task = task;
-        this.lombokCache = lombokCache;
     }
 
-    public PublishDiagnosticsParams[] errors() {
-        var result = new PublishDiagnosticsParams[task.roots.size()];
-        for (var i = 0; i < task.roots.size(); i++) {
-            var root = task.roots.get(i);
+    public ErrorReport errors(Set<java.net.URI> requestedUris) {
+        var requested = requestedUris == null ? Set.<java.net.URI>of() : new LinkedHashSet<>(requestedUris);
+        var result = new ArrayList<PublishDiagnosticsParams>();
+        long convertNanos = 0;
+        long warningNanos = 0;
+        var processedRoots = 0;
+        var compilerDiagnosticsCount = 0;
+        var warningDiagnosticsCount = 0;
+        for (var root : task.roots) {
             var uri = root.getSourceFile().toUri();
-            result[i] = new PublishDiagnosticsParams();
-            result[i].uri = uri;
+            if (!requested.isEmpty() && !requested.contains(uri)) {
+                continue;
+            }
+            var params = new PublishDiagnosticsParams();
+            params.uri = uri;
+            result.add(params);
             // Skip diagnostics for JAR-based files (they are not user code)
             if (isJarOrCachedSource(uri)) {
                 LOG.fine("Skipping diagnostics for JAR source: " + uri);
                 continue;
             }
-            result[i].diagnostics.addAll(compilerErrors(root));
-            result[i].diagnostics.addAll(LombokHandler.constructorDiagnostics(task, lombokCache, root));
-            result[i].diagnostics.addAll(LombokHandler.builderConstructorDiagnostics(task, root));
-            result[i].diagnostics.addAll(unusedWarnings(root));
-            result[i].diagnostics.addAll(notThrownWarnings(root));
+            processedRoots++;
+            var convertStarted = System.nanoTime();
+            var filtered = filterCompilerDiagnostics(compilerErrors(root), root);
+            convertNanos += System.nanoTime() - convertStarted;
+            params.diagnostics.addAll(filtered.compilerDiagnostics());
+            compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
+            if (!filtered.syntaxSuppressed()) {
+                var warningStarted = System.nanoTime();
+                var unused = unusedWarnings(root);
+                var notThrown = notThrownWarnings(root);
+                warningNanos += System.nanoTime() - warningStarted;
+                params.diagnostics.addAll(unused);
+                params.diagnostics.addAll(notThrown);
+                warningDiagnosticsCount += unused.size() + notThrown.size();
+            }
         }
-        // TODO hint fields that could be final
-
-        return result;
+        return new ErrorReport(
+                List.copyOf(result),
+                task.roots.size(),
+                requested.size(),
+                processedRoots,
+                compilerDiagnosticsCount,
+                warningDiagnosticsCount,
+                convertNanos / 1_000_000,
+                warningNanos / 1_000_000);
     }
 
     private boolean isJarOrCachedSource(java.net.URI uri) {
@@ -71,36 +113,79 @@ public class ErrorProvider {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
             if (d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
 
-            // Replace or filter out errors for Lombok-generated members
-            var lombokAdjusted = LombokHandler.adjustDiagnostic(task, lombokCache, d, root);
-            if (lombokAdjusted != null) {
-                result.add(lombokAdjusted);
-                continue;
-            }
-            if (LombokHandler.shouldFilterDiagnostic(task, lombokCache, d)) {
-                continue;  // Skip this error
-            }
-
             result.add(lspDiagnostic(d, root.getLineMap()));
         }
         return result;
     }
 
-    /**
-     * Check if a diagnostic is about a Lombok-generated member.
-     * Examples of such errors:
-     * - "cannot find symbol\n  symbol:   method getOne()\n  location: variable foo of type Foo"
-     * - "cannot find symbol\n  symbol:   method setAge(int)\n  location: class Foo"
-     */
+    private DiagnosticFilterResult filterCompilerDiagnostics(
+            List<org.javacs.lsp.Diagnostic> compilerDiagnostics, CompilationUnitTree root) {
+        var deduped = dedupeDiagnostics(compilerDiagnostics);
+        var firstSyntaxLine = firstSyntaxBlockingLine(deduped);
+        if (firstSyntaxLine == -1) {
+            return new DiagnosticFilterResult(deduped, false, compilerDiagnostics.size() - deduped.size());
+        }
+
+        org.javacs.lsp.Diagnostic primarySyntaxDiagnostic = null;
+        for (var diagnostic : deduped) {
+            if (diagnostic.severity == null || diagnostic.severity != DiagnosticSeverity.Error) {
+                continue;
+            }
+            if (diagnostic.range.start.line == firstSyntaxLine && isSyntaxBlockingDiagnostic(diagnostic)) {
+                primarySyntaxDiagnostic = diagnostic;
+                break;
+            }
+        }
+        var filtered = new ArrayList<org.javacs.lsp.Diagnostic>();
+        if (primarySyntaxDiagnostic != null) {
+            filtered.add(primarySyntaxDiagnostic);
+        }
+        return new DiagnosticFilterResult(filtered, true, compilerDiagnostics.size() - filtered.size());
+    }
+
+    private List<org.javacs.lsp.Diagnostic> dedupeDiagnostics(List<org.javacs.lsp.Diagnostic> diagnostics) {
+        var unique = new LinkedHashMap<String, org.javacs.lsp.Diagnostic>();
+        for (var diagnostic : diagnostics) {
+            unique.putIfAbsent(diagnosticKey(diagnostic), diagnostic);
+        }
+        return new ArrayList<>(unique.values());
+    }
+
+    private int firstSyntaxBlockingLine(List<org.javacs.lsp.Diagnostic> diagnostics) {
+        var firstLine = Integer.MAX_VALUE;
+        for (var diagnostic : diagnostics) {
+            if (!isSyntaxBlockingDiagnostic(diagnostic)) {
+                continue;
+            }
+            firstLine = Math.min(firstLine, diagnostic.range.start.line);
+        }
+        return firstLine == Integer.MAX_VALUE ? -1 : firstLine;
+    }
+
+    private boolean isSyntaxBlockingDiagnostic(org.javacs.lsp.Diagnostic diagnostic) {
+        return diagnostic.code != null && SYNTAX_BLOCKING_CODES.contains(diagnostic.code);
+    }
+
+    private String diagnosticKey(org.javacs.lsp.Diagnostic diagnostic) {
+        return diagnostic.code
+                + "|"
+                + diagnostic.message
+                + "|"
+                + diagnostic.range.start.line
+                + ":"
+                + diagnostic.range.start.character
+                + "|"
+                + diagnostic.range.end.line
+                + ":"
+                + diagnostic.range.end.character;
+    }
 
     private List<org.javacs.lsp.Diagnostic> unusedWarnings(CompilationUnitTree root) {
         var result = new ArrayList<org.javacs.lsp.Diagnostic>();
         var warnUnused = new WarnUnused(task.task);
         warnUnused.scan(root, null);
         for (var unusedEl : warnUnused.notUsed()) {
-            if (!LombokHandler.shouldSuppressUnusedField(unusedEl, task, lombokCache)) {
-                result.add(warnUnused(unusedEl));
-            }
+            result.add(warnUnused(unusedEl));
         }
         return result;
     }

@@ -6,6 +6,7 @@ import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.DocTrees;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
@@ -23,8 +24,6 @@ import javax.lang.model.type.*;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
-import org.javacs.LombokHandler;
-import org.javacs.LombokMetadataCache;
 import org.javacs.MarkdownHelper;
 import org.javacs.hover.ShortTypePrinter;
 import org.javacs.lsp.ParameterInformation;
@@ -34,34 +33,24 @@ import org.javacs.lsp.SignatureInformation;
 public class SignatureProvider {
 
     private final CompilerProvider compiler;
-    private final LombokMetadataCache lombokCache;
 
     public static final SignatureHelp NOT_SUPPORTED = new SignatureHelp(List.of(), -1, -1);
 
-    public SignatureProvider(CompilerProvider compiler, LombokMetadataCache lombokCache) {
+    public SignatureProvider(CompilerProvider compiler) {
         this.compiler = compiler;
-        this.lombokCache = lombokCache;
     }
 
     public SignatureHelp signatureHelp(Path file, int line, int column) {
         // TODO prune
-        try (var task = compiler.compile(file)) {
-            var cursor = task.root().getLineMap().getPosition(line, column);
-            var path = new FindInvocationAt(task.task).scan(task.root(), cursor);
+        try (var task = compiler.compileFastWithProcessors(file)) {
+            var root = task.root(file);
+            var cursor = root.getLineMap().getPosition(line, column);
+            var path = new FindInvocationAt(task.task).scan(root, cursor);
             if (path == null) return NOT_SUPPORTED;
             if (path.getLeaf() instanceof MethodInvocationTree) {
                 var invoke = (MethodInvocationTree) path.getLeaf();
-                var overloads = methodOverloads(task, invoke);
-                var activeParameter = activeParameter(task, invoke.getArguments(), cursor);
-                if (overloads.isEmpty()
-                        && invoke.getMethodSelect() instanceof MemberSelectTree) {
-                    var lombokHelp =
-                            LombokHandler.signatureHelpForMethod(
-                                    task, (MemberSelectTree) invoke.getMethodSelect(), activeParameter, lombokCache);
-                    if (lombokHelp != null) {
-                        return lombokHelp;
-                    }
-                }
+                var overloads = methodOverloads(task, root, invoke);
+                var activeParameter = activeParameter(task, root, invoke.getArguments(), cursor);
                 var signatures = new ArrayList<SignatureInformation>();
                 for (var method : overloads) {
                     var info = info(method);
@@ -74,15 +63,8 @@ public class SignatureProvider {
             }
             if (path.getLeaf() instanceof NewClassTree) {
                 var invoke = (NewClassTree) path.getLeaf();
-                var overloads = constructorOverloads(task, invoke);
-                var activeParameter = activeParameter(task, invoke.getArguments(), cursor);
-                if (overloads.isEmpty()) {
-                    var lombokHelp =
-                            LombokHandler.signatureHelpForConstructor(task, invoke, activeParameter, lombokCache);
-                    if (lombokHelp != null) {
-                        return lombokHelp;
-                    }
-                }
+                var overloads = constructorOverloads(task, root, invoke);
+                var activeParameter = activeParameter(task, root, invoke.getArguments(), cursor);
                 var signatures = new ArrayList<SignatureInformation>();
                 for (var method : overloads) {
                     var info = info(method);
@@ -97,21 +79,22 @@ public class SignatureProvider {
         }
     }
 
-    private List<ExecutableElement> methodOverloads(CompileTask task, MethodInvocationTree method) {
+    private List<ExecutableElement> methodOverloads(
+            CompileTask task, CompilationUnitTree root, MethodInvocationTree method) {
         if (method.getMethodSelect() instanceof IdentifierTree) {
             var id = (IdentifierTree) method.getMethodSelect();
-            return scopeOverloads(task, id);
+            return scopeOverloads(task, root, id);
         }
         if (method.getMethodSelect() instanceof MemberSelectTree) {
             var select = (MemberSelectTree) method.getMethodSelect();
-            return memberOverloads(task, select);
+            return memberOverloads(task, root, select);
         }
         throw new RuntimeException(method.getMethodSelect().toString());
     }
 
-    private List<ExecutableElement> scopeOverloads(CompileTask task, IdentifierTree method) {
+    private List<ExecutableElement> scopeOverloads(CompileTask task, CompilationUnitTree root, IdentifierTree method) {
         var trees = Trees.instance(task.task);
-        var path = trees.getPath(task.root(), method);
+        var path = trees.getPath(root, method);
         var scope = trees.getScope(path);
         var list = new ArrayList<ExecutableElement>();
         Predicate<CharSequence> filter = name -> method.getName().contentEquals(name);
@@ -124,9 +107,10 @@ public class SignatureProvider {
         return list;
     }
 
-    private List<ExecutableElement> memberOverloads(CompileTask task, MemberSelectTree method) {
+    private List<ExecutableElement> memberOverloads(
+            CompileTask task, CompilationUnitTree root, MemberSelectTree method) {
         var trees = Trees.instance(task.task);
-        var path = trees.getPath(task.root(), method.getExpression());
+        var path = trees.getPath(root, method.getExpression());
         var isStatic = trees.getElement(path) instanceof TypeElement;
         var scope = trees.getScope(path);
         var type = typeElement(trees.getTypeMirror(path));
@@ -154,9 +138,10 @@ public class SignatureProvider {
         return null;
     }
 
-    private List<ExecutableElement> constructorOverloads(CompileTask task, NewClassTree method) {
+    private List<ExecutableElement> constructorOverloads(
+            CompileTask task, CompilationUnitTree root, NewClassTree method) {
         var trees = Trees.instance(task.task);
-        var path = trees.getPath(task.root(), method.getIdentifier());
+        var path = trees.getPath(root, method.getIdentifier());
         var scope = trees.getScope(path);
         var type = (TypeElement) trees.getElement(path);
         var list = new ArrayList<ExecutableElement>();
@@ -188,7 +173,7 @@ public class SignatureProvider {
 
     private ParameterInformation parameter(VariableElement p) {
         var info = new ParameterInformation();
-        info.label = ShortTypePrinter.NO_PACKAGE.print(p.asType());
+        info.label = ShortTypePrinter.NO_PACKAGE.print(p.asType()) + " " + p.getSimpleName();
         return info;
     }
 
@@ -199,14 +184,18 @@ public class SignatureProvider {
         var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
         var file = compiler.findAnywhere(className);
         if (file.isEmpty()) return;
-        var parse = compiler.parse(file.get());
-        var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-        var path = Trees.instance(task.task).getPath(parse.root, source);
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
-        if (docTree != null) {
-            info.documentation = MarkdownHelper.asMarkupContent(docTree);
+        try {
+            var parse = compiler.parse(file.get());
+            var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
+            var path = Trees.instance(task.task).getPath(parse.root, source);
+            var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+            if (docTree != null) {
+                info.documentation = MarkdownHelper.asMarkupContent(docTree);
+            }
+            info.parameters = parametersFromSource(source);
+        } catch (RuntimeException missingSourceMethod) {
+            // Generated methods (for example Lombok accessors) have no source MethodTree.
         }
-        info.parameters = parametersFromSource(source);
     }
 
     private void addFancyLabel(SignatureInformation info) {
@@ -227,10 +216,9 @@ public class SignatureProvider {
         return list;
     }
 
-    private int activeParameter(CompileTask task, List<? extends ExpressionTree> arguments, long cursor) {
+    private int activeParameter(
+            CompileTask task, CompilationUnitTree root, List<? extends ExpressionTree> arguments, long cursor) {
         var pos = Trees.instance(task.task).getSourcePositions();
-        ;
-        var root = task.root();
         for (var i = 0; i < arguments.size(); i++) {
             var end = pos.getEndPosition(root, arguments.get(i));
             if (cursor <= end) {

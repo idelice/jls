@@ -15,16 +15,34 @@ public class SourceFileObject implements JavaFileObject {
     final String contents;
     /** if contents is set, the modified time of contents */
     final Instant modified;
+    /** if contents is set from an open document, this is its LSP version, otherwise -1 */
+    final int version;
 
     public SourceFileObject(Path path) {
-        this(path, null, Instant.EPOCH);
+        if (!FileStore.isJavaFile(path)) throw new RuntimeException(path + " is not a java source");
+        this.path = path;
+        var active = FileStore.activeDocument(path);
+        if (active != null) {
+            this.contents = active.content;
+            this.modified = active.modified;
+            this.version = active.version;
+        } else {
+            this.contents = null;
+            this.modified = Instant.EPOCH;
+            this.version = -1;
+        }
     }
 
     public SourceFileObject(Path path, String contents, Instant modified) {
+        this(path, contents, modified, -1);
+    }
+
+    public SourceFileObject(Path path, String contents, Instant modified, int version) {
         if (!FileStore.isJavaFile(path)) throw new RuntimeException(path + " is not a java source");
         this.path = path;
         this.contents = contents;
         this.modified = modified;
+        this.version = version;
     }
 
     @Override
@@ -132,5 +150,16 @@ public class SourceFileObject implements JavaFileObject {
     @Override
     public String toString() {
         return path.toString();
+    }
+
+    int contentVersion() {
+        return version;
+    }
+
+    Instant contentModified() {
+        if (contents == null) {
+            return null;
+        }
+        return modified;
     }
 }

@@ -10,6 +10,7 @@ import com.sun.source.tree.ParameterizedTypeTree;
 import com.sun.source.tree.PrimitiveTypeTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
+import com.sun.source.util.JavacTask;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.io.IOException;
@@ -22,6 +23,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -144,14 +146,53 @@ public class FindHelper {
         return location(task, path, "");
     }
 
+    public static Location location(ParseTask task, TreePath path) {
+        return location(task.task, path, "", false);
+    }
+
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
+        return location(task, path, name, false);
+    }
+
+    public static Location location(ParseTask task, TreePath path, CharSequence name) {
+        return location(task.task, path, name, false);
+    }
+
+    public static Location locationStrict(ParseTask task, TreePath path, CharSequence name) {
+        return location(task.task, path, name, true);
+    }
+
+    public static Location locationStrict(CompileTask task, TreePath path, CharSequence name) {
+        return location(task, path, name, true);
+    }
+
+    private static Location location(CompileTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
+        return location(task.task, path, name, strictNameMatch);
+    }
+
+    private static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
         var lines = path.getCompilationUnit().getLineMap();
-        var pos = Trees.instance(task.task).getSourcePositions();
-        var start = (int) pos.getStartPosition(path.getCompilationUnit(), path.getLeaf());
-        var end = (int) pos.getEndPosition(path.getCompilationUnit(), path.getLeaf());
-        if (name.length() > 0) {
-            start = FindHelper.findNameIn(path.getCompilationUnit(), name, start, end);
-            end = start + name.length();
+        var pos = Trees.instance(task).getSourcePositions();
+        var start = -1;
+        var end = -1;
+        for (var current = path; current != null; current = current.getParentPath()) {
+            start = (int) pos.getStartPosition(current.getCompilationUnit(), current.getLeaf());
+            end = (int) pos.getEndPosition(current.getCompilationUnit(), current.getLeaf());
+            if (start >= 0 && end >= start) {
+                break;
+            }
+        }
+        if (name.length() > 0 && start >= 0 && end >= start) {
+            var namedStart = FindHelper.findNameIn(path.getCompilationUnit(), name, start, end);
+            if (namedStart >= 0) {
+                start = namedStart;
+                end = start + name.length();
+            } else if (strictNameMatch) {
+                return null;
+            }
+        }
+        if (start < 0 || end < start) {
+            return null;
         }
         var startLine = (int) lines.getLineNumber(start);
         var startColumn = (int) lines.getColumnNumber(start);
@@ -167,7 +208,17 @@ public class FindHelper {
     private static URI normalizeUri(URI uri) {
         if (uri == null) return null;
         if (!"jar".equals(uri.getScheme())) return uri;
-        return jarUriCache.computeIfAbsent(uri, FindHelper::extractJarUri);
+        var cached = jarUriCache.get(uri);
+        if (cached != null) {
+            CacheAudit.hit("jar_source.extract");
+            return cached;
+        }
+        CacheAudit.miss("jar_source.extract");
+        var extracted = extractJarUri(uri);
+        jarUriCache.put(uri, extracted);
+        CacheAudit.load("jar_source.extract");
+        CacheAudit.store("jar_source.extract");
+        return extracted;
     }
 
     private static URI extractJarUri(URI uri) {
@@ -215,4 +266,6 @@ public class FindHelper {
         }
         return -1;
     }
+
+    private static final Logger LOG = Logger.getLogger("main");
 }

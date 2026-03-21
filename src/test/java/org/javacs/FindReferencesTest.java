@@ -3,22 +3,23 @@ package org.javacs;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import org.javacs.lsp.*;
+import java.util.Set;
+import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.completion.ExternalBinaryTypeIndex;
+import org.javacs.completion.TypeMemberIndex;
+import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.navigation.ReferenceProvider;
 import org.junit.Test;
 
 public class FindReferencesTest {
-    private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+    private static final ReferenceContext REFERENCES = referenceContext();
 
     protected List<String> items(String file, int row, int column) {
-        var uri = FindResource.uri(file);
-        var params = new ReferenceParams();
-
-        params.textDocument = new TextDocumentIdentifier(uri);
-        params.position = new Position(row - 1, column - 1);
-
-        var locations = server.findReferences(params).orElse(List.of());
+        var path = FindResource.path(file);
+        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, path, row, column).find();
         var strings = new ArrayList<String>();
         for (var l : locations) {
             var fileName = StringSearch.fileName(l.uri);
@@ -35,7 +36,9 @@ public class FindReferencesTest {
 
     @Test
     public void findInterfaceReference() {
-        assertThat(items("/org/javacs/example/GotoImplementation.java", 9, 21), contains("GotoImplementation.java(5)"));
+        assertThat(
+                items("/org/javacs/example/GotoImplementation.java", 9, 21),
+                contains("GotoImplementation.java(5)", "GotoImplementation.java(14)"));
     }
 
     @Test
@@ -60,5 +63,115 @@ public class FindReferencesTest {
     @Test
     public void varTypeReferences() {
         assertThat(items("/org/javacs/example/VarTypeReferences.java", 4, 27), contains("VarTypeReferences.java(9)"));
+    }
+
+    @Test
+    public void staticImportFieldReferences() {
+        assertThat(
+                items("/org/javacs/example/StaticImportInterface.java", 4, 12),
+                contains("GotoStaticImportField.java(7)"));
+    }
+
+    @Test
+    public void staticImportFieldReferencesFromUsage() {
+        assertThat(
+                items("/org/javacs/example/GotoStaticImportField.java", 7, 21),
+                contains("GotoStaticImportField.java(7)"));
+    }
+
+    @Test
+    public void staticImportFieldReferencesCrossPackage() {
+        assertThat(
+                items("/org/javacs/example/models/StaticImportCrossPackageInterface.java", 4, 12),
+                contains("StaticImportCrossPackageUsage.java(7)"));
+    }
+
+    @Test
+    public void staticImportMethodReferencesCrossPackage() {
+        assertThat(
+                items("/org/javacs/example/models/StaticImportCrossPackageInterface.java", 6, 19),
+                contains("StaticImportCrossPackageUsage.java(11)"));
+    }
+
+    @Test
+    public void staticImportMethodReferencesFromUsageCrossPackage() {
+        assertThat(
+                items("/org/javacs/example/service/StaticImportCrossPackageUsage.java", 11, 16),
+                contains("StaticImportCrossPackageUsage.java(11)"));
+    }
+
+    @Test
+    public void inheritedFieldReferencesFromDeclaration() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(items(file, 10, 19), contains("InheritedPojoMembers.java(5)"));
+    }
+
+    @Test
+    public void inheritedFieldReferencesFromUsage() {
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(items(file, 5, 10), contains("InheritedPojoMembers.java(5)"));
+    }
+
+    @Test
+    public void lombokFieldReferencesIncludeGeneratedAccessors() {
+        var file = "/org/javacs/example/LombokFieldReferences.java";
+        assertThat(
+                items(file, 7, 20),
+                contains(
+                        "LombokFieldReferences.java(10)",
+                        "LombokFieldReferences.java(11)",
+                        "LombokFieldReferences.java(12)",
+                        "LombokFieldReferences.java(13)"));
+    }
+
+    @Test
+    public void lombokAccessorReferencesIncludeFieldReadsAndWrites() {
+        var file = "/org/javacs/example/LombokFieldReferences.java";
+        assertThat(
+                items(file, 10, 13),
+                contains(
+                        "LombokFieldReferences.java(10)",
+                        "LombokFieldReferences.java(11)",
+                        "LombokFieldReferences.java(12)",
+                        "LombokFieldReferences.java(13)"));
+    }
+
+    @Test
+    public void abstractMethodReferencesIncludeOverridesAndCallSites() {
+        var file = "/org/javacs/example/OverrideHierarchy.java";
+        assertThat(
+                items(file, 4, 21),
+                contains(
+                        "OverrideHierarchy.java(9)",
+                        "OverrideHierarchy.java(16)",
+                        "OverrideHierarchy.java(16)"));
+    }
+
+    private static ReferenceContext referenceContext() {
+        var workspaceRoot = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT;
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspaceRoot));
+        var infer = new InferConfig(workspaceRoot);
+        var compiler =
+                new JavaCompilerService(
+                        infer.classPath(), infer.buildDocPath(), java.util.Collections.emptySet(), java.util.Collections.emptySet());
+        CompositeTypeIndex index;
+        try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
+            index =
+                    new CompositeTypeIndex(
+                            WorkspaceTypeIndex.wrap(TypeMemberIndex.from(task)),
+                            new ExternalBinaryTypeIndex(compiler));
+        }
+        return new ReferenceContext(compiler, index);
+    }
+
+    private static final class ReferenceContext {
+        final JavaCompilerService compiler;
+        final CompositeTypeIndex index;
+
+        ReferenceContext(JavaCompilerService compiler, CompositeTypeIndex index) {
+            this.compiler = compiler;
+            this.index = index;
+        }
     }
 }

@@ -10,7 +10,7 @@ JAVA_HOME="./jdks/windows/jdk-21"
 rm -rf dist/windows
 jlink \
   --module-path $JAVA_HOME/jmods \
-  --add-modules java.base,java.compiler,java.logging,java.sql,java.xml,jdk.compiler,jdk.jdi,jdk.unsupported,jdk.zipfs \
+  --add-modules java.base,java.compiler,java.logging,java.sql,java.xml,jdk.compiler,jdk.jdeps,jdk.jdi,jdk.unsupported,jdk.zipfs \
   --output dist/windows \
   --no-header-files \
   --no-man-pages \
