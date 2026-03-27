@@ -9,7 +9,5 @@ public interface LanguageClient {
 
     void registerCapability(String method, JsonElement options);
 
-    void refreshInlayHints();
-
     void customNotification(String method, JsonElement params);
 }

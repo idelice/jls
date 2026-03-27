@@ -37,7 +37,6 @@ import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
 import org.javacs.lsp.InitializeParams;
-import org.javacs.lsp.InlayHintParams;
 import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
@@ -3558,9 +3557,6 @@ public class JavaLanguageServerTest {
 
         var settings = new JsonObject();
         var java = new JsonObject();
-        var inlayHints = new JsonObject();
-        inlayHints.addProperty("enabled", true);
-        java.add("inlayHints", inlayHints);
         java.addProperty("codeLens", true);
         settings.add("java", java);
         var change = new DidChangeConfigurationParams();
@@ -3646,9 +3642,6 @@ public class JavaLanguageServerTest {
                                         String method, com.google.gson.JsonElement options) {}
 
                                 @Override
-                                public void refreshInlayHints() {}
-
-                                @Override
                                 public void customNotification(
                                         String method, com.google.gson.JsonElement params) {}
                             });
@@ -3712,261 +3705,7 @@ public class JavaLanguageServerTest {
         }
     }
 
-    @Test
-    public void didOpenDoesNotEagerlyRefreshInlayHintsBeforeIndexInstall() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
 
-        try {
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertEquals("didOpen should not request immediate inlay hint refresh", 0, client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void didOpenDoesNotRefreshInlayHintsAfterInitialIndexInstall() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
-
-        try {
-            var before = completionIndexVersion(server);
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "expected completion index to advance after open",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "didOpen should not request inlay hint refresh after index install",
-                    0,
-                    client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void didOpenDoesNotRefreshInlayHintsWithoutClientSupport() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        server.initialize(init);
-        server.initialized();
-
-        try {
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void didChangeDoesNotRefreshInlayHintsAfterIncrementalIndexUpdate() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
-
-        try {
-            var file = FindResource.path("org/javacs/example/LombokCrossTypeModel.java");
-            var original = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = original;
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "expected completion index to initialize before didChange check",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
-
-            var before = completionIndexVersion(server);
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = file.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = original.replace("private String name;", "private String title;");
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            Assert.assertTrue(
-                    "didChange should still refresh completion index",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "didChange should not request inlay hint refresh after incremental index update",
-                    0,
-                    client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void didSaveDoesNotRefreshInlayHintsAfterSharedIndexUpdate() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
-
-        try {
-            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-            var text = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "expected completion index to initialize before didSave check",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
-
-            var before = completionIndexVersion(server);
-            var save = new DidSaveTextDocumentParams();
-            save.textDocument = new TextDocumentIdentifier(file.toUri());
-            server.didSaveTextDocument(save);
-
-            Assert.assertTrue(
-                    "didSave should still refresh completion index",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "didSave should not request inlay hint refresh after shared index update",
-                    0,
-                    client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void externalJavaSourceSkipsWorkspaceDiagnosticsAndInlayHints() throws Exception {
-        FileStore.reset();
-        var workspace = Files.createTempDirectory("jls-workspace-only");
-        var externalRoot = Files.createTempDirectory("jls-external-java");
-        var client = new RecordingDiagnosticsClient();
-        try {
-            var workspaceFile = workspace.resolve("src/app/Main.java");
-            Files.createDirectories(workspaceFile.getParent());
-            Files.writeString(workspaceFile, "package app;\nclass Main {}\n");
-
-            var externalFile = externalRoot.resolve("cached/ext/ExternalPojo.java");
-            Files.createDirectories(externalFile.getParent());
-            Files.writeString(
-                    externalFile,
-                    "package ext;\n"
-                            + "class ExternalPojo {\n"
-                            + "  void test() {\n"
-                            + "    var value = unknown();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = externalFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(externalFile);
-            server.didOpenTextDocument(open);
-
-            Thread.sleep(1100);
-            Assert.assertFalse(
-                    "external cached-source files should not become active workspace documents",
-                    FileStore.activeDocuments().contains(externalFile));
-            Assert.assertEquals(
-                    "external cached-source files should not publish diagnostics",
-                    0,
-                    client.diagnosticsPublishCount.get());
-
-            var hints =
-                    server.inlayHint(
-                            new InlayHintParams(
-                                    new TextDocumentIdentifier(externalFile.toUri()),
-                                    new Range(new Position(0, 0), new Position(10, 0))));
-            Assert.assertTrue(
-                    "external cached-source files should not return inlay hints",
-                    hints.isEmpty());
-        } finally {
-            deleteRecursively(externalRoot);
-            deleteRecursively(workspace);
-        }
-    }
 
     @Test
     public void didChangeDiagnosticsAreCoalescedWithLongerDebounce() throws Exception {
@@ -4310,9 +4049,6 @@ public class JavaLanguageServerTest {
         public void registerCapability(String method, com.google.gson.JsonElement options) {}
 
         @Override
-        public void refreshInlayHints() {}
-
-        @Override
         public void customNotification(String method, com.google.gson.JsonElement params) {}
 
         boolean awaitErrorMatching(
@@ -4394,44 +4130,6 @@ public class JavaLanguageServerTest {
 
         List<Diagnostic> diagnostics(java.net.URI uri) {
             return diagnosticsByUri.getOrDefault(uri, List.of());
-        }
-    }
-
-    private static class RecordingInlayHintClient implements LanguageClient {
-        private final CountDownLatch refreshRequested = new CountDownLatch(1);
-        private final AtomicInteger refreshCount = new AtomicInteger();
-
-        @Override
-        public void publishDiagnostics(PublishDiagnosticsParams params) {}
-
-        @Override
-        public void showMessage(ShowMessageParams params) {}
-
-        @Override
-        public void registerCapability(String method, com.google.gson.JsonElement options) {}
-
-        @Override
-        public void refreshInlayHints() {
-            refreshCount.incrementAndGet();
-            refreshRequested.countDown();
-        }
-
-        @Override
-        public void customNotification(String method, com.google.gson.JsonElement params) {}
-
-        private boolean awaitRefresh(long timeout, TimeUnit unit) throws InterruptedException {
-            return refreshRequested.await(timeout, unit) && refreshCount.get() > 0;
-        }
-
-        private boolean awaitRefreshCountAtLeast(int target, long timeout, TimeUnit unit) throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (System.nanoTime() < deadline) {
-                if (refreshCount.get() >= target) {
-                    return true;
-                }
-                Thread.sleep(25);
-            }
-            return refreshCount.get() >= target;
         }
     }
 

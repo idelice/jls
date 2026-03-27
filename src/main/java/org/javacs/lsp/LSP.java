@@ -168,17 +168,6 @@ public class LSP {
         }
 
         @Override
-        public void refreshInlayHints() {
-            var requestMethod = "workspace/inlayHint/refresh";
-            var id = new Random().nextInt();
-            var messageText =
-                    String.format(
-                            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":null}",
-                            id, requestMethod);
-            writeClient(send, messageText);
-        }
-
-        @Override
         public void customNotification(String method, JsonElement params) {
             notifyClient(send, method, params);
         }
@@ -323,13 +312,13 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
-                    case "textDocument/inlayHint":
-                        {
-                            var params = gson.fromJson(r.params, InlayHintParams.class);
-                            var response = server.inlayHint(params);
-                            respond(send, r.id, response);
-                            break;
-                        }
+                    // case "textDocument/inlayHint":
+                    //     {
+                    //         var params = gson.fromJson(r.params, InlayHintParams.class);
+                    //         var response = server.inlayHint(params);
+                    //         respond(send, r.id, response);
+                    //         break;
+                    //     }
                     case "textDocument/didOpen":
                         {
                             var params = gson.fromJson(r.params, DidOpenTextDocumentParams.class);

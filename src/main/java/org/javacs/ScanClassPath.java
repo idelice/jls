@@ -137,7 +137,6 @@ class ScanClassPath {
             }
         }
 
-        LOG.info(String.format("Found %d classes in the java platform", classes.size()));
         LOG.info(
                 String.format(
                         "[perf] jdk_class_scan modules=%d classes=%d took=%dms",
@@ -163,7 +162,6 @@ class ScanClassPath {
             classes.add(c.getName());
         }
 
-        LOG.info(String.format("Found %d classes in classpath", classes.size()));
         LOG.info(
                 String.format(
                         "[perf] classpath_scan locations=%d classes=%d took=%dms",

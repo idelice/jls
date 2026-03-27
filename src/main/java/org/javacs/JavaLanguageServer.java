@@ -281,10 +281,6 @@ class JavaLanguageServer extends LanguageServer {
                 var compiled = Instant.now();
                 var compileMs = Duration.between(started, compiled).toMillis();
                 var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
-                LOG.info(
-                        String.format(
-                                "[perf] diagnostics_compile trigger=%s files=%d took=%dms",
-                                trigger, javaFiles.size(), compileMs));
                 LOG.fine(
                         String.format(
                                 "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s parse=%dms enter=%dms analyze=%dms",
@@ -915,7 +911,6 @@ class JavaLanguageServer extends LanguageServer {
         }
         cancelPendingDiagnostics("didOpenBootstrap");
         cancelPendingCompletionIndex("didOpenBootstrap");
-        var started = Instant.now();
         LOG.info(
                 String.format(
                         "[perf] workspace bootstrap started trigger=didOpenBootstrap files=%d",
@@ -924,11 +919,6 @@ class JavaLanguageServer extends LanguageServer {
         synchronized (diagnosticsCompileMutex) {
             try {
                 task = selection.compiler.compile(workspaceFiles.toArray(Path[]::new));
-                var compiled = Instant.now();
-                LOG.info(
-                        String.format(
-                                "[perf] diagnostics_compile trigger=didOpenBootstrap files=%d took=%dms",
-                                workspaceFiles.size(), Duration.between(started, compiled).toMillis()));
                 var compileTelemetry = selection.compiler.lastCompileTelemetry();
                 LOG.info(
                         String.format(
@@ -1102,7 +1092,6 @@ class JavaLanguageServer extends LanguageServer {
         var inferenceFinished = Instant.now();
         javaEndProgress();
         LOG.info("[perf] lombok_setting enabled=" + lombokEnabled);
-        var interactiveStarted = Instant.now();
         var interactive =
                 new JavaCompilerService(
                         classPath,
@@ -1519,16 +1508,6 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
         return new FoldProvider(compiler()).foldingRanges(file);
-    }
-
-    @Override
-    public List<InlayHint> inlayHint(InlayHintParams params) {
-            return List.of();
-        // if (params == null || params.textDocument == null || !FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
-        //     return List.of();
-        // }
-        // var file = Paths.get(params.textDocument.uri);
-        // return new InlayHintService(compiler(), completionSnapshot().workspaceIndex()).inlayHints(file, params.range);
     }
 
     @Override
