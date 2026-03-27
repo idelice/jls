@@ -46,9 +46,6 @@ public final class LombokAnnotations {
 
     private LombokAnnotations() {}
 
-    public static boolean hasLombokAnnotation(ModifiersTree modifiers) {
-        return hasAnnotation(modifiers, KNOWN);
-    }
 
     public static boolean hasStructuralLombokAnnotation(ModifiersTree modifiers) {
         return hasAnnotation(modifiers, STRUCTURAL);
@@ -58,9 +55,6 @@ public final class LombokAnnotations {
         return hasAnnotation(modifiers, LOGGING_ONLY);
     }
 
-    public static boolean hasLombokAnnotation(ModifiersTree modifiers, Set<String> simpleNames) {
-        return hasAnnotation(modifiers, simpleNames);
-    }
 
     public static boolean isLombokAnnotationType(String annotationType) {
         if (annotationType == null || annotationType.isBlank()) {
@@ -76,9 +70,6 @@ public final class LombokAnnotations {
         return isLombokAnnotationType(annotationType) && STRUCTURAL.contains(simpleName(annotationType));
     }
 
-    public static boolean isLoggingOnlyLombokAnnotationType(String annotationType) {
-        return isLombokAnnotationType(annotationType) && LOGGING_ONLY.contains(simpleName(annotationType));
-    }
 
     public static String simpleName(String annotationType) {
         if (annotationType == null || annotationType.isBlank()) {

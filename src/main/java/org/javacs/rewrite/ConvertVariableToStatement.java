@@ -23,9 +23,9 @@ public class ConvertVariableToStatement implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var trees = Trees.instance(task.task);
+        var trees = Trees.instance(task.task());
         var pos = trees.getSourcePositions();
-        var lines = task.root.getLineMap();
+        var lines = task.root().getLineMap();
         var variable = findVariable(task, position);
         if (variable == null) {
             return CANCELLED;
@@ -37,8 +37,8 @@ public class ConvertVariableToStatement implements Rewrite {
         if (!isExpressionStatement(expression)) {
             return CANCELLED;
         }
-        var start = pos.getStartPosition(task.root, variable);
-        var end = pos.getStartPosition(task.root, expression);
+        var start = pos.getStartPosition(task.root(), variable);
+        var end = pos.getStartPosition(task.root(), expression);
         var startLine = (int) lines.getLineNumber(start);
         var startColumn = (int) lines.getColumnNumber(start);
         var startPos = new Position(startLine - 1, startColumn - 1);
@@ -52,7 +52,7 @@ public class ConvertVariableToStatement implements Rewrite {
     }
 
     static VariableTree findVariable(ParseTask task, int position) {
-        return new FindVariableAt(task.task).scan(task.root, position);
+        return new FindVariableAt(task.task()).scan(task.root(), position);
     }
 
     /** https://docs.oracle.com/javase/specs/jls/se13/html/jls-14.html#jls-14.8 */

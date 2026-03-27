@@ -352,10 +352,6 @@ public class FileStore {
         return cursor + column;
     }
 
-    public static int offsetAt(String sourceText, Position position) {
-        return offsetAt(sourceText, position.line, position.character);
-    }
-
     private static String patch(String sourceText, TextDocumentContentChangeEvent change) {
         var range = change.range;
         if (range == null) return change.text;

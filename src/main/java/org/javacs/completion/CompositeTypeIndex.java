@@ -2,6 +2,7 @@ package org.javacs.completion;
 
 import com.sun.source.tree.CompilationUnitTree;
 import java.nio.file.Path;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -15,24 +16,13 @@ import org.javacs.CompilerProvider;
  * already know an owner is workspace-owned must stay on the workspace index instead of using this
  * facade as a fallback chooser.
  */
-public final class CompositeTypeIndex {
+public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
     public static final CompositeTypeIndex EMPTY =
             new CompositeTypeIndex(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY);
-
-    private final WorkspaceTypeIndex workspace;
-    private final ExternalBinaryTypeIndex external;
 
     public CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
         this.workspace = workspace == null ? WorkspaceTypeIndex.EMPTY : workspace;
         this.external = external == null ? ExternalBinaryTypeIndex.EMPTY : external;
-    }
-
-    public WorkspaceTypeIndex workspace() {
-        return workspace;
-    }
-
-    public ExternalBinaryTypeIndex external() {
-        return external;
     }
 
     public List<TypeMemberIndex.Member> members(String qualifiedName, boolean staticContext) {
@@ -58,14 +48,6 @@ public final class CompositeTypeIndex {
             return workspaceMember;
         }
         return external.member(qualifiedName, name, staticContext, erasedParameterTypes);
-    }
-
-    public Optional<TypeMemberIndex.Member> memberByCanonicalKey(String canonicalKey) {
-        var workspaceMember = workspace.memberByCanonicalKey(canonicalKey);
-        if (workspaceMember.isPresent()) {
-            return workspaceMember;
-        }
-        return external.memberByCanonicalKey(canonicalKey);
     }
 
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
@@ -125,7 +107,7 @@ public final class CompositeTypeIndex {
         return typeInfo(qualifiedName)
                 .map(
                         info -> {
-                            var result = new java.util.LinkedHashSet<String>();
+                            var result = new LinkedHashSet<String>();
                             if (info.superclass != null && !info.superclass.isBlank()) {
                                 result.add(info.superclass);
                             }
@@ -136,7 +118,7 @@ public final class CompositeTypeIndex {
     }
 
     public Set<String> relatedMethodKeys(String ownerType, String memberName, String[] erasedParameterTypes) {
-        var keys = new java.util.LinkedHashSet<String>(workspace.relatedMethodKeys(ownerType, memberName, erasedParameterTypes));
+        var keys = new LinkedHashSet<>(workspace.relatedMethodKeys(ownerType, memberName, erasedParameterTypes));
         external.member(ownerType, memberName, false, erasedParameterTypes).ifPresent(member -> keys.add(member.canonicalKey));
         external.member(ownerType, memberName, true, erasedParameterTypes).ifPresent(member -> keys.add(member.canonicalKey));
         return Set.copyOf(keys);

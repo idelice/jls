@@ -106,7 +106,7 @@ final class ExternalBinaryDecompiler {
                 var topLevelName = topLevelFile.getFileName().toString();
                 var innerPrefix = topLevelName.substring(0, topLevelName.length() - ".class".length()) + "$";
                 try (var stream = Files.list(classDir)) {
-                    for (var child : stream.collect(Collectors.toList())) {
+                    for (var child : stream.toList()) {
                         var fileName = child.getFileName().toString();
                         if (!fileName.startsWith(innerPrefix) || !fileName.endsWith(".class")) {
                             continue;
@@ -212,8 +212,7 @@ final class ExternalBinaryDecompiler {
     private Optional<BinaryTarget> resolveReflectiveTopLevel(String qualifiedName) {
         for (var binaryName : binaryNameCandidates(qualifiedName)) {
             try {
-                var cls = Class.forName(binaryName, false, classLoader);
-                var topLevel = cls;
+                var topLevel = Class.forName(binaryName, false, classLoader);
                 while (topLevel.getEnclosingClass() != null) {
                     topLevel = topLevel.getEnclosingClass();
                 }

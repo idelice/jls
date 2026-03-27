@@ -23,14 +23,7 @@ class InferConfig {
     private static final Map<String, MavenDependencyCacheEntry> MVN_DEPENDENCY_CACHE =
             new ConcurrentHashMap<>();
 
-    private static class MavenDependencyCacheEntry {
-        final long pomLastModifiedMillis;
-        final Set<Path> dependencies;
-
-        MavenDependencyCacheEntry(long pomLastModifiedMillis, Set<Path> dependencies) {
-            this.pomLastModifiedMillis = pomLastModifiedMillis;
-            this.dependencies = dependencies;
-        }
+    private record MavenDependencyCacheEntry(long pomLastModifiedMillis, Set<Path> dependencies) {
     }
 
     /** Root of the workspace that is currently open in VSCode */

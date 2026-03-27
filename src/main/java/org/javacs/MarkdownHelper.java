@@ -396,20 +396,14 @@ public class MarkdownHelper {
     }
 
     private static String decodeEntity(String name) {
-        switch (name) {
-            case "lt":
-                return "<";
-            case "gt":
-                return ">";
-            case "amp":
-                return "&";
-            case "nbsp":
-                return " ";
-            case "quot":
-                return "\"";
-            default:
-                return "&" + name + ";";
-        }
+        return switch (name) {
+            case "lt" -> "<";
+            case "gt" -> ">";
+            case "amp" -> "&";
+            case "nbsp" -> " ";
+            case "quot" -> "\"";
+            default -> "&" + name + ";";
+        };
     }
 
     private static final Logger LOG = Logger.getLogger("main");

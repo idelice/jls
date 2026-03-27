@@ -28,10 +28,6 @@ public final class WorkspaceTypeIndex {
         return new WorkspaceTypeIndex(TypeMemberIndex.workspaceDeclarations(task));
     }
 
-    public TypeMemberIndex unwrap() {
-        return delegate;
-    }
-
     public int size() {
         return delegate.size();
     }
@@ -47,10 +43,6 @@ public final class WorkspaceTypeIndex {
     public Optional<TypeMemberIndex.Member> member(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         return delegate.member(qualifiedName, name, staticContext, erasedParameterTypes);
-    }
-
-    public Optional<TypeMemberIndex.Member> memberByCanonicalKey(String canonicalKey) {
-        return delegate.memberByCanonicalKey(canonicalKey);
     }
 
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
@@ -75,9 +67,5 @@ public final class WorkspaceTypeIndex {
 
     public Set<String> relatedMethodKeys(String ownerType, String memberName, String[] erasedParameterTypes) {
         return delegate.relatedMethodKeys(ownerType, memberName, erasedParameterTypes);
-    }
-
-    public WorkspaceTypeIndex replaceWorkspaceDeclarations(WorkspaceTypeIndex updates, Set<Path> replacedFiles) {
-        return new WorkspaceTypeIndex(delegate.replaceWorkspaceDeclarations(updates == null ? TypeMemberIndex.EMPTY : updates.delegate, replacedFiles));
     }
 }

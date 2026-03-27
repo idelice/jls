@@ -193,7 +193,7 @@ public class SignatureProvider {
         try {
             var parse = compiler.parse(file.get());
             var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-            var path = Trees.instance(task.task).getPath(parse.root, source);
+            var path = Trees.instance(task.task).getPath(parse.root(), source);
             var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
             if (docTree != null) {
                 info.documentation = MarkdownHelper.asMarkupContent(docTree);

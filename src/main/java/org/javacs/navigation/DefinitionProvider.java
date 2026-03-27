@@ -71,11 +71,11 @@ public class DefinitionProvider {
         var parse = compiler.parse(file);
         long cursor;
         try {
-            cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
+            cursor = FileStore.offset(parse.root().getSourceFile().getCharContent(true).toString(), line, column);
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }
-        var path = new FindNameAt(parse).scan(parse.root, cursor);
+        var path = new FindNameAt(parse).scan(parse.root(), cursor);
         if (path == null) return new ResolvedSymbol(NOT_SUPPORTED, null, null, false, null, null);
         return resolve(parse, path, cursor);
     }
@@ -185,7 +185,7 @@ public class DefinitionProvider {
 
         var receiver = types.resolveExpression(memberSelect.getExpression());
         if (receiver.isPresent()) {
-            var member = lookupMember(receiver.get().qualifiedType, name, receiver.get().staticContext);
+            var member = lookupMember(receiver.get().qualifiedType(), name, receiver.get().staticContext());
             if (member.isPresent()) {
                 var selected = member.get();
                 if (selected.kind == CompletionItemKind.Method || selected.kind == CompletionItemKind.Constructor) {
@@ -194,13 +194,13 @@ public class DefinitionProvider {
                 return resolveFieldFromMember(selected.ownerType, name, selected);
             }
 
-            var fields = findFieldLocations(receiver.get().qualifiedType, name);
+            var fields = findFieldLocations(receiver.get().qualifiedType(), name);
             if (!fields.isEmpty()) {
-                return new ResolvedSymbol(fields, receiver.get().qualifiedType, name, false, null, name);
+                return new ResolvedSymbol(fields, receiver.get().qualifiedType(), name, false, null, name);
             }
 
-            var nestedType = receiver.get().qualifiedType + "." + name;
-            if (typeLookup.resolveWorkspaceNestedType(receiver.get().qualifiedType, name).isPresent()) {
+            var nestedType = receiver.get().qualifiedType() + "." + name;
+            if (typeLookup.resolveWorkspaceNestedType(receiver.get().qualifiedType(), name).isPresent()) {
                 return resolveTypeName(nestedType, name);
             }
         }
@@ -215,7 +215,7 @@ public class DefinitionProvider {
             return new ResolvedSymbol(NOT_SUPPORTED, null, name, true, null, name);
         }
         if ("new".equals(name)) {
-            var ownerType = receiver.get().qualifiedType;
+            var ownerType = receiver.get().qualifiedType();
             return new ResolvedSymbol(findConstructorLocations(ownerType, -1), ownerType, simpleName(ownerType), true, null, simpleName(ownerType));
         }
         return resolveQualifiedMethodInvocation(types, memberReference.getQualifierExpression(), name, List.of());
@@ -238,11 +238,8 @@ public class DefinitionProvider {
                 return resolved;
             }
         }
-        var staticImport = resolveStaticImportMethod(parse.root, methodName, invocation.getArguments().size(), argTypes);
-        if (staticImport.isPresent()) {
-            return staticImport.get();
-        }
-        return new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName);
+        var staticImport = resolveStaticImportMethod(parse.root(), methodName, invocation.getArguments().size(), argTypes);
+        return staticImport.orElseGet(() -> new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName));
     }
 
     private ResolvedSymbol resolveQualifiedMethodInvocation(
@@ -255,19 +252,19 @@ public class DefinitionProvider {
             return new ResolvedSymbol(NOT_SUPPORTED, null, methodName, true, null, methodName);
         }
         var argTypes = resolveArgumentTypes(arguments, types);
-        var ownerType = receiver.get().qualifiedType;
+        var ownerType = receiver.get().qualifiedType();
         var memberWithArgs =
                 hasResolvedArgumentTypes(argTypes)
                         ? lookupMember(
                                 ownerType,
                                 methodName,
-                                receiver.get().staticContext,
+                        receiver.get().staticContext(),
                                 argTypes.toArray(String[]::new))
                         : Optional.<TypeMemberIndex.Member>empty();
         var memberWithoutArgs =
                 memberWithArgs.isPresent()
                         ? Optional.<TypeMemberIndex.Member>empty()
-                        : lookupMember(ownerType, methodName, receiver.get().staticContext);
+                        : lookupMember(ownerType, methodName, receiver.get().staticContext());
         var member = memberWithArgs.or(() -> memberWithoutArgs).orElse(null);
         var resolvedOwnerType = member != null ? member.ownerType : ownerType;
         return resolveMethod(resolvedOwnerType, methodName, arguments.size(), argTypes, member);
@@ -323,16 +320,13 @@ public class DefinitionProvider {
 
     private ResolvedSymbol resolveTypeTree(ParseTask parse, Tree typeTree, String simpleName) {
         var resolved = resolveTypeName(parse, typeTree.toString());
-        if (resolved.isEmpty()) {
-            return new ResolvedSymbol(NOT_SUPPORTED, null, null, false, null, simpleName);
-        }
-        return resolveTypeName(resolved.get(), simpleName);
+        return resolved.map(s -> resolveTypeName(s, simpleName)).orElseGet(() -> new ResolvedSymbol(NOT_SUPPORTED, null, null, false, null, simpleName));
     }
 
     private ResolvedSymbol resolveConstructorInvocation(
             ParseTask parse, NewClassTree newClassTree, ParseTypeResolver types, String simpleName) {
         var resolved =
-                types.resolveTypeTree(newClassTree.getIdentifier(), true).map(type -> type.qualifiedType);
+                types.resolveTypeTree(newClassTree.getIdentifier(), true).map(type -> type.qualifiedType());
         if (resolved.isEmpty()) {
             resolved = resolveTypeName(parse, newClassTree.getIdentifier().toString());
         }
@@ -384,7 +378,7 @@ public class DefinitionProvider {
 
     private Optional<ResolvedSymbol> resolveStaticImportField(ParseTask parse, String fieldName) {
         ResolvedSymbol match = null;
-        for (var ownerType : TypeMemberIndex.staticImportOwnerTypes(fieldName, parse.root)) {
+        for (var ownerType : TypeMemberIndex.staticImportOwnerTypes(fieldName, parse.root())) {
             var member = lookupMember(ownerType, fieldName, true).orElse(null);
             var resolved =
                     member != null
@@ -442,7 +436,7 @@ public class DefinitionProvider {
             return Optional.empty();
         }
 
-        var ownerType = types.resolveExpression(switchExpression).map(type -> type.qualifiedType);
+        var ownerType = types.resolveExpression(switchExpression).map(type -> type.qualifiedType());
         if (ownerType.isEmpty() || ownerType.get().isBlank()) {
             return Optional.empty();
         }
@@ -486,14 +480,6 @@ public class DefinitionProvider {
             }
         }
         return true;
-    }
-
-    private ResolvedSymbol fromDeclaration(ParseTask parse, TreePath path, String name) {
-        var location = FindHelper.location(parse, path, name);
-        if (location == null) {
-            return new ResolvedSymbol(NOT_SUPPORTED, null, name, false, null, name);
-        }
-        return new ResolvedSymbol(List.of(location), null, name, false, null, name);
     }
 
     private ResolvedSymbol typeDeclaration(ParseTask parse, TreePath path, ClassTree cls) {
@@ -614,7 +600,7 @@ public class DefinitionProvider {
             }
         }
         java.util.Collections.reverse(names);
-        var pkg = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        var pkg = parse.root().getPackageName() == null ? "" : parse.root().getPackageName().toString();
         if (pkg.isBlank()) {
             return String.join(".", names);
         }
@@ -625,7 +611,7 @@ public class DefinitionProvider {
         var result = new ArrayList<String>(args.size());
         for (var argument : args) {
             var resolved = types.resolveExpression(argument);
-            result.add(resolved.map(type -> canonicalType(type.qualifiedType)).orElse(""));
+            result.add(resolved.map(type -> canonicalType(type.qualifiedType())).orElse(""));
         }
         return result;
     }
@@ -658,7 +644,7 @@ public class DefinitionProvider {
     }
 
     private ResolvedSymbol findOverriddenDeclaration(TypeMemberIndex.Member method) {
-        var pending = new java.util.ArrayDeque<String>(completionIndex.directSupertypes(method.ownerType));
+        var pending = new java.util.ArrayDeque<>(completionIndex.directSupertypes(method.ownerType));
         var visited = new java.util.LinkedHashSet<String>();
         while (!pending.isEmpty()) {
             var superType = pending.removeFirst();
@@ -677,7 +663,7 @@ public class DefinitionProvider {
                                 override.get().erasedParameterTypes == null
                                         ? List.of()
                                         : java.util.Arrays.stream(override.get().erasedParameterTypes)
-                                                .map(type -> canonicalType(type))
+                                                .map(DefinitionProvider::canonicalType)
                                                 .toList());
                 if (!locations.isEmpty()) {
                     return new ResolvedSymbol(
@@ -737,10 +723,7 @@ public class DefinitionProvider {
             return locations;
         }
         var decompiled = openDecompiledTypeSource(ownerType);
-        if (decompiled.isPresent()) {
-            return findMethodLocations(decompiled.get(), methodName, argCount, argTypes);
-        }
-        return List.of();
+        return decompiled.map(typeSource -> findMethodLocations(typeSource, methodName, argCount, argTypes)).orElseGet(List::of);
     }
 
     private List<Location> findMethodLocations(
@@ -797,7 +780,7 @@ public class DefinitionProvider {
     }
 
     private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
-        return typeLookup.resolveTypeName(typeName, parse.root);
+        return typeLookup.resolveTypeName(typeName, parse.root());
     }
 
     private List<Location> findFieldLocations(String ownerType, String fieldName) {
@@ -810,10 +793,7 @@ public class DefinitionProvider {
             return locations;
         }
         var decompiled = openDecompiledTypeSource(ownerType);
-        if (decompiled.isPresent()) {
-            return findFieldLocations(decompiled.get(), fieldName);
-        }
-        return List.of();
+        return decompiled.map(typeSource -> findFieldLocations(typeSource, fieldName)).orElseGet(List::of);
     }
 
     private List<Location> findFieldLocations(TypeSource source, String fieldName) {
@@ -955,16 +935,13 @@ public class DefinitionProvider {
         }
         var parse = compiler.parse(decompiledSource.get());
         var classPath = findClassPath(parse, qualifiedType);
-        if (classPath.isEmpty()) {
-            return Optional.empty();
-        }
-        return Optional.of(new TypeSource(parse, classPath.get()));
+        return classPath.map(trees -> new TypeSource(parse, trees));
     }
 
     private Optional<TreePath> findClassPath(ParseTask parse, String qualifiedType) {
         try {
             var classTree = FindHelper.findType(parse, qualifiedType);
-            var path = Trees.instance(parse.task).getPath(parse.root, classTree);
+            var path = Trees.instance(parse.task()).getPath(parse.root(), classTree);
             return Optional.ofNullable(path);
         } catch (RuntimeException notFound) {
             return Optional.empty();
@@ -999,13 +976,6 @@ public class DefinitionProvider {
         return index >= 0 ? qualifiedType.substring(index + 1) : qualifiedType;
     }
 
-    private static final class TypeSource {
-        final ParseTask task;
-        final TreePath classPath;
-
-        TypeSource(ParseTask task, TreePath classPath) {
-            this.task = task;
-            this.classPath = classPath;
-        }
+    private record TypeSource(ParseTask task, TreePath classPath) {
     }
 }

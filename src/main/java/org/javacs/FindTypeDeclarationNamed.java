@@ -23,7 +23,7 @@ class FindTypeDeclarationNamed extends TreeScanner<ClassTree, String> {
             return t;
         }
         var recurse = super.visitClass(t, find);
-        qualifiedName.remove(qualifiedName.size() - 1);
+        qualifiedName.removeLast();
         return recurse;
     }
 

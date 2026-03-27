@@ -208,7 +208,7 @@ class ReusableCompiler {
 
             if (ht.get(Log.logKey) instanceof ReusableLog) {
                 // log already inited - not first round
-                ((ReusableLog) Log.instance(this)).clear();
+                Log.instance(this).clear();
                 Enter.instance(this).newRound();
                 ((ReusableJavaCompiler) ReusableJavaCompiler.instance(this)).clear();
                 Types.instance(this).newRound();

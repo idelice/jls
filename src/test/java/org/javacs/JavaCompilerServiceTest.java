@@ -85,13 +85,13 @@ public class JavaCompilerServiceTest {
         try {
             var first = compiler.parse(new SourceFileObject(file, "class ParseCache { int one; }\n", Instant.EPOCH, 1));
             var second = compiler.parse(new SourceFileObject(file, "class ParseCache { int one; }\n", Instant.EPOCH, 1));
-            assertThat("same source fingerprint should reuse cached AST", second.root, sameInstance(first.root));
+            assertThat("same source fingerprint should reuse cached AST", second.root(), sameInstance(first.root()));
 
             var third = compiler.parse(new SourceFileObject(file, "class ParseCache { int two; }\n", Instant.EPOCH, 2));
-            assertThat("new source version should refresh cached AST", third.root, not(sameInstance(first.root)));
+            assertThat("new source version should refresh cached AST", third.root(), not(sameInstance(first.root())));
             var parsed = compiler.parsedUnits.get(file);
             assertThat("parsedUnits should track latest parsed unit per file", parsed, notNullValue());
-            assertThat("parsedUnits should track latest AST per file", parsed.task.root, sameInstance(third.root));
+            assertThat("parsedUnits should track latest AST per file", parsed.task().root(), sameInstance(third.root()));
         } finally {
             Files.deleteIfExists(file);
         }
@@ -123,8 +123,8 @@ public class JavaCompilerServiceTest {
 
             assertThat(
                     "same source fingerprint parsed by different compilers should reuse shared AST",
-                    second.root,
-                    sameInstance(first.root));
+                    second.root(),
+                    sameInstance(first.root()));
         } finally {
             Files.deleteIfExists(file);
         }

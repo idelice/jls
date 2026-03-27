@@ -5,7 +5,6 @@ import static org.javacs.JsonHelper.GSON;
 import com.google.gson.*;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.Trees;
 import java.nio.file.Files;
@@ -271,15 +270,12 @@ class JavaLanguageServer extends LanguageServer {
             var javaFiles = normalizeJavaFiles(files);
             if (javaFiles.isEmpty()) return;
             LOG.info("Lint " + javaFiles.size() + " files...");
-            var started = Instant.now();
             CompileTask task = null;
             try {
                 diagnosticsCompilesInFlight.incrementAndGet();
                 task =
                         diagnosticsCompiler.compileDiagnostics(
                                 javaFiles.stream().map(SourceFileObject::new).toList());
-                var compiled = Instant.now();
-                var compileMs = Duration.between(started, compiled).toMillis();
                 var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
                 LOG.fine(
                         String.format(
@@ -289,13 +285,13 @@ class JavaLanguageServer extends LanguageServer {
                                 dirtyOpenCount,
                                 javaFiles.size(),
                                 task.roots.size(),
-                                compileTelemetry.annotationProcessingEnabled,
-                                compileTelemetry.expandedSources,
-                                compileTelemetry.path,
-                                compileTelemetry.cacheName,
-                                compileTelemetry.parseMs,
-                                compileTelemetry.enterMs,
-                                compileTelemetry.analyzeMs));
+                                compileTelemetry.annotationProcessingEnabled(),
+                                compileTelemetry.expandedSources(),
+                                compileTelemetry.path(),
+                                compileTelemetry.cacheName(),
+                                compileTelemetry.parseMs(),
+                                compileTelemetry.enterMs(),
+                                compileTelemetry.analyzeMs()));
                 if (shouldYieldToDidSaveDiagnostics(trigger, "post_compile")) {
                     return;
                 }
@@ -634,9 +630,9 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private List<DeclaredTypeShape> declaredTypeShapes(ParseTask parse) {
-        var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        var packageName = parse.root().getPackageName() == null ? "" : parse.root().getPackageName().toString();
         var result = new ArrayList<DeclaredTypeShape>();
-        for (var decl : parse.root.getTypeDecls()) {
+        for (var decl : parse.root().getTypeDecls()) {
             if (!(decl instanceof ClassTree cls)) {
                 continue;
             }
@@ -753,10 +749,6 @@ class JavaLanguageServer extends LanguageServer {
                 + isStatic;
     }
 
-    private void scheduleDiagnostics(Collection<Path> files, String trigger) {
-        scheduleDiagnostics(files, trigger, DIAGNOSTIC_DEBOUNCE_MS);
-    }
-
     private void scheduleDiagnostics(Collection<Path> files, String trigger, long delayMs) {
         var batch = resolveDiagnosticsBatch(files, trigger);
         if (batch.files().isEmpty()) return;
@@ -864,7 +856,7 @@ class JavaLanguageServer extends LanguageServer {
         if (requested.isEmpty()) {
             return new DiagnosticsBatch(List.of(), 0, 0);
         }
-        var batch = new LinkedHashSet<Path>(requested);
+        var batch = new LinkedHashSet<>(requested);
         var activeJavaFiles = new LinkedHashSet<>(normalizeJavaFiles(FileStore.activeDocuments()));
         var dirtyOpenCount = 0;
         if (!activeJavaFiles.isEmpty()) {
@@ -927,13 +919,13 @@ class JavaLanguageServer extends LanguageServer {
                                 0,
                                 workspaceFiles.size(),
                                 task.roots.size(),
-                                compileTelemetry.annotationProcessingEnabled,
-                                compileTelemetry.expandedSources,
-                                compileTelemetry.path,
-                                compileTelemetry.cacheName,
-                                compileTelemetry.parseMs,
-                                compileTelemetry.enterMs,
-                                compileTelemetry.analyzeMs));
+                                compileTelemetry.annotationProcessingEnabled(),
+                                compileTelemetry.expandedSources(),
+                                compileTelemetry.path(),
+                                compileTelemetry.cacheName(),
+                                compileTelemetry.parseMs(),
+                                compileTelemetry.enterMs(),
+                                compileTelemetry.analyzeMs()));
                 publishDiagnosticsFromTask(task, List.of(file), "didOpenBootstrap", -1);
                 var indexStarted = Instant.now();
                 var nextIndex = TypeMemberIndex.workspaceDeclarations(task);
@@ -1124,27 +1116,11 @@ class JavaLanguageServer extends LanguageServer {
         return new CompilerSet(interactive, diagnostics, lombokEnabled);
     }
 
-    private static class CompilerSet {
-        final JavaCompilerService interactive;
-        final JavaCompilerService diagnosticsPrimary;
-        final boolean lombokEnabled;
-
-        CompilerSet(
-                JavaCompilerService interactive,
-                JavaCompilerService diagnosticsPrimary,
-                boolean lombokEnabled) {
-            this.interactive = interactive;
-            this.diagnosticsPrimary = diagnosticsPrimary;
-            this.lombokEnabled = lombokEnabled;
-        }
+    private record CompilerSet(JavaCompilerService interactive, JavaCompilerService diagnosticsPrimary,
+                               boolean lombokEnabled) {
     }
 
-    private static class DiagnosticsCompilerSelection {
-        final JavaCompilerService compiler;
-
-        DiagnosticsCompilerSelection(JavaCompilerService compiler) {
-            this.compiler = compiler;
-        }
+    private record DiagnosticsCompilerSelection(JavaCompilerService compiler) {
     }
 
     private Set<String> externalDependencies() {
@@ -1388,7 +1364,7 @@ class JavaLanguageServer extends LanguageServer {
         var readiness = ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
         var snapshot = completionSnapshot();
         var provider = new CompletionProvider(cacheCompiler, snapshot.typeIndex(), snapshot.version());
-        var list = provider.complete(file, params.position.line + 1, params.position.character + 1, -1);
+        var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(
                 String.format(
@@ -1552,23 +1528,17 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private boolean canRename(Element rename) {
-        switch (rename.getKind()) {
-            case METHOD:
-            case FIELD:
-            case LOCAL_VARIABLE:
-            case PARAMETER:
-            case EXCEPTION_PARAMETER:
-                return true;
-            default:
+        return switch (rename.getKind()) {
+            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER -> true;
+            default ->
                 // TODO rename other types
-                return false;
-        }
+                    false;
+        };
     }
 
     private boolean canFindSource(Element rename) {
         if (rename == null) return false;
-        if (rename instanceof TypeElement) {
-            var type = (TypeElement) rename;
+        if (rename instanceof TypeElement type) {
             var name = type.getQualifiedName().toString();
             return compiler().findTypeDeclaration(name) != CompilerProvider.NOT_FOUND;
         }
@@ -1602,18 +1572,13 @@ class JavaLanguageServer extends LanguageServer {
             var path = new FindNameAt(task).scan(task.root(), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = Trees.instance(task.task).getElement(path);
-            switch (el.getKind()) {
-                case METHOD:
-                    return renameMethod(task, (ExecutableElement) el, params.newName);
-                case FIELD:
-                    return renameField(task, (VariableElement) el, params.newName);
-                case LOCAL_VARIABLE:
-                case PARAMETER:
-                case EXCEPTION_PARAMETER:
-                    return renameVariable(task, (VariableElement) el, params.newName);
-                default:
-                    return Rewrite.NOT_SUPPORTED;
-            }
+            return switch (el.getKind()) {
+                case METHOD -> renameMethod(task, (ExecutableElement) el, params.newName);
+                case FIELD -> renameField(task, (VariableElement) el, params.newName);
+                case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER ->
+                        renameVariable(task, (VariableElement) el, params.newName);
+                default -> Rewrite.NOT_SUPPORTED;
+            };
         }
     }
 
@@ -1728,8 +1693,4 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
     }
-
-    @Override
-    public void doAsyncWork() {}
-
 }

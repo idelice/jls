@@ -36,13 +36,11 @@ import org.javacs.lsp.Diagnostic;
 import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
-import org.javacs.lsp.InitializeParams;
 import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
 import org.javacs.lsp.ReferenceParams;
-import org.javacs.lsp.Range;
 import org.javacs.lsp.ShowMessageParams;
 import org.javacs.lsp.TextDocumentIdentifier;
 import org.javacs.lsp.TextDocumentContentChangeEvent;
@@ -3342,7 +3340,7 @@ public class JavaLanguageServerTest {
 
             Assert.assertEquals(
                     Optional.of("p.A"),
-                    boundary.resolveWorkspaceType("A", parse.root));
+                    boundary.resolveWorkspaceType("A", parse.root()));
             Assert.assertTrue(
                     "workspace-owned candidates must not reach external lookup",
                     boundary.findExternalSource("p.A", "unitTest").isEmpty());
@@ -3351,7 +3349,7 @@ public class JavaLanguageServerTest {
                     capture.countContaining("[workspace-boundary] external_leak candidate=p.A reason=unitTest") > 0);
             Assert.assertEquals(
                     Optional.of("java.util.ArrayList"),
-                    boundary.resolveTypeName("ArrayList", parse.root));
+                    boundary.resolveTypeName("ArrayList", parse.root()));
             Assert.assertEquals(
                     "dependency/JDK lookup should not be reported as workspace leakage",
                     0,
@@ -3438,7 +3436,7 @@ public class JavaLanguageServerTest {
         var compiler = server.compiler();
         var opened = compiler.parsedUnits.get(file);
         Assert.assertNotNull("didOpen should parse and store AST", opened);
-        var openedRoot = opened.task.root;
+        var openedRoot = opened.task().root();
 
         var firstCompletion =
                 server.completion(
@@ -3452,7 +3450,7 @@ public class JavaLanguageServerTest {
         Assert.assertSame(
                 "completion/hover should reuse didOpen parse result when text is unchanged",
                 openedRoot,
-                afterOpenRequests.task.root);
+                afterOpenRequests.task().root());
 
         var save = new DidSaveTextDocumentParams();
         save.textDocument = new TextDocumentIdentifier(file.toUri());
@@ -3463,7 +3461,7 @@ public class JavaLanguageServerTest {
         Assert.assertSame(
                 "didSave should reuse existing parse result when there is no text change",
                 openedRoot,
-                afterSave.task.root);
+                afterSave.task().root());
 
         var change = new DidChangeTextDocumentParams();
         change.textDocument.uri = file.toUri();
@@ -3476,8 +3474,8 @@ public class JavaLanguageServerTest {
         var changed = compiler.parsedUnits.get(file);
         Assert.assertNotNull("didChange should refresh parsed unit", changed);
         Assert.assertNotSame(
-                "didChange should reparse when text changes", openedRoot, changed.task.root);
-        var changedRoot = changed.task.root;
+                "didChange should reparse when text changes", openedRoot, changed.task().root());
+        var changedRoot = changed.task().root();
 
         var secondCompletion =
                 server.completion(
@@ -3491,7 +3489,7 @@ public class JavaLanguageServerTest {
         Assert.assertSame(
                 "completion/hover should reuse didChange parse result until next edit",
                 changedRoot,
-                afterChangeRequests.task.root);
+                afterChangeRequests.task().root());
     }
 
     @Test

@@ -15,7 +15,6 @@ import javax.lang.model.util.*;
 import javax.tools.*;
 
 public class CompileBatch implements AutoCloseable {
-    static final int MAX_COMPLETION_ITEMS = 50;
     private static final Logger LOG = Logger.getLogger("main");
         private static final AtomicLong FULL_BATCHES = new AtomicLong();
     private static final AtomicLong ANALYZE_INVOCATIONS = new AtomicLong();
@@ -51,29 +50,6 @@ public class CompileBatch implements AutoCloseable {
     final long parseMs;
     final long enterMs;
     final long analyzeMs;
-
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
-        this(parent, files, true, AnalysisMode.FULL);
-    }
-
-    /**
-     * Create a compilation batch with optional annotation processing.
-     *
-     * @param parent the compiler service
-     * @param files the files to compile
-     * @param allowAP if false, uses non-AP options even if Lombok is present
-     */
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean allowAP) {
-        this(parent, files, allowAP, AnalysisMode.FULL);
-    }
-
-    CompileBatch(
-            JavaCompilerService parent,
-            Collection<? extends JavaFileObject> files,
-            boolean allowAP,
-            AnalysisMode analysisMode) {
-        this(parent, files, allowAP, analysisMode, parent.compiler);
-    }
 
     CompileBatch(
             JavaCompilerService parent,
@@ -353,7 +329,7 @@ public class CompileBatch implements AutoCloseable {
     private Path findPackagePrivateClass(String packageName, String className) {
         for (var file : FileStore.list(packageName)) {
             var parse = parent.parse(file);
-            for (var declaration : parse.root.getTypeDecls()) {
+            for (var declaration : parse.root().getTypeDecls()) {
                 if (!(declaration instanceof ClassTree)) continue;
                 var cls = (ClassTree) declaration;
                 var isPublic = cls.getModifiers().getFlags().contains(Modifier.PUBLIC);

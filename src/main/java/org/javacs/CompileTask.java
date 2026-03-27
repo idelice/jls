@@ -10,14 +10,7 @@ import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 
 public class CompileTask implements AutoCloseable {
-    public static class SourceStamp {
-        public final long modifiedMillis;
-        public final int version;
-
-        public SourceStamp(long modifiedMillis, int version) {
-            this.modifiedMillis = modifiedMillis;
-            this.version = version;
-        }
+    public record SourceStamp(long modifiedMillis, int version) {
     }
 
     public final JavacTask task;
@@ -33,7 +26,7 @@ public class CompileTask implements AutoCloseable {
         if (roots.size() != 1) {
             LOG.fine(String.format("[perf] compile_root_ambiguous roots=%d using_first", roots.size()));
         }
-        return roots.get(0);
+        return roots.getFirst();
     }
 
     public CompilationUnitTree root(Path file) {

@@ -53,11 +53,11 @@ public class HoverProvider {
         var parse = compiler.parse(file);
         long cursor;
         try {
-            cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
+            cursor = FileStore.offset(parse.root().getSourceFile().getCharContent(true).toString(), line, column);
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }
-        var path = new FindNameAt(parse).scan(parse.root, cursor);
+        var path = new FindNameAt(parse).scan(parse.root(), cursor);
         if (path == null) {
             return null;
         }
@@ -99,8 +99,8 @@ public class HoverProvider {
             var parse = compiler.parse(target);
             var line = location.range.start.line + 1;
             var column = location.range.start.character + 1;
-            long cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
-            var path = new FindNameAt(parse).scan(parse.root, cursor);
+            long cursor = FileStore.offset(parse.root().getSourceFile().getCharContent(true).toString(), line, column);
+            var path = new FindNameAt(parse).scan(parse.root(), cursor);
             if (path == null) {
                 return Optional.empty();
             }
@@ -113,7 +113,7 @@ public class HoverProvider {
     private Optional<MarkupContent> renderResolvedDeclaration(
             ResolvedDeclaration resolved, DefinitionProvider.ResolvedSymbol symbol) {
         var tree = resolved.path().getLeaf();
-        if (tree instanceof ClassTree cls && symbol != null && symbol.method() && symbol.memberName() != null) {
+        if (tree instanceof ClassTree && symbol != null && symbol.method() && symbol.memberName() != null) {
             var methodPath = findMethodInClass(resolved.parse(), resolved.path(), symbol.memberName());
             if (methodPath.isPresent()) {
                 tree = methodPath.get().getLeaf();
@@ -189,7 +189,7 @@ public class HoverProvider {
     private String renderDeclaration(ParseTask parse, TreePath path, DefinitionProvider.ResolvedSymbol symbol) {
         var tree = path.getLeaf();
         if (tree instanceof ClassTree cls) {
-            return classSignature(parse, path, cls);
+            return classSignature(cls);
         }
         if (tree instanceof MethodTree method) {
             return methodSignature(parse, method);
@@ -207,7 +207,7 @@ public class HoverProvider {
         return tree.toString();
     }
 
-    private String classSignature(ParseTask parse, TreePath classPath, ClassTree cls) {
+    private String classSignature(ClassTree cls) {
         var modifiers = joinModifiers(cls.getModifiers().getFlags().stream().map(Enum::toString).toList());
         var kind = switch (cls.getKind()) {
             case ANNOTATION_TYPE -> "@interface";
@@ -267,7 +267,7 @@ public class HoverProvider {
         if (packageName.isBlank()) {
             packageName = "(default package)";
         }
-        return "**" + packageName + "**\n" + qualifiedName + "\n" + classSignature(parse, classPath, cls);
+        return "**" + packageName + "**\n" + qualifiedName + "\n" + classSignature(cls);
     }
 
     private String qualifiedClassName(ParseTask parse, TreePath classPath) {
@@ -278,7 +278,7 @@ public class HoverProvider {
             }
         }
         java.util.Collections.reverse(names);
-        var pkg = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        var pkg = parse.root().getPackageName() == null ? "" : parse.root().getPackageName().toString();
         if (pkg.isBlank()) {
             return String.join(".", names);
         }
@@ -294,7 +294,7 @@ public class HoverProvider {
     }
 
     private String docs(ParseTask task, TreePath path) {
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+        var docTree = DocTrees.instance(task.task()).getDocCommentTree(path);
         if (docTree == null) return "";
         return MarkdownHelper.asMarkdown(docTree);
     }
@@ -310,7 +310,7 @@ public class HoverProvider {
     }
 
     private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
-        return typeLookup.resolveTypeName(typeName, parse.root);
+        return typeLookup.resolveTypeName(typeName, parse.root());
     }
 
     private String joinModifiers(List<String> modifiers) {
@@ -338,9 +338,9 @@ public class HoverProvider {
             return;
         }
         resolveDetail(item, data, tree);
-        var path = Trees.instance(task.task).getPath(task.root, tree);
+        var path = Trees.instance(task.task()).getPath(task.root(), tree);
         if (path == null) return;
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+        var docTree = DocTrees.instance(task.task()).getDocCommentTree(path);
         if (docTree == null) return;
         item.documentation = MarkdownHelper.asMarkupContent(docTree);
     }

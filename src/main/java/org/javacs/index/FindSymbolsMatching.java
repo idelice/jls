@@ -7,7 +7,6 @@ import java.util.Objects;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
 import org.javacs.lsp.Location;
-import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.SymbolInformation;
 import org.javacs.lsp.SymbolKind;
@@ -108,7 +107,7 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
     }
 
     private Location location(Tree t) {
-        var trees = Trees.instance(task.task);
+        var trees = Trees.instance(task.task());
         var pos = trees.getSourcePositions();
         var start = pos.getStartPosition(root, t);
         var end = pos.getEndPosition(root, t);

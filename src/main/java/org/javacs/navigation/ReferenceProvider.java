@@ -12,14 +12,8 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
+
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
@@ -174,7 +168,7 @@ public class ReferenceProvider {
                     }
                     dedup.putIfAbsent(key(location), location);
                 }
-            }.scan(parse.root, null);
+            }.scan(parse.root(), null);
         }
         return new ArrayList<>(dedup.values());
     }
@@ -245,9 +239,9 @@ public class ReferenceProvider {
 
     private DefinitionProvider.ResolvedSymbol resolveOccurrence(
             DefinitionProvider definitions, ParseTask parse, TreePath path) {
-        var cursor = Trees.instance(parse.task).getSourcePositions().getStartPosition(parse.root, path.getLeaf());
+        var cursor = Trees.instance(parse.task()).getSourcePositions().getStartPosition(parse.root(), path.getLeaf());
         if (cursor < 0) {
-            cursor = parse.root.getLineMap().getPosition(1, 1);
+            cursor = parse.root().getLineMap().getPosition(1, 1);
         }
         return definitions.resolve(parse, path, cursor + 1);
     }
@@ -270,11 +264,11 @@ public class ReferenceProvider {
         var column = location.range.start.character + 1;
         long cursor;
         try {
-            cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
+            cursor = FileStore.offset(parse.root().getSourceFile().getCharContent(true).toString(), line, column);
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }
-        var path = new org.javacs.FindNameAt(parse).scan(parse.root, cursor);
+        var path = new org.javacs.FindNameAt(parse).scan(parse.root(), cursor);
         if (path == null || !(path.getLeaf() instanceof MethodTree method)) {
             return List.of();
         }
@@ -297,7 +291,7 @@ public class ReferenceProvider {
     }
 
     private List<String> declaredParameterTypes(ParseTask parse, TreePath path, MethodTree method) {
-        var cursor = Trees.instance(parse.task).getSourcePositions().getStartPosition(parse.root, path.getLeaf()) + 1;
+        var cursor = Trees.instance(parse.task()).getSourcePositions().getStartPosition(parse.root(), path.getLeaf()) + 1;
         var resolver = new ParseTypeResolver(parse, completionIndex, compiler, cursor);
         var result = new ArrayList<String>(method.getParameters().size());
         for (VariableTree parameter : method.getParameters()) {
@@ -305,18 +299,18 @@ public class ReferenceProvider {
                 return List.of();
             }
             var resolved = resolver.resolveTypeTree(parameter.getType(), false);
-            result.add(canonicalType(resolved.map(type -> type.qualifiedType).orElse(parameter.getType().toString())));
+            result.add(canonicalType(resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse(parameter.getType().toString())));
         }
         return result;
     }
 
     private List<String> argumentTypes(ParseTask parse, TreePath path, List<? extends ExpressionTree> arguments) {
-        var cursor = Trees.instance(parse.task).getSourcePositions().getStartPosition(parse.root, path.getLeaf()) + 1;
+        var cursor = Trees.instance(parse.task()).getSourcePositions().getStartPosition(parse.root(), path.getLeaf()) + 1;
         var resolver = new ParseTypeResolver(parse, completionIndex, compiler, cursor);
         var result = new ArrayList<String>(arguments.size());
         for (var argument : arguments) {
             var resolved = resolver.resolveExpression(argument);
-            result.add(canonicalType(resolved.map(type -> type.qualifiedType).orElse("")));
+            result.add(canonicalType(resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse("")));
         }
         return result;
     }
@@ -366,20 +360,19 @@ public class ReferenceProvider {
     private Set<String> relatedMethodKeys(
             DefinitionProvider.ResolvedSymbol target, List<String> targetParameterTypes) {
         if (target.indexMember() != null) {
+            String[] erasedParameterTypes = target.indexMember().erasedParameterTypes == null
+                    ? new String[0]
+                    : target.indexMember().erasedParameterTypes;
             if (completionIndex.isWorkspaceOwnedType(target.indexMember().ownerType, compiler)) {
                 return completionIndex.workspace().relatedMethodKeys(
                         target.indexMember().ownerType,
                         target.indexMember().name,
-                        target.indexMember().erasedParameterTypes == null
-                                ? new String[0]
-                                : target.indexMember().erasedParameterTypes);
+                        erasedParameterTypes);
             }
             return completionIndex.relatedMethodKeys(
                     target.indexMember().ownerType,
                     target.indexMember().name,
-                    target.indexMember().erasedParameterTypes == null
-                            ? new String[0]
-                            : target.indexMember().erasedParameterTypes);
+                    erasedParameterTypes);
         }
         if (completionIndex.isWorkspaceOwnedType(target.qualifiedType(), compiler)) {
             return completionIndex.workspace().relatedMethodKeys(
@@ -458,10 +451,7 @@ public class ReferenceProvider {
         if (classFile == null || classFile.equals(CompilerProvider.NOT_FOUND)) {
             return files;
         }
-        var combined = new ArrayList<Path>();
-        for (var f : files) {
-            combined.add(f);
-        }
+        var combined = new ArrayList<>(Arrays.asList(files));
         if (!combined.contains(classFile)) {
             combined.add(classFile);
         }

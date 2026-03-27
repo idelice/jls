@@ -32,16 +32,7 @@ import org.javacs.completion.CompositeTypeIndex;
 import org.javacs.completion.TypeMemberIndex;
 
 final class ParseTypeResolver {
-    static final class TypeResolution {
-        final String qualifiedType;
-        final boolean staticContext;
-        final boolean arrayType;
-
-        TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType) {
-            this.qualifiedType = qualifiedType;
-            this.staticContext = staticContext;
-            this.arrayType = arrayType;
-        }
+    record TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType) {
     }
 
     private static final int MAX_RESOLVE_DEPTH = 24;
@@ -56,33 +47,17 @@ final class ParseTypeResolver {
     private TypeResolution superType;
 
     ParseTypeResolver(ParseTask parseTask, CompositeTypeIndex index, CompilerProvider compiler, long cursor) {
-        this.root = parseTask.root;
-        this.positions = Trees.instance(parseTask.task).getSourcePositions();
+        this.root = parseTask.root();
+        this.positions = Trees.instance(parseTask.task()).getSourcePositions();
         this.compiler = compiler;
         this.index = index == null ? CompositeTypeIndex.EMPTY : index;
         this.typeLookup = new TypeLookupBoundary(compiler, this.index);
         this.cursor = cursor;
     }
 
-    Optional<TypeResolution> resolve(Tree expression, String fallbackIdentifier) {
-        if (expression != null) {
-            var direct = resolveExpression(expression, 0);
-            if (direct.isPresent()) {
-                return direct;
-            }
-        }
-        if (fallbackIdentifier == null || fallbackIdentifier.isBlank()) {
-            return Optional.empty();
-        }
-        return resolveIdentifier(fallbackIdentifier, 0);
-    }
 
     Optional<TypeResolution> resolveExpression(Tree expression) {
         return resolveExpression(expression, 0);
-    }
-
-    Optional<TypeResolution> resolveIdentifier(String identifier) {
-        return resolveIdentifier(identifier, 0);
     }
 
     Optional<TreePath> resolveVisibleDeclaration(String targetName) {
@@ -170,10 +145,7 @@ final class ParseTypeResolver {
                 return Optional.empty();
             }
             var component = resolveTypeTree(newArrayTree.getType(), false);
-            if (component.isEmpty()) {
-                return Optional.empty();
-            }
-            return Optional.of(new TypeResolution(component.get().qualifiedType, false, true));
+            return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType, false, true));
         }
         if (expression instanceof MethodInvocationTree invocationTree) {
             return resolveMethodInvocation(invocationTree, depth + 1);
@@ -456,10 +428,6 @@ final class ParseTypeResolver {
         return typeLookup.resolveExternalDependencyType(typeName, root);
     }
 
-    private Optional<String> resolveTypeNameFallback(String typeName) {
-        return typeLookup.resolveExternalDependencyType(typeName, root);
-    }
-
     private Optional<String> resolveNestedTypeFallback(String simpleName) {
         for (var classPath = enclosingClassPath();
                 classPath != null;
@@ -578,16 +546,7 @@ final class ParseTypeResolver {
                 || (next.depth == existing.depth && next.start > existing.start);
     }
 
-    private static final class CandidateType {
-        final TypeResolution resolution;
-        final int depth;
-        final long start;
-
-        CandidateType(TypeResolution resolution, int depth, long start) {
-            this.resolution = resolution;
-            this.depth = depth;
-            this.start = start;
-        }
+    private record CandidateType(TypeResolution resolution, int depth, long start) {
     }
 
     private static final class CandidatePath {

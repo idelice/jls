@@ -422,7 +422,7 @@ public class TypeMemberIndex {
     private void addInheritedMembers(
             String qualifiedName, boolean staticContext, List<Member> members, Set<String> seenStorageKeys) {
         var visited = new ObjectLinkedOpenHashSet<String>();
-        var pending = new java.util.ArrayDeque<String>(directSupertypes(qualifiedName));
+        var pending = new java.util.ArrayDeque<>(directSupertypes(qualifiedName));
         while (!pending.isEmpty()) {
             var superType = pending.removeFirst();
             if (!visited.add(superType)) {
@@ -477,7 +477,7 @@ public class TypeMemberIndex {
     private Optional<Member> inheritedMember(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var visited = new ObjectLinkedOpenHashSet<String>();
-        var pending = new java.util.ArrayDeque<String>(directSupertypes(qualifiedName));
+        var pending = new java.util.ArrayDeque<>(directSupertypes(qualifiedName));
         while (!pending.isEmpty()) {
             var superType = pending.removeFirst();
             if (!visited.add(superType)) {
@@ -740,7 +740,6 @@ public class TypeMemberIndex {
                 LOG.fine(String.format("[completion] canonicalized type symbol %s for index extraction", qualifiedName));
             }
 
-            var members = new ArrayList<Member>();
             var seen = new Object2ObjectOpenHashMap<String, Member>();
             for (var member : elements.getAllMembers(type)) {
                 if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
@@ -748,8 +747,7 @@ public class TypeMemberIndex {
                 if (kind == null) continue;
 
                 var ownerElement = member.getEnclosingElement();
-                if (!(ownerElement instanceof TypeElement)) continue;
-                var ownerType = (TypeElement) ownerElement;
+                if (!(ownerElement instanceof TypeElement ownerType)) continue;
                 var ownerName = ownerType.getQualifiedName().toString();
                 var declaredInOwner = qualifiedName.equals(ownerName);
                 if (!declaredInOwner && member.getModifiers().contains(Modifier.PRIVATE)) continue;
@@ -759,7 +757,7 @@ public class TypeMemberIndex {
                 var isPrivate = member.getModifiers().contains(Modifier.PRIVATE);
 
                 String detail;
-                String returnType = null;
+                String returnType;
                 String[] parameterNames = null;
                 String[] erasedParameterTypes = null;
                 if (member instanceof ExecutableElement executable) {
@@ -804,7 +802,7 @@ public class TypeMemberIndex {
             addSyntheticLombokAccessors(qualifiedName, declaredTree, seen);
             addSyntheticSlf4jLoggerField(qualifiedName, declaredTree, seen);
 
-            members.addAll(seen.values());
+            var members = new ArrayList<>(seen.values());
             members.sort(
                     Comparator.comparingInt((Member m) -> m.priority)
                             .thenComparing(m -> m.name, String.CASE_INSENSITIVE_ORDER)

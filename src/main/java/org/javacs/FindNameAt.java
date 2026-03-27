@@ -13,7 +13,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     }
 
     public FindNameAt(ParseTask task) {
-        this.task = task.task;
+        this.task = task.task();
     }
 
     @Override

@@ -23,13 +23,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import org.javacs.lsp.Location;
-import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 
 public class FindHelper {
@@ -71,7 +69,7 @@ public class FindHelper {
     }
 
     public static ClassTree findType(ParseTask task, String className) {
-        return new FindTypeDeclarationNamed().scan(task.root, className);
+        return new FindTypeDeclarationNamed().scan(task.root(), className);
     }
 
     public static ExecutableElement findMethod(
@@ -119,8 +117,7 @@ public class FindHelper {
     }
 
     private static boolean typeMatches(Tree candidate, String erasedType) {
-        if (candidate instanceof ParameterizedTypeTree) {
-            var parameterized = (ParameterizedTypeTree) candidate;
+        if (candidate instanceof ParameterizedTypeTree parameterized) {
             return typeMatches(parameterized.getType(), erasedType);
         }
         if (candidate instanceof PrimitiveTypeTree) {
@@ -133,8 +130,7 @@ public class FindHelper {
         if (candidate instanceof MemberSelectTree) {
             return candidate.toString().equals(erasedType);
         }
-        if (candidate instanceof ArrayTypeTree) {
-            var array = (ArrayTypeTree) candidate;
+        if (candidate instanceof ArrayTypeTree array) {
             if (!erasedType.endsWith("[]")) return false;
             var erasedElement = erasedType.substring(0, erasedType.length() - "[]".length());
             return typeMatches(array.getType(), erasedElement);
@@ -147,7 +143,7 @@ public class FindHelper {
     }
 
     public static Location location(ParseTask task, TreePath path) {
-        return location(task.task, path, "", false);
+        return location(task.task(), path, "", false);
     }
 
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
@@ -155,15 +151,11 @@ public class FindHelper {
     }
 
     public static Location location(ParseTask task, TreePath path, CharSequence name) {
-        return location(task.task, path, name, false);
+        return location(task.task(), path, name, false);
     }
 
     public static Location locationStrict(ParseTask task, TreePath path, CharSequence name) {
-        return location(task.task, path, name, true);
-    }
-
-    public static Location locationStrict(CompileTask task, TreePath path, CharSequence name) {
-        return location(task, path, name, true);
+        return location(task.task(), path, name, true);
     }
 
     private static Location location(CompileTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
@@ -182,7 +174,7 @@ public class FindHelper {
                 break;
             }
         }
-        if (name.length() > 0 && start >= 0 && end >= start) {
+        if (!name.isEmpty() && start >= 0 && end >= start) {
             var namedStart = FindHelper.findNameIn(path.getCompilationUnit(), name, start, end);
             if (namedStart >= 0) {
                 start = namedStart;
@@ -265,6 +257,4 @@ public class FindHelper {
         }
         return -1;
     }
-
-    private static final Logger LOG = Logger.getLogger("main");
 }

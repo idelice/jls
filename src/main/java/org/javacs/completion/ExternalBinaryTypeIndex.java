@@ -171,23 +171,6 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
-    public Optional<TypeMemberIndex.Member> memberByCanonicalKey(String canonicalKey) {
-        if (canonicalKey == null || canonicalKey.isBlank()) {
-            return Optional.empty();
-        }
-        var split = canonicalKey.indexOf('#');
-        if (split <= 0) {
-            return Optional.empty();
-        }
-        var ownerType = canonicalKey.substring(0, split);
-        return typeInfo(ownerType)
-                .flatMap(
-                        info ->
-                                info.members.stream()
-                                        .filter(member -> Objects.equals(member.canonicalKey, canonicalKey))
-                                        .findFirst());
-    }
-
     private List<TypeMemberIndex.Member> linkedMembers(String qualifiedName, boolean staticContext) {
         return typeInfo(qualifiedName)
                 .map(
@@ -243,7 +226,7 @@ public final class ExternalBinaryTypeIndex {
             }
         }
         if (candidates.size() == 1) {
-            return Optional.of(candidates.iterator().next());
+            return Optional.of(candidates.getFirst());
         }
         return Optional.empty();
     }
@@ -268,10 +251,7 @@ public final class ExternalBinaryTypeIndex {
 
     private Optional<TypeMemberIndex.TypeInfo> loadLinkedTypeInfo(String qualifiedName) {
         var raw = rawTypeInfo(qualifiedName);
-        if (raw.isEmpty()) {
-            return Optional.empty();
-        }
-        return Optional.of(applySourceLinks(raw.get()));
+        return raw.map(this::applySourceLinks);
     }
 
     private Optional<TypeMemberIndex.TypeInfo> loadRawTypeInfo(String qualifiedName) {
@@ -564,11 +544,6 @@ public final class ExternalBinaryTypeIndex {
             var parameterTypes = parseBinaryParameterTypes(methodType);
             var parameterNames = syntheticParameterNames(parameterTypes.length);
             if ("<init>".equals(name)) {
-                if (classFile.flags().has(AccessFlag.ENUM)) {
-                    var normalized = stripEnumConstructorPrefix(parameterTypes, parameterNames);
-                    parameterTypes = normalized.parameterTypes();
-                    parameterNames = normalized.parameterNames();
-                }
                 continue;
             }
             var returnType = normalizeBinaryType(methodType.returnType());
@@ -840,25 +815,7 @@ public final class ExternalBinaryTypeIndex {
         return names;
     }
 
-    private ParameterList stripEnumConstructorPrefix(String[] parameterTypes, String[] parameterNames) {
-        if (parameterTypes.length >= 2
-                && "java.lang.String".equals(parameterTypes[0])
-                && "int".equals(parameterTypes[1])) {
-            return new ParameterList(
-                    java.util.Arrays.copyOfRange(parameterTypes, 2, parameterTypes.length),
-                    java.util.Arrays.copyOfRange(parameterNames, 2, parameterNames.length));
-        }
-        return new ParameterList(parameterTypes, parameterNames);
-    }
-
-    private String normalizeBinaryType(String typeName) {
-        if (typeName == null) {
-            return "java.lang.Object";
-        }
-        return typeName.replace('$', '.');
-    }
-
-    private String normalizeBinaryType(ClassDesc typeDesc) {
+       private String normalizeBinaryType(ClassDesc typeDesc) {
         if (typeDesc == null) {
             return "java.lang.Object";
         }
@@ -918,9 +875,6 @@ public final class ExternalBinaryTypeIndex {
         return baseType + "[]".repeat(dimensions);
     }
 
-    private record ParameterList(String[] parameterTypes, String[] parameterNames) {}
-
     private record BinaryClassModel(String qualifiedName, String simpleName, List<TypeMemberIndex.Member> members) {}
-
     private record SourceLombokMetadata(java.util.Map<String, String> accessorToField) {}
 }

@@ -18,8 +18,8 @@ public class RemoveClass implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var type = new FindTypeDeclarationAt(task.task).scan(task.root, (long) position);
-        TextEdit[] edits = {new EditHelper(task.task).removeTree(task.root, type)};
+        var type = new FindTypeDeclarationAt(task.task()).scan(task.root(), (long) position);
+        TextEdit[] edits = {new EditHelper(task.task()).removeTree(task.root(), type)};
         return Map.of(file, edits);
     }
 }

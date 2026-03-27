@@ -17,7 +17,6 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.tools.*;
@@ -63,14 +62,7 @@ class JavaCompilerService implements CompilerProvider {
             boolean lombokConfiguredEnabled,
             String compilerRole) {
         var constructorStarted = Instant.now();
-        // System.err.println("Class path:");
-        // for (var p : classPath) {
-        //     System.err.println("  " + p);
-        // }
-        // System.err.println("Doc path:");
-        // for (var p : docPath) {
-        //     System.err.println("  " + p);
-        // }
+
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
         this.classPath = Collections.unmodifiableSet(classPath);
         this.docPath = Collections.unmodifiableSet(docPath);
@@ -102,55 +94,55 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch cachedCompile;
     private final Map<JavaFileObject, SourceFingerprint> cachedModified =
-        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
-            boolean remove = size() > MAX_CACHE_SIZE;
-            if (remove) {
-                LOG.fine("Cache eviction: removing oldest entry");
-            }
-            return remove;
-        }
-    };
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+                    boolean remove = size() > MAX_CACHE_SIZE;
+                    if (remove) {
+                        LOG.fine("Cache eviction: removing oldest entry");
+                    }
+                    return remove;
+                }
+            };
     private long cachedCompileContentRevision = -1;
     private CompileBatch cachedCompileNoExpansion;
     private final Map<JavaFileObject, SourceFingerprint> cachedCompileNoExpansionModified =
-        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
-            boolean remove = size() > MAX_CACHE_SIZE;
-            if (remove) {
-                LOG.fine("Cache eviction: removing oldest entry");
-            }
-            return remove;
-        }
-    };
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+                    boolean remove = size() > MAX_CACHE_SIZE;
+                    if (remove) {
+                        LOG.fine("Cache eviction: removing oldest entry");
+                    }
+                    return remove;
+                }
+            };
     private long cachedCompileNoExpansionContentRevision = -1;
     private CompileBatch cachedFastCompile;
     private final Map<JavaFileObject, SourceFingerprint> cachedFastModified =
-        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
-            boolean remove = size() > MAX_CACHE_SIZE;
-            if (remove) {
-                LOG.fine("Cache eviction: removing oldest entry");
-            }
-            return remove;
-        }
-    };
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+                    boolean remove = size() > MAX_CACHE_SIZE;
+                    if (remove) {
+                        LOG.fine("Cache eviction: removing oldest entry");
+                    }
+                    return remove;
+                }
+            };
     private long cachedFastCompileContentRevision = -1;
     private CompileBatch cachedFastCompileNoAp;
     private final Map<JavaFileObject, SourceFingerprint> cachedFastNoApModified =
-        new LinkedHashMap<JavaFileObject, SourceFingerprint>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
-            boolean remove = size() > MAX_CACHE_SIZE;
-            if (remove) {
-                LOG.fine("Cache eviction: removing oldest entry");
-            }
-            return remove;
-        }
-    };
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
+                    boolean remove = size() > MAX_CACHE_SIZE;
+                    if (remove) {
+                        LOG.fine("Cache eviction: removing oldest entry");
+                    }
+                    return remove;
+                }
+            };
     private long cachedFastCompileNoApContentRevision = -1;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
     final Map<Path, ParsedUnit> parsedUnits = new ConcurrentHashMap<>();
@@ -158,58 +150,28 @@ class JavaCompilerService implements CompilerProvider {
     private volatile LombokTypeIndex lombokTypeIndex = LombokTypeIndex.empty();
     private volatile CompileTelemetry lastCompileTelemetry = CompileTelemetry.empty();
 
-    static class ParsedUnit {
-        final ParseTask task;
-        final SourceFingerprint fingerprint;
-
-        ParsedUnit(ParseTask task, SourceFingerprint fingerprint) {
-            this.task = task;
-            this.fingerprint = fingerprint;
-        }
+    record ParsedUnit(ParseTask task, SourceFingerprint fingerprint) {
     }
 
-    private static class SourceFingerprint {
-        final long modifiedMillis;
-        final int version;
-
-        SourceFingerprint(long modifiedMillis, int version) {
-            this.modifiedMillis = modifiedMillis;
-            this.version = version;
-        }
+    private record SourceFingerprint(long modifiedMillis, int version) {
 
         @Override
-        public boolean equals(Object other) {
-            if (!(other instanceof SourceFingerprint)) {
-                return false;
+            public boolean equals(Object other) {
+                if (!(other instanceof SourceFingerprint(long millis, int version1))) {
+                    return false;
+                }
+            return modifiedMillis == millis && version == version1;
             }
-            var that = (SourceFingerprint) other;
-            return modifiedMillis == that.modifiedMillis && version == that.version;
-        }
 
-        @Override
-        public int hashCode() {
-            return Objects.hash(modifiedMillis, version);
-        }
     }
 
-    private static class LombokTypeIndex {
-        final Set<String> lombokTypes;
-        final Map<String, Path> byQualifiedName;
-        final Map<String, Set<String>> bySimpleName;
-
-        LombokTypeIndex(
-                Set<String> lombokTypes,
-                Map<String, Path> byQualifiedName,
-                Map<String, Set<String>> bySimpleName) {
-            this.lombokTypes = lombokTypes;
-            this.byQualifiedName = byQualifiedName;
-            this.bySimpleName = bySimpleName;
-        }
+    private record LombokTypeIndex(Set<String> lombokTypes, Map<String, Path> byQualifiedName,
+                                   Map<String, Set<String>> bySimpleName) {
 
         static LombokTypeIndex empty() {
-            return new LombokTypeIndex(Set.of(), Map.of(), Map.of());
+                return new LombokTypeIndex(Set.of(), Map.of(), Map.of());
+            }
         }
-    }
 
     private record ExpandedSources(
             Collection<? extends JavaFileObject> sources,
@@ -217,42 +179,14 @@ class JavaCompilerService implements CompilerProvider {
             int requestedCount,
             int expandedCount) {}
 
-    static final class CompileTelemetry {
-        final String cacheName;
-        final String path;
-        final boolean annotationProcessingEnabled;
-        final boolean lombokExpansionUsed;
-        final int requestedSources;
-        final int expandedSources;
-        final long parseMs;
-        final long enterMs;
-        final long analyzeMs;
-
-        CompileTelemetry(
-                String cacheName,
-                String path,
-                boolean annotationProcessingEnabled,
-                boolean lombokExpansionUsed,
-                int requestedSources,
-                int expandedSources,
-                long parseMs,
-                long enterMs,
-                long analyzeMs) {
-            this.cacheName = cacheName;
-            this.path = path;
-            this.annotationProcessingEnabled = annotationProcessingEnabled;
-            this.lombokExpansionUsed = lombokExpansionUsed;
-            this.requestedSources = requestedSources;
-            this.expandedSources = expandedSources;
-            this.parseMs = parseMs;
-            this.enterMs = enterMs;
-            this.analyzeMs = analyzeMs;
-        }
+    record CompileTelemetry(String cacheName, String path, boolean annotationProcessingEnabled,
+                            boolean lombokExpansionUsed, int requestedSources, int expandedSources, long parseMs,
+                            long enterMs, long analyzeMs) {
 
         static CompileTelemetry empty() {
-            return new CompileTelemetry("unknown", "unknown", false, false, 0, 0, -1, -1, -1);
+                return new CompileTelemetry("unknown", "unknown", false, false, 0, 0, -1, -1, -1);
+            }
         }
-    }
 
     private SourceFingerprint fingerprint(JavaFileObject file) {
         var version = -1;
@@ -288,7 +222,7 @@ class JavaCompilerService implements CompilerProvider {
             ReusableCompiler compilerInstance) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
 
-        CompileBatch firstAttempt = null;
+        CompileBatch firstAttempt;
         try {
             firstAttempt = new CompileBatch(this, sources, allowAP, mode, compilerInstance);
         } catch (CompileBatch.APFailureException e) {
@@ -325,13 +259,12 @@ class JavaCompilerService implements CompilerProvider {
         firstAttempt.close();
         firstAttempt.borrow.close();
 
-        var moreSources = new ArrayList<JavaFileObject>();
-        moreSources.addAll(sources);
+        var moreSources = new ArrayList<JavaFileObject>(sources);
         for (var add : addFiles) {
             moreSources.add(new SourceFileObject(add));
         }
 
-        CompileBatch secondAttempt = null;
+        CompileBatch secondAttempt;
         try {
             secondAttempt = new CompileBatch(this, moreSources, allowAP, mode, compilerInstance);
         } catch (CompileBatch.APFailureException e) {
@@ -396,15 +329,6 @@ class JavaCompilerService implements CompilerProvider {
         for (var f : sources) {
             modifiedCache.put(f, fingerprint(f));
         }
-    }
-
-    private void closeCacheIfIdle(CompileBatch cache, Map<JavaFileObject, SourceFingerprint> modifiedCache) {
-        if (cache == null) return;
-        if (!cache.closed) {
-            throw new RuntimeException("Compiler is still in-use!");
-        }
-        cache.borrow.close();
-        modifiedCache.clear();
     }
 
     private CompileBatch selectedCompileBatch(
@@ -556,18 +480,11 @@ class JavaCompilerService implements CompilerProvider {
             expanded.putIfAbsent(lombokSource, new SourceFileObject(lombokSource));
         }
 
-        var reason =
-                requestedHasLombokAnnotations
-                        ? (referencedLombokSources.isEmpty()
-                                ? "requested_lombok_annotations"
-                                : "annotations_and_references")
-                        : "referenced_lombok_types";
-
         if (expanded.size() + nonFileSources.size() == sources.size()) {
             return new ExpandedSources(sources, true, sources.size(), sources.size());
         }
 
-        var result = new ArrayList<JavaFileObject>(expanded.values());
+        var result = new ArrayList<>(expanded.values());
         result.addAll(nonFileSources);
         return new ExpandedSources(result, true, sources.size(), result.size());
     }
@@ -675,7 +592,7 @@ class JavaCompilerService implements CompilerProvider {
                 addTypeTokens(node.getExpression(), refs);
                 return super.visitMemberSelect(node, refs);
             }
-        }.scan(parsed.root, referenced);
+        }.scan(parsed.root(), referenced);
         return referenced;
     }
 
@@ -844,7 +761,7 @@ class JavaCompilerService implements CompilerProvider {
                 String.format(
                         "[lombok] annotation processing disabled phase=%s reason=%s root=%s",
                         phase, failure.getMessage(), root.toString());
-        LOG.log(Level.WARNING, message, failure);
+        LOG.fine(message);
     }
 
     private static Throwable rootCause(Throwable t) {
@@ -900,7 +817,7 @@ class JavaCompilerService implements CompilerProvider {
 
     private boolean containsType(Path file, String className) {
         if (cacheContainsType.needs(file, null)) {
-            var root = parse(file).root;
+            var root = parse(file).root();
             var types = new ArrayList<String>();
             new FindTypeDeclarations().scan(root, types);
             cacheContainsType.load(file, null, types);
