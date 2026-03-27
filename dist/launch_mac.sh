@@ -1,7 +1,6 @@
 #!/bin/sh
 JLINK_VM_OPTIONS="\
 --add-modules jdk.jdeps \
---add-exports jdk.jdeps/com.sun.tools.classfile=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED \
 --add-exports jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED \
@@ -25,4 +24,5 @@ JLINK_VM_OPTIONS="\
 --add-opens jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED \
 --add-opens jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED"
 DIR=`dirname $0`
-"$DIR/mac/bin/java" $JLINK_VM_OPTIONS -classpath "$DIR/classpath/*" "$@"
+JAVA_BIN="$DIR/mac/bin/java"
+exec "$JAVA_BIN" $JLINK_VM_OPTIONS -classpath "$DIR/classpath/*" "$@"

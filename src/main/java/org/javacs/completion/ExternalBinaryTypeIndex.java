@@ -2,15 +2,16 @@ package org.javacs.completion;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.sun.tools.classfile.AccessFlags;
-import com.sun.tools.classfile.ClassFile;
-import com.sun.tools.classfile.ConstantPoolException;
-import com.sun.tools.classfile.Descriptor;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ModifiersTree;
 import com.sun.source.tree.VariableTree;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.constantpool.ConstantPoolException;
+import java.lang.constant.ClassDesc;
+import java.lang.constant.MethodTypeDesc;
+import java.lang.reflect.AccessFlag;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
@@ -502,7 +503,7 @@ public final class ExternalBinaryTypeIndex {
                         return Optional.of(parseBinaryClassModel(qualifiedName, in));
                     }
                 }
-            } catch (IOException | ConstantPoolException | Descriptor.InvalidDescriptor ex) {
+            } catch (IOException | ConstantPoolException ex) {
                 LOG.fine(
                         String.format(
                                 "[external-binary] classfile miss type=%s root=%s reason=%s",
@@ -515,22 +516,22 @@ public final class ExternalBinaryTypeIndex {
     }
 
     private BinaryClassModel parseBinaryClassModel(String qualifiedName, InputStream input)
-            throws IOException, ConstantPoolException, Descriptor.InvalidDescriptor {
-        var classFile = ClassFile.read(input);
+            throws IOException, ConstantPoolException {
+        var classFile = ClassFile.of().parse(input.readAllBytes());
         var simpleName = simpleName(qualifiedName);
         var seenMembers = new LinkedHashMap<String, TypeMemberIndex.Member>();
 
-        for (var field : classFile.fields) {
-            if (field.access_flags.is(AccessFlags.ACC_SYNTHETIC)) {
+        for (var field : classFile.fields()) {
+            if (field.flags().has(AccessFlag.SYNTHETIC)) {
                 continue;
             }
-            var name = field.getName(classFile.constant_pool);
+            var name = field.fieldName().stringValue();
             if (name == null || name.isBlank()) {
                 continue;
             }
-            var type = normalizeBinaryType(field.descriptor.getFieldType(classFile.constant_pool));
-            var staticMember = field.access_flags.is(AccessFlags.ACC_STATIC);
-            var privateMember = field.access_flags.is(AccessFlags.ACC_PRIVATE);
+            var type = normalizeBinaryType(field.fieldTypeSymbol());
+            var staticMember = field.flags().has(AccessFlag.STATIC);
+            var privateMember = field.flags().has(AccessFlag.PRIVATE);
             var member =
                     new TypeMemberIndex.Member(
                             qualifiedName,
@@ -550,28 +551,29 @@ public final class ExternalBinaryTypeIndex {
             seenMembers.putIfAbsent(memberKey(member), member);
         }
 
-        for (var method : classFile.methods) {
-            if (method.access_flags.is(AccessFlags.ACC_SYNTHETIC)
-                    || method.access_flags.is(AccessFlags.ACC_BRIDGE)) {
+        for (var method : classFile.methods()) {
+            if (method.flags().has(AccessFlag.SYNTHETIC)
+                    || method.flags().has(AccessFlag.BRIDGE)) {
                 continue;
             }
-            var name = method.getName(classFile.constant_pool);
+            var name = method.methodName().stringValue();
             if (name == null || name.isBlank() || "<clinit>".equals(name)) {
                 continue;
             }
-            var parameterTypes = parseBinaryParameterTypes(method.descriptor, classFile);
+            var methodType = method.methodTypeSymbol();
+            var parameterTypes = parseBinaryParameterTypes(methodType);
             var parameterNames = syntheticParameterNames(parameterTypes.length);
             if ("<init>".equals(name)) {
-                if (classFile.access_flags.is(AccessFlags.ACC_ENUM)) {
+                if (classFile.flags().has(AccessFlag.ENUM)) {
                     var normalized = stripEnumConstructorPrefix(parameterTypes, parameterNames);
                     parameterTypes = normalized.parameterTypes();
                     parameterNames = normalized.parameterNames();
                 }
                 continue;
             }
-            var returnType = normalizeBinaryType(method.descriptor.getReturnType(classFile.constant_pool));
-            var staticMember = method.access_flags.is(AccessFlags.ACC_STATIC);
-            var privateMember = method.access_flags.is(AccessFlags.ACC_PRIVATE);
+            var returnType = normalizeBinaryType(methodType.returnType());
+            var staticMember = method.flags().has(AccessFlag.STATIC);
+            var privateMember = method.flags().has(AccessFlag.PRIVATE);
             var detail =
                     returnType
                             + " "
@@ -811,22 +813,13 @@ public final class ExternalBinaryTypeIndex {
         return new URLClassLoader(urls, ExternalBinaryTypeIndex.class.getClassLoader());
     }
 
-    private String[] parseBinaryParameterTypes(Descriptor descriptor, ClassFile classFile)
-            throws ConstantPoolException, Descriptor.InvalidDescriptor {
-        var raw = descriptor.getParameterTypes(classFile.constant_pool).trim();
-        if (raw.isEmpty() || "()".equals(raw)) {
+    private String[] parseBinaryParameterTypes(MethodTypeDesc methodType) {
+        if (methodType == null || methodType.parameterCount() == 0) {
             return new String[0];
         }
-        if (raw.startsWith("(") && raw.endsWith(")")) {
-            raw = raw.substring(1, raw.length() - 1).trim();
-        }
-        if (raw.isEmpty()) {
-            return new String[0];
-        }
-        var parts = raw.split(",\\s*");
-        var normalized = new String[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            normalized[i] = normalizeBinaryType(parts[i]);
+        var normalized = new String[methodType.parameterCount()];
+        for (int i = 0; i < methodType.parameterCount(); i++) {
+            normalized[i] = normalizeBinaryType(methodType.parameterType(i));
         }
         return normalized;
     }
@@ -863,6 +856,66 @@ public final class ExternalBinaryTypeIndex {
             return "java.lang.Object";
         }
         return typeName.replace('$', '.');
+    }
+
+    private String normalizeBinaryType(ClassDesc typeDesc) {
+        if (typeDesc == null) {
+            return "java.lang.Object";
+        }
+        return normalizeBinaryDescriptor(typeDesc.descriptorString());
+    }
+
+    private String normalizeBinaryDescriptor(String descriptor) {
+        if (descriptor == null || descriptor.isBlank()) {
+            return "java.lang.Object";
+        }
+        int dimensions = 0;
+        while (dimensions < descriptor.length() && descriptor.charAt(dimensions) == '[') {
+            dimensions++;
+        }
+        var baseDescriptor = descriptor.substring(dimensions);
+        String baseType;
+        switch (baseDescriptor) {
+            case "B":
+                baseType = "byte";
+                break;
+            case "C":
+                baseType = "char";
+                break;
+            case "D":
+                baseType = "double";
+                break;
+            case "F":
+                baseType = "float";
+                break;
+            case "I":
+                baseType = "int";
+                break;
+            case "J":
+                baseType = "long";
+                break;
+            case "S":
+                baseType = "short";
+                break;
+            case "Z":
+                baseType = "boolean";
+                break;
+            case "V":
+                baseType = "void";
+                break;
+            default:
+                if (baseDescriptor.startsWith("L") && baseDescriptor.endsWith(";")) {
+                    baseType =
+                            baseDescriptor
+                                    .substring(1, baseDescriptor.length() - 1)
+                                    .replace('/', '.')
+                                    .replace('$', '.');
+                } else {
+                    baseType = baseDescriptor.replace('/', '.').replace('$', '.');
+                }
+                break;
+        }
+        return baseType + "[]".repeat(dimensions);
     }
 
     private record ParameterList(String[] parameterTypes, String[] parameterNames) {}

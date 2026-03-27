@@ -28,6 +28,12 @@ public class Main {
             Logger.getLogger("java.lang.ProcessBuilder").setLevel(Level.INFO);
             // Logger.getLogger("").addHandler(new FileHandler("javacs.%u.log", false));
             setRootFormat();
+            LOG.info(
+                    String.format(
+                            "Starting JLS java.version=%s java.runtime.version=%s java.home=%s",
+                            System.getProperty("java.version"),
+                            System.getProperty("java.runtime.version"),
+                            System.getProperty("java.home")));
 
             LSP.connect(JavaLanguageServer::new, System.in, System.out);
         } catch (Throwable t) {

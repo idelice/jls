@@ -20,9 +20,8 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 
 ### Prerequisites
 
-- Java 20+
+- Java 25
 - Maven
-- npm
 - protobuf
 
 ### Build
@@ -128,7 +127,7 @@ The Java compiler API provides incremental compilation at the level of files: yo
 
 Before installing locally, you need to install prerequisites: maven, protobuf.
 
-You also need to have Java 20+ installed. Point the `JAVA_HOME` environment variable to it.
+You also need to have Java 25 installed if you are building without `./scripts/build.sh`.
 
 Assuming you have these prerequisites, you should be able to install locally using:
 
@@ -138,4 +137,4 @@ Assuming you have these prerequisites, you should be able to install locally usi
 
 ## Logs
 
-The Java service process will output a log file to stderr.
+The Java service process logs to stderr and prints the active runtime JDK details at startup.
