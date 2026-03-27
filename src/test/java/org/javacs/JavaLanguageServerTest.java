@@ -3054,6 +3054,262 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void completionInfersEnhancedForAndLambdaItemTypeFromPlainSourceListReturn() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-plain-source");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var plainService = serviceDir.resolve("PlainService.java");
+            var useFile = serviceDir.resolve("PlainUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    plainService,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.List;\n"
+                            + "class PlainService {\n"
+                            + "  List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "class PlainUse {\n"
+                            + "  void test(PlainService service) {\n"
+                            + "    for (var item : service.getItems()) {\n"
+                            + "      item.\n"
+                            + "    }\n"
+                            + "    service.getItems().stream().map(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, plainService);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before plain source generic-slot check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var loopCompletion = completionAtMarker(server, useFile, useText, "      item.");
+            var lambdaCompletion = completionAtMarker(server, useFile, useText, "item -> item.");
+
+            var loopLabels = completionLabels(loopCompletion);
+            var lambdaLabels = completionLabels(lambdaCompletion);
+            Assert.assertTrue(loopLabels.contains("getSku"));
+            Assert.assertTrue(loopLabels.contains("getQuantity"));
+            Assert.assertTrue(loopLabels.contains("getFamily"));
+            Assert.assertTrue(lambdaLabels.contains("getSku"));
+            Assert.assertTrue(lambdaLabels.contains("getQuantity"));
+            Assert.assertTrue(lambdaLabels.contains("getFamily"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInfersEnhancedForAndLambdaItemTypeThroughLombokGetterListReturn() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-lombok-source");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            var useFile = serviceDir.resolve("LombokUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.model;\n"
+                            + "import java.util.List;\n"
+                            + "import lombok.Data;\n"
+                            + "@Data\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  private List<LineItem> items;\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.OrderEnvelope;\n"
+                            + "class LombokUse {\n"
+                            + "  void test(OrderEnvelope envelope) {\n"
+                            + "    for (var item : envelope.getItems()) {\n"
+                            + "      item.\n"
+                            + "    }\n"
+                            + "    envelope.getItems().stream().map(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+            openJavaFile(server, lineItem);
+            openJavaFile(server, envelope);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before Lombok generic-slot check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var useText = Files.readString(useFile);
+            var loopCompletion = completionAtMarker(server, useFile, useText, "      item.");
+            var lambdaCompletion = completionAtMarker(server, useFile, useText, "item -> item.");
+
+            var loopLabels = completionLabels(loopCompletion);
+            var lambdaLabels = completionLabels(lambdaCompletion);
+            Assert.assertTrue(loopLabels.contains("getSku"));
+            Assert.assertTrue(loopLabels.contains("getQuantity"));
+            Assert.assertTrue(loopLabels.contains("getFamily"));
+            Assert.assertTrue(lambdaLabels.contains("getSku"));
+            Assert.assertTrue(lambdaLabels.contains("getQuantity"));
+            Assert.assertTrue(lambdaLabels.contains("getFamily"));
+
+            var completionFlow = capture.lastLineContaining("[perf] completion_flow file=LombokUse.java");
+            Assert.assertNotNull("expected completion flow for Lombok generic-slot completion", completionFlow);
+            Assert.assertTrue(completionFlow.contains("mode=member_index"));
+            Assert.assertTrue(completionFlow.contains("enter=0"));
+            Assert.assertTrue(completionFlow.contains("analyze=0"));
+            Assert.assertTrue(completionFlow.contains("ap=0"));
+            Assert.assertTrue(
+                    "expected resolved member cache state for Lombok lambda completion: " + completionFlow,
+                    !completionFlow.contains("member_cache=unresolved_type"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void ambiguousLambdaTargetFailsClosedForMemberCompletion() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-ambiguous-lambda");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var useFile = serviceDir.resolve("AmbiguousLambdaUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.function.Consumer;\n"
+                            + "import java.util.function.Function;\n"
+                            + "class AmbiguousLambdaUse {\n"
+                            + "  void use(Function<LineItem, String> fn) {}\n"
+                            + "  void use(Consumer<LineItem> fn) {}\n"
+                            + "  void test() {\n"
+                            + "    use(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before ambiguous lambda check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var completion = completionAtMarker(server, useFile, useText, "item -> item.");
+            Assert.assertTrue(
+                    "ambiguous lambda target should fail closed instead of defaulting to Object members",
+                    completion.items.isEmpty());
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionSuggestsStaticInterfaceMembersInIncompleteStaticMethodBody() throws Exception {
+        var workspace = Files.createTempDirectory("jls-interface-static-identifier-parse");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo/spi");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("PricingPort.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo.spi;\n"
+                            + "import java.util.Map;\n"
+                            + "public interface PricingPort {\n"
+                            + "  Map<String, Integer> HARD_CODED_REGIONS = Map.of();\n"
+                            + "  int price(String sku);\n"
+                            + "  default int fallbackDiscount(String family) { return 0; }\n"
+                            + "  static String directLookup(String region) { return region; }\n"
+                            + "  static String testConstants() {\n"
+                            + "    HAR\n"
+                            + "  }\n"
+                            + "  static String testStaticMethod() {\n"
+                            + "    dir\n"
+                            + "  }\n"
+                            + "  static String testInstanceMethod() {\n"
+                            + "    pri\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, file);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before interface static completion check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var text = Files.readString(file);
+            var harCompletion = completionAtMarker(server, file, text, "    HAR");
+            var harLabels = completionLabels(harCompletion);
+            Assert.assertTrue(harLabels.contains("HARD_CODED_REGIONS"));
+            var dirCompletion = completionAtMarker(server, file, text, "    dir");
+            var dirLabels = completionLabels(dirCompletion);
+            Assert.assertTrue(dirLabels.contains("directLookup"));
+            var priCompletion = completionAtMarker(server, file, text, "    pri");
+            var priLabels = completionLabels(priCompletion);
+            Assert.assertFalse(priLabels.contains("price"));
+            Assert.assertFalse(priLabels.contains("fallbackDiscount"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void typeLookupBoundaryBlocksWorkspaceLeakAndStillResolvesExternalDependency() throws Exception {
         var workspace = Files.createTempDirectory("jls-type-lookup-boundary");
         var logger = Logger.getLogger("main");
@@ -3973,6 +4229,42 @@ public class JavaLanguageServerTest {
             }
         }
         return false;
+    }
+
+    private static void openJavaFile(JavaLanguageServer server, Path file) throws IOException {
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = Files.readString(file);
+        server.didOpenTextDocument(open);
+    }
+
+    private static CompletionList completionAtMarker(
+            JavaLanguageServer server, Path file, String contents, String marker) {
+        var offset = contents.indexOf(marker);
+        Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
+        offset += marker.length();
+        var line = 0;
+        var character = 0;
+        for (int i = 0; i < offset; i++) {
+            if (contents.charAt(i) == '\n') {
+                line++;
+                character = 0;
+            } else {
+                character++;
+            }
+        }
+        return server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(line, character)))
+                .orElseThrow();
+    }
+
+    private static Set<String> completionLabels(CompletionList completion) {
+        return completion.items.stream()
+                .map(item -> item.label)
+                .collect(java.util.stream.Collectors.toSet());
     }
 
     private static boolean isSyntaxBlockingDiagnostic(Diagnostic diagnostic) {
