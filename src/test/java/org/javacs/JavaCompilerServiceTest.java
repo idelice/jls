@@ -226,6 +226,60 @@ public class JavaCompilerServiceTest {
     }
 
     @Test
+    public void compileDiagnosticsDoesNotExpandToPackagePrivateCompanions() throws Exception {
+        var root = Files.createTempDirectory("diagnostics-no-expansion-");
+        try {
+            var pkg = root.resolve("p");
+            Files.createDirectories(pkg);
+            var use = pkg.resolve("Use.java");
+            var defs = pkg.resolve("Defs.java");
+
+            Files.writeString(
+                    defs,
+                    "package p;\n"
+                            + "class PackagePrivateType {}\n");
+            Files.writeString(
+                    use,
+                    "package p;\n"
+                            + "class Use {\n"
+                            + "  PackagePrivateType value;\n"
+                            + "}\n");
+
+            FileStore.setWorkspaceRoots(Set.of(root));
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet());
+
+            try (var task = service.compile(use)) {
+                assertThat(
+                        "regular compile should expand to include package-private companion",
+                        task.roots.size(),
+                        is(2));
+                assertThat(
+                        "regular compile should resolve package-private companion without unresolved-location diagnostic",
+                        task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
+                        is(true));
+            }
+
+            try (var task = service.compileDiagnostics(List.of(new SourceFileObject(use)))) {
+                assertThat(
+                        "diagnostics compile should stay constrained to explicitly requested roots",
+                        task.roots.size(),
+                        is(1));
+                assertThat(
+                        "constrained diagnostics compile should surface unresolved companion diagnostic instead of expanding sources",
+                        task.diagnostics.stream().anyMatch(d -> d.getCode().contains("cant.resolve.location")),
+                        is(true));
+            }
+        } finally {
+            deleteTree(root);
+        }
+    }
+
+    @Test
     public void nonLombokProjectDoesNotExpandSourcesForAp() throws Exception {
         var root = Files.createTempDirectory("lombok-no-expand-");
         try {

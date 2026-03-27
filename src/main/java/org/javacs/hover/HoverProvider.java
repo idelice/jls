@@ -18,6 +18,7 @@ import java.util.StringJoiner;
 import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.FindNameAt;
 import org.javacs.JsonHelper;
@@ -50,7 +51,12 @@ public class HoverProvider {
 
     public MarkupContent hover(Path file, int line, int column) {
         var parse = compiler.parse(file);
-        var cursor = parse.root.getLineMap().getPosition(line, column);
+        long cursor;
+        try {
+            cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
         var path = new FindNameAt(parse).scan(parse.root, cursor);
         if (path == null) {
             return null;
@@ -93,13 +99,13 @@ public class HoverProvider {
             var parse = compiler.parse(target);
             var line = location.range.start.line + 1;
             var column = location.range.start.character + 1;
-            var cursor = parse.root.getLineMap().getPosition(line, column);
+            long cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
             var path = new FindNameAt(parse).scan(parse.root, cursor);
             if (path == null) {
                 return Optional.empty();
             }
             return Optional.of(new ResolvedDeclaration(parse, path));
-        } catch (RuntimeException ignored) {
+        } catch (RuntimeException | java.io.IOException ignored) {
             return Optional.empty();
         }
     }

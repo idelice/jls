@@ -9,6 +9,8 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -214,6 +216,7 @@ class InferConfig {
 
     static Set<Path> mvnDependencies(Path pomXml, String goal, Map<String, String> envVars) {
         Objects.requireNonNull(pomXml, "pom.xml path is null");
+        var started = Instant.now();
         try {
             var pomAbsolute = pomXml.toAbsolutePath().normalize();
             var pomLastModifiedMillis = Files.getLastModifiedTime(pomAbsolute).toMillis();
@@ -221,6 +224,12 @@ class InferConfig {
             var cached = MVN_DEPENDENCY_CACHE.get(cacheKey);
             if (cached != null && cached.pomLastModifiedMillis == pomLastModifiedMillis) {
                 CacheAudit.hit("infer_config.maven_dependencies");
+                LOG.info(
+                        String.format(
+                                "[perf] infer_config_maven goal=%s source=cache dependencies=%d took=%dms",
+                                goal,
+                                cached.dependencies.size(),
+                                Duration.between(started, Instant.now()).toMillis()));
                 return cached.dependencies;
             }
             CacheAudit.miss("infer_config.maven_dependencies");
@@ -238,6 +247,7 @@ class InferConfig {
             var output = Files.createTempFile("jls-maven-output", ".txt");
             LOG.info("Running " + String.join(" ", command) + " ...");
             var workingDirectory = pomXml.toAbsolutePath().getParent().toFile();
+            var processStarted = Instant.now();
             var process =
                     new ProcessBuilder()
                             .command(command)
@@ -248,6 +258,10 @@ class InferConfig {
 
             var result = process.waitFor();
             if (result != 0) {
+                LOG.warning(
+                        String.format(
+                                "[perf] infer_config_maven goal=%s source=process exit=%d took=%dms",
+                                goal, result, Duration.between(started, Instant.now()).toMillis()));
                 return Set.of();
             }
             // Read output
@@ -262,6 +276,13 @@ class InferConfig {
             MVN_DEPENDENCY_CACHE.put(cacheKey, new MavenDependencyCacheEntry(pomLastModifiedMillis, immutable));
             CacheAudit.load("infer_config.maven_dependencies");
             CacheAudit.store("infer_config.maven_dependencies");
+            LOG.info(
+                    String.format(
+                            "[perf] infer_config_maven goal=%s source=process dependencies=%d process=%dms total=%dms",
+                            goal,
+                            immutable.size(),
+                            Duration.between(processStarted, Instant.now()).toMillis(),
+                            Duration.between(started, Instant.now()).toMillis()));
             return immutable;
         } catch (InterruptedException | IOException e) {
             throw new RuntimeException(e);

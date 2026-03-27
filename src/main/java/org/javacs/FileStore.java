@@ -15,6 +15,8 @@ import javax.lang.model.element.TypeElement;
 import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidCloseTextDocumentParams;
 import org.javacs.lsp.DidOpenTextDocumentParams;
+import org.javacs.lsp.Position;
+import org.javacs.lsp.Range;
 import org.javacs.lsp.TextDocumentContentChangeEvent;
 
 public class FileStore {
@@ -337,7 +339,7 @@ public class FileStore {
     }
 
     /** Convert from line/column (1-based) to offset (0-based) */
-    static int offset(String contents, int line, int column) {
+    public static int offset(String contents, int line, int column) {
         line--;
         column--;
         int cursor = 0;
@@ -348,6 +350,10 @@ public class FileStore {
             cursor++;
         }
         return cursor + column;
+    }
+
+    public static int offsetAt(String sourceText, Position position) {
+        return offsetAt(sourceText, position.line, position.character);
     }
 
     private static String patch(String sourceText, TextDocumentContentChangeEvent change) {
@@ -395,6 +401,36 @@ public class FileStore {
             character++;
         }
         return i;
+    }
+
+    public static Position positionAt(String sourceText, int targetOffset) {
+        if (targetOffset < 0) targetOffset = 0;
+        if (targetOffset > sourceText.length()) targetOffset = sourceText.length();
+
+        var line = 0;
+        var character = 0;
+        for (var i = 0; i < targetOffset; i++) {
+            var c = sourceText.charAt(i);
+            if (c == '\n') {
+                line++;
+                character = 0;
+            } else if (c == '\r') {
+                if (i + 1 < targetOffset && sourceText.charAt(i + 1) == '\n') {
+                    i++;
+                }
+                line++;
+                character = 0;
+            } else {
+                character++;
+            }
+        }
+        return new Position(line, character);
+    }
+
+    public static Range range(String sourceText, long start, long end) {
+        var safeStart = (int) Math.max(0, Math.min(Integer.MAX_VALUE, start));
+        var safeEnd = (int) Math.max(safeStart, Math.min(Integer.MAX_VALUE, end));
+        return new Range(positionAt(sourceText, safeStart), positionAt(sourceText, safeEnd));
     }
 
     static boolean isJavaFile(Path file) {

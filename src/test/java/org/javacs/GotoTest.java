@@ -182,6 +182,12 @@ public class GotoTest {
     }
 
     @Test
+    public void gotoInheritedDefaultInterfaceMethod() {
+        var file = "/org/javacs/example/InterfaceDefaultReference.java";
+        assertThat(doGoto(file, 11, 20, false), hasItem("InterfaceDefaultReference.java:4"));
+    }
+
+    @Test
     public void packagePrivate() {
         // There is a separate bug where javac doesn't find package-private classes in files with different names.
         // This is tested in WarningsTest#referencePackagePrivateClassInFileWithDifferentName

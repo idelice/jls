@@ -147,6 +147,12 @@ public class FindReferencesTest {
                         "OverrideHierarchy.java(16)"));
     }
 
+    @Test
+    public void interfaceDefaultMethodReferencesIncludeInheritedCallSites() {
+        var file = "/org/javacs/example/InterfaceDefaultReference.java";
+        assertThat(items(file, 4, 28), contains("InterfaceDefaultReference.java(11)"));
+    }
+
     private static ReferenceContext referenceContext() {
         var workspaceRoot = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT;
         FileStore.reset();

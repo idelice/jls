@@ -48,6 +48,9 @@ public class CompileBatch implements AutoCloseable {
     final List<CompilationUnitTree> roots;
     final Map<Path, CompileTask.SourceStamp> sourceStamps;
     final AnalysisMode analysisMode;
+    final long parseMs;
+    final long enterMs;
+    final long analyzeMs;
 
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
         this(parent, files, true, AnalysisMode.FULL);
@@ -149,6 +152,9 @@ public class CompileBatch implements AutoCloseable {
             }
             throw new RuntimeException("Compilation failed: " + e.getMessage(), e);
         } finally {
+            this.parseMs = parseNanos / 1_000_000;
+            this.enterMs = enterNanos / 1_000_000;
+            this.analyzeMs = analyzeNanos / 1_000_000;
             if (analysisMode == AnalysisMode.FULL) {
                 FULL_BATCHES.incrementAndGet();
             }

@@ -75,7 +75,6 @@ class Parser {
         var trees = Trees.instance(task);
         var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
-        var lines = root.getLineMap();
         var start = (int) pos.getStartPosition(root, path.getLeaf());
         var end = (int) pos.getEndPosition(root, path.getLeaf());
 
@@ -150,13 +149,7 @@ class Parser {
             }
             end = start + name.length();
         }
-        var startLine = (int) lines.getLineNumber(start);
-        var startCol = (int) lines.getColumnNumber(start);
-        var endLine = (int) lines.getLineNumber(end);
-        var endCol = (int) lines.getColumnNumber(end);
-        var range = new Range(new Position(startLine - 1, startCol - 1), new Position(endLine - 1, endCol - 1));
-
-        return range;
+        return FileStore.range(contents.toString(), start, end);
     }
 
     private static int indexOf(CharSequence contents, String name, int start) {

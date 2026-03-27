@@ -20,6 +20,7 @@ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -308,7 +309,7 @@ public class TypeMemberIndex {
         var list = new ArrayList<Member>();
         var seen = new ObjectLinkedOpenHashSet<String>();
         addDirectMembers(type, staticContext, list, seen);
-        addInheritedSyntheticMembers(qualifiedName, staticContext, list, seen);
+        addInheritedMembers(qualifiedName, staticContext, list, seen);
         return list;
     }
 
@@ -321,7 +322,7 @@ public class TypeMemberIndex {
         if (direct.isPresent()) {
             return direct;
         }
-        return inheritedSyntheticMember(qualifiedName, name, staticContext, null);
+        return inheritedMember(qualifiedName, name, staticContext, null);
     }
 
     public Optional<Member> member(String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
@@ -334,7 +335,7 @@ public class TypeMemberIndex {
         if (direct.isPresent()) {
             return direct;
         }
-        return inheritedSyntheticMember(qualifiedName, name, staticContext, targetKey);
+        return inheritedMember(qualifiedName, name, staticContext, erasedParameterTypes);
     }
 
     public Optional<Member> memberByCanonicalKey(String canonicalKey) {
@@ -418,7 +419,7 @@ public class TypeMemberIndex {
         }
     }
 
-    private void addInheritedSyntheticMembers(
+    private void addInheritedMembers(
             String qualifiedName, boolean staticContext, List<Member> members, Set<String> seenStorageKeys) {
         var visited = new ObjectLinkedOpenHashSet<String>();
         var pending = new java.util.ArrayDeque<String>(directSupertypes(qualifiedName));
@@ -432,7 +433,7 @@ public class TypeMemberIndex {
                 continue;
             }
             for (var member : type.members) {
-                if (!member.synthetic || staticContext != member.isStatic) {
+                if (staticContext != member.isStatic || member.isPrivate) {
                     continue;
                 }
                 var storageKey = memberStorageKey(member);
@@ -473,8 +474,8 @@ public class TypeMemberIndex {
         return Optional.empty();
     }
 
-    private Optional<Member> inheritedSyntheticMember(
-            String qualifiedName, String name, boolean staticContext, String targetKey) {
+    private Optional<Member> inheritedMember(
+            String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var visited = new ObjectLinkedOpenHashSet<String>();
         var pending = new java.util.ArrayDeque<String>(directSupertypes(qualifiedName));
         while (!pending.isEmpty()) {
@@ -487,19 +488,18 @@ public class TypeMemberIndex {
                 continue;
             }
             for (var member : type.members) {
-                if (!member.synthetic || staticContext != member.isStatic) {
+                if (staticContext != member.isStatic || member.isPrivate) {
                     continue;
                 }
-                if (targetKey != null) {
-                    if (member.kind != CompletionItemKind.Method) {
-                        continue;
-                    }
-                    if (Objects.equals(targetKey, member.canonicalKey)) {
+                if (erasedParameterTypes != null) {
+                    if (member.kind == CompletionItemKind.Method
+                            && Objects.equals(name, member.name)
+                            && Arrays.equals(
+                                    erasedParameterTypes == null ? new String[0] : erasedParameterTypes,
+                                    member.erasedParameterTypes == null ? new String[0] : member.erasedParameterTypes)) {
                         return Optional.of(member);
                     }
-                    continue;
-                }
-                if (Objects.equals(name, member.name)) {
+                } else if (Objects.equals(name, member.name)) {
                     return Optional.of(member);
                 }
             }

@@ -171,8 +171,8 @@ public class FindHelper {
     }
 
     private static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
-        var lines = path.getCompilationUnit().getLineMap();
         var pos = Trees.instance(task).getSourcePositions();
+        var root = path.getCompilationUnit();
         var start = -1;
         var end = -1;
         for (var current = path; current != null; current = current.getParentPath()) {
@@ -194,14 +194,13 @@ public class FindHelper {
         if (start < 0 || end < start) {
             return null;
         }
-        var startLine = (int) lines.getLineNumber(start);
-        var startColumn = (int) lines.getColumnNumber(start);
-        var startPos = new Position(startLine - 1, startColumn - 1);
-        var endLine = (int) lines.getLineNumber(end);
-        var endColumn = (int) lines.getColumnNumber(end);
-        var endPos = new Position(endLine - 1, endColumn - 1);
-        var range = new Range(startPos, endPos);
-        var uri = normalizeUri(path.getCompilationUnit().getSourceFile().toUri());
+        Range range;
+        try {
+            range = FileStore.range(root.getSourceFile().getCharContent(true).toString(), start, end);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        var uri = normalizeUri(root.getSourceFile().toUri());
         return new Location(uri, range);
     }
 

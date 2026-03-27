@@ -275,7 +275,9 @@ class JavaLanguageServer extends LanguageServer {
             CompileTask task = null;
             try {
                 diagnosticsCompilesInFlight.incrementAndGet();
-                task = diagnosticsCompiler.compile(javaFiles.toArray(Path[]::new));
+                task =
+                        diagnosticsCompiler.compileDiagnostics(
+                                javaFiles.stream().map(SourceFileObject::new).toList());
                 var compiled = Instant.now();
                 var compileMs = Duration.between(started, compiled).toMillis();
                 var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
@@ -285,7 +287,7 @@ class JavaLanguageServer extends LanguageServer {
                                 trigger, javaFiles.size(), compileMs));
                 LOG.fine(
                         String.format(
-                                "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s",
+                                "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s parse=%dms enter=%dms analyze=%dms",
                                 trigger,
                                 requestedCount,
                                 dirtyOpenCount,
@@ -294,7 +296,10 @@ class JavaLanguageServer extends LanguageServer {
                                 compileTelemetry.annotationProcessingEnabled,
                                 compileTelemetry.expandedSources,
                                 compileTelemetry.path,
-                                compileTelemetry.cacheName));
+                                compileTelemetry.cacheName,
+                                compileTelemetry.parseMs,
+                                compileTelemetry.enterMs,
+                                compileTelemetry.analyzeMs));
                 if (shouldYieldToDidSaveDiagnostics(trigger, "post_compile")) {
                     return;
                 }
@@ -924,6 +929,21 @@ class JavaLanguageServer extends LanguageServer {
                         String.format(
                                 "[perf] diagnostics_compile trigger=didOpenBootstrap files=%d took=%dms",
                                 workspaceFiles.size(), Duration.between(started, compiled).toMillis()));
+                var compileTelemetry = selection.compiler.lastCompileTelemetry();
+                LOG.info(
+                        String.format(
+                                "[perf] diagnostics_summary trigger=didOpenBootstrap requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s parse=%dms enter=%dms analyze=%dms",
+                                workspaceFiles.size(),
+                                0,
+                                workspaceFiles.size(),
+                                task.roots.size(),
+                                compileTelemetry.annotationProcessingEnabled,
+                                compileTelemetry.expandedSources,
+                                compileTelemetry.path,
+                                compileTelemetry.cacheName,
+                                compileTelemetry.parseMs,
+                                compileTelemetry.enterMs,
+                                compileTelemetry.analyzeMs));
                 publishDiagnosticsFromTask(task, List.of(file), "didOpenBootstrap", -1);
                 var indexStarted = Instant.now();
                 var nextIndex = TypeMemberIndex.workspaceDeclarations(task);
@@ -1035,6 +1055,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private CompilerSet createCompilers() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
+        var started = Instant.now();
 
         javaStartProgress(new JavaStartProgressParams("Configure javac"));
         javaReportProgress(new JavaReportProgressParams("Finding source roots"));
@@ -1044,39 +1065,74 @@ class JavaLanguageServer extends LanguageServer {
         var extraArgs = extraCompilerArgs();
         var addExports = addExports();
         var lombokEnabled = lombokEnabled();
+        var settingsLoaded = Instant.now();
         Set<Path> resolvedDocPath;
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
             resolvedDocPath = docPath();
+            LOG.info(
+                    String.format(
+                            "[perf] compiler_config_inference mode=explicit classpath=%d docpath=%d took=%dms",
+                            classPath.size(),
+                            resolvedDocPath.size(),
+                            Duration.between(settingsLoaded, Instant.now()).toMillis()));
         }
         // Otherwise, combine inference with user-specified external dependencies
         else {
             var infer = new InferConfig(workspaceRoot, externalDependencies);
 
             javaReportProgress(new JavaReportProgressParams("Inferring class path"));
+            var inferClassPathStarted = Instant.now();
             classPath = infer.classPath();
+            var inferredClassPath = Instant.now();
 
             javaReportProgress(new JavaReportProgressParams("Inferring doc path"));
+            var inferDocPathStarted = Instant.now();
             resolvedDocPath = infer.buildDocPath();
+            LOG.info(
+                    String.format(
+                            "[perf] compiler_config_inference mode=inferred external=%d classpath=%d docpath=%d classpath_infer=%dms docpath_infer=%dms total=%dms",
+                            externalDependencies.size(),
+                            classPath.size(),
+                            resolvedDocPath.size(),
+                            Duration.between(inferClassPathStarted, inferredClassPath).toMillis(),
+                            Duration.between(inferDocPathStarted, Instant.now()).toMillis(),
+                            Duration.between(settingsLoaded, Instant.now()).toMillis()));
         }
+        var inferenceFinished = Instant.now();
         javaEndProgress();
         LOG.info("[perf] lombok_setting enabled=" + lombokEnabled);
-        return new CompilerSet(
+        var interactiveStarted = Instant.now();
+        var interactive =
                 new JavaCompilerService(
                         classPath,
                         resolvedDocPath,
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "interactive"),
+                        "interactive");
+        var diagnosticsStarted = Instant.now();
+        var diagnostics =
                 new JavaCompilerService(
                         classPath,
                         resolvedDocPath,
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "diagnostics"),
-                lombokEnabled);
+                        "diagnostics");
+        LOG.info(
+                String.format(
+                        "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms total=%dms",
+                        classPath.size(),
+                        resolvedDocPath.size(),
+                        extraArgs.size(),
+                        addExports.size(),
+                        Duration.between(started, settingsLoaded).toMillis(),
+                        Duration.between(settingsLoaded, inferenceFinished).toMillis(),
+                        Duration.between(inferenceFinished, diagnosticsStarted).toMillis(),
+                        Duration.between(diagnosticsStarted, Instant.now()).toMillis(),
+                        Duration.between(started, Instant.now()).toMillis()));
+        return new CompilerSet(interactive, diagnostics, lombokEnabled);
     }
 
     private static class CompilerSet {
@@ -1416,7 +1472,11 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshot();
-        var found = new ReferenceProvider(compiler(), snapshot.typeIndex(), file, line, column).find();
+        var includeDeclaration = position.context != null && position.context.includeDeclaration;
+        var found =
+                new ReferenceProvider(
+                                compiler(), snapshot.typeIndex(), file, line, column, includeDeclaration)
+                        .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -1477,8 +1537,16 @@ class JavaLanguageServer extends LanguageServer {
         LOG.info("Try to rename...");
         var file = Paths.get(params.textDocument.uri);
         try (var task = compiler().compile(file)) {
-            var lines = task.root().getLineMap();
-            var cursor = lines.getPosition(params.position.line + 1, params.position.character + 1);
+            long cursor;
+            try {
+                cursor =
+                        FileStore.offset(
+                                task.root().getSourceFile().getCharContent(true).toString(),
+                                params.position.line + 1,
+                                params.position.character + 1);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
             var path = new FindNameAt(task).scan(task.root(), cursor);
             if (path == null) {
                 LOG.info("...no element under cursor");
@@ -1542,8 +1610,16 @@ class JavaLanguageServer extends LanguageServer {
     private Rewrite createRewrite(RenameParams params) {
         var file = Paths.get(params.textDocument.uri);
         try (var task = compiler().compile(file)) {
-            var lines = task.root().getLineMap();
-            var position = lines.getPosition(params.position.line + 1, params.position.character + 1);
+            long position;
+            try {
+                position =
+                        FileStore.offset(
+                                task.root().getSourceFile().getCharContent(true).toString(),
+                                params.position.line + 1,
+                                params.position.character + 1);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
             var path = new FindNameAt(task).scan(task.root(), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = Trees.instance(task.task).getElement(path);

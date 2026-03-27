@@ -21,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.ParseTask;
 import org.javacs.completion.CompositeTypeIndex;
@@ -32,19 +33,31 @@ public class ReferenceProvider {
     private final CompositeTypeIndex completionIndex;
     private final Path file;
     private final int line, column;
+    private final boolean includeDeclaration;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
     public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, CompositeTypeIndex.EMPTY, file, line, column);
+        this(compiler, CompositeTypeIndex.EMPTY, file, line, column, false);
     }
 
     public ReferenceProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, Path file, int line, int column) {
+        this(compiler, completionIndex, file, line, column, false);
+    }
+
+    public ReferenceProvider(
+            CompilerProvider compiler,
+            CompositeTypeIndex completionIndex,
+            Path file,
+            int line,
+            int column,
+            boolean includeDeclaration) {
         this.compiler = compiler;
         this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
         this.file = file;
         this.line = line;
         this.column = column;
+        this.includeDeclaration = includeDeclaration;
     }
 
     public List<Location> find() {
@@ -156,7 +169,7 @@ public class ReferenceProvider {
                         return;
                     }
                     var location = FindHelper.locationStrict(parse, path, name);
-                    if (location == null || isDeclarationLocation(location, target)) {
+                    if (location == null || (!includeDeclaration && isDeclarationLocation(location, target))) {
                         return;
                     }
                     dedup.putIfAbsent(key(location), location);
@@ -191,10 +204,28 @@ public class ReferenceProvider {
             return true;
         }
         var resolvedKey = methodCanonicalKey(resolved, parse, path);
-        return resolved.method()
-                && resolvedKey != null
-                && relatedMethodKeys.contains(resolvedKey)
+        if (!resolved.method()) {
+            return false;
+        }
+        if (resolvedKey != null && relatedMethodKeys.contains(resolvedKey)) {
+            return signatureMatches(targetParameterTypes, occurrenceParameterTypes(parse, path));
+        }
+        return methodOwnerMatches(target.qualifiedType(), resolved.qualifiedType())
+                && Objects.equals(target.memberName(), resolved.memberName())
                 && signatureMatches(targetParameterTypes, occurrenceParameterTypes(parse, path));
+    }
+
+    private boolean methodOwnerMatches(String targetOwner, String resolvedOwner) {
+        if (Objects.equals(targetOwner, resolvedOwner)) {
+            return true;
+        }
+        if (targetOwner == null || resolvedOwner == null) {
+            return false;
+        }
+        return completionIndex.directSupertypes(resolvedOwner).contains(targetOwner)
+                || completionIndex.directSupertypes(targetOwner).contains(resolvedOwner)
+                || completionIndex.subtypes(targetOwner).contains(resolvedOwner)
+                || completionIndex.subtypes(resolvedOwner).contains(targetOwner);
     }
 
     private boolean matchesFieldReference(
@@ -237,7 +268,12 @@ public class ReferenceProvider {
         var parse = compiler.parse(targetFile);
         var line = location.range.start.line + 1;
         var column = location.range.start.character + 1;
-        var cursor = parse.root.getLineMap().getPosition(line, column);
+        long cursor;
+        try {
+            cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
         var path = new org.javacs.FindNameAt(parse).scan(parse.root, cursor);
         if (path == null || !(path.getLeaf() instanceof MethodTree method)) {
             return List.of();
@@ -287,6 +323,10 @@ public class ReferenceProvider {
 
     private boolean signatureMatches(List<String> targetParameterTypes, List<String> occurrenceParameterTypes) {
         if (targetParameterTypes.isEmpty() || occurrenceParameterTypes.isEmpty()) {
+            return true;
+        }
+        if (targetParameterTypes.stream().anyMatch(String::isBlank)
+                || occurrenceParameterTypes.stream().anyMatch(String::isBlank)) {
             return true;
         }
         return targetParameterTypes.equals(occurrenceParameterTypes);

@@ -21,8 +21,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
-import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.FindNameAt;
 import org.javacs.ParseTask;
@@ -41,7 +41,6 @@ public class DefinitionProvider {
     private final int column;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
-    private static final Logger LOG = Logger.getLogger("main");
 
     public record ResolvedSymbol(
             List<Location> locations,
@@ -70,7 +69,12 @@ public class DefinitionProvider {
 
     public ResolvedSymbol resolveSymbol() {
         var parse = compiler.parse(file);
-        var cursor = parse.root.getLineMap().getPosition(line, column);
+        long cursor;
+        try {
+            cursor = FileStore.offset(parse.root.getSourceFile().getCharContent(true).toString(), line, column);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
         var path = new FindNameAt(parse).scan(parse.root, cursor);
         if (path == null) return new ResolvedSymbol(NOT_SUPPORTED, null, null, false, null, null);
         return resolve(parse, path, cursor);
@@ -222,9 +226,13 @@ public class DefinitionProvider {
         var argTypes = resolveArgumentTypes(invocation.getArguments(), types);
         var owner = types.currentEnclosingTypeName();
         if (owner.isPresent()) {
-            var member =
-                    lookupMember(owner.get(), methodName, false, argTypes.toArray(String[]::new))
-                            .orElse(null);
+            TypeMemberIndex.Member member = null;
+            if (hasResolvedArgumentTypes(argTypes)) {
+                member = lookupMember(owner.get(), methodName, false, argTypes.toArray(String[]::new)).orElse(null);
+            }
+            if (member == null) {
+                member = lookupMember(owner.get(), methodName, false).orElse(null);
+            }
             var resolved = resolveMethod(owner.get(), methodName, invocation.getArguments().size(), argTypes, member);
             if (!resolved.locations().isEmpty()) {
                 return resolved;
@@ -249,11 +257,13 @@ public class DefinitionProvider {
         var argTypes = resolveArgumentTypes(arguments, types);
         var ownerType = receiver.get().qualifiedType;
         var memberWithArgs =
-                lookupMember(
-                        ownerType,
-                        methodName,
-                        receiver.get().staticContext,
-                        argTypes.toArray(String[]::new));
+                hasResolvedArgumentTypes(argTypes)
+                        ? lookupMember(
+                                ownerType,
+                                methodName,
+                                receiver.get().staticContext,
+                                argTypes.toArray(String[]::new))
+                        : Optional.<TypeMemberIndex.Member>empty();
         var memberWithoutArgs =
                 memberWithArgs.isPresent()
                         ? Optional.<TypeMemberIndex.Member>empty()
@@ -618,6 +628,10 @@ public class DefinitionProvider {
             result.add(resolved.map(type -> canonicalType(type.qualifiedType)).orElse(""));
         }
         return result;
+    }
+
+    private boolean hasResolvedArgumentTypes(List<String> argTypes) {
+        return !argTypes.isEmpty() && argTypes.stream().noneMatch(String::isBlank);
     }
 
     private ResolvedSymbol resolvedFieldSymbol(String ownerType, String fieldName, List<Location> locations) {

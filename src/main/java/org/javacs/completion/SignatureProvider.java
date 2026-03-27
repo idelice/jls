@@ -23,6 +23,7 @@ import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.*;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.hover.ShortTypePrinter;
@@ -44,7 +45,12 @@ public class SignatureProvider {
         // TODO prune
         try (var task = compiler.compileFastWithProcessors(file)) {
             var root = task.root(file);
-            var cursor = root.getLineMap().getPosition(line, column);
+            long cursor;
+            try {
+                cursor = FileStore.offset(root.getSourceFile().getCharContent(true).toString(), line, column);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
             var path = new FindInvocationAt(task.task).scan(root, cursor);
             if (path == null) return NOT_SUPPORTED;
             if (path.getLeaf() instanceof MethodInvocationTree) {

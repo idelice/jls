@@ -177,7 +177,12 @@ public class CompletionProvider {
         var parseStarted = Instant.now();
         var task = compiler.parse(file);
         var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
-        var cursor = task.root.getLineMap().getPosition(line, column);
+        long cursor;
+        try {
+            cursor = FileStore.offset(task.root.getSourceFile().getCharContent(true).toString(), line, column);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
         var contents = new PruneMethodBodies(task.task).scan(task.root, cursor);
         var endOfLine = endOfLine(contents, (int) cursor);
         contents.insert(endOfLine, ';');
@@ -449,7 +454,6 @@ public class CompletionProvider {
         final String qualifiedType;
         final boolean staticContext;
         final boolean arrayType;
-
         TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType) {
             this.qualifiedType = qualifiedType;
             this.staticContext = staticContext;

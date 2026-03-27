@@ -9,6 +9,8 @@ import java.net.URLClassLoader;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.logging.Logger;
@@ -113,6 +115,7 @@ class ScanClassPath {
 
     static Set<String> jdkTopLevelClasses() {
         LOG.info("Searching for top-level classes in the JDK");
+        var started = Instant.now();
 
         var classes = new HashSet<String>();
         var fs = FileSystems.getFileSystem(URI.create("jrt:/"));
@@ -135,12 +138,17 @@ class ScanClassPath {
         }
 
         LOG.info(String.format("Found %d classes in the java platform", classes.size()));
+        LOG.info(
+                String.format(
+                        "[perf] jdk_class_scan modules=%d classes=%d took=%dms",
+                        JDK_MODULES.length, classes.size(), Duration.between(started, Instant.now()).toMillis()));
 
         return classes;
     }
 
     static Set<String> classPathTopLevelClasses(Set<Path> classPath) {
         LOG.info(String.format("Searching for top-level classes in %d classpath locations", classPath.size()));
+        var started = Instant.now();
 
         var urls = classPath.stream().map(ScanClassPath::toUrl).toArray(URL[]::new);
         var classLoader = new URLClassLoader(urls, null);
@@ -156,6 +164,10 @@ class ScanClassPath {
         }
 
         LOG.info(String.format("Found %d classes in classpath", classes.size()));
+        LOG.info(
+                String.format(
+                        "[perf] classpath_scan locations=%d classes=%d took=%dms",
+                        classPath.size(), classes.size(), Duration.between(started, Instant.now()).toMillis()));
 
         return classes;
     }
