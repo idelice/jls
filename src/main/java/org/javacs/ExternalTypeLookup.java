@@ -6,8 +6,8 @@ import java.util.LinkedHashSet;
 import java.util.Optional;
 import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
-import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.completion.TypeMemberIndex;
+import org.javacs.completion.TypeIndexRouter;
+import org.javacs.completion.WorkspaceTypeIndex;
 
 /**
  * Resolves type names and type source across the workspace/dependency boundary.
@@ -16,15 +16,15 @@ import org.javacs.completion.TypeMemberIndex;
  * caller: if a request already knows it is resolving a workspace owner, it must stay on the
  * workspace path instead of relying on composite member lookup.
  */
-public final class TypeLookupBoundary {
+public final class ExternalTypeLookup {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
-    private final CompositeTypeIndex index;
+    private final TypeIndexRouter index;
 
-    public TypeLookupBoundary(CompilerProvider compiler, CompositeTypeIndex index) {
+    public ExternalTypeLookup(CompilerProvider compiler, TypeIndexRouter index) {
         this.compiler = compiler;
-        this.index = index == null ? CompositeTypeIndex.EMPTY : index;
+        this.index = index == null ? TypeIndexRouter.EMPTY : index;
     }
 
     /**
@@ -51,7 +51,7 @@ public final class TypeLookupBoundary {
         if (raw.isEmpty()) {
             return Optional.empty();
         }
-        if (TypeMemberIndex.isPrimitiveTypeName(raw)) {
+        if (WorkspaceTypeIndex.isPrimitiveTypeName(raw)) {
             return Optional.of(raw);
         }
         var workspace = index.workspace().resolveTypeName(typeName, root);
@@ -131,7 +131,7 @@ public final class TypeLookupBoundary {
         if (raw.isEmpty()) {
             return Optional.empty();
         }
-        if (TypeMemberIndex.isPrimitiveTypeName(raw)) {
+        if (WorkspaceTypeIndex.isPrimitiveTypeName(raw)) {
             return Optional.of(raw);
         }
         if (raw.contains(".") && resolveExternalQualifiedType(raw, "qualified").isPresent()) {

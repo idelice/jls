@@ -11,18 +11,24 @@ import javax.lang.model.type.DeclaredType;
 import org.javacs.CompileTask;
 
 class ScopeHelper {
-    // TODO is this still necessary? Test speed. We could get rid of the extra static-imports step.
+    /**
+     * Return lexical scopes that participate in Java member lookup.
+     *
+     * <p>The Scope API appends compilation-unit/import scopes after the last real class scope. Those
+     * outer scopes are useful for import completion, but they do not model lexical enclosing classes
+     * and methods. Trimming by a fixed count was brittle across JDK scope layouts and could drop a
+     * real enclosing class scope for nested types, which in turn hid inherited members and valid
+     * {@code TypeName.this}/{@code TypeName.super} completions.
+     */
     static List<Scope> fastScopes(Scope start) {
         var scopes = new ArrayList<Scope>();
         for (var s = start; s != null; s = s.getEnclosingScope()) {
+            if (s.getEnclosingClass() == null && s.getEnclosingMethod() == null) {
+                break;
+            }
             scopes.add(s);
         }
-        // Scopes may be contained in an enclosing scope.
-        // The outermost scope contains those elements available via "star import" declarations;
-        // the scope within that contains the top level elements of the compilation unit, including any named
-        // imports.
-        // https://parent.docs.oracle.com/en/java/javase/11/docs/api/jdk.compiler/com/sun/source/tree/Scope.html
-        return scopes.subList(0, scopes.size() - 2);
+        return scopes;
     }
 
     static List<Element> scopeMembers(CompileTask task, Scope inner, Predicate<CharSequence> filter) {

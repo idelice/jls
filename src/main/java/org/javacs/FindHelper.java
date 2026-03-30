@@ -158,6 +158,10 @@ public class FindHelper {
         return location(task.task(), path, name, true);
     }
 
+    public static URI normalizeLocationUri(URI uri) {
+        return normalizeUri(uri);
+    }
+
     private static Location location(CompileTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
         return location(task.task, path, name, strictNameMatch);
     }

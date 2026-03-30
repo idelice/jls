@@ -16,16 +16,16 @@ import org.javacs.CompilerProvider;
  * already know an owner is workspace-owned must stay on the workspace index instead of using this
  * facade as a fallback chooser.
  */
-public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
-    public static final CompositeTypeIndex EMPTY =
-            new CompositeTypeIndex(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY);
+public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
+    public static final TypeIndexRouter EMPTY =
+            new TypeIndexRouter(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY);
 
-    public CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
+    public TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
         this.workspace = workspace == null ? WorkspaceTypeIndex.EMPTY : workspace;
         this.external = external == null ? ExternalBinaryTypeIndex.EMPTY : external;
     }
 
-    public List<TypeMemberIndex.Member> members(String qualifiedName, boolean staticContext) {
+    public List<WorkspaceTypeIndex.Member> members(String qualifiedName, boolean staticContext) {
         var workspaceMembers = workspace.members(qualifiedName, staticContext);
         if (!workspaceMembers.isEmpty()) {
             return workspaceMembers;
@@ -33,7 +33,7 @@ public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTyp
         return external.members(qualifiedName, staticContext);
     }
 
-    public Optional<TypeMemberIndex.Member> member(String qualifiedName, String name, boolean staticContext) {
+    public Optional<WorkspaceTypeIndex.Member> member(String qualifiedName, String name, boolean staticContext) {
         var workspaceMember = workspace.member(qualifiedName, name, staticContext);
         if (workspaceMember.isPresent()) {
             return workspaceMember;
@@ -41,13 +41,36 @@ public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTyp
         return external.member(qualifiedName, name, staticContext);
     }
 
-    public Optional<TypeMemberIndex.Member> member(
+    public Optional<WorkspaceTypeIndex.Member> ownerMember(
+            String qualifiedName,
+            String name,
+            boolean staticContext,
+            CompilerProvider compiler) {
+        if (isWorkspaceOwnedType(qualifiedName, compiler)) {
+            return workspace.member(qualifiedName, name, staticContext);
+        }
+        return member(qualifiedName, name, staticContext);
+    }
+
+    public Optional<WorkspaceTypeIndex.Member> member(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var workspaceMember = workspace.member(qualifiedName, name, staticContext, erasedParameterTypes);
         if (workspaceMember.isPresent()) {
             return workspaceMember;
         }
         return external.member(qualifiedName, name, staticContext, erasedParameterTypes);
+    }
+
+    public Optional<WorkspaceTypeIndex.Member> ownerMember(
+            String qualifiedName,
+            String name,
+            boolean staticContext,
+            String[] erasedParameterTypes,
+            CompilerProvider compiler) {
+        if (isWorkspaceOwnedType(qualifiedName, compiler)) {
+            return workspace.member(qualifiedName, name, staticContext, erasedParameterTypes);
+        }
+        return member(qualifiedName, name, staticContext, erasedParameterTypes);
     }
 
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
@@ -87,7 +110,7 @@ public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTyp
         return false;
     }
 
-    public Optional<TypeMemberIndex.TypeInfo> typeInfo(String qualifiedName) {
+    public Optional<WorkspaceTypeIndex.TypeInfo> typeInfo(String qualifiedName) {
         var workspaceType = workspace.typeInfo(qualifiedName);
         if (workspaceType.isPresent()) {
             return workspaceType;
@@ -104,7 +127,7 @@ public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTyp
         if (!workspaceSupertypes.isEmpty()) {
             return workspaceSupertypes;
         }
-        return typeInfo(qualifiedName).map(TypeIndexSupport::directSupertypes).orElse(Set.of());
+        return typeInfo(qualifiedName).map(WorkspaceTypeIndex::directSupertypes).orElse(Set.of());
     }
 
     public Set<String> relatedMethodKeys(String ownerType, String memberName, String[] erasedParameterTypes) {
@@ -116,5 +139,13 @@ public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTyp
 
     public Optional<Path> externalDecompiledSourcePath(String qualifiedName) {
         return external.decompiledSourcePath(qualifiedName);
+    }
+
+    public Optional<String> workspaceNestedType(String ownerType, String simpleName) {
+        if (ownerType == null || ownerType.isBlank() || simpleName == null || simpleName.isBlank()) {
+            return Optional.empty();
+        }
+        var candidate = ownerType + "." + simpleName;
+        return workspace.containsType(candidate) ? Optional.of(candidate) : Optional.empty();
     }
 }

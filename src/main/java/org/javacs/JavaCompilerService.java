@@ -367,7 +367,7 @@ class JavaCompilerService implements CompilerProvider {
             boolean allowAP,
             boolean expandAdditionalSources) {
         boolean useAP = allowAP && lombokApEnabled;
-        var expandedSources = expandSourcesForLombokAP(sources, useAP);
+        var expandedSources = expandSourcesForLombokAPDetails(sources, useAP);
         var effectiveSources = expandedSources.sources();
         var cacheName = cacheMetricName(mode, useAP, expandAdditionalSources);
         var useFreshDiagnosticsLombokCompile =
@@ -453,7 +453,12 @@ class JavaCompilerService implements CompilerProvider {
         return new SourceFileObject(sourceFile.path, contents, modified, sourceFile.contentVersion());
     }
 
-    private ExpandedSources expandSourcesForLombokAP(
+    private Collection<? extends JavaFileObject> expandSourcesForLombokAP(
+            Collection<? extends JavaFileObject> sources, boolean allowAP) {
+        return expandSourcesForLombokAPDetails(sources, allowAP).sources();
+    }
+
+    private ExpandedSources expandSourcesForLombokAPDetails(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
         if (!allowAP || !lombokPresentOnClasspath) {
             return new ExpandedSources(sources, false, sources.size(), sources.size());
@@ -829,15 +834,13 @@ class JavaCompilerService implements CompilerProvider {
 
     private boolean hasLombokAnnotation(Path file) {
         if (cacheHasLombokAnnotation.needs(file, null)) {
-            var hasLombok = false;
-            try (var lines = FileStore.lines(file)) {
-                hasLombok = LombokAnnotations.sourceMayRequireLombokExpansion(lines, LOMBOK_SCAN_LINE_LIMIT);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            cacheHasLombokAnnotation.load(file, null, hasLombok);
+            cacheHasLombokAnnotation.load(file, null, quickMaybeUsesLombok(file));
         }
         return cacheHasLombokAnnotation.get(file, null);
+    }
+
+    private boolean quickMaybeUsesLombok(Path file) {
+        return LombokAnnotations.sourceMayRequireLombokExpansion(file, LOMBOK_SCAN_LINE_LIMIT);
     }
 
     private final Cache<Void, List<String>> cacheFileImports = new Cache<>("helper.file_imports");

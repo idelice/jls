@@ -7,9 +7,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.completion.TypeIndexRouter;
 import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.TypeMemberIndex;
 import org.javacs.completion.WorkspaceTypeIndex;
 import org.javacs.navigation.ReferenceProvider;
 import org.junit.Test;
@@ -161,11 +160,11 @@ public class FindReferencesTest {
         var compiler =
                 new JavaCompilerService(
                         infer.classPath(), infer.buildDocPath(), java.util.Collections.emptySet(), java.util.Collections.emptySet());
-        CompositeTypeIndex index;
+        TypeIndexRouter index;
         try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
             index =
-                    new CompositeTypeIndex(
-                            WorkspaceTypeIndex.wrap(TypeMemberIndex.from(task)),
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(task),
                             new ExternalBinaryTypeIndex(compiler));
         }
         return new ReferenceContext(compiler, index);
@@ -173,9 +172,9 @@ public class FindReferencesTest {
 
     private static final class ReferenceContext {
         final JavaCompilerService compiler;
-        final CompositeTypeIndex index;
+        final TypeIndexRouter index;
 
-        ReferenceContext(JavaCompilerService compiler, CompositeTypeIndex index) {
+        ReferenceContext(JavaCompilerService compiler, TypeIndexRouter index) {
             this.compiler = compiler;
             this.index = index;
         }

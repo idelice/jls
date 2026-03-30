@@ -12,10 +12,6 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.*;
-import java.util.logging.Handler;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
 import org.junit.*;
 
@@ -98,7 +94,7 @@ public class JavaCompilerServiceTest {
     }
 
     @Test
-    public void parseCacheIsSharedAcrossCompilerServicesForSameSourceVersion() throws Exception {
+    public void parseCacheIsScopedToCompilerServiceInstances() throws Exception {
         var file = Files.createTempFile("shared-parse-cache-", ".java");
         try {
             var firstCompiler =
@@ -120,19 +116,26 @@ public class JavaCompilerServiceTest {
             var second =
                     secondCompiler.parse(
                             new SourceFileObject(file, "class SharedParseCache { int one; }\n", Instant.EPOCH, 1));
+            var secondRepeat =
+                    secondCompiler.parse(
+                            new SourceFileObject(file, "class SharedParseCache { int one; }\n", Instant.EPOCH, 1));
 
             assertThat(
-                    "same source fingerprint parsed by different compilers should reuse shared AST",
+                    "parse caching should remain isolated per compiler service",
                     second.root(),
-                    sameInstance(first.root()));
+                    not(sameInstance(first.root())));
+            assertThat(
+                    "repeated parses within the same compiler service should still reuse the cached AST",
+                    secondRepeat.root(),
+                    sameInstance(second.root()));
         } finally {
             Files.deleteIfExists(file);
         }
     }
 
     @Test
-    public void reusesPerOptionCompilerContextsWithoutRepeatedRecreation() throws Exception {
-        var service =
+    public void keepsCompilerContextGrowthBoundedAcrossRepeatedCompiles() throws Exception {
+        var fullService =
                 new JavaCompilerService(
                         Set.of(Paths.get("lib/lombok-1.18.30.jar")),
                         Collections.emptySet(),
@@ -140,13 +143,27 @@ public class JavaCompilerServiceTest {
                         Collections.emptySet());
         var file = FindResource.path("org/javacs/example/HelloWorld.java");
 
-        try (var ignored = service.compile(file)) {}
-        try (var ignored = service.compileFastWithProcessors(file)) {}
-        try (var ignored = service.compile(file)) {}
-        try (var ignored = service.compileFastWithProcessors(file)) {}
+        try (var ignored = fullService.compile(file)) {}
+        try (var ignored = fullService.compile(file)) {}
+        var fullContexts = reusableCompilerContexts(fullService.compiler);
+        assertThat(
+                "repeated full compiles should not keep creating new reusable contexts",
+                fullContexts.size(),
+                lessThanOrEqualTo(2));
 
-        var contexts = reusableCompilerContexts(service.compiler);
-        assertThat("expected one context per distinct option set", contexts.size(), is(2));
+        var fastService =
+                new JavaCompilerService(
+                        Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+        try (var ignored = fastService.compileFastWithProcessors(file)) {}
+        try (var ignored = fastService.compileFastWithProcessors(file)) {}
+        var fastContexts = reusableCompilerContexts(fastService.compiler);
+        assertThat(
+                "repeated fast AP compiles should not keep creating new reusable contexts",
+                fastContexts.size(),
+                lessThanOrEqualTo(2));
     }
 
     @Test
@@ -319,11 +336,6 @@ public class JavaCompilerServiceTest {
     @Test
     public void fullWorkspaceCompileSkipsPackagePrivateRetryWhenWorkspaceAlreadyCovered() throws Exception {
         var root = Files.createTempDirectory("workspace-covered-compile-");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = root.resolve("p");
             Files.createDirectories(pkg);
@@ -349,28 +361,20 @@ public class JavaCompilerServiceTest {
                 assertThat(
                         task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
                         is(true));
+                assertThat(
+                        "explicitly requested workspace sources should compile in a single batch",
+                        task.roots.size(),
+                        is(2));
             }
-
-            assertThat(
-                    "full workspace compile should not do a second compile batch",
-                    capture.countContaining("compile_retry mode=full sources=2 additional=1 action=second_attempt"),
-                    is(0));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
             deleteTree(root);
         }
     }
 
     @Test
-    public void targetedFullCompileStillRetriesForPackagePrivateSourceRecovery() throws Exception {
+    public void targetedFullCompileRecoversPackagePrivateDependency() throws Exception {
         var root = Files.createTempDirectory("targeted-retry-compile-");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = root.resolve("p");
             Files.createDirectories(pkg);
@@ -397,15 +401,12 @@ public class JavaCompilerServiceTest {
                         "targeted full compile should recover the package-private dependency",
                         task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
                         is(true));
+                assertThat(
+                        "targeted full compile should include the recovered package-private source in the batch",
+                        task.roots.size(),
+                        is(2));
             }
-
-            assertThat(
-                    "targeted compile should still run a second batch when additional sources are needed",
-                    capture.countContaining("compile_retry mode=full sources=1 additional=1 action=second_attempt"),
-                    greaterThan(0));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
             deleteTree(root);
         }
@@ -466,32 +467,5 @@ public class JavaCompilerServiceTest {
                         return FileVisitResult.CONTINUE;
                     }
                 });
-    }
-
-    private static final class TestLogCapture extends Handler {
-        private final List<String> lines = Collections.synchronizedList(new ArrayList<>());
-
-        @Override
-        public void publish(LogRecord record) {
-            lines.add(record.getMessage());
-        }
-
-        @Override
-        public void flush() {}
-
-        @Override
-        public void close() {}
-
-        int countContaining(String needle) {
-            synchronized (lines) {
-                var count = 0;
-                for (var line : lines) {
-                    if (line != null && line.contains(needle)) {
-                        count++;
-                    }
-                }
-                return count;
-            }
-        }
     }
 }

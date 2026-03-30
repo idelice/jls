@@ -72,10 +72,10 @@ public class HoverTest {
     }
 
     @Test
-    public void lombokGeneratedMethodInMultiRootCompile() {
-        assertThat(
-                symbolAt("/org/javacs/example/LombokCrossTypeDiagnostics.java", 7, 16),
-                containsString("getName()"));
+    public void lombokGeneratedAccessorInMultiRootCompileResolvesToBackingField() {
+        var hover = symbolAt("/org/javacs/example/LombokCrossTypeDiagnostics.java", 7, 16);
+        assertThat(hover, containsString("String name"));
+        assertThat(hover, not(containsString("getName()")));
     }
 
     // Re-using the language server makes these tests go a lot faster, but it will potentially produce surprising output

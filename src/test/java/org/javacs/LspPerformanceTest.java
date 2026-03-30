@@ -20,9 +20,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
-import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.completion.TypeIndexRouter;
 import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.TypeMemberIndex;
 import org.javacs.completion.WorkspaceTypeIndex;
 import org.javacs.navigation.ReferenceProvider;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -137,11 +136,17 @@ public class LspPerformanceTest {
 
     @Test
     public void interactiveSequenceAvoidsFullCompileUntilSaveDiagnostics() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
+        var client = new TrackingClient();
+        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var uri = file.toUri();
         var original = FileStore.contents(file);
         open(server, file, 1, original);
         server.lint(List.of(file));
+        assertTrue("expected initial diagnostics to publish", client.awaitDiagnosticsForUri(uri, 10, TimeUnit.SECONDS));
+        assertTrue(
+                "expected diagnostics traffic to settle before measuring interactive requests",
+                client.awaitDiagnosticsQuiet(uri, 10, TimeUnit.SECONDS, 300));
 
         change(server, file, 2, original + "\n// interactive-sequence");
 
@@ -1274,11 +1279,11 @@ public class LspPerformanceTest {
         var compiler =
                 new JavaCompilerService(
                         infer.classPath(), infer.buildDocPath(), Collections.emptySet(), Collections.emptySet());
-        CompositeTypeIndex index;
+        TypeIndexRouter index;
         try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
             index =
-                    new CompositeTypeIndex(
-                            WorkspaceTypeIndex.wrap(TypeMemberIndex.from(task)),
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(task),
                             new ExternalBinaryTypeIndex(compiler));
         }
         return new ReferenceContext(compiler, index);
@@ -1286,9 +1291,9 @@ public class LspPerformanceTest {
 
     private static class ReferenceContext {
         final JavaCompilerService compiler;
-        final CompositeTypeIndex index;
+        final TypeIndexRouter index;
 
-        ReferenceContext(JavaCompilerService compiler, CompositeTypeIndex index) {
+        ReferenceContext(JavaCompilerService compiler, TypeIndexRouter index) {
             this.compiler = compiler;
             this.index = index;
         }
@@ -1299,11 +1304,13 @@ public class LspPerformanceTest {
         private final AtomicInteger publishCalls = new AtomicInteger();
         private final Map<URI, List<org.javacs.lsp.Diagnostic>> latestDiagnosticsByUri =
                 new ConcurrentHashMap<>();
+        private volatile long lastPublishNanos = -1L;
 
         @Override
         public void publishDiagnostics(PublishDiagnosticsParams params) {
             publishCalls.incrementAndGet();
             latestDiagnosticsByUri.put(params.uri, List.copyOf(params.diagnostics));
+            lastPublishNanos = System.nanoTime();
             diagnosticsPublished.countDown();
         }
 
@@ -1357,6 +1364,23 @@ public class LspPerformanceTest {
                 if (stable) {
                     return true;
                 }
+            }
+            return false;
+        }
+
+        boolean awaitDiagnosticsQuiet(URI uri, long timeout, TimeUnit unit, long quietMillis)
+                throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            var quietNanos = TimeUnit.MILLISECONDS.toNanos(quietMillis);
+            while (System.nanoTime() < deadline) {
+                if (!latestDiagnosticsByUri.containsKey(uri) || lastPublishNanos < 0L) {
+                    Thread.sleep(20);
+                    continue;
+                }
+                if (System.nanoTime() - lastPublishNanos >= quietNanos) {
+                    return true;
+                }
+                Thread.sleep(20);
             }
             return false;
         }

@@ -16,7 +16,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import javax.tools.JavaFileObject;
 import org.javacs.completion.CompletionProvider;
-import org.javacs.completion.CompositeTypeIndex;
+import org.javacs.completion.TypeIndexRouter;
 import org.javacs.hover.HoverProvider;
 import org.javacs.lsp.*;
 import org.junit.Ignore;
@@ -280,7 +280,7 @@ public class CompletionsTest extends CompletionsBase {
                                 return delegate.compile(sources);
                             }
                         },
-                        CompositeTypeIndex.EMPTY);
+                        TypeIndexRouter.EMPTY);
         provider.resolveCompletionItem(item);
         assertThat(item.label, equalTo("Goto"));
     }
@@ -915,8 +915,8 @@ public class CompletionsTest extends CompletionsBase {
     @Test
     public void completeParens() {
         var inserts = insertText("/org/javacs/example/CompleteParens.java", 5, 12);
-        assertThat(inserts, hasItem("returnsVoid()$0"));
-        assertThat(inserts, hasItem("returnsString()$0"));
+        assertThat(inserts, hasItem("returnsVoid()"));
+        assertThat(inserts, hasItem("returnsString()"));
         assertThat(inserts, hasItem("returnsArg($0)"));
     }
 

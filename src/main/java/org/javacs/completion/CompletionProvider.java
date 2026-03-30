@@ -8,6 +8,7 @@ import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.BlockTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
@@ -15,6 +16,8 @@ import com.sun.source.tree.NewArrayTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.Scope;
+import com.sun.source.tree.SwitchExpressionTree;
+import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.VariableTree;
@@ -71,20 +74,22 @@ import org.javacs.JsonHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
-import org.javacs.TypeLookupBoundary;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.InsertTextFormat;
 import org.javacs.lsp.TextEdit;
+import org.javacs.resolve.ParseTypeResolver;
+import org.javacs.resolve.TypeNames;
 import org.javacs.rewrite.AddImport;
 
+/** Completion entrypoint that stays on the parse/index path without compiling on each request. */
 public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
-    private final CompositeTypeIndex completionIndex;
+    private final TypeIndexRouter completionIndex;
     private final long completionIndexVersion;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
@@ -162,20 +167,60 @@ public class CompletionProvider {
             long indexVersion,
             String targetType,
             boolean staticContext,
+            boolean enclosingInstanceAccess,
+            boolean methodReference,
             String partial,
             boolean endsWithParen,
             String currentType) {}
 
+    private record CompletionRequestContext(
+            ParseTask task, String contents, long cursor, TreePath parsePath, MemberAccessContext memberAccess, long parseMs) {}
+
     private record IndexedCompletionResult(CompletionList list, long resolveMs, String cacheState) {}
 
-    public CompletionProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex, long completionIndexVersion) {
+    public CompletionProvider(CompilerProvider compiler, TypeIndexRouter completionIndex, long completionIndexVersion) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
+        this.completionIndex = completionIndex == null ? TypeIndexRouter.EMPTY : completionIndex;
         this.completionIndexVersion = Math.max(0L, completionIndexVersion);
     }
 
     public CompletionList complete(Path file, int line, int column) {
         var started = Instant.now();
+        var request = prepareRequestContext(file, line, column);
+        CompletionList list;
+        String mode;
+        long resolveMs = 0;
+        String memberCacheState = "n/a";
+        if (request.memberAccess() != null && isImportOrPackageContext(request.parsePath())) {
+            // `import foo.bar.` should stay on the import completion path.
+            list = completeParseOnly(request.task(), request.contents(), request.cursor(), request.memberAccess().partial);
+            mode = "import_parse";
+        } else if (request.memberAccess() != null) {
+            var indexed =
+                    completeParseAndIndex(
+                            request.task(),
+                            request.parsePath(),
+                            request.cursor(),
+                            request.memberAccess(),
+                            endsWithParen(request.contents(), (int) request.cursor()));
+            list = indexed.list();
+            resolveMs = indexed.resolveMs();
+            memberCacheState = indexed.cacheState();
+            mode = "member_index";
+        } else {
+            list = completeParseOnly(
+                    request.task(), request.contents(), request.cursor(), partialIdentifier(request.contents(), (int) request.cursor()));
+            mode = "identifier_parse";
+        }
+        if (list == NOT_SUPPORTED) {
+            return NOT_SUPPORTED;
+        }
+        list = finalizeCompletionList(request.task(), list);
+        logCompletionFlow(file, mode, request.parseMs(), resolveMs, memberCacheState, started);
+        return list;
+    }
+
+    private CompletionRequestContext prepareRequestContext(Path file, int line, int column) {
         var parseStarted = Instant.now();
         var task = compiler.parse(file);
         var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
@@ -189,35 +234,12 @@ public class CompletionProvider {
         var endOfLine = endOfLine(contents, (int) cursor);
         contents.insert(endOfLine, ';');
         var pruned = contents.toString();
-        var memberAccess = memberAccessContext(pruned, (int) cursor);
         var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
-        CompletionList list;
-        String mode;
-        long resolveMs = 0;
-        String memberCacheState = "n/a";
-        if (memberAccess != null && isImportOrPackageContext(parsePath)) {
-            // `import foo.bar.` should stay on the import completion path.
-            list = completeParseOnly(task, pruned, cursor, memberAccess.partial);
-            mode = "import_parse";
-        } else if (memberAccess != null) {
-            var indexed =
-                    completeParseAndIndex(
-                            task,
-                            parsePath,
-                            cursor,
-                            memberAccess,
-                            endsWithParen(pruned, (int) cursor));
-            list = indexed.list();
-            resolveMs = indexed.resolveMs();
-            memberCacheState = indexed.cacheState();
-            mode = "member_index";
-        } else {
-            list = completeParseOnly(task, pruned, cursor, partialIdentifier(pruned, (int) cursor));
-            mode = "identifier_parse";
-        }
-        if (list == NOT_SUPPORTED) {
-            return NOT_SUPPORTED;
-        }
+        var memberAccess = memberAccessContext(pruned, (int) cursor);
+        return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, parseMs);
+    }
+
+    private CompletionList finalizeCompletionList(ParseTask task, CompletionList list) {
         // Some sentinel paths use immutable lists (List.of()).
         // Completion post-processing mutates/sorts the list, so ensure mutability.
         if (!(list.items instanceof ArrayList)) {
@@ -225,6 +247,11 @@ public class CompletionProvider {
         }
         addTopLevelSnippets(task, list);
         sortCompletionItems(list.items);
+        return list;
+    }
+
+    private void logCompletionFlow(
+            Path file, String mode, long parseMs, long resolveMs, String memberCacheState, Instant started) {
         LOG.info(
                 String.format(
                         "[perf] completion_flow file=%s mode=%s sources=1 enter=%d analyze=%d ap=%d index_version=%d parse=%dms resolve=%dms member_cache=%s took=%dms",
@@ -238,7 +265,6 @@ public class CompletionProvider {
                         resolveMs,
                         memberCacheState,
                         Duration.between(started, Instant.now()).toMillis()));
-        return list;
     }
 
     private int endOfLine(CharSequence contents, int cursor) {
@@ -279,25 +305,34 @@ public class CompletionProvider {
             return new IndexedCompletionResult(EMPTY, resolveMs, "unresolved_type");
         }
         var target = resolved.get();
-        if (!target.arrayType && !isQualifiedTypeName(target.qualifiedType)) {
+        if (!target.arrayType() && !isQualifiedTypeName(target.qualifiedType())) {
             return new IndexedCompletionResult(EMPTY, resolveMs, "non_fqn_type");
         }
         var currentType = resolver.currentEnclosingTypeName();
-        if (target.arrayType) {
+        if (target.arrayType()) {
             return new IndexedCompletionResult(
-                    completeArrayMemberSelect(target.staticContext), resolveMs, "array_type");
+                    completeArrayMemberSelect(target.staticContext()), resolveMs, "array_type");
         }
         var membersStarted = Instant.now();
-        var members = index.members(target.qualifiedType, target.staticContext);
+        var members =
+                memberAccess.methodReference() && target.staticContext()
+                        ? mergeMemberContexts(index, target.qualifiedType())
+                        : index.members(target.qualifiedType(), target.staticContext());
         var membersMs = Duration.between(membersStarted, Instant.now()).toMillis();
         if (members.isEmpty()) {
             return new IndexedCompletionResult(EMPTY, resolveMs + membersMs, "no_members");
         }
+        var enclosingInstanceAccess =
+                target.staticContext()
+                        && isAccessibleEnclosingInstanceType(
+                                parseTask, parsePath, cursor, target.qualifiedType(), memberAccess.receiver);
         var cacheKey =
                 new MemberCompletionCacheKey(
                         completionIndexVersion,
-                        target.qualifiedType,
-                        target.staticContext,
+                        target.qualifiedType(),
+                        target.staticContext(),
+                        enclosingInstanceAccess,
+                        memberAccess.methodReference(),
                         memberAccess.partial,
                         endsWithParen,
                         currentType.orElse(""));
@@ -313,11 +348,12 @@ public class CompletionProvider {
 
         var buildStarted = Instant.now();
         var list = new ArrayList<CompletionItem>();
-        var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();
+        var methods = new TreeMap<String, List<WorkspaceTypeIndex.Member>>();
         var methodPriority = new HashMap<String, Integer>();
         for (var member : members) {
-            if (!isIndexMemberVisible(member, target.qualifiedType, currentType)) continue;
+            if (!isIndexMemberVisible(member, target.qualifiedType(), currentType)) continue;
             if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
+            if (memberAccess.methodReference() && member.kind != CompletionItemKind.Method) continue;
             if (member.kind == CompletionItemKind.Method) {
                 methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
                 methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
@@ -328,13 +364,15 @@ public class CompletionProvider {
             }
         }
         for (var entry : methods.entrySet()) {
-            var method = indexedMethod(entry.getValue(), !endsWithParen);
+            var method = indexedMethod(entry.getValue(), memberAccess.methodReference() ? false : !endsWithParen);
             method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
             list.add(method);
         }
-        if (target.staticContext) {
+        if (memberAccess.methodReference() && target.staticContext()) {
+            list.add(keyword("new"));
+        } else if (target.staticContext()) {
             list.add(keyword("class"));
-            if (resolver.isEnclosingInstanceType(target.qualifiedType)) {
+            if (enclosingInstanceAccess) {
                 list.add(keyword("this"));
                 list.add(keyword("super"));
             }
@@ -342,7 +380,7 @@ public class CompletionProvider {
         var result = new CompletionList(false, list);
         var buildMs = Duration.between(buildStarted, Instant.now()).toMillis();
         if (memberAccess.partial.isEmpty()
-                && !"java.lang.Object".equals(target.qualifiedType)
+                && !"java.lang.Object".equals(target.qualifiedType())
                 && isWeakObjectOnlyResult(result)) {
             return new IndexedCompletionResult(
                     EMPTY, resolveMs + membersMs + buildMs, "miss_drop_weak_object_only");
@@ -357,7 +395,7 @@ public class CompletionProvider {
     }
 
     private boolean isIndexMemberVisible(
-            TypeMemberIndex.Member member, String targetType, Optional<String> currentEnclosingType) {
+            WorkspaceTypeIndex.Member member, String targetType, Optional<String> currentEnclosingType) {
         if (!member.isPrivate) {
             return true;
         }
@@ -372,6 +410,9 @@ public class CompletionProvider {
             if (cursor.getLeaf() instanceof MemberSelectTree select) {
                 return select.getExpression();
             }
+            if (cursor.getLeaf() instanceof MemberReferenceTree reference) {
+                return reference.getQualifierExpression();
+            }
         }
         return null;
     }
@@ -380,10 +421,10 @@ public class CompletionProvider {
         if (typeName == null || typeName.isBlank()) {
             return false;
         }
-        return typeName.contains(".") || TypeMemberIndex.isPrimitiveTypeName(typeName);
+        return typeName.contains(".") || WorkspaceTypeIndex.isPrimitiveTypeName(typeName);
     }
 
-    private int indexMemberPriority(TypeMemberIndex.Member member) {
+    private int indexMemberPriority(WorkspaceTypeIndex.Member member) {
         if (member.kind == CompletionItemKind.Method) {
             if (isUtilityMethodName(member.name)) return 90; // always sink utility methods
             if (member.priority == 2) return 80; // java.lang.Object methods near end
@@ -405,7 +446,7 @@ public class CompletionProvider {
         return Priority.PACKAGE_MEMBER;
     }
 
-    private CompletionItem indexedMember(TypeMemberIndex.Member member) {
+    private CompletionItem indexedMember(WorkspaceTypeIndex.Member member) {
         var item = new CompletionItem();
         item.label = member.name;
         item.kind = member.kind;
@@ -419,7 +460,7 @@ public class CompletionProvider {
         return item;
     }
 
-    private CompletionItem indexedMethod(List<TypeMemberIndex.Member> overloads, boolean addParens) {
+    private CompletionItem indexedMethod(List<WorkspaceTypeIndex.Member> overloads, boolean addParens) {
         var first = overloads.get(0);
         var item = new CompletionItem();
         item.label = first.name;
@@ -447,1248 +488,6 @@ public class CompletionProvider {
         data.plusOverloads = Math.max(0, overloads.size() - 1);
         item.data = JsonHelper.GSON.toJsonTree(data);
         return item;
-    }
-
-    private record TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType,
-                                  String firstTypeArgument) {
-
-        TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType) {
-                this(qualifiedType, staticContext, arrayType, null);
-            }
-
-            TypeResolution withFirstTypeArgument(String nextFirstTypeArgument) {
-                return new TypeResolution(qualifiedType, staticContext, arrayType, nextFirstTypeArgument);
-            }
-        }
-
-    private record CandidateType(TypeResolution resolution, int depth, long start) {
-    }
-
-    private static class ParseTypeResolver {
-        private static final int MAX_RESOLVE_DEPTH = 24;
-
-        private static final class SourceClassInfo {
-            final CompilationUnitTree sourceRoot;
-            final TreePath classPath;
-            final ClassTree classTree;
-
-            SourceClassInfo(CompilationUnitTree sourceRoot, TreePath classPath) {
-                this.sourceRoot = sourceRoot;
-                this.classPath = classPath;
-                this.classTree = (ClassTree) classPath.getLeaf();
-            }
-        }
-
-        private final CompilationUnitTree root;
-        private final SourcePositions positions;
-        private final CompilerProvider compiler;
-        private final TypeLookupBoundary typeLookup;
-        private final CompositeTypeIndex index;
-        private final long cursor;
-        private final TreePath cursorPath;
-        private ClassLoader externalClassLoader;
-        private TypeResolution thisType;
-        private TypeResolution superType;
-
-        ParseTypeResolver(ParseTask parseTask, CompilerProvider compiler, CompositeTypeIndex index, long cursor) {
-            this.root = parseTask.root();
-            this.positions = Trees.instance(parseTask.task()).getSourcePositions();
-            this.compiler = compiler;
-            this.index = index;
-            this.typeLookup = new TypeLookupBoundary(compiler, index);
-            this.cursor = cursor;
-            this.cursorPath = new FindCompletionsAt(parseTask.task()).scan(parseTask.root(), cursor);
-        }
-
-        Optional<TypeResolution> resolve(Tree expression, String fallbackIdentifier) {
-            if (expression != null) {
-                var direct = resolveExpression(expression, 0);
-                if (direct.isPresent()) {
-                    return direct;
-                }
-            }
-            if (fallbackIdentifier == null || fallbackIdentifier.isBlank()) {
-                return Optional.empty();
-            }
-            return resolveIdentifier(fallbackIdentifier, 0);
-        }
-
-        private Optional<TypeResolution> resolveExpression(Tree expression, int depth) {
-            if (expression == null || depth > MAX_RESOLVE_DEPTH) {
-                return Optional.empty();
-            }
-            if (expression instanceof ParenthesizedTree parenthesized) {
-                return resolveExpression(parenthesized.getExpression(), depth + 1);
-            }
-            if (expression instanceof IdentifierTree identifier) {
-                return resolveIdentifier(identifier.getName().toString(), depth + 1);
-            }
-            if (expression instanceof NewClassTree newClassTree) {
-                return resolveTypeTree(newClassTree.getIdentifier(), root, false);
-            }
-            if (expression instanceof NewArrayTree newArrayTree) {
-                if (newArrayTree.getType() == null) {
-                    return Optional.empty();
-                }
-                var component = resolveTypeTree(newArrayTree.getType(), root, false);
-                return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType, false, true));
-            }
-            if (expression instanceof MethodInvocationTree invocationTree) {
-                return resolveMethodInvocation(invocationTree, depth + 1);
-            }
-            if (expression instanceof MemberSelectTree memberSelectTree) {
-                return resolveMemberSelect(memberSelectTree, depth + 1);
-            }
-            if (expression instanceof TypeCastTree castTree) {
-                return resolveTypeTree(castTree.getType(), root, false);
-            }
-            if (expression instanceof ArrayAccessTree arrayAccessTree) {
-                var array = resolveExpression(arrayAccessTree.getExpression(), depth + 1);
-                if (array.isEmpty()) {
-                    return Optional.empty();
-                }
-                var type = array.get();
-                if (!type.arrayType || type.qualifiedType == null || type.qualifiedType.isBlank()) {
-                    return Optional.empty();
-                }
-                return Optional.of(new TypeResolution(type.qualifiedType, false, false));
-            }
-            if (expression instanceof LiteralTree literal) {
-                return literalType(literal);
-            }
-            return Optional.empty();
-        }
-
-        private Optional<TypeResolution> resolveMethodInvocation(MethodInvocationTree invocationTree, int depth) {
-            var select = invocationTree.getMethodSelect();
-            if (select instanceof IdentifierTree identifier) {
-                var current = resolveThisType();
-                if (current.isEmpty()) {
-                    return Optional.empty();
-                }
-                var method =
-                        resolveMemberFromIndexOrSource(
-                                current.get().qualifiedType, identifier.getName().toString(), false);
-                if (method.isEmpty()) {
-                    return Optional.empty();
-                }
-                return returnTypeOf(method.get());
-            }
-            if (select instanceof MemberSelectTree memberSelectTree) {
-                var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
-                if (receiver.isEmpty()) {
-                    return Optional.empty();
-                }
-                var method =
-                        resolveMemberFromIndexOrSource(
-                                receiver.get().qualifiedType,
-                                memberSelectTree.getIdentifier().toString(),
-                                receiver.get().staticContext);
-                if (method.isEmpty()) {
-                    return Optional.empty();
-                }
-                var external = resolveExternalMethodReturnType(receiver.get(), method.get());
-                if (external.isPresent()) {
-                    return external;
-                }
-                return returnTypeOf(method.get());
-            }
-            return Optional.empty();
-        }
-
-        private Optional<TypeResolution> resolveMemberSelect(MemberSelectTree memberSelectTree, int depth) {
-            var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
-            if (receiver.isEmpty()) {
-                return resolveTypeTree(memberSelectTree, root, true);
-            }
-            if (receiver.get().arrayType && "length".equals(memberSelectTree.getIdentifier().toString())) {
-                return Optional.of(new TypeResolution("int", false, false));
-            }
-            if (receiver.get().staticContext && "class".equals(memberSelectTree.getIdentifier().toString())) {
-                return Optional.of(new TypeResolution("java.lang.Class", false, false));
-            }
-            var member =
-                    resolveMemberFromIndexOrSource(
-                            receiver.get().qualifiedType,
-                            memberSelectTree.getIdentifier().toString(),
-                            receiver.get().staticContext);
-            if (member.isEmpty()) {
-                return Optional.empty();
-            }
-            return returnTypeOf(member.get());
-        }
-
-        private Optional<TypeResolution> resolveIdentifier(String identifier, int depth) {
-            if ("this".equals(identifier)) {
-                return resolveThisType();
-            }
-            if ("super".equals(identifier)) {
-                return resolveSuperType();
-            }
-            var variable = resolveVisibleVariable(identifier, depth + 1);
-            if (variable.isPresent()) {
-                return variable;
-            }
-            var implicitLogger = resolveImplicitSlf4jLogger(identifier);
-            if (implicitLogger.isPresent()) {
-                return implicitLogger;
-            }
-            var enclosingField = resolveEnclosingField(identifier);
-            if (enclosingField.isPresent()) {
-                return enclosingField;
-            }
-            var nested = resolveNestedTypeInEnclosingScopes(identifier);
-            if (nested.isPresent()) {
-                return Optional.of(new TypeResolution(nested.get(), true, false));
-            }
-            var type = typeLookup.resolveTypeName(identifier, root);
-            return type.map(s -> new TypeResolution(s, true, false));
-        }
-
-        private Optional<TypeResolution> resolveEnclosingField(String identifier) {
-            if (identifier == null || identifier.isBlank()) {
-                return Optional.empty();
-            }
-            var current = resolveThisType();
-            if (current.isEmpty()) {
-                return Optional.empty();
-            }
-            var field = resolveMemberFromIndexOrSource(current.get().qualifiedType, identifier, false);
-            if (field.isEmpty() || field.get().kind != CompletionItemKind.Field) {
-                return Optional.empty();
-            }
-            return returnTypeOf(field.get());
-        }
-
-        private Optional<TypeMemberIndex.Member> resolveMemberFromIndexOrSource(
-                String ownerType, String memberName, boolean staticContext) {
-            var indexed = resolveIndexedMember(ownerType, memberName, staticContext, null);
-            if (indexed.isPresent()) {
-                return indexed;
-            }
-            return resolveSourceMember(ownerType, memberName, staticContext);
-        }
-
-        private Optional<TypeMemberIndex.Member> resolveIndexedMember(
-                String ownerType, String memberName, boolean staticContext, String[] erasedParameterTypes) {
-            if (index.isWorkspaceOwnedType(ownerType, compiler)) {
-                return erasedParameterTypes == null
-                        ? index.workspace().member(ownerType, memberName, staticContext)
-                        : index.workspace().member(ownerType, memberName, staticContext, erasedParameterTypes);
-            }
-            return erasedParameterTypes == null
-                    ? index.external().rawMember(ownerType, memberName, staticContext)
-                    : index.external().rawMember(ownerType, memberName, staticContext, erasedParameterTypes);
-        }
-
-        private Optional<TypeMemberIndex.Member> resolveSourceMember(
-                String ownerType, String memberName, boolean staticContext) {
-            var info = sourceClassInfo(ownerType);
-            if (info.isEmpty()) {
-                return Optional.empty();
-            }
-            for (var member : info.get().classTree.getMembers()) {
-                if (member instanceof VariableTree field) {
-                    if (!field.getName().contentEquals(memberName)) {
-                        continue;
-                    }
-                    var isStatic =
-                            field.getModifiers() != null
-                                    && field.getModifiers().getFlags().contains(Modifier.STATIC);
-                    if (isStatic != staticContext) {
-                        continue;
-                    }
-                    var fieldType = resolveTypeTree(field.getType(), info.get().sourceRoot, false);
-                    if (fieldType.isEmpty()) {
-                        continue;
-                    }
-                    return Optional.of(
-                            new TypeMemberIndex.Member(
-                                    ownerType,
-                                    memberName,
-                                    CompletionItemKind.Field,
-                                    isStatic,
-                                    field.getModifiers() != null
-                                            && field.getModifiers().getFlags().contains(Modifier.PRIVATE),
-                                    0,
-                                    field.getType() + " " + memberName,
-                                    typeName(fieldType.get()),
-                                    null,
-                                    null,
-                                    TypeMemberIndex.canonicalMemberKey(ownerType, CompletionItemKind.Field, memberName, null),
-                                    TypeMemberIndex.canonicalMemberKey(ownerType, CompletionItemKind.Field, memberName, null),
-                                    null,
-                                    false));
-                }
-                if (member instanceof MethodTree method) {
-                    if (!method.getName().contentEquals(memberName)) {
-                        continue;
-                    }
-                    var isStatic =
-                            method.getModifiers() != null
-                                    && method.getModifiers().getFlags().contains(Modifier.STATIC);
-                    if (isStatic != staticContext) {
-                        continue;
-                    }
-                    var returnType =
-                            method.getReturnType() == null
-                                    ? Optional.<TypeResolution>empty()
-                                    : resolveTypeTree(method.getReturnType(), info.get().sourceRoot, false);
-                    var parameterNames = new String[method.getParameters().size()];
-                    var erasedParameterTypes = new String[method.getParameters().size()];
-                    for (int i = 0; i < method.getParameters().size(); i++) {
-                        var parameter = method.getParameters().get(i);
-                        parameterNames[i] = parameter.getName().toString();
-                        erasedParameterTypes[i] = parameter.getType().toString();
-                    }
-                    return Optional.of(
-                            new TypeMemberIndex.Member(
-                                    ownerType,
-                                    memberName,
-                                    CompletionItemKind.Method,
-                                    isStatic,
-                                    method.getModifiers() != null
-                                            && method.getModifiers().getFlags().contains(Modifier.PRIVATE),
-                                    0,
-                                    method.toString(),
-                                    returnType.map(ParseTypeResolver::typeName).orElse(null),
-                                    parameterNames,
-                                    erasedParameterTypes,
-                                    TypeMemberIndex.canonicalMemberKey(
-                                            ownerType, CompletionItemKind.Method, memberName, erasedParameterTypes),
-                                    TypeMemberIndex.canonicalMemberKey(
-                                            ownerType, CompletionItemKind.Method, memberName, erasedParameterTypes),
-                                    null,
-                                    false));
-                }
-            }
-            return Optional.empty();
-        }
-
-        private Optional<TypeResolution> resolveImplicitSlf4jLogger(String identifier) {
-            if (!"log".equals(identifier)) {
-                return Optional.empty();
-            }
-            var classPath = enclosingClassPath();
-            if (classPath == null) {
-                return Optional.empty();
-            }
-            var classTree = (ClassTree) classPath.getLeaf();
-            if (!LombokAnnotations.hasLoggingOnlyLombokAnnotation(classTree.getModifiers())) {
-                return Optional.empty();
-            }
-            var ownerType = qualifiedClassName(root, classPath);
-            var loggerMember =
-                    index.isWorkspaceOwnedType(ownerType, compiler)
-                            ? index.workspace().member(ownerType, "log", false)
-                            : index.member(ownerType, "log", false);
-            if (loggerMember.isEmpty()) {
-                loggerMember =
-                        index.isWorkspaceOwnedType(ownerType, compiler)
-                                ? index.workspace().member(ownerType, "log", true)
-                                : index.member(ownerType, "log", true);
-            }
-            if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
-                return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
-            }
-            var loggerType = "org.slf4j.Logger";
-            if (!index.containsType(loggerType)) {
-                return Optional.empty();
-            }
-            return Optional.of(new TypeResolution(loggerType, false, false));
-        }
-
-        private Optional<String> resolveNestedTypeInEnclosingScopes(String simpleName) {
-            for (var classPath = enclosingClassPath(); classPath != null; classPath = parentClassPath(classPath.getParentPath())) {
-                var owner = qualifiedClassName(root, classPath);
-                var candidate = owner + "." + simpleName;
-                if (index.workspace().containsType(candidate) || sourceClassInfo(candidate).isPresent()) {
-                    return Optional.of(candidate);
-                }
-            }
-            return Optional.empty();
-        }
-
-        private TreePath parentClassPath(TreePath from) {
-            for (var cursor = from; cursor != null; cursor = cursor.getParentPath()) {
-                if (cursor.getLeaf() instanceof ClassTree) {
-                    return cursor;
-                }
-            }
-            return null;
-        }
-
-        private Optional<TypeResolution> resolveVisibleVariable(String targetName, int depth) {
-            final CandidateType[] best = new CandidateType[1];
-            new TreePathScanner<Void, Void>() {
-                @Override
-                public Void visitClass(ClassTree classTree, Void p) {
-                    if (!containsCursor(classTree)) {
-                        return null;
-                    }
-                    for (var member : classTree.getMembers()) {
-                        if (member instanceof VariableTree) {
-                            scan(member, p);
-                        } else if (containsCursor(member)) {
-                            scan(member, p);
-                        }
-                    }
-                    return null;
-                }
-
-                @Override
-                public Void visitMethod(MethodTree methodTree, Void p) {
-                    if (!containsCursor(methodTree)) {
-                        return null;
-                    }
-                    for (var parameter : methodTree.getParameters()) {
-                        consider(parameter, getCurrentPath(), depth + 1);
-                    }
-                    if (methodTree.getBody() != null) {
-                        scan(methodTree.getBody(), p);
-                    }
-                    return null;
-                }
-
-                @Override
-                public Void visitBlock(BlockTree blockTree, Void p) {
-                    if (!containsCursor(blockTree)) {
-                        return null;
-                    }
-                    for (var statement : blockTree.getStatements()) {
-                        var start = startOf(statement);
-                        if (start >= 0 && start >= cursor) {
-                            break;
-                        }
-                        scan(statement, p);
-                    }
-                    return null;
-                }
-
-                @Override
-                public Void visitVariable(VariableTree variableTree, Void p) {
-                    consider(variableTree, getCurrentPath(), depth + 1);
-                    return null;
-                }
-
-                private void consider(VariableTree variableTree, TreePath path, int nextDepth) {
-                    if (!variableTree.getName().contentEquals(targetName)) {
-                        return;
-                    }
-                    var start = startOf(variableTree);
-                    if (start < 0 || start >= cursor) {
-                        return;
-                    }
-                    var resolved = resolveVariableType(variableTree, path, nextDepth);
-                    if (resolved.isEmpty()) {
-                        return;
-                    }
-                    var candidate = new CandidateType(resolved.get(), depth(path), start);
-                    if (best[0] == null
-                            || candidate.depth > best[0].depth
-                            || (candidate.depth == best[0].depth && candidate.start > best[0].start)) {
-                        best[0] = candidate;
-                    }
-                }
-            }.scan(root, null);
-
-            if (best[0] == null) {
-                return Optional.empty();
-            }
-            return Optional.of(best[0].resolution);
-        }
-
-        private Optional<TypeResolution> resolveVariableType(VariableTree variableTree, TreePath path, int depth) {
-            if (variableTree.getType() != null && !"var".equals(variableTree.getType().toString())) {
-                return resolveTypeTree(variableTree.getType(), root, false);
-            }
-            var enhancedFor = resolveEnhancedForVariableType(variableTree, path, depth + 1);
-            if (enhancedFor.isPresent()) {
-                return enhancedFor;
-            }
-            var lambda = resolveLambdaParameterType(variableTree, path, depth + 1);
-            if (lambda.isPresent()) {
-                return lambda;
-            }
-            if (variableTree.getInitializer() != null) {
-                return resolveExpression(variableTree.getInitializer(), depth + 1);
-            }
-            return Optional.empty();
-        }
-
-        private Optional<TypeResolution> resolveEnhancedForVariableType(
-                VariableTree variableTree, TreePath path, int depth) {
-            var parent = path == null ? null : path.getParentPath();
-            if (parent == null || !(parent.getLeaf() instanceof EnhancedForLoopTree loop) || loop.getVariable() != variableTree) {
-                return Optional.empty();
-            }
-            var iterableType = resolveExpression(loop.getExpression(), depth + 1);
-            if (iterableType.isEmpty()) {
-                return Optional.empty();
-            }
-            if (iterableType.get().arrayType) {
-                return Optional.of(new TypeResolution(iterableType.get().qualifiedType, false, false));
-            }
-            if (iterableType.get().firstTypeArgument == null || iterableType.get().firstTypeArgument.isBlank()) {
-                return Optional.empty();
-            }
-            return Optional.of(new TypeResolution(iterableType.get().firstTypeArgument, false, false));
-        }
-
-        private Optional<TypeResolution> resolveLambdaParameterType(
-                VariableTree variableTree, TreePath path, int depth) {
-            var parent = path == null ? null : path.getParentPath();
-            if (parent == null || !(parent.getLeaf() instanceof LambdaExpressionTree lambda)) {
-                return Optional.empty();
-            }
-            if (lambda.getParameters().size() != 1 || lambda.getParameters().get(0) != variableTree) {
-                return Optional.empty();
-            }
-            var invocationPath = parent.getParentPath();
-            if (invocationPath == null || !(invocationPath.getLeaf() instanceof MethodInvocationTree invocation)) {
-                return Optional.empty();
-            }
-            var argumentIndex = -1;
-            for (int i = 0; i < invocation.getArguments().size(); i++) {
-                if (invocation.getArguments().get(i) == lambda) {
-                    argumentIndex = i;
-                    break;
-                }
-            }
-            if (argumentIndex < 0) {
-                return Optional.empty();
-            }
-            var functionalType = resolveInvocationArgumentType(invocation, argumentIndex, depth + 1);
-            if (functionalType.isEmpty()) {
-                return Optional.empty();
-            }
-            return resolveSamParameterType(functionalType.get());
-        }
-
-        private Optional<TypeResolution> resolveTypeTree(Tree tree, CompilationUnitTree sourceRoot, boolean staticContext) {
-            if (tree == null) {
-                return Optional.empty();
-            }
-            if (tree instanceof AnnotatedTypeTree annotatedTypeTree) {
-                return resolveTypeTree(annotatedTypeTree.getUnderlyingType(), sourceRoot, staticContext);
-            }
-            if (tree instanceof ParameterizedTypeTree parameterizedTypeTree) {
-                var raw = resolveTypeTree(parameterizedTypeTree.getType(), sourceRoot, staticContext);
-                if (raw.isEmpty()) {
-                    return Optional.empty();
-                }
-                var firstTypeArgument = firstTypeArgument(parameterizedTypeTree, sourceRoot);
-                return Optional.of(raw.get().withFirstTypeArgument(firstTypeArgument.orElse(null)));
-            }
-            if (tree instanceof ArrayTypeTree arrayTypeTree) {
-                var component = resolveTypeTree(arrayTypeTree.getType(), sourceRoot, staticContext);
-                return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType, staticContext, true));
-            }
-            var typeName = tree.toString();
-            var resolved = typeLookup.resolveTypeName(typeName, sourceRoot);
-            if (resolved.isEmpty()) {
-                resolved = resolveTypeNameInSource(typeName, sourceRoot);
-            }
-            return resolved.map(type -> new TypeResolution(type, staticContext, false));
-        }
-
-        private Optional<String> firstTypeArgument(ParameterizedTypeTree parameterizedTypeTree, CompilationUnitTree sourceRoot) {
-            if (parameterizedTypeTree.getTypeArguments().isEmpty()) {
-                return Optional.empty();
-            }
-            var resolved = resolveTypeTree(parameterizedTypeTree.getTypeArguments().get(0), sourceRoot, false);
-            return resolved.map(ParseTypeResolver::typeName);
-        }
-
-        private Optional<TypeResolution> resolveThisType() {
-            if (thisType != null) {
-                return Optional.of(thisType);
-            }
-            var classPath = enclosingClassPath();
-            if (classPath == null) {
-                return Optional.empty();
-            }
-            var qualified = qualifiedClassName(root, classPath);
-            thisType = new TypeResolution(qualified, false, false);
-            return Optional.of(thisType);
-        }
-
-        Optional<String> currentEnclosingTypeName() {
-            return resolveThisType().map(type -> type.qualifiedType);
-        }
-
-        boolean isEnclosingInstanceType(String qualifiedType) {
-            if (qualifiedType == null || qualifiedType.isBlank() || cursorPath == null) {
-                return false;
-            }
-            var blockedByStaticContext = false;
-            for (var path = cursorPath; path != null; path = path.getParentPath()) {
-                var leaf = path.getLeaf();
-                if (leaf instanceof MethodTree methodTree
-                        && methodTree.getModifiers() != null
-                        && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                    blockedByStaticContext = true;
-                    continue;
-                }
-                if (leaf instanceof BlockTree blockTree) {
-                    var parent = path.getParentPath();
-                    if (parent != null && parent.getLeaf() instanceof ClassTree && blockTree.isStatic()) {
-                        blockedByStaticContext = true;
-                    }
-                    continue;
-                }
-                if (!(leaf instanceof ClassTree classTree)) {
-                    continue;
-                }
-                var className = qualifiedClassName(root, path);
-                if (qualifiedType.equals(className)) {
-                    return !blockedByStaticContext;
-                }
-                if (classTree.getModifiers() != null && classTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                    blockedByStaticContext = true;
-                }
-            }
-            return false;
-        }
-
-        private Optional<TypeResolution> resolveSuperType() {
-            if (superType != null) {
-                return Optional.of(superType);
-            }
-            var classPath = enclosingClassPath();
-            if (classPath == null) {
-                return Optional.empty();
-            }
-            var classTree = (ClassTree) classPath.getLeaf();
-            if (classTree.getExtendsClause() == null) {
-                superType = new TypeResolution("java.lang.Object", false, false);
-                return Optional.of(superType);
-            }
-            var resolved = resolveTypeTree(classTree.getExtendsClause(), root, false);
-            resolved.ifPresent(typeResolution -> superType = typeResolution);
-            return resolved;
-        }
-
-        private Optional<TypeResolution> returnTypeOf(TypeMemberIndex.Member member) {
-            var workspaceSource = resolveWorkspaceSourceMemberType(member);
-            if (workspaceSource.isPresent()) {
-                return workspaceSource;
-            }
-            if (member.returnType == null || member.returnType.isBlank()) {
-                return Optional.empty();
-            }
-            var type = member.returnType;
-            var isArray = type.endsWith("[]");
-            if (isArray) {
-                type = type.substring(0, type.length() - 2);
-            }
-            var resolved = typeLookup.resolveTypeName(type, root);
-            if (resolved.isEmpty()) {
-                resolved = resolveTypeNameInCurrentSource(type);
-            }
-            return resolved.map(next -> new TypeResolution(next, false, isArray, firstTypeArgumentFromTypeName(member.returnType).orElse(null)));
-        }
-
-        private Optional<TypeResolution> resolveWorkspaceSourceMemberType(TypeMemberIndex.Member member) {
-            if (member == null || !index.isWorkspaceOwnedType(member.ownerType, compiler)) {
-                return Optional.empty();
-            }
-            var info = sourceClassInfo(member.ownerType);
-            if (info.isEmpty()) {
-                return Optional.empty();
-            }
-            if (member.backingFieldName != null && !member.backingFieldName.isBlank()) {
-                for (var candidate : info.get().classTree.getMembers()) {
-                    if (candidate instanceof VariableTree field && field.getName().contentEquals(member.backingFieldName)) {
-                        return resolveTypeTree(field.getType(), info.get().sourceRoot, false);
-                    }
-                }
-            }
-            for (var candidate : info.get().classTree.getMembers()) {
-                if (member.kind == CompletionItemKind.Field && candidate instanceof VariableTree field && field.getName().contentEquals(member.name)) {
-                    return resolveTypeTree(field.getType(), info.get().sourceRoot, false);
-                }
-                if (member.kind == CompletionItemKind.Method
-                        && candidate instanceof MethodTree method
-                        && method.getName().contentEquals(member.name)
-                        && method.getReturnType() != null
-                        && method.getParameters().size() == (member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length)) {
-                    return resolveTypeTree(method.getReturnType(), info.get().sourceRoot, false);
-                }
-            }
-            return Optional.empty();
-        }
-
-        private Optional<TypeResolution> resolveInvocationArgumentType(
-                MethodInvocationTree invocation, int argumentIndex, int depth) {
-            var select = invocation.getMethodSelect();
-            if (select instanceof IdentifierTree identifier) {
-                var current = resolveThisType();
-                if (current.isEmpty()) {
-                    return Optional.empty();
-                }
-                return resolveMethodArgumentType(
-                        current.get(), current.get().qualifiedType, identifier.getName().toString(), false, invocation, argumentIndex);
-            }
-            if (select instanceof MemberSelectTree memberSelectTree) {
-                var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
-                if (receiver.isEmpty()) {
-                    return Optional.empty();
-                }
-                return resolveMethodArgumentType(
-                        receiver.get(),
-                        receiver.get().qualifiedType,
-                        memberSelectTree.getIdentifier().toString(),
-                        receiver.get().staticContext,
-                        invocation,
-                        argumentIndex);
-            }
-            return Optional.empty();
-        }
-
-        private Optional<TypeResolution> resolveMethodArgumentType(
-                TypeResolution receiverType,
-                String ownerType,
-                String methodName,
-                boolean staticContext,
-                MethodInvocationTree invocation,
-                int argumentIndex) {
-            var source = resolveSourceMethodArgumentType(ownerType, methodName, staticContext, invocation, argumentIndex);
-            if (source.isPresent()) {
-                return source;
-            }
-            if (index.isWorkspaceOwnedType(ownerType, compiler)) {
-                return Optional.empty();
-            }
-            return resolveExternalMethodArgumentType(receiverType, ownerType, methodName, staticContext, invocation, argumentIndex);
-        }
-
-        private Optional<TypeResolution> resolveSourceMethodArgumentType(
-                String ownerType,
-                String methodName,
-                boolean staticContext,
-                MethodInvocationTree invocation,
-                int argumentIndex) {
-            var info = sourceClassInfo(ownerType);
-            if (info.isEmpty()) {
-                return Optional.empty();
-            }
-            var matches = new ArrayList<MethodTree>();
-            for (var member : info.get().classTree.getMembers()) {
-                if (!(member instanceof MethodTree method)) {
-                    continue;
-                }
-                if (!method.getName().contentEquals(methodName)) {
-                    continue;
-                }
-                var isStatic =
-                        method.getModifiers() != null
-                                && method.getModifiers().getFlags().contains(Modifier.STATIC);
-                if (isStatic != staticContext || method.getParameters().size() != invocation.getArguments().size()) {
-                    continue;
-                }
-                matches.add(method);
-            }
-            if (matches.size() != 1) {
-                return Optional.empty();
-            }
-            return resolveTypeTree(matches.getFirst().getParameters().get(argumentIndex).getType(), info.get().sourceRoot, false);
-        }
-
-        private Optional<TypeResolution> resolveExternalMethodArgumentType(
-                TypeResolution receiverType,
-                String ownerType,
-                String methodName,
-                boolean staticContext,
-                MethodInvocationTree invocation,
-                int argumentIndex) {
-            var method = resolveReflectiveMethod(ownerType, methodName, staticContext, invocation.getArguments().size());
-            if (method.isEmpty()) {
-                return Optional.empty();
-            }
-            var bindings = bindingsForMethodOwner(receiverType, method.get().getDeclaringClass());
-            var parameterTypes = method.get().getGenericParameterTypes();
-            if (argumentIndex < 0 || argumentIndex >= parameterTypes.length) {
-                return Optional.empty();
-            }
-            return resolveReflectiveType(parameterTypes[argumentIndex], bindings);
-        }
-
-        private Optional<TypeResolution> resolveSamParameterType(TypeResolution functionalType) {
-            if (functionalType == null || functionalType.qualifiedType == null || functionalType.qualifiedType.isBlank()) {
-                return Optional.empty();
-            }
-            if (index.isWorkspaceOwnedType(functionalType.qualifiedType, compiler)) {
-                return resolveSourceSamParameterType(functionalType);
-            }
-            var rawClass = loadExternalClass(functionalType.qualifiedType);
-            if (rawClass.isEmpty()) {
-                return Optional.empty();
-            }
-            var sam = singleAbstractMethod(rawClass.get());
-            if (sam.isEmpty() || sam.get().getParameterCount() != 1) {
-                return Optional.empty();
-            }
-            var bindings = new HashMap<java.lang.reflect.TypeVariable<?>, TypeResolution>();
-            var vars = rawClass.get().getTypeParameters();
-            if (vars.length > 0 && functionalType.firstTypeArgument != null && !functionalType.firstTypeArgument.isBlank()) {
-                bindings.put(vars[0], simpleResolution(functionalType.firstTypeArgument));
-            }
-            return resolveReflectiveType(sam.get().getGenericParameterTypes()[0], bindings);
-        }
-
-        private Optional<TypeResolution> resolveSourceSamParameterType(TypeResolution functionalType) {
-            var info = sourceClassInfo(functionalType.qualifiedType);
-            if (info.isEmpty()) {
-                return Optional.empty();
-            }
-            MethodTree sam = null;
-            for (var member : info.get().classTree.getMembers()) {
-                if (!(member instanceof MethodTree method)) {
-                    continue;
-                }
-                var modifiers = method.getModifiers() == null ? Set.<Modifier>of() : method.getModifiers().getFlags();
-                if (modifiers.contains(Modifier.DEFAULT) || modifiers.contains(Modifier.STATIC) || modifiers.contains(Modifier.PRIVATE)) {
-                    continue;
-                }
-                if (method.getBody() != null) {
-                    continue;
-                }
-                if (sam != null) {
-                    return Optional.empty();
-                }
-                sam = method;
-            }
-            if (sam == null || sam.getParameters().size() != 1) {
-                return Optional.empty();
-            }
-            return resolveTypeTree(sam.getParameters().get(0).getType(), info.get().sourceRoot, false);
-        }
-
-        private Optional<TypeResolution> resolveExternalMethodReturnType(TypeResolution receiverType, TypeMemberIndex.Member member) {
-            if (receiverType == null
-                    || member == null
-                    || member.ownerType == null
-                    || member.name == null
-                    || index.isWorkspaceOwnedType(member.ownerType, compiler)) {
-                return Optional.empty();
-            }
-            var method =
-                    resolveReflectiveMethod(
-                            member.ownerType,
-                            member.name,
-                            member.isStatic,
-                            member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length);
-            if (method.isEmpty()) {
-                return Optional.empty();
-            }
-            var bindings = bindingsForMethodOwner(receiverType, method.get().getDeclaringClass());
-            return resolveReflectiveType(method.get().getGenericReturnType(), bindings);
-        }
-
-        private Optional<Method> resolveReflectiveMethod(
-                String ownerType, String methodName, boolean staticContext, int parameterCount) {
-            var rawClass = loadExternalClass(ownerType);
-            if (rawClass.isEmpty()) {
-                return Optional.empty();
-            }
-            Method match = null;
-            for (var method : rawClass.get().getMethods()) {
-                if (!method.getName().equals(methodName)
-                        || method.getParameterCount() != parameterCount
-                        || staticContext != java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
-                    continue;
-                }
-                if (match != null && !sameReflectiveSignature(match, method)) {
-                    return Optional.empty();
-                }
-                match = method;
-            }
-            return Optional.ofNullable(match);
-        }
-
-        private boolean sameReflectiveSignature(Method left, Method right) {
-            return left.getDeclaringClass().equals(right.getDeclaringClass())
-                    && Objects.deepEquals(left.getParameterTypes(), right.getParameterTypes());
-        }
-
-        private Map<java.lang.reflect.TypeVariable<?>, TypeResolution> bindingsForMethodOwner(
-                TypeResolution receiverType, Class<?> declaringClass) {
-            if (receiverType == null || receiverType.qualifiedType == null || receiverType.qualifiedType.isBlank()) {
-                return Map.of();
-            }
-            var receiverClass = loadExternalClass(receiverType.qualifiedType);
-            if (receiverClass.isEmpty()) {
-                return Map.of();
-            }
-            var initial = new HashMap<java.lang.reflect.TypeVariable<?>, TypeResolution>();
-            var receiverVars = receiverClass.get().getTypeParameters();
-            if (receiverVars.length > 0 && receiverType.firstTypeArgument != null && !receiverType.firstTypeArgument.isBlank()) {
-                initial.put(receiverVars[0], simpleResolution(receiverType.firstTypeArgument));
-            }
-            return resolveBindingsForClass(receiverClass.get(), initial, declaringClass).orElse(Map.of());
-        }
-
-        private Optional<Map<java.lang.reflect.TypeVariable<?>, TypeResolution>> resolveBindingsForClass(
-                Class<?> current,
-                Map<java.lang.reflect.TypeVariable<?>, TypeResolution> bindings,
-                Class<?> target) {
-            if (current.equals(target)) {
-                return Optional.of(bindings);
-            }
-            var candidates = new ArrayList<Type>();
-            Collections.addAll(candidates, current.getGenericInterfaces());
-            if (current.getGenericSuperclass() != null) {
-                candidates.add(current.getGenericSuperclass());
-            }
-            for (var candidate : candidates) {
-                var raw = rawClass(candidate);
-                if (raw.isEmpty()) {
-                    continue;
-                }
-                var nextBindings = bindingsForSuperType(candidate, bindings);
-                if (raw.get().equals(target)) {
-                    return Optional.of(nextBindings);
-                }
-                var nested = resolveBindingsForClass(raw.get(), nextBindings, target);
-                if (nested.isPresent()) {
-                    return nested;
-                }
-            }
-            return Optional.empty();
-        }
-
-        private Map<java.lang.reflect.TypeVariable<?>, TypeResolution> bindingsForSuperType(
-                Type superType, Map<java.lang.reflect.TypeVariable<?>, TypeResolution> currentBindings) {
-            if (!(superType instanceof ParameterizedType parameterized) || !(parameterized.getRawType() instanceof Class<?> rawClass)) {
-                return Map.of();
-            }
-            var next = new HashMap<java.lang.reflect.TypeVariable<?>, TypeResolution>();
-            var vars = rawClass.getTypeParameters();
-            var args = parameterized.getActualTypeArguments();
-            for (int i = 0; i < vars.length && i < args.length; i++) {
-                var resolved = resolveReflectiveType(args[i], currentBindings);
-                if (resolved.isPresent()) {
-                    next.put(vars[i], resolved.get());
-                }
-            }
-            return next;
-        }
-
-        private Optional<TypeResolution> resolveReflectiveType(
-                Type type, Map<java.lang.reflect.TypeVariable<?>, TypeResolution> bindings) {
-            if (type instanceof Class<?> rawClass) {
-                if (rawClass.isArray()) {
-                    return Optional.of(new TypeResolution(rawClass.getComponentType().getName(), false, true));
-                }
-                return Optional.of(new TypeResolution(rawClass.getName(), false, false));
-            }
-            if (type instanceof ParameterizedType parameterized) {
-                var raw = resolveReflectiveType(parameterized.getRawType(), bindings);
-                if (raw.isEmpty()) {
-                    return Optional.empty();
-                }
-                var firstArg =
-                        parameterized.getActualTypeArguments().length == 0
-                                ? Optional.<TypeResolution>empty()
-                                : resolveReflectiveType(parameterized.getActualTypeArguments()[0], bindings);
-                return Optional.of(raw.get().withFirstTypeArgument(firstArg.map(ParseTypeResolver::typeName).orElse(null)));
-            }
-            if (type instanceof java.lang.reflect.TypeVariable<?> typeVariable) {
-                var bound = bindings.get(typeVariable);
-                if (bound != null) {
-                    return Optional.of(bound);
-                }
-                var bounds = typeVariable.getBounds();
-                return bounds.length == 0 ? Optional.empty() : resolveReflectiveType(bounds[0], bindings);
-            }
-            if (type instanceof java.lang.reflect.WildcardType wildcard) {
-                if (wildcard.getLowerBounds().length > 0) {
-                    return resolveReflectiveType(wildcard.getLowerBounds()[0], bindings);
-                }
-                for (var upper : wildcard.getUpperBounds()) {
-                    var resolved = resolveReflectiveType(upper, bindings);
-                    if (resolved.isPresent() && !"java.lang.Object".equals(resolved.get().qualifiedType)) {
-                        return resolved;
-                    }
-                }
-                return Optional.empty();
-            }
-            if (type instanceof GenericArrayType arrayType) {
-                var component = resolveReflectiveType(arrayType.getGenericComponentType(), bindings);
-                return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType, false, true));
-            }
-            return Optional.empty();
-        }
-
-        private Optional<Class<?>> rawClass(Type type) {
-            if (type instanceof Class<?> rawClass) {
-                return Optional.of(rawClass);
-            }
-            if (type instanceof ParameterizedType parameterized && parameterized.getRawType() instanceof Class<?> rawClass) {
-                return Optional.of(rawClass);
-            }
-            return Optional.empty();
-        }
-
-        private Optional<Class<?>> loadExternalClass(String qualifiedType) {
-            if (qualifiedType == null || qualifiedType.isBlank()) {
-                return Optional.empty();
-            }
-            var loader = externalClassLoader();
-            if (loader == null) {
-                return Optional.empty();
-            }
-            var binaryName = qualifiedType;
-            while (true) {
-                try {
-                    return Optional.of(Class.forName(binaryName, false, loader));
-                } catch (ClassNotFoundException ignored) {
-                    var split = binaryName.lastIndexOf('.');
-                    if (split < 0) {
-                        return Optional.empty();
-                    }
-                    binaryName = binaryName.substring(0, split) + "$" + binaryName.substring(split + 1);
-                }
-            }
-        }
-
-        private ClassLoader externalClassLoader() {
-            if (externalClassLoader != null) {
-                return externalClassLoader;
-            }
-            var urls =
-                    compiler.classPathRoots().stream()
-                            .map(Path::toUri)
-                            .map(
-                                    uri -> {
-                                        try {
-                                            return uri.toURL();
-                                        } catch (java.io.IOException e) {
-                                            throw new RuntimeException(e);
-                                        }
-                                    })
-                            .toArray(URL[]::new);
-            externalClassLoader = new URLClassLoader(urls, CompletionProvider.class.getClassLoader());
-            return externalClassLoader;
-        }
-
-        private Optional<Method> singleAbstractMethod(Class<?> rawClass) {
-            Method found = null;
-            for (var method : rawClass.getMethods()) {
-                if (!java.lang.reflect.Modifier.isAbstract(method.getModifiers())
-                        || method.getDeclaringClass().equals(Object.class)) {
-                    continue;
-                }
-                if (found != null && !sameReflectiveSignature(found, method)) {
-                    return Optional.empty();
-                }
-                found = method;
-            }
-            return Optional.ofNullable(found);
-        }
-
-        private Optional<String> firstTypeArgumentFromTypeName(String typeName) {
-            if (typeName == null || typeName.isBlank()) {
-                return Optional.empty();
-            }
-            var start = typeName.indexOf('<');
-            var end = typeName.lastIndexOf('>');
-            if (start < 0 || end <= start) {
-                return Optional.empty();
-            }
-            var first = typeName.substring(start + 1, end).trim();
-            var comma = first.indexOf(',');
-            if (comma >= 0) {
-                first = first.substring(0, comma).trim();
-            }
-            while (first.startsWith("? extends ")) {
-                first = first.substring("? extends ".length()).trim();
-            }
-            while (first.startsWith("? super ")) {
-                first = first.substring("? super ".length()).trim();
-            }
-            if (first.isBlank() || "?".equals(first)) {
-                return Optional.empty();
-            }
-            var resolved = typeLookup.resolveTypeName(first, root);
-            if (resolved.isEmpty()) {
-                resolved = resolveTypeNameInCurrentSource(first);
-            }
-            return resolved;
-        }
-
-        private Optional<String> resolveTypeNameInCurrentSource(String typeName) {
-            return resolveTypeNameInSource(typeName, root);
-        }
-
-        private Optional<String> resolveTypeNameInSource(String typeName, CompilationUnitTree sourceRoot) {
-            if (typeName == null || typeName.isBlank()) {
-                return Optional.empty();
-            }
-            var raw = typeName.replace('$', '.');
-            if (raw.contains(".") && declaredClassPathInRoot(sourceRoot, raw) != null) {
-                return Optional.of(raw);
-            }
-            final String[] match = new String[1];
-            final boolean[] ambiguous = {false};
-            new TreePathScanner<Void, Void>() {
-                @Override
-                public Void visitClass(ClassTree classTree, Void unused) {
-                    var qualified = qualifiedClassName(sourceRoot, getCurrentPath());
-                    var simple = classTree.getSimpleName().toString();
-                    if (!simple.equals(raw)) {
-                        return super.visitClass(classTree, unused);
-                    }
-                    if (match[0] == null) {
-                        match[0] = qualified;
-                    } else if (!match[0].equals(qualified)) {
-                        ambiguous[0] = true;
-                    }
-                    return super.visitClass(classTree, unused);
-                }
-            }.scan(sourceRoot, null);
-            if (ambiguous[0]) {
-                return Optional.empty();
-            }
-            return Optional.ofNullable(match[0]);
-        }
-
-        private Optional<SourceClassInfo> sourceClassInfo(String qualifiedType) {
-            if (qualifiedType == null || qualifiedType.isBlank()) {
-                return Optional.empty();
-            }
-            var current = declaredClassPathInRoot(root, qualifiedType);
-            if (current != null) {
-                return Optional.of(new SourceClassInfo(root, current));
-            }
-            var declaration = compiler.findTypeDeclaration(qualifiedType);
-            if (declaration == null || declaration.equals(CompilerProvider.NOT_FOUND)) {
-                return Optional.empty();
-            }
-            var parsed = compiler.parse(declaration);
-            var classPath = declaredClassPathInRoot(parsed.root(), qualifiedType);
-            return classPath == null ? Optional.empty() : Optional.of(new SourceClassInfo(parsed.root(), classPath));
-        }
-
-        private TreePath declaredClassPathInRoot(CompilationUnitTree sourceRoot, String qualifiedType) {
-            if (qualifiedType == null || qualifiedType.isBlank()) {
-                return null;
-            }
-            final TreePath[] match = new TreePath[1];
-            new TreePathScanner<Void, Void>() {
-                @Override
-                public Void visitClass(ClassTree classTree, Void unused) {
-                    if (qualifiedType.equals(qualifiedClassName(sourceRoot, getCurrentPath()))) {
-                        match[0] = getCurrentPath();
-                        return null;
-                    }
-                    return super.visitClass(classTree, unused);
-                }
-            }.scan(sourceRoot, null);
-            return match[0];
-        }
-
-        private Optional<TypeResolution> literalType(LiteralTree literal) {
-            var value = literal.getValue();
-            if (value == null) {
-                return Optional.empty();
-            }
-            if (value instanceof String) {
-                return Optional.of(new TypeResolution("java.lang.String", false, false));
-            }
-            if (value instanceof Integer) {
-                return Optional.of(new TypeResolution("java.lang.Integer", false, false));
-            }
-            if (value instanceof Long) {
-                return Optional.of(new TypeResolution("java.lang.Long", false, false));
-            }
-            if (value instanceof Float) {
-                return Optional.of(new TypeResolution("java.lang.Float", false, false));
-            }
-            if (value instanceof Double) {
-                return Optional.of(new TypeResolution("java.lang.Double", false, false));
-            }
-            if (value instanceof Boolean) {
-                return Optional.of(new TypeResolution("java.lang.Boolean", false, false));
-            }
-            if (value instanceof Character) {
-                return Optional.of(new TypeResolution("java.lang.Character", false, false));
-            }
-            return Optional.empty();
-        }
-
-        private TreePath enclosingClassPath() {
-            final TreePath[] best = new TreePath[1];
-            final int[] bestDepth = {-1};
-            new TreePathScanner<Void, Void>() {
-                @Override
-                public Void visitClass(ClassTree classTree, Void p) {
-                    if (!containsCursor(classTree)) {
-                        return null;
-                    }
-                    var depth = depth(getCurrentPath());
-                    if (depth > bestDepth[0]) {
-                        bestDepth[0] = depth;
-                        best[0] = getCurrentPath();
-                    }
-                    return super.visitClass(classTree, p);
-                }
-            }.scan(root, null);
-            return best[0];
-        }
-
-        private String qualifiedClassName(CompilationUnitTree sourceRoot, TreePath classPath) {
-            var classes = new ArrayList<String>();
-            for (var cursorPath = classPath; cursorPath != null; cursorPath = cursorPath.getParentPath()) {
-                if (cursorPath.getLeaf() instanceof ClassTree classTree) {
-                    classes.add(classTree.getSimpleName().toString());
-                }
-            }
-            Collections.reverse(classes);
-            var packageName = sourceRoot.getPackageName() == null ? "" : sourceRoot.getPackageName().toString();
-            return packageName.isEmpty() ? String.join(".", classes) : packageName + "." + String.join(".", classes);
-        }
-
-        private boolean containsCursor(Tree tree) {
-            var start = startOf(tree);
-            var end = endOf(tree);
-            if (start < 0 || end < 0) {
-                return false;
-            }
-            return start <= cursor && cursor <= end;
-        }
-
-        private long startOf(Tree tree) {
-            return positions.getStartPosition(root, tree);
-        }
-
-        private long endOf(Tree tree) {
-            return positions.getEndPosition(root, tree);
-        }
-
-        private int depth(TreePath path) {
-            var depth = 0;
-            for (var cursorPath = path; cursorPath != null; cursorPath = cursorPath.getParentPath()) {
-                depth++;
-            }
-            return depth;
-        }
-
-        private static TypeResolution simpleResolution(String qualifiedType) {
-            if (qualifiedType == null || qualifiedType.isBlank()) {
-                return new TypeResolution("", false, false);
-            }
-            var array = qualifiedType.endsWith("[]");
-            return new TypeResolution(array ? qualifiedType.substring(0, qualifiedType.length() - 2) : qualifiedType, false, array);
-        }
-
-        private static String typeName(TypeResolution resolution) {
-            if (resolution == null || resolution.qualifiedType == null) {
-                return null;
-            }
-            return resolution.arrayType ? resolution.qualifiedType + "[]" : resolution.qualifiedType;
-        }
     }
 
     private boolean isImportOrPackageContext(TreePath path) {
@@ -1745,10 +544,17 @@ public class CompletionProvider {
             case IMPORT:
                 return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
             default:
+                var enumCase = completeEnumCase(parseTask, path, cursor, partial);
+                if (enumCase != null) {
+                    return enumCase;
+                }
                 var list = new CompletionList();
+                var endsWithParen = endsWithParen(contents, (int) cursor);
                 addKeywords(path, partial, list);
                 addSyntacticLocalVariables(parseTask, cursor, partial, list);
                 addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
+                addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
+                addEnclosingInstanceKeywords(path, list);
                 addSlf4jLoggerIfAnnotated(parseTask, path, cursor, partial, list);
                 addStaticImportsFromIndex(parseTask.root(), partial, false, list);
                 addImportedTypeNames(parseTask.root(), partial, list);
@@ -1831,7 +637,7 @@ public class CompletionProvider {
             if (importTree.isStatic()) continue;
             var qualified = importTree.getQualifiedIdentifier().toString();
             if (qualified.endsWith(".*")) continue;
-            var simple = simpleName(qualified).toString();
+            var simple = TypeNames.simpleName(qualified);
             if (!matchesCompletionPrefix(simple, partial)) continue;
             if (!seen.add(simple)) continue;
             list.items.add(classItem(qualified));
@@ -1866,7 +672,7 @@ public class CompletionProvider {
             if (i.isStatic()) continue;
             var imported = i.getQualifiedIdentifier().toString();
             if (imported.endsWith(".*")) continue;
-            if (simpleName(imported).toString().equals(item.label)) {
+            if (TypeNames.simpleName(imported).equals(item.label)) {
                 return true;
             }
         }
@@ -1901,8 +707,8 @@ public class CompletionProvider {
     }
 
     private void addKeywords(TreePath path, String partial, CompletionList list) {
-        var level = findKeywordLevel(path);
         String[] keywords = {};
+        var level = findKeywordLevel(path);
         if (level instanceof CompilationUnitTree) {
             keywords = TOP_LEVEL_KEYWORDS;
         } else if (level instanceof ClassTree) {
@@ -1927,6 +733,10 @@ public class CompletionProvider {
         new TreePathScanner<Void, Void>() {
             @Override
             public Void visitVariable(VariableTree t, Void __) {
+                var parent = getCurrentPath().getParentPath();
+                if (parent != null && parent.getLeaf() instanceof ClassTree) {
+                    return super.visitVariable(t, null);
+                }
                 var start = positions.getStartPosition(task.root(), t);
                 if (start < 0 || start >= cursor) return super.visitVariable(t, null);
                 var name = t.getName().toString();
@@ -1953,7 +763,7 @@ public class CompletionProvider {
             return;
         }
         var classTree = (ClassTree) classPath.getLeaf();
-        var staticContext = isSyntacticStaticContext(path);
+        var staticContext = !hasAccessibleEnclosingInstance(path);
         for (var member : classTree.getMembers()) {
             switch (member.getKind()) {
                 case VARIABLE:
@@ -1980,6 +790,122 @@ public class CompletionProvider {
                     break;
             }
         }
+    }
+
+    /**
+     * Enrich parse-only identifier completions with members that come from enclosing source types
+     * and their supertypes. This keeps the fast parse/index path while restoring inherited and
+     * outer-scope members that are not present in the local syntax tree alone.
+     */
+    private void addIndexedEnclosingTypeMembers(
+            ParseTask parseTask, TreePath path, String partial, CompletionList list, boolean endsWithParen) {
+        if (completionIndex == null || path == null) {
+            return;
+        }
+        var seen = new HashSet<String>();
+        for (var item : list.items) {
+            if (item != null && item.label != null) {
+                seen.add(item.label);
+            }
+        }
+        var methods = new TreeMap<String, List<WorkspaceTypeIndex.Member>>();
+        var methodPriority = new HashMap<String, Integer>();
+        var blockedByStaticContext = false;
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            var leaf = cursor.getLeaf();
+            if (leaf instanceof MethodTree methodTree
+                    && methodTree.getModifiers() != null
+                    && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                blockedByStaticContext = true;
+                continue;
+            }
+            if (leaf instanceof BlockTree blockTree) {
+                var parent = cursor.getParentPath();
+                if (parent != null && parent.getLeaf() instanceof ClassTree && blockTree.isStatic()) {
+                    blockedByStaticContext = true;
+                }
+                continue;
+            }
+            if (!(leaf instanceof ClassTree classTree)) {
+                continue;
+            }
+            var qualifiedType = qualifiedEnclosingClassName(parseTask.root(), cursor);
+            if (qualifiedType != null) {
+                addIndexedEnclosingMembers(
+                        qualifiedType,
+                        partial,
+                        blockedByStaticContext,
+                        seen,
+                        methods,
+                        methodPriority,
+                        list);
+            }
+            if (classTree.getModifiers() != null && classTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                blockedByStaticContext = true;
+            }
+        }
+        for (var entry : methods.entrySet()) {
+            var method = indexedMethod(entry.getValue(), !endsWithParen);
+            method.sortText =
+                    sortKey(
+                            methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
+            replaceSyntacticMethodPlaceholder(list, method);
+        }
+    }
+
+    private CompletionList completeEnumCase(ParseTask parseTask, TreePath path, long cursor, String partial) {
+        if (completionIndex == null || path == null) {
+            return null;
+        }
+        var switchExpression = switchExpression(path);
+        if (switchExpression == null) {
+            return null;
+        }
+        var resolver = new ParseTypeResolver(parseTask, compiler, completionIndex, cursor);
+        var resolved = resolver.resolve(switchExpression, null);
+        if (resolved.isEmpty()) {
+            return null;
+        }
+        var enumType = resolved.get().qualifiedType();
+        if (enumType == null || enumType.isBlank()) {
+            return null;
+        }
+        var list = new CompletionList();
+        var seen = new HashSet<String>();
+        for (var member : completionIndex.members(enumType, true)) {
+            if (!matchesCompletionPrefix(member.name, partial)) continue;
+            if (!isEnumCaseConstant(member, enumType)) continue;
+            if (!seen.add(member.name)) continue;
+            var item = indexedMember(member);
+            item.sortText = sortKey(Priority.FIELD, item.label);
+            list.items.add(item);
+        }
+        if (list.items.isEmpty()) {
+            return null;
+        }
+        sortCompletionItems(list.items);
+        return list;
+    }
+
+    private Tree switchExpression(TreePath path) {
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            if (cursor.getLeaf() instanceof SwitchTree switchTree) {
+                return switchTree.getExpression();
+            }
+            if (cursor.getLeaf() instanceof SwitchExpressionTree switchExpressionTree) {
+                return switchExpressionTree.getExpression();
+            }
+        }
+        return null;
+    }
+
+    private boolean isEnumCaseConstant(WorkspaceTypeIndex.Member member, String enumType) {
+        if (member.kind == CompletionItemKind.EnumMember) {
+            return true;
+        }
+        return member.kind == CompletionItemKind.Field
+                && member.isStatic
+                && sameQualifiedType(enumType, member.returnType);
     }
 
     private boolean isSyntacticStaticContext(TreePath path) {
@@ -2127,6 +1053,27 @@ public class CompletionProvider {
         return false;
     }
 
+    private void replaceSyntacticMethodPlaceholder(CompletionList list, CompletionItem replacement) {
+        for (int i = 0; i < list.items.size(); i++) {
+            var item = list.items.get(i);
+            if (item == null || !Objects.equals(item.label, replacement.label)) {
+                continue;
+            }
+            if (isSyntacticMethodPlaceholder(item)) {
+                list.items.set(i, replacement);
+            }
+            return;
+        }
+        list.items.add(replacement);
+    }
+
+    private boolean isSyntacticMethodPlaceholder(CompletionItem item) {
+        return item != null
+                && item.kind == CompletionItemKind.Method
+                && Objects.equals(item.detail, "method")
+                && item.data == null;
+    }
+
     private void addSyntacticMemberUsages(
             ParseTask task, long cursor, String receiver, String partial, CompletionList list) {
         var trees = Trees.instance(task.task());
@@ -2211,7 +1158,7 @@ public class CompletionProvider {
         if (completionIndex == null || root == null) {
             return;
         }
-        var methods = new TreeMap<String, List<TypeMemberIndex.Member>>();
+        var methods = new TreeMap<String, List<WorkspaceTypeIndex.Member>>();
         var methodPriority = new HashMap<String, Integer>();
         var seen = new HashSet<String>();
         for (var item : list.items) {
@@ -2294,7 +1241,7 @@ public class CompletionProvider {
             list.items.add(item);
         }
         for (var className : compiler.publicTopLevelTypes()) {
-            if (!StringSearch.matchesPartialName(simpleName(className), partial)) continue;
+            if (!StringSearch.matchesPartialName(TypeNames.simpleName(className), partial)) continue;
             if (!uniques.add(className)) {
                 continue;
             }
@@ -2387,13 +1334,13 @@ public class CompletionProvider {
         if (className.indexOf('.') < 0) {
             return false;
         }
-        var targetSimple = simpleName(className).toString();
+        var targetSimple = TypeNames.simpleName(className);
         for (var i : root.getImports()) {
             if (i.isStatic()) continue;
             var imported = i.getQualifiedIdentifier().toString();
             if (imported.endsWith(".*")) continue;
             if (imported.equals(className)) continue;
-            var importedSimple = simpleName(imported).toString();
+            var importedSimple = TypeNames.simpleName(imported);
             if (importedSimple.equals(targetSimple)) {
                 return true;
             }
@@ -2544,6 +1491,200 @@ public class CompletionProvider {
         return false;
     }
 
+    private void addEnclosingInstanceKeywords(TreePath path, CompletionList list) {
+        if (!hasAccessibleEnclosingInstance(path)) {
+            return;
+        }
+        if (!containsCompletionLabel(list, "this")) {
+            list.items.add(keyword("this"));
+        }
+        if (!containsCompletionLabel(list, "super")) {
+            list.items.add(keyword("super"));
+        }
+    }
+
+    private boolean hasAccessibleEnclosingInstance(TreePath path) {
+        if (path == null) {
+            return false;
+        }
+        var blockedByStaticContext = false;
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            var leaf = cursor.getLeaf();
+            if (leaf instanceof MethodTree methodTree
+                    && methodTree.getModifiers() != null
+                    && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                blockedByStaticContext = true;
+                continue;
+            }
+            if (leaf instanceof BlockTree blockTree) {
+                var parent = cursor.getParentPath();
+                if (parent != null && parent.getLeaf() instanceof ClassTree && blockTree.isStatic()) {
+                    blockedByStaticContext = true;
+                }
+                continue;
+            }
+            if (leaf instanceof ClassTree) {
+                return !blockedByStaticContext;
+            }
+        }
+        return false;
+    }
+
+    private boolean isAccessibleEnclosingInstanceType(
+            ParseTask parseTask, TreePath path, long cursor, String qualifiedType, String receiverName) {
+        if (path == null
+                || ((qualifiedType == null || qualifiedType.isBlank())
+                        && (receiverName == null || receiverName.isBlank()))) {
+            return false;
+        }
+        for (var classPath = enclosingClassPath(parseTask, cursor);
+                classPath != null;
+                classPath = parentEnclosingClassPath(classPath)) {
+            var classTree = (ClassTree) classPath.getLeaf();
+            var enclosingType = qualifiedEnclosingClassName(parseTask.root(), classPath);
+            if (!sameQualifiedType(qualifiedType, enclosingType)
+                    && !sameSimpleTypeName(receiverName, classTree.getSimpleName().toString())
+                    && !sameSimpleTypeName(qualifiedType, classTree.getSimpleName().toString())) {
+                continue;
+            }
+            return !hasStaticBoundaryBetween(path, classPath);
+        }
+        var nearestNamedClass = nearestNamedEnclosingClassPath(parseTask, cursor);
+        if (nearestNamedClass != null) {
+            var classTree = (ClassTree) nearestNamedClass.getLeaf();
+            var enclosingType = qualifiedEnclosingClassName(parseTask.root(), nearestNamedClass);
+            if ((sameQualifiedType(qualifiedType, enclosingType)
+                            || sameSimpleTypeName(receiverName, classTree.getSimpleName().toString())
+                            || sameSimpleTypeName(qualifiedType, classTree.getSimpleName().toString()))
+                    && !hasStaticBoundaryBetween(path, nearestNamedClass)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private TreePath parentEnclosingClassPath(TreePath classPath) {
+        if (classPath == null) {
+            return null;
+        }
+        for (var cursor = classPath.getParentPath(); cursor != null; cursor = cursor.getParentPath()) {
+            if (cursor.getLeaf() instanceof ClassTree) {
+                return cursor;
+            }
+        }
+        return null;
+    }
+
+    private TreePath nearestNamedEnclosingClassPath(ParseTask parseTask, long cursor) {
+        for (var classPath = enclosingClassPath(parseTask, cursor);
+                classPath != null;
+                classPath = parentEnclosingClassPath(classPath)) {
+            var classTree = (ClassTree) classPath.getLeaf();
+            if (!classTree.getSimpleName().contentEquals("")) {
+                return classPath;
+            }
+        }
+        return null;
+    }
+
+    private boolean hasStaticBoundaryBetween(TreePath path, TreePath targetClassPath) {
+        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
+            if (cursor.getLeaf() == targetClassPath.getLeaf()) {
+                return false;
+            }
+            var leaf = cursor.getLeaf();
+            if (leaf instanceof MethodTree methodTree
+                    && methodTree.getModifiers() != null
+                    && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                return true;
+            }
+            if (leaf instanceof BlockTree blockTree) {
+                var parent = cursor.getParentPath();
+                if (parent != null && parent.getLeaf() instanceof ClassTree && blockTree.isStatic()) {
+                    return true;
+                }
+            }
+            if (leaf instanceof ClassTree classTree
+                    && classTree.getModifiers() != null
+                    && classTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                return true;
+            }
+        }
+        return true;
+    }
+
+    private String qualifiedEnclosingClassName(CompilationUnitTree root, TreePath classPath) {
+        var classes = new ArrayList<String>();
+        for (var cursor = classPath; cursor != null; cursor = cursor.getParentPath()) {
+            if (!(cursor.getLeaf() instanceof ClassTree classTree)) {
+                continue;
+            }
+            var simpleName = classTree.getSimpleName().toString();
+            if (simpleName.isBlank()) {
+                return null;
+            }
+            classes.add(simpleName);
+        }
+        if (classes.isEmpty()) {
+            return null;
+        }
+        Collections.reverse(classes);
+        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+        var qualified = String.join(".", classes);
+        return packageName.isEmpty() ? qualified : packageName + "." + qualified;
+    }
+
+    private void addIndexedEnclosingMembers(
+            String qualifiedType,
+            String partial,
+            boolean blockedByStaticContext,
+            Set<String> seen,
+            Map<String, List<WorkspaceTypeIndex.Member>> methods,
+            Map<String, Integer> methodPriority,
+            CompletionList list) {
+        addIndexedEnclosingMembersForStaticContext(
+                qualifiedType, partial, true, seen, methods, methodPriority, list);
+        if (!blockedByStaticContext) {
+            addIndexedEnclosingMembersForStaticContext(
+                    qualifiedType, partial, false, seen, methods, methodPriority, list);
+        }
+    }
+
+    private void addIndexedEnclosingMembersForStaticContext(
+            String qualifiedType,
+            String partial,
+            boolean staticContext,
+            Set<String> seen,
+            Map<String, List<WorkspaceTypeIndex.Member>> methods,
+            Map<String, Integer> methodPriority,
+            CompletionList list) {
+        for (var member : completionIndex.members(qualifiedType, staticContext)) {
+            if (!matchesCompletionPrefix(member.name, partial)) continue;
+            if (member.kind == CompletionItemKind.Method) {
+                methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
+                methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
+            } else if (seen.add(member.name)) {
+                var item = indexedMember(member);
+                item.sortText = sortKey(indexMemberPriority(member), item.label);
+                list.items.add(item);
+            }
+        }
+    }
+
+    private boolean sameQualifiedType(String left, String right) {
+        if (left == null || right == null) {
+            return false;
+        }
+        return left.equals(right) || left.replace('$', '.').equals(right.replace('$', '.'));
+    }
+
+    private boolean sameSimpleTypeName(String maybeQualified, String simpleName) {
+        if (maybeQualified == null || maybeQualified.isBlank() || simpleName == null || simpleName.isBlank()) {
+            return false;
+        }
+        return TypeNames.simpleName(maybeQualified.replace('$', '.')).equals(simpleName);
+    }
+
     private static final CompletionList EMPTY = new CompletionList(false, List.of());
 
     private void putMethod(ExecutableElement method, Map<String, List<ExecutableElement>> methods) {
@@ -2633,7 +1774,7 @@ public class CompletionProvider {
 
     private CompletionItem classItem(String className) {
         var i = new CompletionItem();
-        i.label = simpleName(className).toString();
+        i.label = TypeNames.simpleName(className);
         i.kind = CompletionItemKind.Class;
         i.detail = className;
         i.sortText = sortKey(Priority.IMPORTED_CLASS, i.label);
@@ -2894,6 +2035,13 @@ public class CompletionProvider {
                         .thenComparingInt(item -> item.kind));
     }
 
+    private List<WorkspaceTypeIndex.Member> mergeMemberContexts(TypeIndexRouter index, String qualifiedType) {
+        var merged = new ArrayList<WorkspaceTypeIndex.Member>();
+        merged.addAll(index.members(qualifiedType, true));
+        merged.addAll(index.members(qualifiedType, false));
+        return merged;
+    }
+
     private MemberAccessContext memberAccessContext(String contents, int cursor) {
         if (cursor < 0 || cursor > contents.length()) {
             return null;
@@ -2906,27 +2054,32 @@ public class CompletionProvider {
         while (partialStart > 0 && Character.isJavaIdentifierPart(contents.charAt(partialStart - 1))) {
             partialStart--;
         }
-        var dot = partialStart - 1;
-        if (dot < 0 || contents.charAt(dot) != '.') {
+        var separatorEnd = partialStart - 1;
+        var methodReference = false;
+        if (separatorEnd < 0) {
             return null;
         }
-        var receiverEnd = dot;
+        var receiverEnd = separatorEnd;
+        if (contents.charAt(separatorEnd) == '.') {
+            methodReference = false;
+        } else if (separatorEnd > 0
+                && contents.charAt(separatorEnd) == ':'
+                && contents.charAt(separatorEnd - 1) == ':') {
+            methodReference = true;
+            receiverEnd = separatorEnd - 1;
+        } else {
+            return null;
+        }
         var receiverStart = receiverEnd;
         while (receiverStart > 0 && Character.isJavaIdentifierPart(contents.charAt(receiverStart - 1))) {
             receiverStart--;
         }
         var receiver = receiverStart < receiverEnd ? contents.substring(receiverStart, receiverEnd) : "";
         var partial = contents.substring(partialStart, effectiveCursor);
-        return new MemberAccessContext(receiver, partial, partial.isEmpty());
+        return new MemberAccessContext(receiver, partial, partial.isEmpty(), methodReference);
     }
 
-    private record MemberAccessContext(String receiver, String partial, boolean dotTrigger) {
-    }
-
-    private CharSequence simpleName(String className) {
-        var dot = className.lastIndexOf('.');
-        if (dot == -1) return className;
-        return className.subSequence(dot + 1, className.length());
+    private record MemberAccessContext(String receiver, String partial, boolean dotTrigger, boolean methodReference) {
     }
 
 }
