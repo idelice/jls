@@ -104,17 +104,7 @@ public record CompositeTypeIndex(WorkspaceTypeIndex workspace, ExternalBinaryTyp
         if (!workspaceSupertypes.isEmpty()) {
             return workspaceSupertypes;
         }
-        return typeInfo(qualifiedName)
-                .map(
-                        info -> {
-                            var result = new LinkedHashSet<String>();
-                            if (info.superclass != null && !info.superclass.isBlank()) {
-                                result.add(info.superclass);
-                            }
-                            result.addAll(info.interfaces);
-                            return Set.copyOf(result);
-                        })
-                .orElse(Set.of());
+        return typeInfo(qualifiedName).map(TypeIndexSupport::directSupertypes).orElse(Set.of());
     }
 
     public Set<String> relatedMethodKeys(String ownerType, String memberName, String[] erasedParameterTypes) {
