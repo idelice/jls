@@ -7,6 +7,12 @@ import java.util.Optional;
 import java.util.Set;
 import org.javacs.CompileTask;
 
+/**
+ * Thin workspace-only wrapper around {@link TypeMemberIndex}.
+ *
+ * <p>This type exists so callers can depend on an explicit workspace boundary instead of reaching
+ * into the broader member-index implementation directly.
+ */
 public final class WorkspaceTypeIndex {
     public static final WorkspaceTypeIndex EMPTY = new WorkspaceTypeIndex(TypeMemberIndex.EMPTY);
 
