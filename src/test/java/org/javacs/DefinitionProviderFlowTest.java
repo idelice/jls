@@ -2,6 +2,8 @@ package org.javacs;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.hasItem;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -230,6 +232,167 @@ public class DefinitionProviderFlowTest {
             assertThat(
                     gotoDefinition(navigationContext(workspace), service, "DeepGraph.DeepNode createLeaf", "DeepGraph.".length()),
                     hasItem("DeepGraph.java:3"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesMethodParameterInLocalScope() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-method-parameter");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            Files.writeString(
+                    modelDir.resolve("CustomerProfile.java"),
+                    "package com.example.demo.model;\n"
+                            + "public class CustomerProfile {\n"
+                            + "  private String segment;\n"
+                            + "  public void setSegment(String segment) { this.segment = segment; }\n"
+                            + "}\n");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.CustomerProfile;\n"
+                            + "class ComplexScenarioService {\n"
+                            + "  private CustomerProfile sampleEnvelope(String seed) {\n"
+                            + "    var customer = new CustomerProfile();\n"
+                            + "    customer.setSegment(seed.length() % 2 == 0 ? \"enterprise\" : \"mid-market\");\n"
+                            + "    return customer;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), service, "seed.length()", 0),
+                    hasItem("ComplexScenarioService.java:4"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesEnhancedForVariableInsteadOfEarlierLambdaVariable() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-enhanced-for-scope");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            Files.writeString(
+                    modelDir.resolve("LineItem.java"),
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "}\n");
+            Files.writeString(
+                    modelDir.resolve("OrderEnvelope.java"),
+                    "package com.example.demo.model;\n"
+                            + "import java.util.List;\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  public List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    serviceDir.resolve("PricingPort.java"),
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import com.example.demo.model.OrderEnvelope;\n"
+                            + "import java.math.BigDecimal;\n"
+                            + "interface PricingPort {\n"
+                            + "  BigDecimal price(OrderEnvelope envelope, LineItem item);\n"
+                            + "}\n");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.OrderEnvelope;\n"
+                            + "import java.math.BigDecimal;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "class ComplexScenarioService {\n"
+                            + "  private final PricingPort pricingPort = null;\n"
+                            + "  private void buildGraph(OrderEnvelope envelope) {\n"
+                            + "    envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());\n"
+                            + "    for (var item : envelope.getItems()) {\n"
+                            + "      item.getFamily();\n"
+                            + "      var perItem = pricingPort.price(envelope, item);\n"
+                            + "      if (perItem.compareTo(new BigDecimal(\"600\")) > 0 && item.getQuantity() > 5) {\n"
+                            + "        break;\n"
+                            + "      }\n"
+                            + "    }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            assertThat(
+                    gotoDefinition(
+                            navigationContext(workspace),
+                            service,
+                            "pricingPort.price(envelope, item)",
+                            "pricingPort.price(envelope, ".length()),
+                    hasItem("ComplexScenarioService.java:9"));
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), service, "item.getQuantity()", 0),
+                    hasItem("ComplexScenarioService.java:9"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesSameFileNestedTypesAndRecordAccessors() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-nested-records");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("NestedDefinitionExample.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "import java.util.List;\n"
+                            + "import java.util.Optional;\n"
+                            + "class NestedDefinitionExample {\n"
+                            + "  record ResolvedSymbol(List<String> locations) {}\n"
+                            + "  ResolvedSymbol resolveSymbol() {\n"
+                            + "    return new ResolvedSymbol(List.of());\n"
+                            + "  }\n"
+                            + "  Optional<ResolvedSymbol> wrap(ResolvedSymbol symbol) {\n"
+                            + "    return Optional.of(symbol);\n"
+                            + "  }\n"
+                            + "  List<String> find() {\n"
+                            + "    return resolveSymbol().locations();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), file, "ResolvedSymbol resolveSymbol()", 0),
+                    hasItem("NestedDefinitionExample.java:5"));
+            assertThat(
+                    gotoDefinition(
+                            navigationContext(workspace),
+                            file,
+                            "Optional<ResolvedSymbol>",
+                            "Optional<".length()),
+                    hasItem("NestedDefinitionExample.java:5"));
+            var context = navigationContext(workspace);
+            var cursor = cursor(file, ".locations()", 1);
+            var resolved =
+                    new DefinitionProvider(
+                                    context.compiler,
+                                    context.index,
+                                    file,
+                                    cursor.line,
+                                    cursor.character)
+                            .resolveSymbol();
+            assertEquals("com.example.demo.NestedDefinitionExample.ResolvedSymbol", resolved.qualifiedType());
+            assertEquals("locations", resolved.memberName());
+            assertFalse(resolved.locations().isEmpty());
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), file, ".locations()", 1),
+                    hasItem("NestedDefinitionExample.java:5"));
         } finally {
             deleteRecursively(workspace);
         }
