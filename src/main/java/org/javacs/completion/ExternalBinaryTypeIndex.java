@@ -36,6 +36,8 @@ import org.javacs.CompilerProvider;
 import org.javacs.CacheAudit;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
+import org.javacs.index.IndexedMember;
+import org.javacs.index.IndexedType;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.TypeNames;
 
@@ -44,7 +46,10 @@ import org.javacs.resolve.TypeNames;
  *
  * <p>This index serves jars, JDK classes, and decompiled dependency sources. Workspace-owned
  * candidates must be resolved before reaching this class. Any workspace hit here is a correctness
- * bug. Vineflower support here is only for read-only dependency inspection and navigation.
+ * bug. The published member shape is shared with the workspace index via
+ * {@link IndexedMember}; every member emitted here is stamped with
+ * {@link IndexedMember.Provenance#EXTERNAL_BINARY}. Vineflower support here is only for
+ * read-only dependency inspection and navigation.
  */
 public final class ExternalBinaryTypeIndex {
     public static final ExternalBinaryTypeIndex EMPTY = new ExternalBinaryTypeIndex();
@@ -55,12 +60,23 @@ public final class ExternalBinaryTypeIndex {
     private final String classPathFingerprint;
     private final Set<Path> classPathRoots;
     private final ClassLoader classLoader;
-    private final Cache<String, Optional<WorkspaceTypeIndex.TypeInfo>> rawTypeCache;
-    private final Cache<String, Optional<WorkspaceTypeIndex.TypeInfo>> typeCache;
+    private final Cache<String, Optional<IndexedType>> rawTypeCache;
+    private final Cache<String, Optional<IndexedType>> typeCache;
     private final Cache<String, Optional<Path>> decompiledSourceCache;
     private final Cache<String, Optional<BinaryClassModel>> classFileCache;
     private final ExternalBinaryDecompiler decompiler;
 
+    /**
+     * Empty dependency index used when no external lookup is available.
+     *
+     * <p>All constructor fields are initialized to harmless defaults:
+     *
+     * <pre>{@code
+     * compiler = null
+     * classPathRoots = []
+     * classPathFingerprint = ""
+     * }</pre>
+     */
     private ExternalBinaryTypeIndex() {
         this.compiler = null;
         this.classPathFingerprint = "";
@@ -73,6 +89,34 @@ public final class ExternalBinaryTypeIndex {
         this.decompiler = new ExternalBinaryDecompiler(Set.of(), "", classLoader);
     }
 
+    /**
+     * Build a dependency-only index for jars and JDK classes visible on the compiler classpath.
+     *
+     * <p>Constructor fields mean:
+     *
+     * <p>{@code compiler}: source of classpath roots and attached source lookup
+     *
+     * <p>{@code classPathRoots}: the concrete jars/directories that will be scanned and loaded
+     *
+     * <p>{@code classPathFingerprint}: stable cache key derived from those roots so decompiled
+     * artifacts can be reused safely
+     *
+     * <p>{@code classLoader}: runtime loader used for reflection-based dependency metadata
+     *
+     * <p>The caches store already-decoded dependency facts. They do not hold workspace symbols.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * compiler.classPathRoots() = [
+     *   /repo/.m2/repository/org/projectlombok/lombok-1.18.30.jar,
+     *   /repo/.m2/repository/com/google/guava/guava-33.0.0.jar
+     * ]
+     * }</pre>
+     *
+     * <p>That gives this index enough information to answer lookups for dependency types such as
+     * {@code com.google.common.collect.ImmutableList} without consulting workspace source.
+     */
     public ExternalBinaryTypeIndex(CompilerProvider compiler) {
         this.compiler = compiler;
         var classPath = compiler == null ? Set.<Path>of() : compiler.classPathRoots();
@@ -106,7 +150,7 @@ public final class ExternalBinaryTypeIndex {
         return (int)typeCache.estimatedSize();
     }
 
-    public Optional<WorkspaceTypeIndex.TypeInfo> typeInfo(String qualifiedName) {
+    public Optional<IndexedType> typeInfo(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
@@ -117,21 +161,21 @@ public final class ExternalBinaryTypeIndex {
         return rawTypeInfo(qualifiedName).isPresent();
     }
 
-    public List<WorkspaceTypeIndex.Member> members(String qualifiedName, boolean staticContext) {
+    public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
         var type = rawTypeInfo(qualifiedName);
         if (type.isEmpty()) {
             return List.of();
         }
-        var result = new ArrayList<WorkspaceTypeIndex.Member>();
+        var result = new ArrayList<IndexedMember>();
         for (var member : type.get().members) {
             if (member.isStatic == staticContext) {
-                result.add(member);
+                result.add(ensureExternalProvenance(member));
             }
         }
         return result;
     }
 
-    public Optional<WorkspaceTypeIndex.Member> member(String qualifiedName, String name, boolean staticContext) {
+    public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext) {
         var linked = linkedMembers(qualifiedName, staticContext);
         for (var member : linked) {
             if (Objects.equals(name, member.name)) {
@@ -141,10 +185,10 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
-    public Optional<WorkspaceTypeIndex.Member> member(
+    public Optional<IndexedMember> member(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var targetKey =
-                WorkspaceTypeIndex.canonicalMemberKey(
+                IndexedMember.canonicalKey(
                         qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
         for (var member : linkedMembers(qualifiedName, staticContext)) {
             if (Objects.equals(targetKey, member.canonicalKey)) {
@@ -154,7 +198,7 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
-    public Optional<WorkspaceTypeIndex.Member> rawMember(String qualifiedName, String name, boolean staticContext) {
+    public Optional<IndexedMember> rawMember(String qualifiedName, String name, boolean staticContext) {
         for (var member : members(qualifiedName, staticContext)) {
             if (Objects.equals(name, member.name)) {
                 return Optional.of(member);
@@ -163,10 +207,10 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
-    public Optional<WorkspaceTypeIndex.Member> rawMember(
+    public Optional<IndexedMember> rawMember(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var targetKey =
-                WorkspaceTypeIndex.canonicalMemberKey(
+                IndexedMember.canonicalKey(
                         qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
         for (var member : members(qualifiedName, staticContext)) {
             if (Objects.equals(targetKey, member.canonicalKey)) {
@@ -176,12 +220,13 @@ public final class ExternalBinaryTypeIndex {
         return Optional.empty();
     }
 
-    private List<WorkspaceTypeIndex.Member> linkedMembers(String qualifiedName, boolean staticContext) {
+    private List<IndexedMember> linkedMembers(String qualifiedName, boolean staticContext) {
         return typeInfo(qualifiedName)
                 .map(
                         info ->
                                 info.members.stream()
                                         .filter(member -> member.isStatic == staticContext)
+                                        .map(this::ensureExternalProvenance)
                                         .toList())
                 .orElse(List.of());
     }
@@ -190,18 +235,18 @@ public final class ExternalBinaryTypeIndex {
         if (typeName == null || typeName.isBlank() || root == null || compiler == null) {
             return Optional.empty();
         }
-        var raw = WorkspaceTypeIndex.normalizeTypeName(typeName);
+        var raw = TypeNames.normalize(typeName);
         if (raw.isEmpty()) {
             return Optional.empty();
         }
-        if (WorkspaceTypeIndex.isPrimitiveTypeName(raw)) {
+        if (TypeNames.isPrimitive(raw)) {
             return Optional.of(raw);
         }
         if (raw.contains(".") && containsType(raw)) {
             return Optional.of(raw);
         }
 
-        return WorkspaceTypeIndex.resolveSimpleName(raw, root, this::containsType);
+        return TypeNames.resolveSimpleName(raw, root, this::containsType);
     }
 
     public Optional<Path> decompiledSourcePath(String qualifiedName) {
@@ -215,34 +260,26 @@ public final class ExternalBinaryTypeIndex {
                 "external_binary.decompiled_source");
     }
 
-    private Optional<WorkspaceTypeIndex.TypeInfo> rawTypeInfo(String qualifiedName) {
+    private Optional<IndexedType> rawTypeInfo(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
         return lookup(rawTypeCache, qualifiedName, this::loadRawTypeInfo, "external_binary.type_raw");
     }
 
-    private Optional<WorkspaceTypeIndex.TypeInfo> loadLinkedTypeInfo(String qualifiedName) {
+    private Optional<IndexedType> loadLinkedTypeInfo(String qualifiedName) {
         var raw = rawTypeInfo(qualifiedName);
         return raw.map(this::applySourceLinks);
     }
 
-    private Optional<WorkspaceTypeIndex.TypeInfo> loadRawTypeInfo(String qualifiedName) {
-        if (isWorkspaceOwnedCandidate(qualifiedName)) {
-            LOG.fine(
-                    String.format(
-                            "[workspace-boundary] external_leak candidate=%s reason=externalTypeInfo caller=%s",
-                            qualifiedName,
-                            callerSummary()));
-            return Optional.empty();
-        }
+    private Optional<IndexedType> loadRawTypeInfo(String qualifiedName) {
         try {
             var binaryClass = Class.forName(qualifiedName, false, classLoader);
             if (binaryClass.isArray()) {
                 return Optional.empty();
             }
             var publicFields = visibleFields(binaryClass);
-            var seen = new LinkedHashMap<String, WorkspaceTypeIndex.Member>();
+            var seen = new LinkedHashMap<String, IndexedMember>();
             for (var field : publicFields) {
                 try {
                     if (field.isSynthetic()) {
@@ -251,7 +288,7 @@ public final class ExternalBinaryTypeIndex {
                     var declaring = field.getDeclaringClass().getName();
                     var priority = memberPriority(qualifiedName, declaring);
                     var member =
-                            new WorkspaceTypeIndex.Member(
+                            new IndexedMember(
                                     declaring,
                                     field.getName(),
                                     CompletionItemKind.Field,
@@ -262,12 +299,13 @@ public final class ExternalBinaryTypeIndex {
                                     canonicalTypeName(field.getType()),
                                     null,
                                     null,
-                                    WorkspaceTypeIndex.canonicalMemberKey(
+                                    IndexedMember.canonicalKey(
                                             declaring, CompletionItemKind.Field, field.getName(), null),
-                                    WorkspaceTypeIndex.canonicalMemberKey(
+                                    IndexedMember.canonicalKey(
                                             declaring, CompletionItemKind.Field, field.getName(), null),
                                     null,
-                                    false);
+                                    false,
+                                    IndexedMember.Provenance.EXTERNAL_BINARY);
                     seen.putIfAbsent(memberKey(member), member);
                 } catch (TypeNotPresentException | LinkageError ex) {
                     LOG.fine(
@@ -303,7 +341,7 @@ public final class ExternalBinaryTypeIndex {
                                     + parameters
                                     + ")";
                     var member =
-                            new WorkspaceTypeIndex.Member(
+                            new IndexedMember(
                                     declaring,
                                     method.getName(),
                                     CompletionItemKind.Method,
@@ -314,12 +352,13 @@ public final class ExternalBinaryTypeIndex {
                                     canonicalTypeName(method.getReturnType()),
                                     parameterNames,
                                     erasedParameterTypes,
-                                    WorkspaceTypeIndex.canonicalMemberKey(
+                                    IndexedMember.canonicalKey(
                                             declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
-                                    WorkspaceTypeIndex.canonicalMemberKey(
+                                    IndexedMember.canonicalKey(
                                             declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
                                     null,
-                                    false);
+                                    false,
+                                    IndexedMember.Provenance.EXTERNAL_BINARY);
                     var key = memberKey(member);
                     var existing = seen.get(key);
                     if (existing == null || member.priority < existing.priority) {
@@ -335,14 +374,23 @@ public final class ExternalBinaryTypeIndex {
                 }
             }
             var members = new ArrayList<>(seen.values());
-            WorkspaceTypeIndex.sortMembers(members);
+            IndexedMember.sort(members);
             var superclass =
                     binaryClass.getSuperclass() == null ? null : canonicalTypeName(binaryClass.getSuperclass());
             var interfaces =
                     java.util.Arrays.stream(binaryClass.getInterfaces())
                             .map(this::canonicalTypeName)
                             .collect(Collectors.toList());
-            var linked = new WorkspaceTypeIndex.TypeInfo(qualifiedName, binaryClass.getSimpleName(), members, false, null, superclass, interfaces);
+            var linked =
+                    new IndexedType(
+                            qualifiedName,
+                            binaryClass.getSimpleName(),
+                            members,
+                            false,
+                            null,
+                            superclass,
+                            interfaces,
+                            IndexedMember.Provenance.EXTERNAL_BINARY);
             return Optional.of(linked);
         } catch (ClassNotFoundException | LinkageError ex) {
             LOG.fine(
@@ -359,14 +407,15 @@ public final class ExternalBinaryTypeIndex {
             if (fallback.isPresent()) {
                 LOG.fine(String.format("[external-binary] classfile fallback type=%s", qualifiedName));
                 return Optional.of(
-                        new WorkspaceTypeIndex.TypeInfo(
+                        new IndexedType(
                                 fallback.get().qualifiedName(),
                                 fallback.get().simpleName(),
                                 fallback.get().members(),
                                 false,
                                 null,
                                 null,
-                                List.of()));
+                                List.of(),
+                                IndexedMember.Provenance.EXTERNAL_BINARY));
             }
             LOG.fine(String.format("[external-binary] miss type=%s reason=%s", qualifiedName, ex.getClass().getSimpleName()));
             return Optional.empty();
@@ -390,44 +439,6 @@ public final class ExternalBinaryTypeIndex {
         CacheAudit.store(metricName);
         return loaded;
     }
-
-    /**
-     * Workspace-owned candidates must not be treated as external dependencies, including nested
-     * names under workspace owners.
-     */
-    private boolean isWorkspaceOwnedCandidate(String qualifiedName) {
-        if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
-            return false;
-        }
-        if (compiler.findTypeDeclaration(qualifiedName) != org.javacs.CompilerProvider.NOT_FOUND) {
-            return true;
-        }
-        for (var i = qualifiedName.lastIndexOf('.'); i > 0; i = qualifiedName.lastIndexOf('.', i - 1)) {
-            var outer = qualifiedName.substring(0, i);
-            if (compiler.findTypeDeclaration(outer) != org.javacs.CompilerProvider.NOT_FOUND) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private String callerSummary() {
-        var join = new StringJoiner(" > ");
-        for (var frame : Thread.currentThread().getStackTrace()) {
-            var className = frame.getClassName();
-            if (className == null
-                    || !className.startsWith("org.javacs.")
-                    || className.equals(ExternalBinaryTypeIndex.class.getName())) {
-                continue;
-            }
-            join.add(className + "#" + frame.getMethodName() + ":" + frame.getLineNumber());
-            if (join.length() > 120) {
-                break;
-            }
-        }
-        return join.length() == 0 ? "<unknown>" : join.toString();
-    }
-
     private Optional<BinaryClassModel> loadBinaryClassModel(String qualifiedName) {
         var relative = qualifiedName.replace('.', '/') + ".class";
         for (var root : classPathRoots) {
@@ -469,7 +480,7 @@ public final class ExternalBinaryTypeIndex {
             throws IOException, ConstantPoolException {
         var classFile = ClassFile.of().parse(input.readAllBytes());
         var simpleName = TypeNames.simpleName(qualifiedName);
-        var seenMembers = new LinkedHashMap<String, WorkspaceTypeIndex.Member>();
+        var seenMembers = new LinkedHashMap<String, IndexedMember>();
 
         for (var field : classFile.fields()) {
             if (field.flags().has(AccessFlag.SYNTHETIC)) {
@@ -483,7 +494,7 @@ public final class ExternalBinaryTypeIndex {
             var staticMember = field.flags().has(AccessFlag.STATIC);
             var privateMember = field.flags().has(AccessFlag.PRIVATE);
             var member =
-                    new WorkspaceTypeIndex.Member(
+                    new IndexedMember(
                             qualifiedName,
                             name,
                             CompletionItemKind.Field,
@@ -494,10 +505,11 @@ public final class ExternalBinaryTypeIndex {
                             type,
                             null,
                             null,
-                            WorkspaceTypeIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Field, name, null),
-                            WorkspaceTypeIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Field, name, null),
+                            IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Field, name, null),
+                            IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Field, name, null),
                             null,
-                            false);
+                            false,
+                            IndexedMember.Provenance.EXTERNAL_BINARY);
             seenMembers.putIfAbsent(memberKey(member), member);
         }
 
@@ -527,7 +539,7 @@ public final class ExternalBinaryTypeIndex {
                             + renderParameters(parameterTypes, parameterNames)
                             + ")";
             var member =
-                    new WorkspaceTypeIndex.Member(
+                    new IndexedMember(
                             qualifiedName,
                             name,
                             CompletionItemKind.Method,
@@ -538,10 +550,11 @@ public final class ExternalBinaryTypeIndex {
                             returnType,
                             parameterNames,
                             parameterTypes,
-                            WorkspaceTypeIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Method, name, parameterTypes),
-                            WorkspaceTypeIndex.canonicalMemberKey(qualifiedName, CompletionItemKind.Method, name, parameterTypes),
+                            IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Method, name, parameterTypes),
+                            IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Method, name, parameterTypes),
                             null,
-                            false);
+                            false,
+                            IndexedMember.Provenance.EXTERNAL_BINARY);
             var key = memberKey(member);
             var existing = seenMembers.get(key);
             if (existing == null || member.priority < existing.priority) {
@@ -550,7 +563,7 @@ public final class ExternalBinaryTypeIndex {
         }
 
         var members = new ArrayList<>(seenMembers.values());
-        WorkspaceTypeIndex.sortMembers(members);
+        IndexedMember.sort(members);
         return new BinaryClassModel(qualifiedName, simpleName, members);
     }
 
@@ -611,42 +624,77 @@ public final class ExternalBinaryTypeIndex {
         }
     }
 
-    private String memberKey(WorkspaceTypeIndex.Member member) {
+    private String memberKey(IndexedMember member) {
         return member.canonicalKey;
     }
 
-    private WorkspaceTypeIndex.TypeInfo applySourceLinks(WorkspaceTypeIndex.TypeInfo raw) {
+    private IndexedMember ensureExternalProvenance(IndexedMember member) {
+        if (member == null || member.provenance == IndexedMember.Provenance.EXTERNAL_BINARY) {
+            return member;
+        }
+        return new IndexedMember(
+                member.ownerType,
+                member.name,
+                member.kind,
+                member.isStatic,
+                member.isPrivate,
+                member.isProtected,
+                member.isPublic,
+                member.isAbstract,
+                member.priority,
+                member.detail,
+                member.returnType,
+                member.declaredReturnType,
+                member.parameterNames,
+                member.erasedParameterTypes,
+                member.declaredParameterTypes,
+                member.canonicalKey,
+                member.logicalKey,
+                member.backingFieldName,
+                member.synthetic,
+                member.origin,
+                IndexedMember.Provenance.EXTERNAL_BINARY,
+                member.modifiers,
+                member.sourceUri,
+                member.declarationRange);
+    }
+
+    private IndexedType applySourceLinks(IndexedType raw) {
         var linkedMembers = applySourceFieldLinks(raw.qualifiedName, raw.members);
         if (linkedMembers == raw.members) {
             return raw;
         }
-        return new WorkspaceTypeIndex.TypeInfo(
+        return new IndexedType(
                 raw.qualifiedName,
                 raw.simpleName,
                 linkedMembers,
                 raw.fromCompiledRoot,
                 raw.sourcePath,
                 raw.superclass,
-                raw.interfaces);
+                raw.interfaces,
+                raw.provenance);
     }
 
-    private List<WorkspaceTypeIndex.Member> applySourceFieldLinks(String qualifiedName, List<WorkspaceTypeIndex.Member> members) {
+    private List<IndexedMember> applySourceFieldLinks(
+            String qualifiedName, List<IndexedMember> members) {
         var sourceMetadata = sourceLombokMetadata(qualifiedName, members);
         if (sourceMetadata.isEmpty()) {
             return members;
         }
-        var linked = new ArrayList<WorkspaceTypeIndex.Member>(members.size());
+        var linked =
+                new ArrayList<IndexedMember>(
+                        members.size() + sourceMetadata.get().syntheticAccessors().size());
         for (var member : members) {
-            var fieldName = sourceMetadata.get().accessorToField.get(member.canonicalKey);
+            var fieldName = sourceMetadata.get().accessorToField().get(member.canonicalKey);
             if (fieldName == null) {
                 linked.add(member);
                 continue;
             }
             var fieldKey =
-                    WorkspaceTypeIndex.canonicalMemberKey(
+                    IndexedMember.canonicalKey(
                             member.ownerType, CompletionItemKind.Field, fieldName, null);
             linked.add(
-                    new WorkspaceTypeIndex.Member(
+                    new IndexedMember(
                             member.ownerType,
                             member.name,
                             member.kind,
@@ -660,13 +708,16 @@ public final class ExternalBinaryTypeIndex {
                             member.canonicalKey,
                             fieldKey,
                             fieldName,
-                            member.synthetic));
+                            member.synthetic,
+                            member.provenance));
         }
+        linked.addAll(sourceMetadata.get().syntheticAccessors());
+        IndexedMember.sort(linked);
         return Collections.unmodifiableList(linked);
     }
 
     private Optional<SourceLombokMetadata> sourceLombokMetadata(
-            String qualifiedName, List<WorkspaceTypeIndex.Member> members) {
+            String qualifiedName, List<IndexedMember> members) {
         if (compiler == null) {
             return Optional.empty();
         }
@@ -684,6 +735,7 @@ public final class ExternalBinaryTypeIndex {
                 return Optional.empty();
             }
             var accessorToField = new LinkedHashMap<String, String>();
+            var syntheticAccessors = new ArrayList<IndexedMember>();
             for (var member : declaration.getMembers()) {
                 if (!(member instanceof VariableTree field)) {
                     continue;
@@ -704,22 +756,103 @@ public final class ExternalBinaryTypeIndex {
                 }
                 var accessorInfo = accessors.get();
                 if (accessorInfo.hasGetter()) {
-                    accessorToField.put(
-                            WorkspaceTypeIndex.canonicalMemberKey(
-                                    qualifiedName, CompletionItemKind.Method, accessorInfo.getterName(), new String[0]),
-                            fieldName);
+                    var getterKey =
+                            IndexedMember.canonicalKey(
+                                    qualifiedName,
+                                    CompletionItemKind.Method,
+                                    accessorInfo.getterName(),
+                                    new String[0]);
+                    accessorToField.put(getterKey, fieldName);
+                    if (members.stream().noneMatch(candidate -> Objects.equals(candidate.canonicalKey, getterKey))) {
+                        var normalizedFieldType = TypeNames.normalize(accessorInfo.fieldType());
+                        syntheticAccessors.add(
+                                new IndexedMember(
+                                        qualifiedName,
+                                        accessorInfo.getterName(),
+                                        CompletionItemKind.Method,
+                                        false,
+                                        false,
+                                        false,
+                                        true,
+                                        false,
+                                        0,
+                                        normalizedFieldType + " " + accessorInfo.getterName() + "()",
+                                        normalizedFieldType,
+                                        normalizedFieldType,
+                                        new String[0],
+                                        new String[0],
+                                        new String[0],
+                                        getterKey,
+                                        IndexedMember.canonicalKey(
+                                                qualifiedName,
+                                                CompletionItemKind.Field,
+                                                fieldName,
+                                                null),
+                                        fieldName,
+                                        true,
+                                        IndexedMember.Origin.LOMBOK_ACCESSOR,
+                                        IndexedMember.Provenance.EXTERNAL_BINARY,
+                                        Set.of(javax.lang.model.element.Modifier.PUBLIC),
+                                        null,
+                                        null));
+                    }
                 }
                 if (accessorInfo.hasSetter()) {
                     var setterName = accessorInfo.setterName();
+                    var normalizedFieldType = TypeNames.normalize(accessorInfo.fieldType());
+                    var setterKey =
+                            IndexedMember.canonicalKey(
+                                    qualifiedName,
+                                    CompletionItemKind.Method,
+                                    setterName,
+                                    new String[] {normalizedFieldType});
+                    accessorToField.put(setterKey, fieldName);
                     for (var candidate : members) {
                         if (candidate.kind != CompletionItemKind.Method || !Objects.equals(candidate.name, setterName)) {
                             continue;
                         }
                         accessorToField.put(candidate.canonicalKey, fieldName);
                     }
+                    if (members.stream().noneMatch(candidate -> Objects.equals(candidate.canonicalKey, setterKey))) {
+                        syntheticAccessors.add(
+                                new IndexedMember(
+                                        qualifiedName,
+                                        setterName,
+                                        CompletionItemKind.Method,
+                                        false,
+                                        false,
+                                        false,
+                                        true,
+                                        false,
+                                        0,
+                                        "void " + setterName + "(" + normalizedFieldType + " " + fieldName + ")",
+                                        "void",
+                                        "void",
+                                        new String[] {fieldName},
+                                        new String[] {normalizedFieldType},
+                                        new String[] {normalizedFieldType},
+                                        setterKey,
+                                        IndexedMember.canonicalKey(
+                                                qualifiedName,
+                                                CompletionItemKind.Field,
+                                                fieldName,
+                                                null),
+                                        fieldName,
+                                        true,
+                                        IndexedMember.Origin.LOMBOK_ACCESSOR,
+                                        IndexedMember.Provenance.EXTERNAL_BINARY,
+                                        Set.of(javax.lang.model.element.Modifier.PUBLIC),
+                                        null,
+                                        null));
+                    }
                 }
             }
-            return accessorToField.isEmpty() ? Optional.empty() : Optional.of(new SourceLombokMetadata(accessorToField));
+            if (accessorToField.isEmpty() && syntheticAccessors.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(
+                    new SourceLombokMetadata(
+                            accessorToField, List.copyOf(syntheticAccessors)));
         } catch (RuntimeException ignored) {
             return Optional.empty();
         }
@@ -844,6 +977,9 @@ public final class ExternalBinaryTypeIndex {
         return baseType + "[]".repeat(dimensions);
     }
 
-    private record BinaryClassModel(String qualifiedName, String simpleName, List<WorkspaceTypeIndex.Member> members) {}
-    private record SourceLombokMetadata(java.util.Map<String, String> accessorToField) {}
+    private record BinaryClassModel(
+            String qualifiedName, String simpleName, List<IndexedMember> members) {}
+    private record SourceLombokMetadata(
+            java.util.Map<String, String> accessorToField,
+            List<IndexedMember> syntheticAccessors) {}
 }

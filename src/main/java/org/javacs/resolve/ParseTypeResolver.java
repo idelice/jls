@@ -10,6 +10,7 @@ import com.sun.source.tree.EnhancedForLoopTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.LiteralTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
@@ -42,10 +43,10 @@ import javax.lang.model.element.Modifier;
 import org.javacs.CompilerProvider;
 import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
-import org.javacs.ExternalTypeLookup;
 import org.javacs.completion.TypeIndexRouter;
 import org.javacs.completion.FindCompletionsAt;
 import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.index.IndexedMember;
 import org.javacs.lsp.CompletionItemKind;
 
 /**
@@ -58,8 +59,8 @@ import org.javacs.lsp.CompletionItemKind;
  *   <li>Lexical locals and parameters.
  *   <li>Enclosing fields and nested types.
  *   <li>Workspace and external index members/types.
- *   <li>Source-backed workspace fallback when the index does not fully describe the current file.
- *   <li>Invocation, lambda, SAM, and stream inference.
+ *   <li>Current-file parse-local inference only.
+ *   <li>Invocation, lambda, SAM, and functional-target inference.
  *   <li>External reflective inference for dependency-only behavior.
  * </ol>
  */
@@ -75,6 +76,8 @@ public final class ParseTypeResolver {
         }
     }
 
+    public record MethodReferenceTarget(TypeResolution receiverType, int argumentCount) {}
+
     private record CandidateType(TypeResolution resolution, int depth, long start) {}
 
     private static final class CandidatePath {
@@ -89,26 +92,13 @@ public final class ParseTypeResolver {
         }
     }
 
-    private static final class SourceClassInfo {
-        final CompilationUnitTree sourceRoot;
-        final TreePath classPath;
-        final ClassTree classTree;
-
-        SourceClassInfo(CompilationUnitTree sourceRoot, TreePath classPath) {
-            this.sourceRoot = sourceRoot;
-            this.classPath = classPath;
-            this.classTree = (ClassTree) classPath.getLeaf();
-        }
-    }
-
     private static final int MAX_RESOLVE_DEPTH = 24;
 
     private final CompilationUnitTree root;
     private final SourcePositions positions;
     private final CompilerProvider compiler;
-    private final ExternalTypeLookup typeLookup;
     private final TypeIndexRouter index;
-    private final StreamCollectorInference streamCollectorInference;
+    private final FunctionalTargetResolver functionalTargetResolver;
     private final long cursor;
     private final TreePath cursorPath;
     private ClassLoader externalClassLoader;
@@ -120,18 +110,17 @@ public final class ParseTypeResolver {
         this.positions = Trees.instance(parseTask.task()).getSourcePositions();
         this.compiler = compiler;
         this.index = index == null ? TypeIndexRouter.EMPTY : index;
-        this.typeLookup = new ExternalTypeLookup(compiler, this.index);
         this.cursor = cursor;
         this.cursorPath = new FindCompletionsAt(parseTask.task()).scan(parseTask.root(), cursor);
-        this.streamCollectorInference =
-                new StreamCollectorInference(
-                        root,
-                        this.index,
-                        new StreamCollectorInference.Support() {
-                            @Override
-                            public Optional<TypeResolution> resolveExpression(Tree expression, int depth) {
-                                return ParseTypeResolver.this.resolveExpression(expression, depth);
-                            }
+        this.functionalTargetResolver =
+                        new FunctionalTargetResolver(
+                                root,
+                                this.index,
+                                new FunctionalTargetResolver.Support() {
+                                    @Override
+                                    public Optional<TypeResolution> resolveExpression(Tree expression, int depth) {
+                                        return ParseTypeResolver.this.resolveExpressionAtDepth(expression, depth);
+                                    }
 
                             @Override
                             public Optional<TypeResolution> resolveTypeTree(
@@ -150,13 +139,23 @@ public final class ParseTypeResolver {
                                 return ParseTypeResolver.this.resolveUniqueInvocationReturnType(
                                         receiverType, methodName, argumentCount);
                             }
+
+                            @Override
+                            public Optional<TypeResolution> resolveSamParameterType(TypeResolution functionalType) {
+                                return ParseTypeResolver.this.resolveSamParameterType(functionalType);
+                            }
+
+                            @Override
+                            public Optional<Integer> resolveSamArity(TypeResolution functionalType) {
+                                return ParseTypeResolver.this.resolveSamArity(functionalType);
+                            }
                         });
     }
 
     // Public entrypoints.
     public Optional<TypeResolution> resolve(Tree expression, String fallbackIdentifier) {
         if (expression != null) {
-            var direct = resolveExpression(expression, 0);
+            var direct = resolveExpressionAtDepth(expression, 0);
             if (direct.isPresent()) {
                 return direct;
             }
@@ -168,54 +167,34 @@ public final class ParseTypeResolver {
     }
 
     public Optional<TypeResolution> resolveExpression(Tree expression) {
-        return resolveExpression(expression, 0);
+        return resolveExpressionAtDepth(expression, 0);
     }
 
     public Optional<String> currentEnclosingTypeName() {
         return resolveThisType().map(TypeResolution::qualifiedType);
     }
 
-    public boolean isEnclosingInstanceType(String qualifiedType) {
-        if (qualifiedType == null || qualifiedType.isBlank() || cursorPath == null) {
-            return false;
+    /**
+     * Ask the functional-target helper whether a method reference should be treated as an unbound
+     * instance method, a bound instance method, or a static method.
+     *
+     * <p>Example: {@code LineItem::getFamily} inside {@code stream.map(...)} resolves to receiver
+     * type {@code LineItem} with invocation arity {@code 0}, not a static call on the type literal.
+     */
+    public Optional<MethodReferenceTarget> resolveMethodReferenceTarget(MemberReferenceTree reference) {
+        if (reference == null || cursorPath == null) {
+            return Optional.empty();
         }
-        var blockedByStaticContext = false;
-        for (var path = cursorPath; path != null; path = path.getParentPath()) {
-            var leaf = path.getLeaf();
-            if (leaf instanceof MethodTree methodTree
-                    && methodTree.getModifiers() != null
-                    && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                blockedByStaticContext = true;
-                continue;
-            }
-            if (leaf instanceof BlockTree blockTree) {
-                var parent = path.getParentPath();
-                if (parent != null && parent.getLeaf() instanceof ClassTree && blockTree.isStatic()) {
-                    blockedByStaticContext = true;
-                }
-                continue;
-            }
-            if (!(leaf instanceof ClassTree classTree)) {
-                continue;
-            }
-            var className = qualifiedClassName(root, path);
-            if (qualifiedType.equals(className)) {
-                return !blockedByStaticContext;
-            }
-            if (classTree.getModifiers() != null && classTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                blockedByStaticContext = true;
-            }
-        }
-        return false;
+        return functionalTargetResolver.resolveMethodReferenceTarget(reference, cursorPath, 0);
     }
 
     // Expression dispatch.
-    private Optional<TypeResolution> resolveExpression(Tree expression, int depth) {
+    private Optional<TypeResolution> resolveExpressionAtDepth(Tree expression, int depth) {
         if (expression == null || depth > MAX_RESOLVE_DEPTH) {
             return Optional.empty();
         }
         if (expression instanceof ParenthesizedTree parenthesized) {
-            return resolveExpression(parenthesized.getExpression(), depth + 1);
+            return resolveExpressionAtDepth(parenthesized.getExpression(), depth + 1);
         }
         if (expression instanceof IdentifierTree identifier) {
             return resolveIdentifier(identifier.getName().toString(), depth + 1);
@@ -240,7 +219,7 @@ public final class ParseTypeResolver {
             return resolveTypeTree(castTree.getType(), root, false);
         }
         if (expression instanceof ArrayAccessTree arrayAccessTree) {
-            var array = resolveExpression(arrayAccessTree.getExpression(), depth + 1);
+            var array = resolveExpressionAtDepth(arrayAccessTree.getExpression(), depth + 1);
             if (array.isEmpty()) {
                 return Optional.empty();
             }
@@ -266,13 +245,15 @@ public final class ParseTypeResolver {
                                             current, identifier.getName().toString(), false));
         }
         if (select instanceof MemberSelectTree memberSelectTree) {
-            var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
+            var receiver = resolveExpressionAtDepth(memberSelectTree.getExpression(), depth + 1);
             if (receiver.isEmpty()) {
                 return Optional.empty();
             }
-            var streamOrCollector = streamCollectorInference.infer(invocationTree, memberSelectTree, receiver.get(), depth + 1);
-            if (streamOrCollector.handled()) {
-                return streamOrCollector.resolution();
+            var functional =
+                    functionalTargetResolver.resolveInvocationReturnType(
+                            invocationTree, memberSelectTree, receiver.get(), depth + 1);
+            if (functional.isPresent()) {
+                return functional;
             }
             return resolveMethodReturnType(
                     receiver.get(),
@@ -283,7 +264,7 @@ public final class ParseTypeResolver {
     }
 
     private Optional<TypeResolution> resolveMemberSelect(MemberSelectTree memberSelectTree, int depth) {
-        var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
+        var receiver = resolveExpressionAtDepth(memberSelectTree.getExpression(), depth + 1);
         if (receiver.isEmpty()) {
             return resolveTypeTree(memberSelectTree, root, true);
         }
@@ -313,7 +294,7 @@ public final class ParseTypeResolver {
         if (nested.isPresent()) {
             return Optional.of(new TypeResolution(nested.get(), true, false));
         }
-        var type = typeLookup.resolveTypeName(identifier, root);
+        var type = resolveTypeNameInSource(identifier, root).or(() -> index.resolveTypeName(identifier, root));
         return type.map(s -> new TypeResolution(s, true, false));
     }
 
@@ -325,7 +306,7 @@ public final class ParseTypeResolver {
         if (current.isEmpty()) {
             return Optional.empty();
         }
-        var field = resolveMemberFromIndexOrSource(current.get().qualifiedType(), identifier, false);
+        var field = resolveIndexedMember(current.get().qualifiedType(), identifier, false, null);
         if (field.isEmpty() || field.get().kind != CompletionItemKind.Field) {
             return Optional.empty();
         }
@@ -341,37 +322,19 @@ public final class ParseTypeResolver {
                 || methodName.isBlank()) {
             return Optional.empty();
         }
-        return resolveMemberFromIndexOrSource(receiverType.qualifiedType(), methodName, staticContext)
-                .flatMap(member -> resolveMemberReturnType(receiverType, member));
-    }
-
-    private Optional<TypeResolution> resolveMemberReturnType(
-            TypeResolution receiverType, WorkspaceTypeIndex.Member member) {
-        var external = resolveExternalMethodReturnType(receiverType, member);
-        return external.isPresent() ? external : returnTypeOf(member);
-    }
-
-    /**
-     * Prefer index metadata first, then fall back to source only for non-workspace owners.
-     *
-     * <p>This keeps workspace symbol identity strict and index-backed while still allowing
-     * source-backed dependency lookups.
-     */
-    private Optional<WorkspaceTypeIndex.Member> resolveMemberFromIndexOrSource(
-            String ownerType, String memberName, boolean staticContext) {
-        var indexed = resolveIndexedMember(ownerType, memberName, staticContext, null);
-        if (indexed.isPresent()) {
-            return indexed;
-        }
-        if (index.isWorkspaceOwnedType(ownerType, compiler)) {
+        var member = resolveIndexedMember(receiverType.qualifiedType(), methodName, staticContext, null);
+        if (member.isEmpty()) {
             return Optional.empty();
         }
-        return resolveSourceMember(ownerType, memberName, staticContext);
+        if (member.get().provenance == IndexedMember.Provenance.WORKSPACE) {
+            return returnTypeOf(member.get());
+        }
+        return resolveExternalMethodReturnType(receiverType, member.get()).or(() -> returnTypeOf(member.get()));
     }
 
-    private Optional<WorkspaceTypeIndex.Member> resolveIndexedMember(
+    private Optional<IndexedMember> resolveIndexedMember(
             String ownerType, String memberName, boolean staticContext, String[] erasedParameterTypes) {
-        if (index.isWorkspaceOwnedType(ownerType, compiler)) {
+        if (index.isWorkspaceOwnedType(ownerType)) {
             return erasedParameterTypes == null
                     ? index.workspace().member(ownerType, memberName, staticContext)
                     : index.workspace().member(ownerType, memberName, staticContext, erasedParameterTypes);
@@ -379,90 +342,6 @@ public final class ParseTypeResolver {
         return erasedParameterTypes == null
                 ? index.external().rawMember(ownerType, memberName, staticContext)
                 : index.external().rawMember(ownerType, memberName, staticContext, erasedParameterTypes);
-    }
-
-    private Optional<WorkspaceTypeIndex.Member> resolveSourceMember(
-            String ownerType, String memberName, boolean staticContext) {
-        var info = sourceClassInfo(ownerType);
-        if (info.isEmpty()) {
-            return Optional.empty();
-        }
-        for (var member : info.get().classTree.getMembers()) {
-            if (member instanceof VariableTree field) {
-                if (!field.getName().contentEquals(memberName)) {
-                    continue;
-                }
-                var isStatic =
-                        field.getModifiers() != null
-                                && field.getModifiers().getFlags().contains(Modifier.STATIC);
-                if (isStatic != staticContext) {
-                    continue;
-                }
-                var fieldType = resolveTypeTree(field.getType(), info.get().sourceRoot, false);
-                if (fieldType.isEmpty()) {
-                    continue;
-                }
-                return Optional.of(
-                        new WorkspaceTypeIndex.Member(
-                                ownerType,
-                                memberName,
-                                CompletionItemKind.Field,
-                                isStatic,
-                                field.getModifiers() != null
-                                        && field.getModifiers().getFlags().contains(Modifier.PRIVATE),
-                                0,
-                                field.getType() + " " + memberName,
-                                typeName(fieldType.get()),
-                                null,
-                                null,
-                                WorkspaceTypeIndex.canonicalMemberKey(ownerType, CompletionItemKind.Field, memberName, null),
-                                WorkspaceTypeIndex.canonicalMemberKey(ownerType, CompletionItemKind.Field, memberName, null),
-                                null,
-                                false));
-            }
-            if (member instanceof MethodTree method) {
-                if (!method.getName().contentEquals(memberName)) {
-                    continue;
-                }
-                var isStatic =
-                        method.getModifiers() != null
-                                && method.getModifiers().getFlags().contains(Modifier.STATIC);
-                if (isStatic != staticContext) {
-                    continue;
-                }
-                var returnType =
-                        method.getReturnType() == null
-                                ? Optional.<TypeResolution>empty()
-                                : resolveTypeTree(method.getReturnType(), info.get().sourceRoot, false);
-                var parameterNames = new String[method.getParameters().size()];
-                var erasedParameterTypes = new String[method.getParameters().size()];
-                for (int i = 0; i < method.getParameters().size(); i++) {
-                    var parameter = method.getParameters().get(i);
-                    parameterNames[i] = parameter.getName().toString();
-                    erasedParameterTypes[i] = parameter.getType().toString();
-                }
-                return Optional.of(
-                        new WorkspaceTypeIndex.Member(
-                                ownerType,
-                                memberName,
-                                CompletionItemKind.Method,
-                                isStatic,
-                                method.getModifiers() != null
-                                        && method.getModifiers().getFlags().contains(Modifier.PRIVATE),
-                                0,
-                                method.toString(),
-                                returnType.map(ParseTypeResolver::typeName).orElse(null),
-                                parameterNames,
-                                erasedParameterTypes,
-                                WorkspaceTypeIndex.canonicalMemberKey(
-                                        ownerType, CompletionItemKind.Method, memberName, erasedParameterTypes),
-                                WorkspaceTypeIndex.canonicalMemberKey(
-                                        ownerType, CompletionItemKind.Method, memberName, erasedParameterTypes),
-                                null,
-                                false));
-            }
-        }
-        return Optional.empty();
     }
 
     private Optional<TypeResolution> resolveImplicitSlf4jLogger(String identifier) {
@@ -478,17 +357,11 @@ public final class ParseTypeResolver {
             return Optional.empty();
         }
         var ownerType = qualifiedClassName(root, classPath);
-        var loggerMember =
-                index.isWorkspaceOwnedType(ownerType, compiler)
-                        ? index.workspace().member(ownerType, "log", false)
-                        : index.member(ownerType, "log", false);
+        var loggerMember = resolveIndexedMember(ownerType, "log", false, null);
         if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
             return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
         }
-        loggerMember =
-                index.isWorkspaceOwnedType(ownerType, compiler)
-                        ? index.workspace().member(ownerType, "log", true)
-                        : index.member(ownerType, "log", true);
+        loggerMember = resolveIndexedMember(ownerType, "log", true, null);
         if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
             return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
         }
@@ -499,14 +372,14 @@ public final class ParseTypeResolver {
         return Optional.of(new TypeResolution(loggerType, false, false));
     }
 
-    // Source-name and nested-type fallback.
+    // Current-file and enclosing-scope fallback.
     private Optional<String> resolveNestedTypeInEnclosingScopes(String simpleName) {
         for (var classPath = enclosingClassPath();
                 classPath != null;
                 classPath = parentClassPath(classPath.getParentPath())) {
             var owner = qualifiedClassName(root, classPath);
             var candidate = owner + "." + simpleName;
-            if (index.workspace().containsType(candidate) || sourceClassInfo(candidate).isPresent()) {
+            if (index.workspace().containsType(candidate)) {
                 return Optional.of(candidate);
             }
         }
@@ -616,7 +489,7 @@ public final class ParseTypeResolver {
             return lambda;
         }
         if (variableTree.getInitializer() != null) {
-            return resolveExpression(variableTree.getInitializer(), depth + 1);
+            return resolveExpressionAtDepth(variableTree.getInitializer(), depth + 1);
         }
         return Optional.empty();
     }
@@ -627,7 +500,7 @@ public final class ParseTypeResolver {
         if (parent == null || !(parent.getLeaf() instanceof EnhancedForLoopTree loop) || loop.getVariable() != variableTree) {
             return Optional.empty();
         }
-        var iterableType = resolveExpression(loop.getExpression(), depth + 1);
+        var iterableType = resolveExpressionAtDepth(loop.getExpression(), depth + 1);
         if (iterableType.isEmpty()) {
             return Optional.empty();
         }
@@ -640,6 +513,13 @@ public final class ParseTypeResolver {
         return Optional.of(new TypeResolution(iterableType.get().firstTypeArgument(), false, false));
     }
 
+    /**
+     * Infer the type of a lambda parameter without semantic attribution.
+     *
+     * <p>Example: in {@code items.stream().map(item -> item.getFamily())}, the parameter
+     * {@code item} gets its type from the stream element. For non-stream cases, this method falls
+     * back to SAM parameter lookup from indexed method signatures.
+     */
     private Optional<TypeResolution> resolveLambdaParameterType(
             VariableTree variableTree, TreePath path, int depth) {
         var parent = path == null ? null : path.getParentPath();
@@ -663,11 +543,14 @@ public final class ParseTypeResolver {
         if (argumentIndex < 0) {
             return Optional.empty();
         }
-        var functionalType = resolveInvocationArgumentType(invocation, argumentIndex, depth + 1);
-        if (functionalType.isEmpty()) {
-            return Optional.empty();
+        var streamParameterType =
+                functionalTargetResolver.resolveLambdaParameterType(
+                        lambda, parent, invocation, argumentIndex, depth + 1);
+        if (streamParameterType.isPresent()) {
+            return streamParameterType;
         }
-        return resolveSamParameterType(functionalType.get());
+        var functionalType = resolveInvocationArgumentType(invocation, argumentIndex, depth + 1);
+        return functionalType.flatMap(this::resolveSamParameterType);
     }
 
     /** Resolve a source type tree into a qualified type before any declaration lookup begins. */
@@ -691,8 +574,10 @@ public final class ParseTypeResolver {
             return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType(), staticContext, true));
         }
         var typeName = tree.toString();
-        var resolved = typeLookup.resolveTypeName(typeName, sourceRoot);
-        if (resolved.isEmpty()) {
+        var resolved = sourceRoot == root
+                ? resolveTypeNameInSource(typeName, sourceRoot).or(() -> index.resolveTypeName(typeName, sourceRoot))
+                : index.resolveTypeName(typeName, sourceRoot);
+        if (resolved.isEmpty() && sourceRoot != root) {
             resolved = resolveTypeNameInSource(typeName, sourceRoot);
         }
         return resolved.map(type -> new TypeResolution(type, staticContext, false));
@@ -738,58 +623,17 @@ public final class ParseTypeResolver {
     }
 
     // Workspace member/type resolution.
-    private Optional<TypeResolution> returnTypeOf(WorkspaceTypeIndex.Member member) {
-        var workspaceSource = resolveWorkspaceSourceMemberType(member);
-        if (workspaceSource.isPresent()) {
-            return workspaceSource;
-        }
-        if (member.returnType == null || member.returnType.isBlank()) {
+    private Optional<TypeResolution> returnTypeOf(IndexedMember member) {
+        if (member == null) {
             return Optional.empty();
         }
-        var type = member.returnType;
-        var isArray = type.endsWith("[]");
-        if (isArray) {
-            type = type.substring(0, type.length() - 2);
-        }
-        var resolved = typeLookup.resolveTypeName(type, root);
-        if (resolved.isEmpty()) {
-            resolved = resolveTypeNameInCurrentSource(type);
-        }
-        return resolved.map(
-                next ->
-                        new TypeResolution(
-                                next, false, isArray, firstTypeArgumentFromTypeName(member.returnType).orElse(null)));
-    }
-
-    /** Recover a member return type directly from workspace source when the index payload is incomplete. */
-    private Optional<TypeResolution> resolveWorkspaceSourceMemberType(WorkspaceTypeIndex.Member member) {
-        if (member == null || !index.isWorkspaceOwnedType(member.ownerType, compiler)) {
-            return Optional.empty();
-        }
-        var info = sourceClassInfo(member.ownerType);
-        if (info.isEmpty()) {
-            return Optional.empty();
-        }
-        if (member.backingFieldName != null && !member.backingFieldName.isBlank()) {
-            for (var candidate : info.get().classTree.getMembers()) {
-                if (candidate instanceof VariableTree field && field.getName().contentEquals(member.backingFieldName)) {
-                    return resolveTypeTree(field.getType(), info.get().sourceRoot, false);
-                }
+        if (member.declaredReturnType != null && !member.declaredReturnType.isBlank()) {
+            var declared = resolveDeclaredTypeName(member.declaredReturnType);
+            if (declared.isPresent()) {
+                return declared;
             }
         }
-        for (var candidate : info.get().classTree.getMembers()) {
-            if (member.kind == CompletionItemKind.Field && candidate instanceof VariableTree field && field.getName().contentEquals(member.name)) {
-                return resolveTypeTree(field.getType(), info.get().sourceRoot, false);
-            }
-            if (member.kind == CompletionItemKind.Method
-                    && candidate instanceof MethodTree method
-                    && method.getName().contentEquals(member.name)
-                    && method.getReturnType() != null
-                    && method.getParameters().size() == (member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length)) {
-                return resolveTypeTree(method.getReturnType(), info.get().sourceRoot, false);
-            }
-        }
-        return Optional.empty();
+        return resolveDeclaredTypeName(member.returnType);
     }
 
     private Optional<TypeResolution> resolveDirectMemberType(TypeResolution receiverType, String memberName) {
@@ -802,11 +646,25 @@ public final class ParseTypeResolver {
         if (receiverType.staticContext() && "class".equals(memberName)) {
             return Optional.of(new TypeResolution("java.lang.Class", false, false));
         }
+        if (receiverType.staticContext()) {
+            var nestedType =
+                    index.workspace()
+                            .typeInfo(receiverType.qualifiedType())
+                            .flatMap(
+                                    info ->
+                                            info.nestedTypes.stream()
+                                                    .filter(candidate -> candidate.endsWith("." + memberName))
+                                                    .findFirst());
+            if (nestedType.isPresent()) {
+                return Optional.of(new TypeResolution(nestedType.get(), true, false));
+            }
+        }
         var member =
-                resolveMemberFromIndexOrSource(
+                resolveIndexedMember(
                         receiverType.qualifiedType(),
                         memberName,
-                        receiverType.staticContext());
+                        receiverType.staticContext(),
+                        null);
         if (member.isEmpty()) {
             return Optional.empty();
         }
@@ -826,11 +684,11 @@ public final class ParseTypeResolver {
         }
         var indexed = uniqueIndexedMethod(receiverType, methodName, argumentCount);
         if (indexed.isPresent()) {
-            return resolveMemberReturnType(receiverType, indexed.get());
-        }
-        var source = resolveUniqueSourceMethodReturnType(receiverType, methodName, argumentCount);
-        if (source.isPresent()) {
-            return source;
+            if (index.isWorkspaceOwnedType(indexed.get().ownerType)) {
+                return returnTypeOf(indexed.get());
+            }
+            return resolveExternalMethodReturnType(receiverType, indexed.get())
+                    .or(() -> returnTypeOf(indexed.get()));
         }
         if (!canUseExternalInference(receiverType.qualifiedType())) {
             return Optional.empty();
@@ -838,9 +696,9 @@ public final class ParseTypeResolver {
         return resolveReflectiveInvocationReturnType(receiverType, methodName, argumentCount);
     }
 
-    private Optional<WorkspaceTypeIndex.Member> uniqueIndexedMethod(
+    private Optional<IndexedMember> uniqueIndexedMethod(
             TypeResolution receiverType, String methodName, int argumentCount) {
-        WorkspaceTypeIndex.Member match = null;
+        IndexedMember match = null;
         for (var member : index.members(receiverType.qualifiedType(), receiverType.staticContext())) {
             if (member.kind != CompletionItemKind.Method
                     || !Objects.equals(member.name, methodName)
@@ -859,36 +717,6 @@ public final class ParseTypeResolver {
         return Optional.ofNullable(match);
     }
 
-    private Optional<TypeResolution> resolveUniqueSourceMethodReturnType(
-            TypeResolution receiverType, String methodName, int argumentCount) {
-        var info = sourceClassInfo(receiverType.qualifiedType());
-        if (info.isEmpty()) {
-            return Optional.empty();
-        }
-        MethodTree match = null;
-        for (var candidate : info.get().classTree.getMembers()) {
-            if (!(candidate instanceof MethodTree method)
-                    || !method.getName().contentEquals(methodName)
-                    || method.getParameters().size() != argumentCount) {
-                continue;
-            }
-            var isStatic =
-                    method.getModifiers() != null
-                            && method.getModifiers().getFlags().contains(Modifier.STATIC);
-            if (isStatic != receiverType.staticContext()) {
-                continue;
-            }
-            if (match != null) {
-                return Optional.empty();
-            }
-            match = method;
-        }
-        if (match == null || match.getReturnType() == null) {
-            return Optional.empty();
-        }
-        return resolveTypeTree(match.getReturnType(), info.get().sourceRoot, false);
-    }
-
     private Optional<TypeResolution> resolveInvocationArgumentType(
             MethodInvocationTree invocation, int argumentIndex, int depth) {
         var select = invocation.getMethodSelect();
@@ -901,7 +729,7 @@ public final class ParseTypeResolver {
                     current.get(), current.get().qualifiedType(), identifier.getName().toString(), false, invocation, argumentIndex);
         }
         if (select instanceof MemberSelectTree memberSelectTree) {
-            var receiver = resolveExpression(memberSelectTree.getExpression(), depth + 1);
+            var receiver = resolveExpressionAtDepth(memberSelectTree.getExpression(), depth + 1);
             if (receiver.isEmpty()) {
                 return Optional.empty();
             }
@@ -923,9 +751,9 @@ public final class ParseTypeResolver {
             boolean staticContext,
             MethodInvocationTree invocation,
             int argumentIndex) {
-        var source = resolveSourceMethodArgumentType(ownerType, methodName, staticContext, invocation, argumentIndex);
-        if (source.isPresent()) {
-            return source;
+        var indexed = resolveIndexedMethodArgumentType(ownerType, methodName, staticContext, invocation, argumentIndex);
+        if (indexed.isPresent()) {
+            return indexed;
         }
         if (!canUseExternalInference(ownerType)) {
             return Optional.empty();
@@ -933,36 +761,43 @@ public final class ParseTypeResolver {
         return resolveExternalMethodArgumentType(receiverType, ownerType, methodName, staticContext, invocation, argumentIndex);
     }
 
-    private Optional<TypeResolution> resolveSourceMethodArgumentType(
+    private Optional<TypeResolution> resolveIndexedMethodArgumentType(
             String ownerType,
             String methodName,
             boolean staticContext,
             MethodInvocationTree invocation,
             int argumentIndex) {
-        var info = sourceClassInfo(ownerType);
-        if (info.isEmpty()) {
+        IndexedMember match = null;
+        for (var member : index.members(ownerType, staticContext)) {
+            if (member.kind != CompletionItemKind.Method) {
+                continue;
+            }
+            if (!methodName.equals(member.name)) {
+                continue;
+            }
+            var arity = member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length;
+            if (arity != invocation.getArguments().size()) {
+                continue;
+            }
+            if (match != null && !Objects.equals(match.canonicalKey, member.canonicalKey)) {
+                return Optional.empty();
+            }
+            match = member;
+        }
+        if (match == null) {
             return Optional.empty();
         }
-        var matches = new ArrayList<MethodTree>();
-        for (var member : info.get().classTree.getMembers()) {
-            if (!(member instanceof MethodTree method)) {
-                continue;
-            }
-            if (!method.getName().contentEquals(methodName)) {
-                continue;
-            }
-            var isStatic =
-                    method.getModifiers() != null
-                            && method.getModifiers().getFlags().contains(Modifier.STATIC);
-            if (isStatic != staticContext || method.getParameters().size() != invocation.getArguments().size()) {
-                continue;
-            }
-            matches.add(method);
+        if (match.declaredParameterTypes != null
+                && argumentIndex >= 0
+                && argumentIndex < match.declaredParameterTypes.length) {
+            return resolveDeclaredTypeName(match.declaredParameterTypes[argumentIndex]);
         }
-        if (matches.size() != 1) {
-            return Optional.empty();
+        if (match.erasedParameterTypes != null
+                && argumentIndex >= 0
+                && argumentIndex < match.erasedParameterTypes.length) {
+            return resolveDeclaredTypeName(match.erasedParameterTypes[argumentIndex]);
         }
-        return resolveTypeTree(matches.getFirst().getParameters().get(argumentIndex).getType(), info.get().sourceRoot, false);
+        return Optional.empty();
     }
 
     private Optional<TypeResolution> resolveExternalMethodArgumentType(
@@ -989,41 +824,67 @@ public final class ParseTypeResolver {
             return Optional.empty();
         }
         if (isWorkspaceType(functionalType.qualifiedType())) {
-            return resolveSourceSamParameterType(functionalType);
+            return resolveIndexedSamParameterType(functionalType);
         }
         return resolveExternalSamParameterType(functionalType);
     }
 
-    private Optional<TypeResolution> resolveSourceSamParameterType(TypeResolution functionalType) {
-        var info = sourceClassInfo(functionalType.qualifiedType());
-        if (info.isEmpty()) {
+    private Optional<Integer> resolveSamArity(TypeResolution functionalType) {
+        if (functionalType == null || functionalType.qualifiedType() == null || functionalType.qualifiedType().isBlank()) {
             return Optional.empty();
         }
-        MethodTree sam = null;
-        for (var member : info.get().classTree.getMembers()) {
-            if (!(member instanceof MethodTree method)) {
-                continue;
+        if (isWorkspaceType(functionalType.qualifiedType())) {
+            IndexedMember sam = null;
+            for (var member : index.workspace().members(functionalType.qualifiedType(), false)) {
+                if (member.kind != CompletionItemKind.Method || member.isStatic || member.isPrivate) {
+                    continue;
+                }
+                if (!member.isAbstract) {
+                    continue;
+                }
+                if (sam != null && !Objects.equals(sam.canonicalKey, member.canonicalKey)) {
+                    return Optional.empty();
+                }
+                sam = member;
             }
-            var modifiers = method.getModifiers() == null ? Set.<Modifier>of() : method.getModifiers().getFlags();
-            if (modifiers.contains(Modifier.DEFAULT) || modifiers.contains(Modifier.STATIC) || modifiers.contains(Modifier.PRIVATE)) {
-                continue;
-            }
-            if (method.getBody() != null) {
-                continue;
-            }
-            if (sam != null) {
+            if (sam == null) {
                 return Optional.empty();
             }
-            sam = method;
+            return Optional.of(sam.declaredParameterTypes == null ? 0 : sam.declaredParameterTypes.length);
         }
-        if (sam == null || sam.getParameters().size() != 1) {
+        var rawClass = loadExternalClass(functionalType.qualifiedType());
+        if (rawClass.isEmpty()) {
             return Optional.empty();
         }
-        return resolveTypeTree(sam.getParameters().get(0).getType(), info.get().sourceRoot, false);
+        return singleAbstractMethod(rawClass.get()).map(Method::getParameterCount);
+    }
+
+    private Optional<TypeResolution> resolveIndexedSamParameterType(TypeResolution functionalType) {
+        IndexedMember sam = null;
+        for (var member : index.workspace().members(functionalType.qualifiedType(), false)) {
+            if (member.kind != CompletionItemKind.Method || member.isStatic || member.isPrivate) {
+                continue;
+            }
+            if (!member.isAbstract) {
+                continue;
+            }
+            if (sam != null && !Objects.equals(sam.canonicalKey, member.canonicalKey)) {
+                return Optional.empty();
+            }
+            sam = member;
+        }
+        if (sam == null) {
+            return Optional.empty();
+        }
+        if (sam.declaredParameterTypes == null || sam.declaredParameterTypes.length != 1) {
+            return Optional.empty();
+        }
+        return resolveDeclaredTypeName(sam.declaredParameterTypes[0]);
     }
 
     // External reflective inference.
-    private Optional<TypeResolution> resolveExternalMethodReturnType(TypeResolution receiverType, WorkspaceTypeIndex.Member member) {
+    private Optional<TypeResolution> resolveExternalMethodReturnType(
+            TypeResolution receiverType, IndexedMember member) {
         if (receiverType == null
                 || member == null
                 || member.ownerType == null
@@ -1301,28 +1162,53 @@ public final class ParseTypeResolver {
         if (first.isBlank() || "?".equals(first)) {
             return Optional.empty();
         }
-        var resolved = typeLookup.resolveTypeName(first, root);
-        if (resolved.isEmpty()) {
-            resolved = resolveTypeNameInCurrentSource(first);
+        return resolveDeclaredTypeName(first).map(TypeResolution::qualifiedType);
+    }
+
+    private Optional<TypeResolution> resolveDeclaredTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return Optional.empty();
         }
-        return resolved;
+        var normalized = TypeNames.normalize(typeName);
+        if (normalized.isEmpty()) {
+            return Optional.empty();
+        }
+        var resolved = resolveTypeNameInSource(normalized, root).or(() -> index.resolveTypeName(normalized, root));
+        if (resolved.isEmpty()) {
+            return Optional.empty();
+        }
+        var array = normalized.endsWith("[]");
+        var qualified = resolved.get();
+        if (array && qualified.endsWith("[]")) {
+            qualified = qualified.substring(0, qualified.length() - 2);
+        }
+        return Optional.of(
+                new TypeResolution(
+                        qualified,
+                        false,
+                        array,
+                        firstTypeArgumentFromTypeName(typeName).orElse(null)));
     }
 
     private boolean isWorkspaceType(String qualifiedType) {
         return qualifiedType != null
                 && !qualifiedType.isBlank()
-                && index.isWorkspaceOwnedType(qualifiedType, compiler);
+                && index.isWorkspaceOwnedType(qualifiedType);
     }
 
     private boolean canUseExternalInference(String qualifiedType) {
         return qualifiedType != null && !qualifiedType.isBlank() && !isWorkspaceType(qualifiedType);
     }
 
-    // Source-backed workspace lookup and source-name fallback.
-    private Optional<String> resolveTypeNameInCurrentSource(String typeName) {
-        return resolveTypeNameInSource(typeName, root);
-    }
-
+    // Current-file type-name fallback.
+    /**
+     * Resolve a simple or nested type name from the current parse tree only.
+     *
+     * <p>This is intentionally narrower than the index. It exists for same-file declarations that
+     * are visible in the open parse tree before any additional workspace repair would be possible.
+     * If two nested classes in the same file share the same simple name in different scopes, this
+     * method returns empty rather than guessing.
+     */
     private Optional<String> resolveTypeNameInSource(String typeName, CompilationUnitTree sourceRoot) {
         if (typeName == null || typeName.isBlank()) {
             return Optional.empty();
@@ -1353,23 +1239,6 @@ public final class ParseTypeResolver {
             return Optional.empty();
         }
         return Optional.ofNullable(match[0]);
-    }
-
-    private Optional<SourceClassInfo> sourceClassInfo(String qualifiedType) {
-        if (qualifiedType == null || qualifiedType.isBlank()) {
-            return Optional.empty();
-        }
-        var current = declaredClassPathInRoot(root, qualifiedType);
-        if (current != null) {
-            return Optional.of(new SourceClassInfo(root, current));
-        }
-        var declaration = compiler.findTypeDeclaration(qualifiedType);
-        if (declaration == null || declaration.equals(CompilerProvider.NOT_FOUND)) {
-            return Optional.empty();
-        }
-        var parsed = compiler.parse(declaration);
-        var classPath = declaredClassPathInRoot(parsed.root(), qualifiedType);
-        return classPath == null ? Optional.empty() : Optional.of(new SourceClassInfo(parsed.root(), classPath));
     }
 
     private TreePath declaredClassPathInRoot(CompilationUnitTree sourceRoot, String qualifiedType) {
@@ -1571,16 +1440,13 @@ public final class ParseTypeResolver {
         return Optional.ofNullable(best.path);
     }
 
-    public Optional<WorkspaceTypeIndex.Member> resolveInheritedFieldMember(String identifier) {
+    public Optional<IndexedMember> resolveInheritedFieldMember(String identifier) {
         var owner = resolveThisType();
         if (owner.isEmpty()) {
             return Optional.empty();
         }
-        var member = resolveIndexedMember(owner.get().qualifiedType(), identifier, false, null);
-        if (member.isEmpty() || member.get().kind != CompletionItemKind.Field) {
-            return Optional.empty();
-        }
-        return member;
+        return resolveIndexedMember(owner.get().qualifiedType(), identifier, false, null)
+                .filter(member -> member.kind == CompletionItemKind.Field);
     }
 
     public Optional<TypeResolution> resolveTypeTree(Tree tree, boolean staticContext) {

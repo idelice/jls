@@ -17,7 +17,7 @@ public class LanguageServerFixture {
     }
 
     public static CompilerProvider getCompilerProvider() {
-        return getJavaLanguageServer().compiler();
+        return getJavaLanguageServer().getOrCreateCompiler();
     }
 
     static JavaLanguageServer getJavaLanguageServer() {

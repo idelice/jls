@@ -11,10 +11,16 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.logging.LogRecord;
 import org.javacs.completion.TypeIndexRouter;
 import org.javacs.completion.ExternalBinaryTypeIndex;
 import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.index.IndexedMember;
 import org.javacs.navigation.DefinitionProvider;
 import org.javacs.lsp.Location;
 import org.junit.Test;
@@ -238,6 +244,53 @@ public class DefinitionProviderFlowTest {
     }
 
     @Test
+    public void workspaceOwnershipComesFromSnapshotForNestedWorkspaceCandidates() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-owned-types");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            Files.createDirectories(modelDir);
+
+            Files.writeString(
+                    modelDir.resolve("DeepGraph.java"),
+                    "package com.example.demo.model;\n"
+                            + "public class DeepGraph {\n"
+                            + "  public static class DeepNode {}\n"
+                            + "}\n");
+
+            var context = navigationContext(workspace);
+            assertEquals(
+                    true,
+                    context.index().isWorkspaceOwnedType(
+                            "com.example.demo.model.DeepGraph.DeepNode"));
+            assertEquals(
+                    true,
+                    context.index().isWorkspaceOwnedType(
+                            "com.example.demo.model.DeepGraph.DeepNode.Leaf"));
+            assertEquals(false, context.index().isWorkspaceOwnedType("java.util.List"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void indexedMemberProvenanceIsExplicitAcrossWorkspaceAndExternalStores() throws Exception {
+        var context = navigationContext();
+
+        var workspaceMember =
+                context.index()
+                        .member("org.javacs.example.GotoSwitchCaseEnum.MyEnum", "FOO", true)
+                        .orElseThrow(() -> new AssertionError("Expected workspace enum constant"));
+        assertEquals(IndexedMember.Provenance.WORKSPACE, workspaceMember.provenance);
+
+        var externalMember =
+                context.index()
+                        .external()
+                        .member("java.lang.System", "out", true)
+                        .orElseThrow(() -> new AssertionError("Expected external JDK field"));
+        assertEquals(IndexedMember.Provenance.EXTERNAL_BINARY, externalMember.provenance);
+    }
+
+    @Test
     public void resolvesMethodParameterInLocalScope() throws Exception {
         var workspace = Files.createTempDirectory("jls-definition-method-parameter");
         try {
@@ -378,6 +431,10 @@ public class DefinitionProviderFlowTest {
                             "Optional<".length()),
                     hasItem("NestedDefinitionExample.java:5"));
             var context = navigationContext(workspace);
+            var parse = context.compiler.parse(file);
+            assertEquals(
+                    Optional.of("com.example.demo.NestedDefinitionExample.ResolvedSymbol"),
+                    context.index.resolveTypeName("ResolvedSymbol", parse.root()));
             var cursor = cursor(file, ".locations()", 1);
             var resolved =
                     new DefinitionProvider(
@@ -394,6 +451,139 @@ public class DefinitionProviderFlowTest {
                     gotoDefinition(navigationContext(workspace), file, ".locations()", 1),
                     hasItem("NestedDefinitionExample.java:5"));
         } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesDefinitionsInsideStreamLambdasAndMethodReferences() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-stream-targets");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "import java.util.stream.Stream;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getFamily() { return \"family\"; }\n"
+                            + "  public boolean isFlagged() { return true; }\n"
+                            + "  public Stream<String> tagsStream() { return Stream.of(); }\n"
+                            + "}\n");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.model;\n"
+                            + "import java.util.List;\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  public List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import com.example.demo.model.OrderEnvelope;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "class ComplexScenarioService {\n"
+                            + "  void test(OrderEnvelope envelope) {\n"
+                            + "    envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());\n"
+                            + "    envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());\n"
+                            + "    envelope.getItems().stream().flatMap(LineItem::tagsStream).collect(Collectors.toList());\n"
+                            + "    envelope.getItems().stream().filter(item -> item.isFlagged()).collect(Collectors.toList());\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var context = navigationContext(workspace);
+            assertThat(
+                    gotoDefinition(context, service, "LineItem::getFamily", "LineItem::".length()),
+                    hasItem("LineItem.java:4"));
+            assertThat(
+                    gotoDefinition(context, service, "item -> item.getFamily()", "item -> item.".length()),
+                    hasItem("LineItem.java:4"));
+            assertThat(
+                    gotoDefinition(context, service, "LineItem::tagsStream", "LineItem::".length()),
+                    hasItem("LineItem.java:6"));
+            assertThat(
+                    gotoDefinition(context, service, "item -> item.isFlagged()", "item -> item.".length()),
+                    hasItem("LineItem.java:5"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void streamDefinitionFailsClosedForAmbiguousOrUnsupportedTargets() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-stream-fail-closed");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            Files.writeString(
+                    modelDir.resolve("LineItem.java"),
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getFamily() { return \"family\"; }\n"
+                            + "}\n");
+            var formatter = modelDir.resolve("Formatter.java");
+            Files.writeString(
+                    formatter,
+                    "package com.example.demo.model;\n"
+                            + "public class Formatter {\n"
+                            + "  public String label(com.example.demo.model.LineItem item) { return item.getFamily(); }\n"
+                            + "  public String label(String value) { return value; }\n"
+                            + "}\n");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.model;\n"
+                            + "import java.util.List;\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  public List<LineItem> getItems() { return List.of(); }\n"
+                            + "  @SuppressWarnings({\"rawtypes\", \"unchecked\"})\n"
+                            + "  public List rawItems() { return List.of(); }\n"
+                            + "}\n");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.Formatter;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import com.example.demo.model.OrderEnvelope;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "class ComplexScenarioService {\n"
+                            + "  private final Formatter formatter = new Formatter();\n"
+                            + "  void test(OrderEnvelope envelope) {\n"
+                            + "    envelope.getItems().stream().map(formatter::label).collect(Collectors.toList());\n"
+                            + "    envelope.rawItems().stream().map(item -> item.toString()).collect(Collectors.toList());\n"
+                            + "    envelope.getItems().stream().collect(Collectors.mapping(LineItem::getFamily, Collectors.toList()));\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var context = navigationContext(workspace);
+            assertEquals(
+                    List.of(),
+                    gotoDefinition(context, service, "formatter::label", "formatter::".length()));
+            assertEquals(
+                    List.of(),
+                    gotoDefinition(context, service, "item -> item.toString()", "item -> item.".length()));
+            assertEquals(
+                    List.of(),
+                    gotoDefinition(context, service, "LineItem::getFamily, Collectors", "LineItem::".length()));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -476,6 +666,33 @@ public class DefinitionProviderFlowTest {
     private record Cursor(int line, int character) {}
 
     private record NavigationContext(JavaCompilerService compiler, TypeIndexRouter index) {}
+
+    private static class TestLogCapture extends Handler {
+        private final List<String> lines = new ArrayList<>();
+
+        @Override
+        public void publish(LogRecord record) {
+            if (record != null && record.getMessage() != null) {
+                lines.add(record.getMessage());
+            }
+        }
+
+        @Override
+        public void flush() {}
+
+        @Override
+        public void close() {}
+
+        int countContaining(String needle) {
+            var count = 0;
+            for (var line : lines) {
+                if (line.contains(needle)) {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
 
     private static void deleteRecursively(Path root) throws IOException {
         if (root == null || !Files.exists(root)) {

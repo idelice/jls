@@ -74,6 +74,7 @@ import org.javacs.JsonHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
+import org.javacs.index.IndexedMember;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
@@ -348,7 +349,7 @@ public class CompletionProvider {
 
         var buildStarted = Instant.now();
         var list = new ArrayList<CompletionItem>();
-        var methods = new TreeMap<String, List<WorkspaceTypeIndex.Member>>();
+        var methods = new TreeMap<String, List<IndexedMember>>();
         var methodPriority = new HashMap<String, Integer>();
         for (var member : members) {
             if (!isIndexMemberVisible(member, target.qualifiedType(), currentType)) continue;
@@ -395,7 +396,7 @@ public class CompletionProvider {
     }
 
     private boolean isIndexMemberVisible(
-            WorkspaceTypeIndex.Member member, String targetType, Optional<String> currentEnclosingType) {
+            IndexedMember member, String targetType, Optional<String> currentEnclosingType) {
         if (!member.isPrivate) {
             return true;
         }
@@ -421,10 +422,10 @@ public class CompletionProvider {
         if (typeName == null || typeName.isBlank()) {
             return false;
         }
-        return typeName.contains(".") || WorkspaceTypeIndex.isPrimitiveTypeName(typeName);
+        return typeName.contains(".") || TypeNames.isPrimitive(typeName);
     }
 
-    private int indexMemberPriority(WorkspaceTypeIndex.Member member) {
+    private int indexMemberPriority(IndexedMember member) {
         if (member.kind == CompletionItemKind.Method) {
             if (isUtilityMethodName(member.name)) return 90; // always sink utility methods
             if (member.priority == 2) return 80; // java.lang.Object methods near end
@@ -446,7 +447,7 @@ public class CompletionProvider {
         return Priority.PACKAGE_MEMBER;
     }
 
-    private CompletionItem indexedMember(WorkspaceTypeIndex.Member member) {
+    private CompletionItem indexedMember(IndexedMember member) {
         var item = new CompletionItem();
         item.label = member.name;
         item.kind = member.kind;
@@ -460,7 +461,7 @@ public class CompletionProvider {
         return item;
     }
 
-    private CompletionItem indexedMethod(List<WorkspaceTypeIndex.Member> overloads, boolean addParens) {
+    private CompletionItem indexedMethod(List<IndexedMember> overloads, boolean addParens) {
         var first = overloads.get(0);
         var item = new CompletionItem();
         item.label = first.name;
@@ -808,7 +809,7 @@ public class CompletionProvider {
                 seen.add(item.label);
             }
         }
-        var methods = new TreeMap<String, List<WorkspaceTypeIndex.Member>>();
+        var methods = new TreeMap<String, List<IndexedMember>>();
         var methodPriority = new HashMap<String, Integer>();
         var blockedByStaticContext = false;
         for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
@@ -899,7 +900,7 @@ public class CompletionProvider {
         return null;
     }
 
-    private boolean isEnumCaseConstant(WorkspaceTypeIndex.Member member, String enumType) {
+    private boolean isEnumCaseConstant(IndexedMember member, String enumType) {
         if (member.kind == CompletionItemKind.EnumMember) {
             return true;
         }
@@ -1158,7 +1159,7 @@ public class CompletionProvider {
         if (completionIndex == null || root == null) {
             return;
         }
-        var methods = new TreeMap<String, List<WorkspaceTypeIndex.Member>>();
+        var methods = new TreeMap<String, List<IndexedMember>>();
         var methodPriority = new HashMap<String, Integer>();
         var seen = new HashSet<String>();
         for (var item : list.items) {
@@ -1639,7 +1640,7 @@ public class CompletionProvider {
             String partial,
             boolean blockedByStaticContext,
             Set<String> seen,
-            Map<String, List<WorkspaceTypeIndex.Member>> methods,
+            Map<String, List<IndexedMember>> methods,
             Map<String, Integer> methodPriority,
             CompletionList list) {
         addIndexedEnclosingMembersForStaticContext(
@@ -1655,7 +1656,7 @@ public class CompletionProvider {
             String partial,
             boolean staticContext,
             Set<String> seen,
-            Map<String, List<WorkspaceTypeIndex.Member>> methods,
+            Map<String, List<IndexedMember>> methods,
             Map<String, Integer> methodPriority,
             CompletionList list) {
         for (var member : completionIndex.members(qualifiedType, staticContext)) {
@@ -2035,8 +2036,8 @@ public class CompletionProvider {
                         .thenComparingInt(item -> item.kind));
     }
 
-    private List<WorkspaceTypeIndex.Member> mergeMemberContexts(TypeIndexRouter index, String qualifiedType) {
-        var merged = new ArrayList<WorkspaceTypeIndex.Member>();
+    private List<IndexedMember> mergeMemberContexts(TypeIndexRouter index, String qualifiedType) {
+        var merged = new ArrayList<IndexedMember>();
         merged.addAll(index.members(qualifiedType, true));
         merged.addAll(index.members(qualifiedType, false));
         return merged;

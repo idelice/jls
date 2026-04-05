@@ -14,8 +14,9 @@ import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.ParseTask;
 import org.javacs.completion.TypeIndexRouter;
-import org.javacs.completion.WorkspaceTypeIndex;
 import org.javacs.lsp.Location;
+import org.javacs.resolve.ParseTypeResolver;
+import org.javacs.resolve.TypeNames;
 
 /**
  * Find references by resolving the target symbol once through {@link DefinitionProvider} and then
@@ -23,7 +24,7 @@ import org.javacs.lsp.Location;
  */
 public class ReferenceProvider {
     private final CompilerProvider compiler;
-    private final TypeIndexRouter completionIndex;
+    private final TypeIndexRouter typeIndexRouter;
     private final Path file;
     private final int line, column;
     private final boolean includeDeclaration;
@@ -34,19 +35,19 @@ public class ReferenceProvider {
         this(compiler, TypeIndexRouter.EMPTY, file, line, column, false);
     }
 
-    public ReferenceProvider(CompilerProvider compiler, TypeIndexRouter completionIndex, Path file, int line, int column) {
-        this(compiler, completionIndex, file, line, column, false);
+    public ReferenceProvider(CompilerProvider compiler, TypeIndexRouter typeIndexRouter, Path file, int line, int column) {
+        this(compiler, typeIndexRouter, file, line, column, false);
     }
 
     public ReferenceProvider(
             CompilerProvider compiler,
-            TypeIndexRouter completionIndex,
+            TypeIndexRouter typeIndexRouter,
             Path file,
             int line,
             int column,
             boolean includeDeclaration) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? TypeIndexRouter.EMPTY : completionIndex;
+        this.typeIndexRouter = typeIndexRouter == null ? TypeIndexRouter.EMPTY : typeIndexRouter;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -54,7 +55,7 @@ public class ReferenceProvider {
     }
 
     public List<Location> find() {
-        var definitions = new DefinitionProvider(compiler, completionIndex, file, line, column);
+        var definitions = new DefinitionProvider(compiler, typeIndexRouter, file, line, column);
         var target = definitions.resolveSymbol();
         if (!isSupported(target)) {
             return NOT_SUPPORTED;
@@ -72,7 +73,7 @@ public class ReferenceProvider {
         return findMemberReferences(
                 definitions,
                 target,
-                NavigationSymbolSupport.targetParameterTypes(compiler, completionIndex, target));
+                NavigationSymbolSupport.targetParameterTypes(compiler, typeIndexRouter, target));
     }
 
     private boolean isSupported(DefinitionProvider.ResolvedSymbol target) {
@@ -154,7 +155,7 @@ public class ReferenceProvider {
 
                 @Override
                 public Void visitNewClass(NewClassTree tree, Void unused) {
-                    maybeAdd(parse, getCurrentPath(), NavigationSymbolSupport.simpleTreeName(tree.getIdentifier().toString()));
+                    maybeAdd(parse, getCurrentPath(), TypeNames.simpleName(tree.getIdentifier().toString()));
                     return super.visitNewClass(tree, unused);
                 }
 
@@ -199,25 +200,25 @@ public class ReferenceProvider {
                 && isConstructorUse(path)
                 && signatureMatches(
                         targetParameterTypes,
-                        NavigationSymbolSupport.occurrenceParameterTypes(parse, path, completionIndex, compiler))) {
+                        NavigationSymbolSupport.occurrenceParameterTypes(parse, path, typeIndexRouter, compiler))) {
             return true;
         }
         var resolvedKey =
                 NavigationSymbolSupport.methodCanonicalKey(
-                        resolved, parse, path, completionIndex, compiler);
+                        resolved, parse, path, typeIndexRouter, compiler);
         if (!resolved.method()) {
             return false;
         }
         if (resolvedKey != null && relatedMethodKeys.contains(resolvedKey)) {
             return signatureMatches(
                     targetParameterTypes,
-                    NavigationSymbolSupport.occurrenceParameterTypes(parse, path, completionIndex, compiler));
+                    NavigationSymbolSupport.occurrenceParameterTypes(parse, path, typeIndexRouter, compiler));
         }
         return methodOwnerMatches(target.qualifiedType(), resolved.qualifiedType())
                 && Objects.equals(target.memberName(), resolved.memberName())
                 && signatureMatches(
                         targetParameterTypes,
-                        NavigationSymbolSupport.occurrenceParameterTypes(parse, path, completionIndex, compiler));
+                        NavigationSymbolSupport.occurrenceParameterTypes(parse, path, typeIndexRouter, compiler));
     }
 
     private boolean methodOwnerMatches(String targetOwner, String resolvedOwner) {
@@ -227,10 +228,10 @@ public class ReferenceProvider {
         if (targetOwner == null || resolvedOwner == null) {
             return false;
         }
-        return completionIndex.directSupertypes(resolvedOwner).contains(targetOwner)
-                || completionIndex.directSupertypes(targetOwner).contains(resolvedOwner)
-                || completionIndex.subtypes(targetOwner).contains(resolvedOwner)
-                || completionIndex.subtypes(resolvedOwner).contains(targetOwner);
+        return typeIndexRouter.directSupertypes(resolvedOwner).contains(targetOwner)
+                || typeIndexRouter.directSupertypes(targetOwner).contains(resolvedOwner)
+                || typeIndexRouter.subtypes(targetOwner).contains(resolvedOwner)
+                || typeIndexRouter.subtypes(resolvedOwner).contains(targetOwner);
     }
 
     private boolean matchesFieldReference(
@@ -254,7 +255,8 @@ public class ReferenceProvider {
         if (cursor < 0) {
             cursor = parse.root().getLineMap().getPosition(1, 1);
         }
-        return definitions.resolve(parse, path, cursor + 1);
+        return definitions.resolve(
+                parse, path, new ParseTypeResolver(parse, compiler, typeIndexRouter, cursor + 1));
     }
 
     private boolean isDeclarationLocation(Location location, DefinitionProvider.ResolvedSymbol target) {
@@ -309,22 +311,22 @@ public class ReferenceProvider {
             String[] erasedParameterTypes = target.indexMember().erasedParameterTypes == null
                     ? new String[0]
                     : target.indexMember().erasedParameterTypes;
-            if (completionIndex.isWorkspaceOwnedType(target.indexMember().ownerType, compiler)) {
-                return completionIndex.workspace().relatedMethodKeys(
+            if (typeIndexRouter.isWorkspaceOwnedType(target.indexMember().ownerType)) {
+                return typeIndexRouter.workspace().relatedMethodKeys(
                         target.indexMember().ownerType,
                         target.indexMember().name,
                         erasedParameterTypes);
             }
-            return completionIndex.relatedMethodKeys(
+            return typeIndexRouter.relatedMethodKeys(
                     target.indexMember().ownerType,
                     target.indexMember().name,
                     erasedParameterTypes);
         }
-        if (completionIndex.isWorkspaceOwnedType(target.qualifiedType(), compiler)) {
-            return completionIndex.workspace().relatedMethodKeys(
+        if (typeIndexRouter.isWorkspaceOwnedType(target.qualifiedType())) {
+            return typeIndexRouter.workspace().relatedMethodKeys(
                     target.qualifiedType(), target.memberName(), targetParameterTypes.toArray(String[]::new));
         }
-        return completionIndex.relatedMethodKeys(
+        return typeIndexRouter.relatedMethodKeys(
                 target.qualifiedType(), target.memberName(), targetParameterTypes.toArray(String[]::new));
     }
 
@@ -334,7 +336,7 @@ public class ReferenceProvider {
             names.add(target.memberName());
             names.addAll(NavigationSymbolSupport.accessorNames(target.memberName()));
         }
-        completionIndex.typeInfo(target.qualifiedType())
+        typeIndexRouter.typeInfo(target.qualifiedType())
                 .ifPresent(
                         info ->
                                 info.members.stream()

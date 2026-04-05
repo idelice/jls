@@ -160,39 +160,6 @@ public final class LombokAnnotations {
                         setterEnabled ? "set" + suffix : null));
     }
 
-    /**
-     * Best-effort accessor-to-field mapping used when compiled metadata does not retain a Lombok
-     * field link.
-     */
-    public static Optional<String> backingFieldNameForAccessor(String accessorName, int parameterCount) {
-        if (accessorName == null || accessorName.isBlank()) {
-            return Optional.empty();
-        }
-        if (parameterCount == 0) {
-            if (accessorName.startsWith("get") && accessorName.length() > 3) {
-                return Optional.of(decapitalizeAccessorSuffix(accessorName.substring(3)));
-            }
-            if (accessorName.startsWith("is") && accessorName.length() > 2) {
-                return Optional.of(decapitalizeAccessorSuffix(accessorName.substring(2)));
-            }
-            return Optional.empty();
-        }
-        if (parameterCount == 1 && accessorName.startsWith("set") && accessorName.length() > 3) {
-            return Optional.of(decapitalizeAccessorSuffix(accessorName.substring(3)));
-        }
-        return Optional.empty();
-    }
-
-    private static String decapitalizeAccessorSuffix(String suffix) {
-        if (suffix == null || suffix.isEmpty()) {
-            return "";
-        }
-        if (suffix.length() > 1 && Character.isUpperCase(suffix.charAt(0)) && Character.isUpperCase(suffix.charAt(1))) {
-            return suffix;
-        }
-        return Character.toLowerCase(suffix.charAt(0)) + suffix.substring(1);
-    }
-
     public record AccessorInfo(String fieldName, String fieldType, String getterName, String setterName) {
         public boolean hasGetter() {
             return getterName != null && !getterName.isBlank();

@@ -5,8 +5,9 @@ import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import org.javacs.index.IndexedMember;
+import org.javacs.index.IndexedType;
 import java.util.Set;
-import org.javacs.CompilerProvider;
 
 /**
  * Read-only view over the published completion/navigation indexes.
@@ -25,52 +26,29 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         this.external = external == null ? ExternalBinaryTypeIndex.EMPTY : external;
     }
 
-    public List<WorkspaceTypeIndex.Member> members(String qualifiedName, boolean staticContext) {
+    public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
         var workspaceMembers = workspace.members(qualifiedName, staticContext);
-        if (!workspaceMembers.isEmpty()) {
+        if (!workspaceMembers.isEmpty() || isWorkspaceOwnedType(qualifiedName)) {
             return workspaceMembers;
         }
         return external.members(qualifiedName, staticContext);
     }
 
-    public Optional<WorkspaceTypeIndex.Member> member(String qualifiedName, String name, boolean staticContext) {
+    public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext) {
         var workspaceMember = workspace.member(qualifiedName, name, staticContext);
-        if (workspaceMember.isPresent()) {
+        if (workspaceMember.isPresent() || isWorkspaceOwnedType(qualifiedName)) {
             return workspaceMember;
         }
         return external.member(qualifiedName, name, staticContext);
     }
 
-    public Optional<WorkspaceTypeIndex.Member> ownerMember(
-            String qualifiedName,
-            String name,
-            boolean staticContext,
-            CompilerProvider compiler) {
-        if (isWorkspaceOwnedType(qualifiedName, compiler)) {
-            return workspace.member(qualifiedName, name, staticContext);
-        }
-        return member(qualifiedName, name, staticContext);
-    }
-
-    public Optional<WorkspaceTypeIndex.Member> member(
+    public Optional<IndexedMember> member(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var workspaceMember = workspace.member(qualifiedName, name, staticContext, erasedParameterTypes);
-        if (workspaceMember.isPresent()) {
+        if (workspaceMember.isPresent() || isWorkspaceOwnedType(qualifiedName)) {
             return workspaceMember;
         }
         return external.member(qualifiedName, name, staticContext, erasedParameterTypes);
-    }
-
-    public Optional<WorkspaceTypeIndex.Member> ownerMember(
-            String qualifiedName,
-            String name,
-            boolean staticContext,
-            String[] erasedParameterTypes,
-            CompilerProvider compiler) {
-        if (isWorkspaceOwnedType(qualifiedName, compiler)) {
-            return workspace.member(qualifiedName, name, staticContext, erasedParameterTypes);
-        }
-        return member(qualifiedName, name, staticContext, erasedParameterTypes);
     }
 
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
@@ -92,27 +70,13 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
      * <p>Interactive callers that already know the owner type should use this to stay on
      * {@link #workspace()} and avoid leaking workspace-owned symbols into dependency fallback.
      */
-    public boolean isWorkspaceOwnedType(String qualifiedName, CompilerProvider compiler) {
-        if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
-            return false;
-        }
-        if (workspace.containsType(qualifiedName)
-                || compiler.findTypeDeclaration(qualifiedName) != CompilerProvider.NOT_FOUND) {
-            return true;
-        }
-        for (var i = qualifiedName.lastIndexOf('.'); i > 0; i = qualifiedName.lastIndexOf('.', i - 1)) {
-            var outer = qualifiedName.substring(0, i);
-            if (workspace.containsType(outer)
-                    || compiler.findTypeDeclaration(outer) != CompilerProvider.NOT_FOUND) {
-                return true;
-            }
-        }
-        return false;
+    public boolean isWorkspaceOwnedType(String qualifiedName) {
+        return workspace.ownsTypeOrEnclosingType(qualifiedName);
     }
 
-    public Optional<WorkspaceTypeIndex.TypeInfo> typeInfo(String qualifiedName) {
+    public Optional<IndexedType> typeInfo(String qualifiedName) {
         var workspaceType = workspace.typeInfo(qualifiedName);
-        if (workspaceType.isPresent()) {
+        if (workspaceType.isPresent() || isWorkspaceOwnedType(qualifiedName)) {
             return workspaceType;
         }
         return external.typeInfo(qualifiedName);
@@ -127,7 +91,9 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         if (!workspaceSupertypes.isEmpty()) {
             return workspaceSupertypes;
         }
-        return typeInfo(qualifiedName).map(WorkspaceTypeIndex::directSupertypes).orElse(Set.of());
+        return typeInfo(qualifiedName)
+                .map(type -> type.directSupertypes.isEmpty() ? Set.<String>of() : Set.copyOf(type.directSupertypes))
+                .orElse(Set.of());
     }
 
     public Set<String> relatedMethodKeys(String ownerType, String memberName, String[] erasedParameterTypes) {

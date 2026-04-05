@@ -24,7 +24,6 @@ import org.javacs.FindNameAt;
 import org.javacs.JsonHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
-import org.javacs.ExternalTypeLookup;
 import org.javacs.completion.TypeIndexRouter;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.Location;
@@ -37,7 +36,6 @@ public class HoverProvider {
 
     final CompilerProvider compiler;
     final TypeIndexRouter completionIndex;
-    final ExternalTypeLookup typeLookup;
 
     public HoverProvider(CompilerProvider compiler) {
         this(compiler, TypeIndexRouter.EMPTY);
@@ -46,7 +44,6 @@ public class HoverProvider {
     public HoverProvider(CompilerProvider compiler, TypeIndexRouter completionIndex) {
         this.compiler = compiler;
         this.completionIndex = completionIndex == null ? TypeIndexRouter.EMPTY : completionIndex;
-        this.typeLookup = new ExternalTypeLookup(compiler, this.completionIndex);
     }
 
     public MarkupContent hover(Path file, int line, int column) {
@@ -310,7 +307,7 @@ public class HoverProvider {
     }
 
     private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
-        return typeLookup.resolveTypeName(typeName, parse.root());
+        return completionIndex.resolveTypeName(typeName, parse.root());
     }
 
     private String joinModifiers(List<String> modifiers) {

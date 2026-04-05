@@ -20,17 +20,18 @@ import org.javacs.FileStore;
 import org.javacs.FindNameAt;
 import org.javacs.ParseTask;
 import org.javacs.completion.TypeIndexRouter;
-import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.index.IndexedMember;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.ParseTypeResolver;
 import org.javacs.resolve.TypeNames;
 
 /**
- * Shared symbol-key and signature helpers for navigation providers.
+ * Shared parse/signature/key helpers for navigation providers.
  *
- * <p>Reference and definition need the same canonical type names, accessor aliases, and
- * parse-based parameter extraction, but symbol resolution itself still belongs to
- * {@link DefinitionProvider}.
+ * <p>This class intentionally keeps only logic that is genuinely shared between reference and
+ * definition: parse-based parameter extraction, canonical/logical navigation keys, and accessor
+ * aliases. Plain type-name formatting belongs to {@link TypeNames} and is called directly at
+ * usage sites.
  */
 final class NavigationSymbolSupport {
     private NavigationSymbolSupport() {}
@@ -95,7 +96,10 @@ final class NavigationSymbolSupport {
                 return List.of();
             }
             var resolved = resolver.resolveTypeTree(parameter.getType(), false);
-            result.add(canonicalType(resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse(parameter.getType().toString())));
+            result.add(
+                    TypeNames.canonicalBoxed(
+                            resolved.map(ParseTypeResolver.TypeResolution::qualifiedType)
+                                    .orElse(parameter.getType().toString())));
         }
         return result;
     }
@@ -104,7 +108,9 @@ final class NavigationSymbolSupport {
         var result = new ArrayList<String>(arguments.size());
         for (var argument : arguments) {
             var resolved = resolver.resolveExpression(argument);
-            result.add(canonicalType(resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse("")));
+            result.add(
+                    TypeNames.canonicalBoxed(
+                            resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse("")));
         }
         return result;
     }
@@ -113,7 +119,7 @@ final class NavigationSymbolSupport {
             DefinitionProvider.ResolvedSymbol resolved,
             ParseTask parse,
             TreePath path,
-            TypeIndexRouter completionIndex,
+            TypeIndexRouter typeIndexRouter,
             CompilerProvider compiler) {
         if (resolved.indexMember() != null && resolved.indexMember().canonicalKey != null) {
             return resolved.indexMember().canonicalKey;
@@ -123,13 +129,13 @@ final class NavigationSymbolSupport {
         }
         List<String> parameterTypes;
         if (path.getLeaf() instanceof MethodTree method) {
-            parameterTypes = declaredParameterTypes(parse, path, method, completionIndex, compiler);
+            parameterTypes = declaredParameterTypes(parse, path, method, typeIndexRouter, compiler);
         } else if (path.getParentPath() != null && path.getParentPath().getLeaf() instanceof MethodTree method) {
-            parameterTypes = declaredParameterTypes(parse, path.getParentPath(), method, completionIndex, compiler);
+            parameterTypes = declaredParameterTypes(parse, path.getParentPath(), method, typeIndexRouter, compiler);
         } else {
-            parameterTypes = occurrenceParameterTypes(parse, path, completionIndex, compiler);
+            parameterTypes = occurrenceParameterTypes(parse, path, typeIndexRouter, compiler);
         }
-        return WorkspaceTypeIndex.canonicalMemberKey(
+        return IndexedMember.canonicalKey(
                 resolved.qualifiedType(),
                 CompletionItemKind.Method,
                 resolved.memberName(),
@@ -147,7 +153,7 @@ final class NavigationSymbolSupport {
         }
         if (!symbol.method()) {
             return Optional.of(
-                    WorkspaceTypeIndex.canonicalMemberKey(
+                    IndexedMember.canonicalKey(
                             symbol.qualifiedType(), CompletionItemKind.Field, symbol.memberName(), null));
         }
         return Optional.empty();
@@ -158,7 +164,7 @@ final class NavigationSymbolSupport {
             return symbol.indexMember().logicalKey;
         }
         if (!symbol.method() && symbol.qualifiedType() != null && symbol.memberName() != null) {
-            return WorkspaceTypeIndex.canonicalMemberKey(
+            return IndexedMember.canonicalKey(
                     symbol.qualifiedType(), CompletionItemKind.Field, symbol.memberName(), null);
         }
         return null;
@@ -176,22 +182,6 @@ final class NavigationSymbolSupport {
         return names;
     }
 
-    static String simpleTreeName(String raw) {
-        return TypeNames.simpleName(raw);
-    }
-
-    static String canonicalType(String typeName) {
-        return TypeNames.canonicalBoxed(typeName);
-    }
-
-    static String simpleTypeName(String typeName) {
-        return TypeNames.simpleName(typeName);
-    }
-
-    static boolean hasResolvedTypes(List<String> types) {
-        return !types.isEmpty() && types.stream().noneMatch(String::isBlank);
-    }
-
     private static List<String> argumentTypes(
             ParseTask parse,
             TreePath path,
@@ -202,7 +192,9 @@ final class NavigationSymbolSupport {
         var result = new ArrayList<String>(arguments.size());
         for (var argument : arguments) {
             var resolved = resolver.resolveExpression(argument);
-            result.add(canonicalType(resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse("")));
+            result.add(
+                    TypeNames.canonicalBoxed(
+                            resolved.map(ParseTypeResolver.TypeResolution::qualifiedType).orElse("")));
         }
         return result;
     }

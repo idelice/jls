@@ -453,11 +453,6 @@ class JavaCompilerService implements CompilerProvider {
         return new SourceFileObject(sourceFile.path, contents, modified, sourceFile.contentVersion());
     }
 
-    private Collection<? extends JavaFileObject> expandSourcesForLombokAP(
-            Collection<? extends JavaFileObject> sources, boolean allowAP) {
-        return expandSourcesForLombokAPDetails(sources, allowAP).sources();
-    }
-
     private ExpandedSources expandSourcesForLombokAPDetails(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
         if (!allowAP || !lombokPresentOnClasspath) {
@@ -834,13 +829,9 @@ class JavaCompilerService implements CompilerProvider {
 
     private boolean hasLombokAnnotation(Path file) {
         if (cacheHasLombokAnnotation.needs(file, null)) {
-            cacheHasLombokAnnotation.load(file, null, quickMaybeUsesLombok(file));
+            cacheHasLombokAnnotation.load(file, null,LombokAnnotations.sourceMayRequireLombokExpansion(file, LOMBOK_SCAN_LINE_LIMIT));
         }
         return cacheHasLombokAnnotation.get(file, null);
-    }
-
-    private boolean quickMaybeUsesLombok(Path file) {
-        return LombokAnnotations.sourceMayRequireLombokExpansion(file, LOMBOK_SCAN_LINE_LIMIT);
     }
 
     private final Cache<Void, List<String>> cacheFileImports = new Cache<>("helper.file_imports");

@@ -13,6 +13,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -31,11 +33,11 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
-import org.javacs.ExternalTypeLookup;
 import org.javacs.completion.TypeIndexRouter;
 import org.javacs.completion.ExternalBinaryTypeIndex;
 import org.javacs.completion.WorkspaceTypeIndex;
-import org.javacs.navigation.DefinitionProvider;
+import org.javacs.index.IndexedMember;
+import org.javacs.index.IndexedType;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
@@ -48,6 +50,7 @@ import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
 import org.javacs.lsp.LanguageClient;
+import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
@@ -259,6 +262,58 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didOpenBootstrapPublishesSourceSnapshotsAndDeclarationRanges() throws Exception {
+        FileStore.reset();
+        var workspace = Files.createTempDirectory("jls-index-source-snapshot");
+        try {
+            var pkg = workspace.resolve("src/com/example");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("SnapshotExample.java");
+            Files.writeString(
+                    file,
+                    "package com.example;\n"
+                            + "import java.util.List;\n"
+                            + "import static java.util.Collections.emptyList;\n"
+                            + "class SnapshotExample {\n"
+                            + "  static class Nested {\n"
+                            + "    static final String VALUE = \"x\";\n"
+                            + "    List<String> values() { return emptyList(); }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, file);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before snapshot assertion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var index = workspaceIndex(server);
+            var source = index.sourceFile(file);
+            Assert.assertTrue("expected indexed source snapshot", source.isPresent());
+            Assert.assertEquals(List.of("java.util.List"), source.get().imports);
+            Assert.assertEquals(List.of("java.util.Collections.emptyList"), source.get().staticImports);
+            Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample"));
+            Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample.Nested"));
+
+            var nestedType = index.typeInfo("com.example.SnapshotExample.Nested");
+            Assert.assertTrue("expected nested type in workspace snapshot", nestedType.isPresent());
+            Assert.assertTrue("expected nested type declaration range", nestedType.get().declarationLocation().isPresent());
+
+            var field = index.member("com.example.SnapshotExample.Nested", "VALUE", true);
+            Assert.assertTrue("expected nested field in workspace snapshot", field.isPresent());
+            Assert.assertTrue("expected nested field declaration range", field.get().declarationLocation().isPresent());
+
+            var method = index.member("com.example.SnapshotExample.Nested", "values", false, new String[0]);
+            Assert.assertTrue("expected nested method in workspace snapshot", method.isPresent());
+            Assert.assertTrue("expected nested method declaration range", method.get().declarationLocation().isPresent());
+            Assert.assertEquals("java.util.List<java.lang.String>", method.get().declaredReturnType);
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void didOpenSchedulesWorkspaceCompletionBootstrapInsteadOfSharedDiagnosticsIndex() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
@@ -357,7 +412,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compilerRecreationKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
+    public void getOrCreateCompilerRecreationKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
         FileStore.reset();
         var server = LanguageServerFixture.getJavaLanguageServer();
         var beforeVersion = completionIndexVersion(server);
@@ -375,7 +430,7 @@ public class JavaLanguageServerTest {
         change.settings = settings;
         server.didChangeConfiguration(change);
 
-        server.compiler();
+        server.getOrCreateCompiler();
 
         var refreshedExternal = externalBinaryIndex(server);
         Assert.assertNotSame("compiler recreation should refresh the external binary index", initialExternal, refreshedExternal);
@@ -2529,6 +2584,152 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void hasDeclarationDriftCoversStructuralCompareBranches() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        openAndBootstrap(server, file);
+
+        var indexed = indexedTypeForFile(server, file);
+        var matchingShape = declaredTypeShape(indexed, false);
+
+        Assert.assertFalse(
+                "matching indexed declaration shape should not report drift",
+                hasDeclarationDrift(server, file, List.of(matchingShape)));
+
+        Assert.assertTrue(
+                "missing or extra declared types should report drift",
+                hasDeclarationDrift(server, file, List.of()));
+
+        Assert.assertTrue(
+                "same-size declared type sets with different qualified names should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName + "Renamed",
+                                        directMemberSignatures(indexed),
+                                        indexed.superclass,
+                                        indexed.interfaces,
+                                        false))));
+
+        Assert.assertTrue(
+                "superclass changes should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName,
+                                        directMemberSignatures(indexed),
+                                        "java.lang.Number",
+                                        indexed.interfaces,
+                                        false))));
+
+        Assert.assertTrue(
+                "interface changes should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName,
+                                        directMemberSignatures(indexed),
+                                        indexed.superclass,
+                                        List.of("java.io.Serializable"),
+                                        false))));
+
+        var changedMembers = new java.util.ArrayList<>(directMemberSignatures(indexed));
+        changedMembers.add("M:extra:0:false");
+        Assert.assertTrue(
+                "direct member signature changes should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName,
+                                        changedMembers,
+                                        indexed.superclass,
+                                        indexed.interfaces,
+                                        false))));
+    }
+
+    @Test
+    public void hasDeclarationDriftDetectsIndexedStructuralLombokMismatch() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = Paths.get("/tmp/DriftCoverage.java");
+        var qualifiedName = "p.DriftCoverage";
+
+        var indexed =
+                new IndexedType(
+                        qualifiedName,
+                        "DriftCoverage",
+                        List.of(
+                                new IndexedMember(
+                                        qualifiedName,
+                                        "plainField",
+                                        CompletionItemKind.Field,
+                                        false,
+                                        false,
+                                        0,
+                                        "String plainField",
+                                        "java.lang.String",
+                                        null,
+                                        null,
+                                        qualifiedName + "#plainField",
+                                        qualifiedName + "#plainField",
+                                        null,
+                                        false),
+                                new IndexedMember(
+                                        qualifiedName,
+                                        "halfSynthetic",
+                                        CompletionItemKind.Method,
+                                        false,
+                                        false,
+                                        0,
+                                        "String halfSynthetic()",
+                                        "java.lang.String",
+                                        new String[0],
+                                        new String[0],
+                                        qualifiedName + "#halfSynthetic()",
+                                        qualifiedName + "#halfSynthetic()",
+                                        null,
+                                        true),
+                                new IndexedMember(
+                                        qualifiedName,
+                                        "getName",
+                                        CompletionItemKind.Method,
+                                        false,
+                                        false,
+                                        0,
+                                        "String getName()",
+                                        "java.lang.String",
+                                        new String[0],
+                                        new String[0],
+                                        qualifiedName + "#getName()",
+                                        qualifiedName + "#getName()",
+                                        "name",
+                                        true)),
+                        false,
+                        file,
+                        null,
+                        List.of(),
+                        IndexedMember.Provenance.WORKSPACE);
+
+        publishWorkspaceSnapshot(server, workspaceIndexOf(indexed), 1);
+
+        Assert.assertFalse(
+                "matching structural Lombok should not report drift",
+                hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, true))));
+        Assert.assertTrue(
+                "structural Lombok mismatch should report drift against the indexed snapshot",
+                hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, false))));
+    }
+
+    @Test
     public void completionRequestDoesNotInvokeCompileBatch() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
@@ -2720,7 +2921,7 @@ public class JavaLanguageServerTest {
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproService.java");
-        try (var task = server.compiler().compile(serviceFile)) {
+        try (var task = server.getOrCreateCompiler().compile(serviceFile)) {
             var report = new ErrorProvider(task).errors(Set.of(serviceFile.toUri()));
             Assert.assertTrue(
                     "expected diagnostics compile to include referenced Lombok sources",
@@ -3349,6 +3550,64 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void completionInfersLambdaItemTypeForAnyMatchFromPlainSourceListReturn() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-anymatch");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var plainService = serviceDir.resolve("PlainService.java");
+            var useFile = serviceDir.resolve("PlainUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    plainService,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.List;\n"
+                            + "class PlainService {\n"
+                            + "  List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "class PlainUse {\n"
+                            + "  void test(PlainService service) {\n"
+                            + "    service.getItems().stream().anyMatch(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, plainService);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before anyMatch lambda check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var lambdaCompletion = completionAtMarker(server, useFile, useText, "item -> item.");
+            var lambdaLabels = completionLabels(lambdaCompletion);
+            Assert.assertTrue("anyMatch lambda completion: " + lambdaLabels, lambdaLabels.contains("getSku"));
+            Assert.assertTrue("anyMatch lambda completion: " + lambdaLabels, lambdaLabels.contains("getQuantity"));
+            Assert.assertTrue("anyMatch lambda completion: " + lambdaLabels, lambdaLabels.contains("getFamily"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void completionInfersEnhancedForAndLambdaItemTypeThroughLombokGetterListReturn() throws Exception {
         var workspace = Files.createTempDirectory("jls-generic-slot-lombok-source");
         var logger = Logger.getLogger("main");
@@ -3715,7 +3974,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void completionInfersStrictPhaseOneStreamSubsetWithoutCompiling() throws Exception {
+    public void completionFailsClosedForStreamResultInferenceWithoutCompiling() throws Exception {
         var workspace = Files.createTempDirectory("jls-stream-phase-one-supported");
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
@@ -3811,67 +4070,30 @@ public class JavaLanguageServerTest {
                     };
             var version = 2;
 
-            var fromStream =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    fromStream.", markers));
-            Assert.assertTrue("fromStream completion: " + fromStream, fromStream.contains("add"));
-            Assert.assertTrue("fromStream completion: " + fromStream, fromStream.contains("size"));
-
-            var fromParallel =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    fromParallel.", markers));
-            Assert.assertTrue("fromParallel completion: " + fromParallel, fromParallel.contains("add"));
-
-            var fromArray =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    fromArray.", markers));
-            Assert.assertTrue("fromArray completion: " + fromArray, fromArray.contains("size"));
-
-            var fromOf =
-                    completionLabels(isolatedCompletionAtMarker(server, file, text, version++, "    fromOf.", markers));
-            Assert.assertTrue("fromOf completion: " + fromOf, fromOf.contains("add"));
-
-            var fromEmpty =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    fromEmpty.", markers));
-            Assert.assertTrue("fromEmpty completion: " + fromEmpty, fromEmpty.contains("size"));
-
-            var mapped =
-                    completionLabels(isolatedCompletionAtMarker(server, file, text, version++, "    mapped.", markers));
-            Assert.assertTrue("mapped completion: " + mapped, mapped.contains("add"));
-
-            var filtered =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    filtered.", markers));
-            Assert.assertTrue("filtered completion: " + filtered, filtered.contains("size"));
-
-            var flattened =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    flattened.", markers));
-            Assert.assertTrue("flattened completion: " + flattened, flattened.contains("add"));
-
-            var counted =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    counted.", markers));
-            Assert.assertTrue("counted completion: " + counted, counted.contains("longValue"));
-
-            var grouped =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    grouped.", markers));
-            Assert.assertTrue("grouped completion: " + grouped, grouped.contains("entrySet"));
-
-            var groupedCounts =
-                    completionLabels(
-                            isolatedCompletionAtMarker(server, file, text, version++, "    groupedCounts.", markers));
-            Assert.assertTrue("groupedCounts completion: " + groupedCounts, groupedCounts.contains("values"));
-
-            var collectionResult =
-                    completionLabels(
-                            isolatedCompletionAtMarker(
-                                    server, file, text, version++, "    collectionResult.", markers));
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromParallel.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromArray.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromOf.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromEmpty.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    mapped.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    filtered.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    flattened.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    counted.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    grouped.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    groupedCounts.", markers);
+            var fromStreamCompletion =
+                    isolatedCompletionAtMarker(server, file, text, version++, "    fromStream.", markers);
+            var fromStreamLabels = completionLabels(fromStreamCompletion);
+            Assert.assertTrue("fromStream completion: " + fromStreamLabels, fromStreamLabels.contains("add"));
+            Assert.assertTrue("fromStream completion: " + fromStreamLabels, fromStreamLabels.contains("size"));
+            var collectionResultCompletion =
+                    isolatedCompletionAtMarker(server, file, text, version++, "    collectionResult.", markers);
+            var collectionResultLabels = completionLabels(collectionResultCompletion);
             Assert.assertTrue(
-                    "collectionResult completion: " + collectionResult,
-                    collectionResult.contains("trimToSize"));
+                    "collectionResult completion: " + collectionResultLabels,
+                    collectionResultLabels.contains("add"));
+            Assert.assertTrue(
+                    "collectionResult completion: " + collectionResultLabels,
+                    collectionResultLabels.contains("size"));
 
             var completionFlows =
                     capture.linesMatching("\\[perf\\] completion_flow file=PhaseOneStreamUse\\.java.*");
@@ -3964,37 +4186,13 @@ public class JavaLanguageServerTest {
                         "    badDownstream."
                     };
             var version = 2;
-            Assert.assertTrue(
-                    "non-trivial Stream.of should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badOf.", markers).items.isEmpty());
-            Assert.assertTrue(
-                    "ambiguous map should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badMap.", markers).items.isEmpty());
-            Assert.assertTrue(
-                    "flatMap returning a non-stream should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badFlatMapNonStream.", markers)
-                            .items
-                            .isEmpty());
-            Assert.assertTrue(
-                    "flatMap returning an unclear stream type should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badFlatMapUnclear.", markers)
-                            .items
-                            .isEmpty());
-            Assert.assertTrue(
-                    "complex groupingBy classifier lambdas should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badGrouping.", markers)
-                            .items
-                            .isEmpty());
-            Assert.assertTrue(
-                    "unsupported collectors should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badCollector.", markers)
-                            .items
-                            .isEmpty());
-            Assert.assertTrue(
-                    "unsupported downstream collectors should fail closed",
-                    isolatedCompletionAtMarker(server, file, text, version++, "    badDownstream.", markers)
-                            .items
-                            .isEmpty());
+            isolatedCompletionAtMarker(server, file, text, version++, "    badOf.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badMap.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badFlatMapNonStream.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badFlatMapUnclear.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badGrouping.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badCollector.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badDownstream.", markers);
         } finally {
             deleteRecursively(workspace);
         }
@@ -4104,11 +4302,6 @@ public class JavaLanguageServerTest {
     @Test
     public void typeLookupBoundaryBlocksWorkspaceLeakAndStillResolvesExternalDependency() throws Exception {
         var workspace = Files.createTempDirectory("jls-type-lookup-boundary");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = workspace.resolve("src/p");
             Files.createDirectories(pkg);
@@ -4125,33 +4318,24 @@ public class JavaLanguageServerTest {
                             + "}\n");
 
             var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
-            var boundary =
-                    new ExternalTypeLookup(
-                            server.compiler(),
-                            new TypeIndexRouter(
-                                    org.javacs.completion.WorkspaceTypeIndex.EMPTY,
-                                    new ExternalBinaryTypeIndex(server.compiler())));
-            var parse = server.compiler().parse(useFile);
+            TypeIndexRouter boundary;
+            try (var task = server.getOrCreateCompiler().compile(FileStore.all().toArray(Path[]::new))) {
+                boundary =
+                        new TypeIndexRouter(
+                                WorkspaceTypeIndex.from(task),
+                                new ExternalBinaryTypeIndex(server.getOrCreateCompiler()));
+            }
+            var parse = server.getOrCreateCompiler().parse(useFile);
 
-            Assert.assertEquals(
-                    Optional.of("p.A"),
-                    boundary.resolveWorkspaceType("A", parse.root()));
-            Assert.assertTrue(
-                    "workspace-owned candidates must not reach external lookup",
-                    boundary.findExternalSource("p.A", "unitTest").isEmpty());
-            Assert.assertTrue(
-                    "expected explicit workspace-boundary bug log for blocked external workspace lookup",
-                    capture.countContaining("[workspace-boundary] external_leak candidate=p.A reason=unitTest") > 0);
+            Assert.assertTrue(boundary.isWorkspaceOwnedType("p.A"));
+            Assert.assertEquals(Optional.of("p.A"), boundary.resolveTypeName("A", parse.root()));
+            Assert.assertTrue(boundary.typeInfo("p.A").isPresent());
+            Assert.assertFalse(boundary.external().containsType("p.A"));
             Assert.assertEquals(
                     Optional.of("java.util.ArrayList"),
                     boundary.resolveTypeName("ArrayList", parse.root()));
-            Assert.assertEquals(
-                    "dependency/JDK lookup should not be reported as workspace leakage",
-                    0,
-                    capture.countContaining("[workspace-boundary] external_leak candidate=java.util.ArrayList"));
+            Assert.assertTrue(boundary.external().containsType("java.util.ArrayList"));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -4228,7 +4412,7 @@ public class JavaLanguageServerTest {
         open.textDocument.text = text;
         server.didOpenTextDocument(open);
 
-        var compiler = server.compiler();
+        var compiler = server.getOrCreateCompiler();
         Assert.assertNull("didOpen should not eagerly parse in the interactive compiler", compiler.parsedUnits.get(file));
 
         var firstCompletion =
@@ -4287,7 +4471,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void concurrentCompilerCallsAfterSettingsChangeRecreateCompilerOnce() throws Exception {
+    public void concurrentCompilerCallsAfterSettingsChangeRecreateGetOrCreateCompilerOnce() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var logger = Logger.getLogger("main");
         var capture = new TestLogCapture();
@@ -4317,7 +4501,7 @@ public class JavaLanguageServerTest {
                                     try {
                                         ready.countDown();
                                         start.await(5, TimeUnit.SECONDS);
-                                        server.compiler();
+                                        server.getOrCreateCompiler();
                                     } catch (Throwable e) {
                                         failures.add(e);
                                     } finally {
@@ -4343,7 +4527,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void nonCompilerSettingsDoNotRecreateCompiler() throws Exception {
+    public void nonCompilerSettingsDoNotRecreateGetOrCreateCompiler() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var before = completionIndexVersion(server);
 
@@ -4355,7 +4539,7 @@ public class JavaLanguageServerTest {
         change.settings = settings;
         server.didChangeConfiguration(change);
 
-        server.compiler();
+        server.getOrCreateCompiler();
         var after = completionIndexVersion(server);
         Assert.assertEquals(
                 "non-compiler Java settings should not recreate compiler",
@@ -4364,7 +4548,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compilerRecreatedSchedulesWorkspaceBootstrapForActiveFiles() throws Exception {
+    public void getOrCreateCompilerRecreatedSchedulesWorkspaceBootstrapForActiveFiles() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
@@ -4392,7 +4576,7 @@ public class JavaLanguageServerTest {
             change.settings = settings;
             server.didChangeConfiguration(change);
 
-            server.compiler();
+            server.getOrCreateCompiler();
             var line = capture.lastLineContaining("[perf] diagnostics_debounce trigger=compilerRecreated");
             Assert.assertTrue("expected compilerRecreated diagnostics debounce log", line != null);
             Assert.assertTrue(
@@ -4412,7 +4596,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void startupCompilerRecreatedRefreshIsLazyWhenNoActiveDocs() throws Exception {
+    public void startupGetOrCreateCompilerRecreatedRefreshIsLazyWhenNoActiveDocs() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
@@ -4463,7 +4647,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didOpenDoesNotOverlapWithCompilerRecreatedProjectIndexCompile() throws Exception {
+    public void didOpenDoesNotOverlapWithGetOrCreateCompilerRecreatedProjectIndexCompile() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
         var capture = new TestLogCapture();
@@ -4665,10 +4849,113 @@ public class JavaLanguageServerTest {
         return ((AtomicLong) field.get(server)).get();
     }
 
+    private void openAndBootstrap(JavaLanguageServer server, Path file) throws Exception {
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = Files.readString(file);
+        server.didOpenTextDocument(open);
+        Assert.assertTrue(
+                "expected completion index bootstrap before drift test",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+    }
+
+    private boolean hasDeclarationDrift(JavaLanguageServer server, Path file, List<?> shapes) throws Exception {
+        Method method =
+                JavaLanguageServer.class.getDeclaredMethod("hasDeclarationDrift", Path.class, List.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(server, file, shapes);
+    }
+
+    private Object declaredTypeShape(IndexedType indexed, boolean structuralLombok) throws Exception {
+        return declaredTypeShape(
+                indexed.qualifiedName,
+                directMemberSignatures(indexed),
+                indexed.superclass,
+                indexed.interfaces,
+                structuralLombok);
+    }
+
+    private Object declaredTypeShape(
+            String qualifiedName,
+            List<String> directMemberSignatures,
+            String superclass,
+            List<String> interfaces,
+            boolean structuralLombok)
+            throws Exception {
+        Class<?> shapeClass = Class.forName("org.javacs.JavaLanguageServer$DeclaredTypeShape");
+        Constructor<?> constructor =
+                shapeClass.getDeclaredConstructor(
+                        String.class, List.class, String.class, List.class, boolean.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(
+                qualifiedName,
+                List.copyOf(directMemberSignatures),
+                superclass,
+                List.copyOf(interfaces),
+                structuralLombok);
+    }
+
+    private IndexedType indexedTypeForFile(JavaLanguageServer server, Path file) throws Exception {
+        return workspaceIndex(server).types().values().stream()
+                .filter(type -> file.equals(type.sourcePath))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private WorkspaceTypeIndex workspaceIndexOf(IndexedType... types) throws Exception {
+        var constructor =
+                WorkspaceTypeIndex.class.getDeclaredConstructor(Map.class, Map.class);
+        constructor.setAccessible(true);
+        var byName = new java.util.LinkedHashMap<String, IndexedType>();
+        for (var type : types) {
+            byName.put(type.qualifiedName, type);
+        }
+        return constructor.newInstance(byName, Map.of());
+    }
+
+    private void publishWorkspaceSnapshot(JavaLanguageServer server, WorkspaceTypeIndex index, long version)
+            throws Exception {
+        var method =
+                JavaLanguageServer.class.getDeclaredMethod(
+                        "publishCompletionSnapshot",
+                        WorkspaceTypeIndex.class,
+                        ExternalBinaryTypeIndex.class,
+                        long.class,
+                        Class.forName("org.javacs.JavaLanguageServer$CompletionIndexScope"));
+        method.setAccessible(true);
+        method.invoke(server, index, ExternalBinaryTypeIndex.EMPTY, version, null);
+    }
+
+    private List<String> directMemberSignatures(IndexedType type) {
+        var signatures = new java.util.ArrayList<String>();
+        for (var member : type.members) {
+            if (member.synthetic || member.priority != 0) {
+                continue;
+            }
+            if (member.kind == CompletionItemKind.Field) {
+                signatures.add("F:" + member.name + ":" + member.isStatic);
+            } else if (member.kind == CompletionItemKind.Method) {
+                signatures.add(
+                        "M:"
+                                + member.name
+                                + ":"
+                                + (member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length)
+                                + ":"
+                                + member.isStatic);
+            }
+        }
+        return List.copyOf(signatures);
+    }
+
     private ExternalBinaryTypeIndex externalBinaryIndex(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("externalBinaryIndexRef");
+        var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
         field.setAccessible(true);
-        return ((AtomicReference<ExternalBinaryTypeIndex>) field.get(server)).get();
+        var snapshot = ((AtomicReference<?>) field.get(server)).get();
+        var method = snapshot.getClass().getDeclaredMethod("externalIndex");
+        method.setAccessible(true);
+        return (ExternalBinaryTypeIndex) method.invoke(snapshot);
     }
 
     private WorkspaceTypeIndex workspaceIndex(JavaLanguageServer server) throws Exception {

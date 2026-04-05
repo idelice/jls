@@ -7,8 +7,6 @@ import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
-import com.sun.source.tree.Tree;
-import com.sun.source.tree.TreeVisitor;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
@@ -16,12 +14,12 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -34,7 +32,6 @@ import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
-import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.IntersectionType;
@@ -43,8 +40,13 @@ import javax.lang.model.type.TypeVariable;
 import javax.lang.model.type.UnionType;
 import javax.lang.model.type.WildcardType;
 import org.javacs.CompileTask;
+import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
+import org.javacs.index.IndexedMember;
+import org.javacs.index.IndexedType;
 import org.javacs.lsp.CompletionItemKind;
+import org.javacs.lsp.Location;
+import org.javacs.lsp.Range;
 import org.javacs.resolve.TypeNames;
 
 /**
@@ -59,131 +61,65 @@ import org.javacs.resolve.TypeNames;
  * instead of layering navigation-only fallback heuristics on top.
  */
 public class WorkspaceTypeIndex {
-    public static final WorkspaceTypeIndex EMPTY =
-            new WorkspaceTypeIndex(Map.of(), Map.of(), Map.of(), Map.of());
-    private static final Set<String> PRIMITIVE_TYPE_NAMES =
-            Set.of("boolean", "byte", "short", "int", "long", "float", "double", "char", "void");
-    private static final Comparator<Member> MEMBER_ORDER =
-            Comparator.comparingInt((Member member) -> member.priority)
-                    .thenComparing(member -> member.name, String.CASE_INSENSITIVE_ORDER)
-                    .thenComparing(member -> member.detail);
-
-    /**
-     * Indexed member metadata used by completion, definition, and references.
-     *
-     * <p>Debugging guide:
-     *
-     * <p>{@code ownerType}: the declaring or synthetic owner, for example
-     * {@code com.example.LineItem} or {@code com.example.LineItem.LineItemBuilder}
-     *
-     * <p>{@code name}: the user-facing member name, for example {@code getSku}, {@code family},
-     * or {@code build}
-     *
-     * <p>{@code canonicalKey}: the unique storage key for one concrete member signature, for
-     * example {@code com.example.LineItem.LineItemBuilder#family(java.lang.String)}
-     *
-     * <p>{@code logicalKey}: the semantic identity shared across generated views of the same source
-     * symbol, for example a Lombok getter, setter, or builder setter pointing back to
-     * {@code com.example.LineItem#family}
-     *
-     * <p>{@code backingFieldName}: the source field name that a generated member maps back to
-     *
-     * <p>{@code priority}: 0 for declared members, 1 for inherited members, 2 for
-     * {@code java.lang.Object} members
-     *
-     * <p>{@code synthetic}: true when the index created the member rather than reading a declared
-     * source/binary member directly
-     */
-    public static class Member {
-        public final String ownerType;
-        public final String name;
-        public final int kind;
-        public final boolean isStatic;
-        public final boolean isPrivate;
-        public final int priority;
-        public final String detail;
-        public final String returnType;
-        public final String[] parameterNames;
-        public final String[] erasedParameterTypes;
-        public final String canonicalKey;
-        public final String logicalKey;
-        public final String backingFieldName;
-        public final boolean synthetic;
-
-        public Member(
-                String ownerType,
-                String name,
-                int kind,
-                boolean isStatic,
-                boolean isPrivate,
-                int priority,
-                String detail,
-                String returnType,
-                String[] parameterNames,
-                String[] erasedParameterTypes,
-                String canonicalKey,
-                String logicalKey,
-                String backingFieldName,
-                boolean synthetic) {
-            this.ownerType = ownerType;
-            this.name = name;
-            this.kind = kind;
-            this.isStatic = isStatic;
-            this.isPrivate = isPrivate;
-            this.priority = priority;
-            this.detail = detail;
-            this.returnType = returnType;
-            this.parameterNames = parameterNames;
-            this.erasedParameterTypes = erasedParameterTypes;
-            this.canonicalKey = canonicalKey;
-            this.logicalKey = logicalKey;
-            this.backingFieldName = backingFieldName;
-            this.synthetic = synthetic;
-        }
-    }
-
-    public static class TypeInfo {
-        public final String qualifiedName;
-        public final String simpleName;
-        public final List<Member> members;
-        public final boolean fromCompiledRoot;
+    public static final WorkspaceTypeIndex EMPTY = new WorkspaceTypeIndex(Map.of(), Map.of());
+    public static final class SourceFileSnapshot {
         public final Path sourcePath;
-        public final String superclass;
-        public final List<String> interfaces;
+        public final URI sourceUri;
+        public final String packageName;
+        public final List<String> imports;
+        public final List<String> staticImports;
+        public final List<String> declaredTypes;
 
-        TypeInfo(
-                String qualifiedName,
-                String simpleName,
-                List<Member> members,
-                boolean fromCompiledRoot,
+        /**
+         * Immutable summary of one source file as seen by the workspace index.
+         *
+         * <p>This answers: "What simple-name and import context does this file contribute without
+         * reparsing it?"
+         *
+         * <p>Use this when a request-time resolver needs file-level visibility facts such as
+         * package, imports, static imports, or declared type names. It is the right snapshot for
+         * simple-name resolution in the current file, and the wrong snapshot for member lookup or
+         * type-graph traversal.
+         *
+         * <p>Examples:
+         *
+         * <pre>{@code
+         * sourcePath = /workspace/src/com/example/OrderService.java
+         * packageName = "com.example"
+         * imports = ["java.util.List", "java.util.stream.Collectors"]
+         * staticImports = ["java.util.Map.entry"]
+         * declaredTypes = ["com.example.OrderService", "com.example.OrderService.Builder"]
+         * }</pre>
+         */
+        SourceFileSnapshot(
                 Path sourcePath,
-                String superclass,
-                List<String> interfaces) {
-            this.qualifiedName = qualifiedName;
-            this.simpleName = simpleName;
-            this.members = Collections.unmodifiableList(new ArrayList<>(members));
-            this.fromCompiledRoot = fromCompiledRoot;
+                URI sourceUri,
+                String packageName,
+                List<String> imports,
+                List<String> staticImports,
+                List<String> declaredTypes) {
             this.sourcePath = sourcePath;
-            this.superclass = superclass;
-            this.interfaces = Collections.unmodifiableList(new ArrayList<>(interfaces));
+            this.sourceUri = sourceUri;
+            this.packageName = packageName;
+            this.imports = Collections.unmodifiableList(new ArrayList<>(imports));
+            this.staticImports = Collections.unmodifiableList(new ArrayList<>(staticImports));
+            this.declaredTypes = Collections.unmodifiableList(new ArrayList<>(declaredTypes));
         }
     }
 
-    private final Map<String, TypeInfo> typesByQualifiedName;
-    private final Map<Path, Set<String>> workspaceTypesByFile;
-    private final Map<String, Set<String>> workspaceSupertypesByType;
+    private final Map<String, IndexedType> typesByQualifiedName;
+    private final Set<String> workspaceOwnedTypeNames;
     private final Map<String, Set<String>> subtypesByType;
+    private final Map<Path, SourceFileSnapshot> sourceFiles;
     private static final Logger LOG = Logger.getLogger("main");
 
     private WorkspaceTypeIndex(
-            Map<String, TypeInfo> typesByQualifiedName,
-            Map<Path, Set<String>> workspaceTypesByFile,
-            Map<String, Set<String>> workspaceSupertypesByType,
-            Map<String, Set<String>> subtypesByType) {
-        var verified = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
+            Map<String, IndexedType> typesByQualifiedName,
+            Map<Path, SourceFileSnapshot> sourceFiles) {
+        var verified = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
         for (var entry : typesByQualifiedName.entrySet()) {
             var key = entry.getKey();
-            var valid = key != null && (key.contains(".") || isPrimitiveTypeName(key));
+            var valid = key != null && (key.contains(".") || TypeNames.isPrimitive(key));
             assert valid : "WorkspaceTypeIndex key must be fully qualified or primitive: " + key;
             if (!valid) {
                 throw new IllegalStateException("WorkspaceTypeIndex key must be fully qualified or primitive: " + key);
@@ -191,26 +127,25 @@ public class WorkspaceTypeIndex {
             verified.put(key, entry.getValue());
         }
         this.typesByQualifiedName = Collections.unmodifiableMap(verified);
-        var verifiedWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
-        for (var entry : workspaceTypesByFile.entrySet()) {
-            verifiedWorkspaceTypes.put(
-                    entry.getKey(),
-                    Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(entry.getValue())));
-        }
-        this.workspaceTypesByFile = Collections.unmodifiableMap(verifiedWorkspaceTypes);
-        this.workspaceSupertypesByType = immutableSetMap(workspaceSupertypesByType);
-        this.subtypesByType = immutableSetMap(subtypesByType);
+        this.workspaceOwnedTypeNames = Collections.unmodifiableSet(workspaceOwnedTypeNames(verified));
+        this.sourceFiles = Collections.unmodifiableMap(new Object2ObjectLinkedOpenHashMap<>(sourceFiles));
+        this.subtypesByType = Collections.unmodifiableMap(invertSubtypeMap(verified));
     }
 
-    private static Map<String, Set<String>> immutableSetMap(Map<String, Set<String>> source) {
-        var copy = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+    private static Set<String> workspaceOwnedTypeNames(Map<String, IndexedType> source) {
+        var owned = new ObjectLinkedOpenHashSet<String>();
         for (var entry : source.entrySet()) {
-            copy.put(entry.getKey(), Collections.unmodifiableSet(new ObjectLinkedOpenHashSet<>(entry.getValue())));
+            owned.add(entry.getKey());
+            var info = entry.getValue();
+            if (info == null || info.enclosingTypes == null) {
+                continue;
+            }
+            owned.addAll(info.enclosingTypes);
         }
-        return Collections.unmodifiableMap(copy);
+        return owned;
     }
 
-    public Map<String, TypeInfo> types() {
+    public Map<String, IndexedType> types() {
         return typesByQualifiedName;
     }
 
@@ -222,82 +157,108 @@ public class WorkspaceTypeIndex {
         return typesByQualifiedName.containsKey(qualifiedName);
     }
 
-    public Optional<TypeInfo> typeInfo(String qualifiedName) {
+    public boolean ownsTypeOrEnclosingType(String qualifiedName) {
+        if (qualifiedName == null || qualifiedName.isBlank()) {
+            return false;
+        }
+        if (workspaceOwnedTypeNames.contains(qualifiedName)) {
+            return true;
+        }
+        for (var i = qualifiedName.lastIndexOf('.'); i > 0; i = qualifiedName.lastIndexOf('.', i - 1)) {
+            var outer = qualifiedName.substring(0, i);
+            if (workspaceOwnedTypeNames.contains(outer)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public Optional<IndexedType> typeInfo(String qualifiedName) {
         return Optional.ofNullable(typesByQualifiedName.get(qualifiedName));
     }
 
-    public WorkspaceTypeIndex filterTypes(Predicate<TypeInfo> keep) {
-        var nextTypes = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
+    public Optional<SourceFileSnapshot> sourceFile(Path file) {
+        if (file == null) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(sourceFiles.get(file));
+    }
+
+    public WorkspaceTypeIndex filterTypes(Predicate<IndexedType> keep) {
+        var nextTypes = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
         for (var entry : typesByQualifiedName.entrySet()) {
             if (keep.test(entry.getValue())) {
                 nextTypes.put(entry.getKey(), entry.getValue());
             }
         }
 
-        var nextWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
-        for (var entry : workspaceTypesByFile.entrySet()) {
-            var kept = new ObjectLinkedOpenHashSet<String>();
-            for (var qualifiedName : entry.getValue()) {
+        var nextSourceFiles = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+        for (var entry : sourceFiles.entrySet()) {
+            var keptTypes = new ArrayList<String>();
+            for (var qualifiedName : entry.getValue().declaredTypes) {
                 if (nextTypes.containsKey(qualifiedName)) {
-                    kept.add(qualifiedName);
+                    keptTypes.add(qualifiedName);
                 }
             }
-            if (!kept.isEmpty()) {
-                nextWorkspaceTypes.put(entry.getKey(), kept);
+            if (!keptTypes.isEmpty()) {
+                var snapshot = entry.getValue();
+                nextSourceFiles.put(
+                        entry.getKey(),
+                        new SourceFileSnapshot(
+                                snapshot.sourcePath,
+                                snapshot.sourceUri,
+                                snapshot.packageName,
+                                snapshot.imports,
+                                snapshot.staticImports,
+                                keptTypes));
             }
         }
-
-        var nextWorkspaceSupertypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
-        for (var entry : workspaceSupertypesByType.entrySet()) {
-            if (!nextTypes.containsKey(entry.getKey())) {
-                continue;
-            }
-            var kept = new ObjectLinkedOpenHashSet<String>();
-            for (var superType : entry.getValue()) {
-                if (nextTypes.containsKey(superType)) {
-                    kept.add(superType);
-                }
-            }
-            nextWorkspaceSupertypes.put(entry.getKey(), kept);
-        }
-
-        var nextSubtypes = invertSubtypeMap(nextWorkspaceSupertypes);
-        return new WorkspaceTypeIndex(nextTypes, nextWorkspaceTypes, nextWorkspaceSupertypes, nextSubtypes);
+        return new WorkspaceTypeIndex(nextTypes, nextSourceFiles);
     }
 
+    /**
+     * Replace the published declarations for a set of source files.
+     *
+     * <p>This is a file-granular snapshot update:
+     *
+     * <ol>
+     *   <li>remove the old declared types for every replaced file
+     *   <li>drop the old {@link SourceFileSnapshot} entries for those files
+     *   <li>install the new file snapshots and declared types from {@code updates}
+     * </ol>
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * before:
+     *   /src/A.java -> ["com.example.A", "com.example.A.Helper"]
+     *
+     * after replacing /src/A.java with a snapshot that only declares com.example.A:
+     *   old A.Helper is removed from the published workspace index
+     * }</pre>
+     */
     public WorkspaceTypeIndex replaceWorkspaceDeclarations(WorkspaceTypeIndex updates, Set<Path> replacedFiles) {
-        if ((updates == null || updates.workspaceTypesByFile.isEmpty()) && (replacedFiles == null || replacedFiles.isEmpty())) {
+        if ((updates == null || updates.sourceFiles.isEmpty())
+                && (replacedFiles == null || replacedFiles.isEmpty())) {
             return this;
         }
-        var nextTypes = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>(typesByQualifiedName);
-        var nextWorkspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
-        for (var entry : workspaceTypesByFile.entrySet()) {
-            nextWorkspaceTypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
-        }
-        var nextWorkspaceSupertypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
-        for (var entry : workspaceSupertypesByType.entrySet()) {
-            nextWorkspaceSupertypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
-        }
-        var nextSubtypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
-        for (var entry : subtypesByType.entrySet()) {
-            nextSubtypes.put(entry.getKey(), new ObjectLinkedOpenHashSet<>(entry.getValue()));
-        }
+        var nextTypes = new Object2ObjectLinkedOpenHashMap<String, IndexedType>(typesByQualifiedName);
+        var nextSourceFiles = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>(sourceFiles);
 
         var filesToReplace = new ObjectLinkedOpenHashSet<Path>();
         if (replacedFiles != null) {
             filesToReplace.addAll(replacedFiles);
         }
         if (updates != null) {
-            filesToReplace.addAll(updates.workspaceTypesByFile.keySet());
+            filesToReplace.addAll(updates.sourceFiles.keySet());
         }
 
         for (var file : filesToReplace) {
-            var previousTypes = nextWorkspaceTypes.remove(file);
-            if (previousTypes == null) {
+            var previousSnapshot = nextSourceFiles.remove(file);
+            if (previousSnapshot == null) {
                 continue;
             }
-            for (var qualifiedName : previousTypes) {
-                removeWorkspaceHierarchy(qualifiedName, nextWorkspaceSupertypes, nextSubtypes);
+            for (var qualifiedName : previousSnapshot.declaredTypes) {
                 var existing = nextTypes.get(qualifiedName);
                 if (existing != null && file.equals(existing.sourcePath)) {
                     nextTypes.remove(qualifiedName);
@@ -306,62 +267,35 @@ public class WorkspaceTypeIndex {
         }
 
         if (updates != null) {
-            for (var entry : updates.workspaceTypesByFile.entrySet()) {
+            for (var entry : updates.sourceFiles.entrySet()) {
                 var file = entry.getKey();
-                var declaredTypes = new ObjectLinkedOpenHashSet<String>(entry.getValue());
-                nextWorkspaceTypes.put(file, declaredTypes);
-                for (var qualifiedName : declaredTypes) {
+                var snapshot = entry.getValue();
+                nextSourceFiles.put(file, snapshot);
+                for (var qualifiedName : snapshot.declaredTypes) {
                     var typeInfo = updates.typesByQualifiedName.get(qualifiedName);
                     if (typeInfo != null) {
                         nextTypes.put(qualifiedName, typeInfo);
-                    }
-                    var supertypes =
-                            new ObjectLinkedOpenHashSet<>(
-                                    updates.workspaceSupertypesByType.getOrDefault(qualifiedName, Set.of()));
-                    nextWorkspaceSupertypes.put(qualifiedName, supertypes);
-                    for (var superType : supertypes) {
-                        nextSubtypes
-                                .computeIfAbsent(superType, __ -> new ObjectLinkedOpenHashSet<>())
-                                .add(qualifiedName);
                     }
                 }
             }
         }
 
-        return new WorkspaceTypeIndex(nextTypes, nextWorkspaceTypes, nextWorkspaceSupertypes, nextSubtypes);
+        return new WorkspaceTypeIndex(nextTypes, nextSourceFiles);
     }
 
-    private void removeWorkspaceHierarchy(
-            String qualifiedName, Map<String, Set<String>> supertypesByType, Map<String, Set<String>> subtypesByType) {
-        var previousSupertypes = supertypesByType.remove(qualifiedName);
-        if (previousSupertypes == null) {
-            return;
-        }
-        for (var superType : previousSupertypes) {
-            var subtypes = subtypesByType.get(superType);
-            if (subtypes == null) {
-                continue;
-            }
-            subtypes.remove(qualifiedName);
-            if (subtypes.isEmpty()) {
-                subtypesByType.remove(superType);
-            }
-        }
-    }
-
-    public List<Member> members(String qualifiedName, boolean staticContext) {
+    public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
         var type = typesByQualifiedName.get(qualifiedName);
         if (type == null) {
             return List.of();
         }
-        var list = new ArrayList<Member>();
+        var list = new ArrayList<IndexedMember>();
         var seen = new ObjectLinkedOpenHashSet<String>();
         addDirectMembers(type, staticContext, list, seen);
         addInheritedMembers(qualifiedName, staticContext, list, seen);
         return list;
     }
 
-    public Optional<Member> member(String qualifiedName, String name, boolean staticContext) {
+    public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext) {
         var type = typesByQualifiedName.get(qualifiedName);
         if (type == null) {
             return Optional.empty();
@@ -373,12 +307,12 @@ public class WorkspaceTypeIndex {
         return inheritedMember(qualifiedName, name, staticContext, null);
     }
 
-    public Optional<Member> member(String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
+    public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var type = typesByQualifiedName.get(qualifiedName);
         if (type == null) {
             return Optional.empty();
         }
-        var targetKey = canonicalMemberKey(qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
+        var targetKey = IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Method, name, erasedParameterTypes);
         var direct = directMethodMember(type, staticContext, targetKey);
         if (direct.isPresent()) {
             return direct;
@@ -386,7 +320,7 @@ public class WorkspaceTypeIndex {
         return inheritedMember(qualifiedName, name, staticContext, erasedParameterTypes);
     }
 
-    public Optional<Member> memberByCanonicalKey(String canonicalKey) {
+    public Optional<IndexedMember> memberByCanonicalKey(String canonicalKey) {
         if (canonicalKey == null || canonicalKey.isBlank()) {
             return Optional.empty();
         }
@@ -417,9 +351,36 @@ public class WorkspaceTypeIndex {
 
     public Set<String> directSupertypes(String qualifiedName) {
         var type = typesByQualifiedName.get(qualifiedName);
-        return directSupertypes(type);
+        if (type == null || type.directSupertypes.isEmpty()) {
+            return Set.of();
+        }
+        return Set.copyOf(type.directSupertypes);
     }
 
+    /**
+     * Return the method keys related to one declaration across the indexed type hierarchy.
+     *
+     * <p>This walks the owner type, its direct/transitive supertypes, and indexed subtypes to
+     * gather matching method keys for the same erased signature. The result is used for features
+     * like references/navigation where overrides and inherited declarations should be treated as
+     * one related group.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * ownerType = "com.example.Base"
+     * methodName = "handle"
+     * erasedParameterTypes = ["java.lang.String"]
+     *
+     * -> {
+     *      "com.example.Base#handle(java.lang.String)",
+     *      "com.example.Child#handle(java.lang.String)"
+     *    }
+     * }</pre>
+     *
+     * <p>A more explicit name would be {@code relatedOverrideMethodKeys}, but the current name is
+     * kept to avoid churn.
+     */
     public Set<String> relatedMethodKeys(String ownerType, String methodName, String[] erasedParameterTypes) {
         var parameterTypes = erasedParameterTypes == null ? new String[0] : erasedParameterTypes;
         var keys = new ObjectLinkedOpenHashSet<String>();
@@ -446,7 +407,7 @@ public class WorkspaceTypeIndex {
     }
 
     private void addDirectMembers(
-            TypeInfo type, boolean staticContext, List<Member> members, Set<String> seenStorageKeys) {
+            IndexedType type, boolean staticContext, List<IndexedMember> members, Set<String> seenStorageKeys) {
         for (var member : type.members) {
             if (staticContext != member.isStatic) {
                 continue;
@@ -460,7 +421,7 @@ public class WorkspaceTypeIndex {
     }
 
     private void addInheritedMembers(
-            String qualifiedName, boolean staticContext, List<Member> members, Set<String> seenStorageKeys) {
+            String qualifiedName, boolean staticContext, List<IndexedMember> members, Set<String> seenStorageKeys) {
         var visited = new ObjectLinkedOpenHashSet<String>();
         var pending = new java.util.ArrayDeque<>(directSupertypes(qualifiedName));
         while (!pending.isEmpty()) {
@@ -486,7 +447,7 @@ public class WorkspaceTypeIndex {
         }
     }
 
-    private Optional<Member> directMember(TypeInfo type, String name, boolean staticContext) {
+    private Optional<IndexedMember> directMember(IndexedType type, String name, boolean staticContext) {
         for (var member : type.members) {
             if (staticContext != member.isStatic) {
                 continue;
@@ -499,7 +460,7 @@ public class WorkspaceTypeIndex {
         return Optional.empty();
     }
 
-    private Optional<Member> directMethodMember(TypeInfo type, boolean staticContext, String targetKey) {
+    private Optional<IndexedMember> directMethodMember(IndexedType type, boolean staticContext, String targetKey) {
         for (var member : type.members) {
             if (staticContext != member.isStatic) {
                 continue;
@@ -514,7 +475,7 @@ public class WorkspaceTypeIndex {
         return Optional.empty();
     }
 
-    private Optional<Member> inheritedMember(
+    private Optional<IndexedMember> inheritedMember(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var visited = new ObjectLinkedOpenHashSet<String>();
         var pending = new java.util.ArrayDeque<>(directSupertypes(qualifiedName));
@@ -548,14 +509,6 @@ public class WorkspaceTypeIndex {
         return Optional.empty();
     }
 
-    public static String canonicalMemberKey(String ownerType, int kind, String name, String[] erasedParameterTypes) {
-        if (kind == CompletionItemKind.Method || kind == CompletionItemKind.Constructor) {
-            var params = erasedParameterTypes == null ? new String[0] : erasedParameterTypes;
-            return ownerType + "#" + name + "(" + String.join(",", params) + ")";
-        }
-        return ownerType + "#" + name;
-    }
-
     public static List<String> staticImportOwnerTypes(String memberName, CompilationUnitTree root) {
         if (memberName == null || memberName.isBlank() || root == null) {
             return List.of();
@@ -569,19 +522,72 @@ public class WorkspaceTypeIndex {
         return List.copyOf(owners);
     }
 
+    /**
+     * Resolve a source-facing type name against the published workspace snapshot only.
+     *
+     * <p>This answers: "If the current file mentions {@code Foo} or {@code Outer.Inner}, which
+     * workspace type does that refer to without reparsing other files?"
+     *
+     * <p>The lookup order is intentionally small:
+     *
+     * <ol>
+     *   <li>exact qualified-name hit
+     *   <li>current-file declared types from {@link SourceFileSnapshot}
+     *   <li>simple-name/import resolution within the workspace snapshot
+     * </ol>
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * // In NestedDefinitionExample.java
+     * raw = "ResolvedSymbol"
+     * -> "com.example.demo.NestedDefinitionExample.ResolvedSymbol"
+     *
+     * raw = "java.util.List"
+     * -> "java.util.List"
+     * }</pre>
+     */
     public Optional<String> resolveTypeName(String typeName, CompilationUnitTree root) {
         if (typeName == null || typeName.isBlank()) {
             return Optional.empty();
         }
-        var raw = normalizeTypeName(typeName);
+        var raw = TypeNames.normalize(typeName);
         if (raw.isEmpty()) {
             return Optional.empty();
         }
-        if (isPrimitiveTypeName(raw)) {
+        if (TypeNames.isPrimitive(raw)) {
             return Optional.of(raw);
         }
         if (typesByQualifiedName.containsKey(raw)) {
             return Optional.of(raw);
+        }
+        if (root != null && root.getSourceFile() != null) {
+            var sourceUri = root.getSourceFile().toUri();
+            if (sourceUri != null && "file".equals(sourceUri.getScheme())) {
+                var snapshot = sourceFiles.get(Paths.get(sourceUri));
+                if (snapshot != null) {
+                    String declaredMatch = null;
+                    var packaged =
+                            snapshot.packageName == null || snapshot.packageName.isBlank()
+                                    ? raw
+                                    : snapshot.packageName + "." + raw;
+                    for (var declaredType : snapshot.declaredTypes) {
+                        if (!Objects.equals(declaredType, raw)
+                                && !Objects.equals(declaredType, packaged)
+                                && !Objects.equals(TypeNames.simpleName(declaredType), raw)
+                                && !(raw.contains(".") && declaredType.endsWith("." + raw))) {
+                            continue;
+                        }
+                        if (declaredMatch != null && !Objects.equals(declaredMatch, declaredType)) {
+                            return Optional.empty();
+                        }
+                        declaredMatch = declaredType;
+                    }
+                    if (declaredMatch != null) {
+                        return Optional.of(declaredMatch);
+                    }
+                }
+            }
         }
         if (raw.contains(".")) {
             var firstSegmentEnd = raw.indexOf('.');
@@ -590,7 +596,8 @@ public class WorkspaceTypeIndex {
             }
             var firstSegment = raw.substring(0, firstSegmentEnd);
             var suffix = raw.substring(firstSegmentEnd);
-            var resolvedPrefix = resolveSimpleName(firstSegment, root);
+            var resolvedPrefix =
+                    TypeNames.resolveSimpleName(firstSegment, root, typesByQualifiedName::containsKey);
             if (resolvedPrefix.isEmpty()) {
                 return Optional.empty();
             }
@@ -600,11 +607,7 @@ public class WorkspaceTypeIndex {
             }
             return Optional.empty();
         }
-        return resolveSimpleName(raw, root);
-    }
-
-    private Optional<String> resolveSimpleName(String simpleName, CompilationUnitTree root) {
-        return resolveSimpleName(simpleName, root, typesByQualifiedName::containsKey);
+        return TypeNames.resolveSimpleName(raw, root, typesByQualifiedName::containsKey);
     }
 
     private static Optional<String> staticImportOwnerType(String imported, String memberName) {
@@ -618,10 +621,6 @@ public class WorkspaceTypeIndex {
             return Optional.empty();
         }
         return Optional.of(imported.substring(0, imported.length() - memberName.length() - 1));
-    }
-
-    public static boolean isPrimitiveTypeName(String typeName) {
-        return PRIMITIVE_TYPE_NAMES.contains(typeName);
     }
 
     public static WorkspaceTypeIndex from(CompileTask task) {
@@ -639,6 +638,12 @@ public class WorkspaceTypeIndex {
 
         var rootDeclaredTypeSources = new Object2ObjectOpenHashMap<String, Path>();
         var rootDeclaredTypeTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
+        var rootDeclaredTypeLocations = new Object2ObjectOpenHashMap<String, Location>();
+        var memberDeclarationLocations = new Object2ObjectOpenHashMap<String, Location>();
+        var typeKinds = new Object2ObjectOpenHashMap<String, Integer>();
+        var typeModifiers = new Object2ObjectOpenHashMap<String, Set<Modifier>>();
+        var nestedTypesByOwner = new Object2ObjectOpenHashMap<String, Set<String>>();
+        var sourceFileSnapshots = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
         var collectedTypes = new Object2ObjectLinkedOpenHashMap<String, TypeElement>();
         var seenMirrors = new ObjectOpenHashSet<String>();
         var skippedInvalidTypeKeys = new ObjectLinkedOpenHashSet<String>();
@@ -649,72 +654,169 @@ public class WorkspaceTypeIndex {
                 sourcePath = Paths.get(sourceUri);
             }
             var rootPath = sourcePath;
+            var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+            var explicitImports = new ArrayList<String>();
+            var staticImports = new ArrayList<String>();
+            for (var importTree : root.getImports()) {
+                var imported = importTree.getQualifiedIdentifier().toString();
+                if (importTree.isStatic()) {
+                    staticImports.add(imported);
+                } else {
+                    explicitImports.add(imported);
+                }
+            }
+            var declaredTypesInFile = new ArrayList<String>();
             new TreePathScanner<Void, Void>() {
                 @Override
-                    public Void visitClass(ClassTree tree, Void p) {
-                        var element = trees.getElement(getCurrentPath());
-                        if (element instanceof TypeElement typeElement) {
-                            var qualifiedName = typeElement.getQualifiedName().toString();
-                            if (isValidIndexKey(qualifiedName)) {
+                public Void visitClass(ClassTree tree, Void p) {
+                    var element = trees.getElement(getCurrentPath());
+                    if (element instanceof TypeElement typeElement) {
+                        var qualifiedName = typeElement.getQualifiedName().toString();
+                        if (isValidIndexKey(qualifiedName)) {
                             collectedTypes.putIfAbsent(qualifiedName, typeElement);
+                            declaredTypesInFile.add(qualifiedName);
                             if (rootPath != null) {
                                 rootDeclaredTypeSources.put(qualifiedName, rootPath);
                             }
                             rootDeclaredTypeTrees.putIfAbsent(qualifiedName, tree);
-                            } else if (qualifiedName != null && !qualifiedName.isBlank()) {
-                                skippedInvalidTypeKeys.add(qualifiedName);
+                            typeKinds.putIfAbsent(qualifiedName, memberKind(typeElement));
+                            typeModifiers.putIfAbsent(qualifiedName, Set.copyOf(typeElement.getModifiers()));
+                            var location = FindHelper.location(task, getCurrentPath(), tree.getSimpleName());
+                            if (location != null) {
+                                rootDeclaredTypeLocations.putIfAbsent(qualifiedName, location);
                             }
-                            if (LombokAnnotations.hasLoggingOnlyLombokAnnotation(tree.getModifiers())) {
-                                collectNamedType(elements, "org.slf4j.Logger", collectedTypes);
+                            var parent = getCurrentPath().getParentPath();
+                            if (parent != null) {
+                                var parentElement = trees.getElement(parent);
+                                if (parentElement instanceof TypeElement parentType) {
+                                    nestedTypesByOwner
+                                            .computeIfAbsent(
+                                                    parentType.getQualifiedName().toString(),
+                                                    __ -> new ObjectLinkedOpenHashSet<>())
+                                            .add(qualifiedName);
+                                }
                             }
+                        } else if (qualifiedName != null && !qualifiedName.isBlank()) {
+                            skippedInvalidTypeKeys.add(qualifiedName);
                         }
-                        return super.visitClass(tree, p);
+                        if (LombokAnnotations.hasLoggingOnlyLombokAnnotation(tree.getModifiers())) {
+                            collectNamedType(elements, "org.slf4j.Logger", collectedTypes);
+                        }
                     }
+                    return super.visitClass(tree, p);
+                }
+
+                @Override
+                public Void visitVariable(VariableTree tree, Void p) {
+                    captureDeclaredMember(tree.getName() == null ? null : tree.getName().toString(), null);
+                    return super.visitVariable(tree, p);
+                }
+
+                @Override
+                public Void visitMethod(MethodTree tree, Void p) {
+                    var parent = getCurrentPath().getParentPath();
+                    var parentLeaf = parent == null ? null : parent.getLeaf();
+                    var label =
+                            tree.getReturnType() == null && parentLeaf instanceof ClassTree classTree
+                                    ? classTree.getSimpleName().toString()
+                                    : tree.getName().toString();
+                    captureDeclaredMember(label, tree);
+                    return super.visitMethod(tree, p);
+                }
+
+                private void captureDeclaredMember(String label, MethodTree methodTree) {
+                    if (label == null || label.isBlank()) {
+                        return;
+                    }
+                    var current = getCurrentPath();
+                    var parent = current == null ? null : current.getParentPath();
+                    if (parent == null || !(parent.getLeaf() instanceof ClassTree)) {
+                        return;
+                    }
+                    var element = trees.getElement(current);
+                    if (element == null || element.getEnclosingElement() == null) {
+                        return;
+                    }
+                    if (!(element.getEnclosingElement() instanceof TypeElement ownerType)) {
+                        return;
+                    }
+                    var kind = memberKind(element);
+                    if (kind == null) {
+                        return;
+                    }
+                    String[] erasedParameterTypes = null;
+                    if (element instanceof ExecutableElement executable) {
+                        erasedParameterTypes = new String[executable.getParameters().size()];
+                        for (int i = 0; i < executable.getParameters().size(); i++) {
+                            erasedParameterTypes[i] = types.erasure(executable.getParameters().get(i).asType()).toString();
+                        }
+                    }
+                    var key =
+                            IndexedMember.canonicalKey(
+                                    ownerType.getQualifiedName().toString(),
+                                    kind,
+                                    label,
+                                    erasedParameterTypes);
+                    var location = FindHelper.location(task, current, label);
+                    if (location != null) {
+                        memberDeclarationLocations.putIfAbsent(key, location);
+                    }
+                }
             }.scan(root, null);
+            if (rootPath != null) {
+                sourceFileSnapshots.put(
+                        rootPath,
+                        new SourceFileSnapshot(
+                                rootPath,
+                                sourceUri,
+                                packageName,
+                                explicitImports,
+                                staticImports,
+                                declaredTypesInFile));
+            }
 
             if (includeReferencedTypes) {
                 new TreePathScanner<Void, Void>() {
                     @Override
                     public Void visitVariable(VariableTree tree, Void p) {
-                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        collectReferencedTypes(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
                         return super.visitVariable(tree, p);
                     }
 
                     @Override
                     public Void visitMethod(MethodTree tree, Void p) {
-                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        collectReferencedTypes(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
                         return super.visitMethod(tree, p);
                     }
 
                     @Override
                     public Void visitMethodInvocation(MethodInvocationTree tree, Void p) {
-                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        collectReferencedTypes(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
                         return super.visitMethodInvocation(tree, p);
                     }
 
                     @Override
                     public Void visitIdentifier(IdentifierTree tree, Void p) {
-                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        collectReferencedTypes(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
                         return super.visitIdentifier(tree, p);
                     }
 
                     @Override
                     public Void visitMemberSelect(MemberSelectTree tree, Void p) {
-                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        collectReferencedTypes(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
                         return super.visitMemberSelect(tree, p);
                     }
 
                     @Override
                     public Void visitNewClass(NewClassTree tree, Void p) {
-                        collectTypeMirror(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
+                        collectReferencedTypes(trees.getTypeMirror(getCurrentPath()), collectedTypes, seenMirrors);
                         return super.visitNewClass(tree, p);
                     }
                 }.scan(root, null);
             }
         }
 
-        var typeEntries = new Object2ObjectLinkedOpenHashMap<String, TypeInfo>();
-        var workspaceSupertypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
+        var typeEntries = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
         for (var collected : collectedTypes.values()) {
             var qualifiedName = collected.getQualifiedName().toString();
             if (!isValidIndexKey(qualifiedName)) {
@@ -730,7 +832,7 @@ public class WorkspaceTypeIndex {
                 LOG.fine(String.format("[completion] canonicalized type symbol %s for index extraction", qualifiedName));
             }
 
-            var seen = new Object2ObjectOpenHashMap<String, Member>();
+            var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
             for (var member : elements.getAllMembers(type)) {
                 if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
                 var kind = memberKind(member);
@@ -743,44 +845,67 @@ public class WorkspaceTypeIndex {
                 if (!declaredInOwner && member.getModifiers().contains(Modifier.PRIVATE)) continue;
                 var declaredInObject = "java.lang.Object".equals(ownerName);
                 var priority = declaredInOwner ? 0 : declaredInObject ? 2 : 1;
-                var isStatic = member.getModifiers().contains(Modifier.STATIC);
-                var isPrivate = member.getModifiers().contains(Modifier.PRIVATE);
+                var modifiers = Set.copyOf(member.getModifiers());
+                var isStatic = modifiers.contains(Modifier.STATIC);
+                var isPrivate = modifiers.contains(Modifier.PRIVATE);
+                var isProtected = modifiers.contains(Modifier.PROTECTED);
+                var isPublic = modifiers.contains(Modifier.PUBLIC);
+                var isAbstract = modifiers.contains(Modifier.ABSTRACT);
 
                 String detail;
                 String returnType;
                 String[] parameterNames = null;
                 String[] erasedParameterTypes = null;
+                String declaredReturnType = null;
+                String[] declaredParameterTypes = null;
                 if (member instanceof ExecutableElement executable) {
                     detail = executable.getReturnType() + " " + executable;
                     returnType = typeName(executable.getReturnType());
+                    declaredReturnType = normalizeDeclaredType(executable.getReturnType());
                     parameterNames = new String[executable.getParameters().size()];
                     erasedParameterTypes = new String[executable.getParameters().size()];
+                    declaredParameterTypes = new String[executable.getParameters().size()];
                     for (int i = 0; i < executable.getParameters().size(); i++) {
                         var param = executable.getParameters().get(i);
                         parameterNames[i] = param.getSimpleName().toString();
                         erasedParameterTypes[i] = types.erasure(param.asType()).toString();
+                        declaredParameterTypes[i] = normalizeDeclaredType(param.asType());
                     }
                 } else {
                     detail = member.asType() + " " + member.getSimpleName();
                     returnType = typeName(member.asType());
+                    declaredReturnType = normalizeDeclaredType(member.asType());
                 }
+                var canonicalKey =
+                        IndexedMember.canonicalKey(
+                                ownerName, kind, member.getSimpleName().toString(), erasedParameterTypes);
+                var memberLocation = memberDeclarationLocations.get(canonicalKey);
 
                 var next =
-                        new Member(
+                        new IndexedMember(
                                 ownerName,
                                 member.getSimpleName().toString(),
                                 kind,
                                 isStatic,
                                 isPrivate,
+                                isProtected,
+                                isPublic,
+                                isAbstract,
                                 priority,
                                 detail,
                                 returnType,
+                                declaredReturnType,
                                 parameterNames,
                                 erasedParameterTypes,
-                                canonicalMemberKey(ownerName, kind, member.getSimpleName().toString(), erasedParameterTypes),
-                                canonicalMemberKey(ownerName, kind, member.getSimpleName().toString(), erasedParameterTypes),
+                                declaredParameterTypes,
+                                canonicalKey,
+                                canonicalKey,
                                 null,
-                                false);
+                                false,
+                                IndexedMember.Origin.DECLARED,
+                                modifiers,
+                                memberLocation == null ? null : memberLocation.uri,
+                                memberLocation == null ? null : memberLocation.range);
                 var key = memberStorageKey(next);
                 var existing = seen.get(key);
                 if (existing == null || next.priority < existing.priority) {
@@ -803,36 +928,33 @@ public class WorkspaceTypeIndex {
                     rootDeclaredTypeSources,
                     collectedTypes);
             var members = new ArrayList<>(seen.values());
-            sortMembers(members);
+            IndexedMember.sort(members);
             var superclass = directSuperclass(type);
             var interfaces = directInterfaces(type);
+            var typeLocation = rootDeclaredTypeLocations.get(qualifiedName);
+            var nestedTypes =
+                    nestedTypesByOwner.containsKey(qualifiedName)
+                            ? List.copyOf(nestedTypesByOwner.get(qualifiedName))
+                            : List.<String>of();
             var typeEntry =
-                    new TypeInfo(
+                    new IndexedType(
                             qualifiedName,
                             type.getSimpleName().toString(),
                             Collections.unmodifiableList(members),
                             fromCompiledRoot,
                             sourcePath,
+                            typeLocation == null ? (sourcePath == null ? null : sourcePath.toUri()) : typeLocation.uri,
                             superclass,
-                            interfaces);
+                            interfaces,
+                            nestedTypes,
+                            typeKinds.getOrDefault(qualifiedName, memberKind(type)),
+                            typeModifiers.getOrDefault(qualifiedName, Set.copyOf(type.getModifiers())),
+                            typeLocation == null ? null : typeLocation.range,
+                            IndexedMember.Provenance.WORKSPACE);
             typeEntries.put(qualifiedName, typeEntry);
-            if (sourcePath != null) {
-                var supertypes = new ObjectLinkedOpenHashSet<String>();
-                if (superclass != null && !superclass.isBlank()) {
-                    supertypes.add(superclass);
-                }
-                supertypes.addAll(interfaces);
-                workspaceSupertypes.put(qualifiedName, supertypes);
-            }
         }
 
         normalizeLombokBuilderTypes(typeEntries, rootDeclaredTypeTrees, rootDeclaredTypeSources);
-
-        var workspaceTypes = new Object2ObjectLinkedOpenHashMap<Path, Set<String>>();
-        for (var entry : rootDeclaredTypeSources.entrySet()) {
-            workspaceTypes.computeIfAbsent(entry.getValue(), __ -> new ObjectLinkedOpenHashSet<>()).add(entry.getKey());
-        }
-        var subtypes = invertSubtypeMap(workspaceSupertypes);
 
         if (!skippedInvalidTypeKeys.isEmpty()) {
             LOG.fine(
@@ -841,82 +963,34 @@ public class WorkspaceTypeIndex {
                             skippedInvalidTypeKeys));
         }
         return new WorkspaceTypeIndex(
-                Collections.unmodifiableMap(typeEntries),
-                Collections.unmodifiableMap(workspaceTypes),
-                Collections.unmodifiableMap(workspaceSupertypes),
-                Collections.unmodifiableMap(subtypes));
+                Collections.unmodifiableMap(typeEntries), Collections.unmodifiableMap(sourceFileSnapshots));
     }
 
-    private static Map<String, Set<String>> invertSubtypeMap(Map<String, Set<String>> workspaceSupertypes) {
+    private static Map<String, Set<String>> invertSubtypeMap(Map<String, IndexedType> typesByQualifiedName) {
         var subtypes = new Object2ObjectLinkedOpenHashMap<String, Set<String>>();
-        for (var entry : workspaceSupertypes.entrySet()) {
-            for (var superType : entry.getValue()) {
+        for (var entry : typesByQualifiedName.entrySet()) {
+            for (var superType : entry.getValue().directSupertypes) {
                 subtypes.computeIfAbsent(superType, __ -> new ObjectLinkedOpenHashSet<>()).add(entry.getKey());
             }
         }
         return subtypes;
     }
 
-    static void sortMembers(List<Member> members) {
-        members.sort(MEMBER_ORDER);
-    }
-
-    static Set<String> directSupertypes(TypeInfo type) {
-        if (type == null) {
-            return Set.of();
-        }
-        var result = new ObjectLinkedOpenHashSet<String>();
-        if (type.superclass != null && !type.superclass.isBlank()) {
-            result.add(type.superclass);
-        }
-        result.addAll(type.interfaces);
-        return result.isEmpty() ? Set.of() : Set.copyOf(result);
-    }
-
-    static Optional<String> resolveSimpleName(
-            String simpleName, CompilationUnitTree root, Predicate<String> containsType) {
-        if (simpleName == null || simpleName.isBlank() || root == null || containsType == null) {
-            return Optional.empty();
-        }
-        var candidates = new ObjectLinkedOpenHashSet<String>();
-        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            var samePackage = packageName + "." + simpleName;
-            if (containsType.test(samePackage)) {
-                candidates.add(samePackage);
-            }
-        }
-
-        for (var importTree : root.getImports()) {
-            if (importTree.isStatic()) {
-                continue;
-            }
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + simpleName) && containsType.test(imported)) {
-                candidates.add(imported);
-            }
-            if (imported.endsWith(".*")) {
-                var candidate = imported.substring(0, imported.length() - 1) + simpleName;
-                if (containsType.test(candidate)) {
-                    candidates.add(candidate);
-                }
-            }
-        }
-
-        var javaLang = "java.lang." + simpleName;
-        if (containsType.test(javaLang)) {
-            candidates.add(javaLang);
-        }
-        if (candidates.size() == 1) {
-            return Optional.of(candidates.iterator().next());
-        }
-        return Optional.empty();
-    }
-
-    static String normalizeTypeName(String typeName) {
-        return TypeNames.normalize(typeName);
-    }
-
+    /**
+     * Return the direct superclass name to store on the indexed type snapshot.
+     *
+     * <p>This is the immediate graph edge only. It is not transitive.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * class Child extends Base {}
+     * -> "com.example.Base"
+     *
+     * class Plain {}
+     * -> null
+     * }</pre>
+     */
     private static String directSuperclass(TypeElement type) {
         var mirror = type.getSuperclass();
         if (mirror == null || mirror.getKind() == javax.lang.model.type.TypeKind.NONE) {
@@ -925,6 +999,16 @@ public class WorkspaceTypeIndex {
         return typeName(mirror);
     }
 
+    /**
+     * Return only the immediate interface edges for the indexed type snapshot.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * class Service implements Runnable, AutoCloseable {}
+     * -> ["java.lang.Runnable", "java.lang.AutoCloseable"]
+     * }</pre>
+     */
     private static List<String> directInterfaces(TypeElement type) {
         var result = new ArrayList<String>();
         for (var iface : type.getInterfaces()) {
@@ -955,6 +1039,29 @@ public class WorkspaceTypeIndex {
         return null;
     }
 
+    /**
+     * Convert a javac {@link TypeMirror} into the stable indexed type name used for owner/member
+     * lookup and type-graph edges.
+     *
+     * <p>This favors lookup stability over source fidelity:
+     *
+     * <ul>
+     *   <li>declared types become qualified names
+     *   <li>type variables collapse to their upper bound
+     *   <li>arrays keep their {@code []} suffix
+     * </ul>
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * List<String>      -> "java.util.List"
+     * T extends Number  -> "java.lang.Number"
+     * String[]          -> "java.lang.String[]"
+     * }</pre>
+     *
+     * <p>If you want the declared signature text instead of the stable lookup name, use
+     * {@link #normalizeDeclaredType(TypeMirror)}.
+     */
     private static String typeName(TypeMirror mirror) {
         if (mirror == null) return null;
         if (mirror instanceof DeclaredType declaredType) {
@@ -980,7 +1087,50 @@ public class WorkspaceTypeIndex {
         return mirror.toString();
     }
 
-    private static void collectTypeMirror(
+    /**
+     * Convert a javac {@link TypeMirror} into the declared signature text stored on indexed
+     * members.
+     *
+     * <p>Unlike {@link #typeName(TypeMirror)}, this preserves generic structure because the goal is
+     * to remember what the declaration said, not just what lookup owner it belongs to.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * List<String> -> "java.util.List<java.lang.String>"
+     * T            -> "T"
+     * Foo.Bar      -> "com.example.Foo.Bar"
+     * }</pre>
+     *
+     * <p>A more explicit name would be {@code declaredSignatureType}, but the current name is kept
+     * to avoid churn.
+     */
+    private static String normalizeDeclaredType(TypeMirror mirror) {
+        if (mirror == null) {
+            return null;
+        }
+        return mirror.toString().replace('$', '.');
+    }
+
+    /**
+     * Recursively collect declared types reachable from a type mirror into the workspace snapshot.
+     *
+     * <p>This is broader than a direct declared-type read. It follows nested generic arguments,
+     * bounds, arrays, wildcards, intersections, and unions so referenced workspace types can be
+     * published without reparsing unrelated files later.
+     *
+     * <p>Examples:
+     *
+     * <pre>{@code
+     * List<Order>           -> collect java.util.List and com.example.Order
+     * T extends Customer    -> collect com.example.Customer
+     * Result<A | B>         -> collect A and B
+     * }</pre>
+     *
+     * <p>A more explicit name would be {@code collectReferencedTypes}; that is the name used here
+     * because the old {@code collectTypeMirror} name hid the recursive graph-building behavior.
+     */
+    private static void collectReferencedTypes(
             TypeMirror mirror, Map<String, TypeElement> collectedTypes, Set<String> seenMirrors) {
         if (mirror == null) {
             return;
@@ -998,32 +1148,32 @@ public class WorkspaceTypeIndex {
                 }
             }
             for (var argument : declaredType.getTypeArguments()) {
-                collectTypeMirror(argument, collectedTypes, seenMirrors);
+                collectReferencedTypes(argument, collectedTypes, seenMirrors);
             }
             return;
         }
         if (mirror instanceof TypeVariable typeVariable) {
-            collectTypeMirror(typeVariable.getUpperBound(), collectedTypes, seenMirrors);
+            collectReferencedTypes(typeVariable.getUpperBound(), collectedTypes, seenMirrors);
             return;
         }
         if (mirror instanceof ArrayType arrayType) {
-            collectTypeMirror(arrayType.getComponentType(), collectedTypes, seenMirrors);
+            collectReferencedTypes(arrayType.getComponentType(), collectedTypes, seenMirrors);
             return;
         }
         if (mirror instanceof WildcardType wildcardType) {
-            collectTypeMirror(wildcardType.getExtendsBound(), collectedTypes, seenMirrors);
-            collectTypeMirror(wildcardType.getSuperBound(), collectedTypes, seenMirrors);
+            collectReferencedTypes(wildcardType.getExtendsBound(), collectedTypes, seenMirrors);
+            collectReferencedTypes(wildcardType.getSuperBound(), collectedTypes, seenMirrors);
             return;
         }
         if (mirror instanceof IntersectionType intersectionType) {
             for (var bound : intersectionType.getBounds()) {
-                collectTypeMirror(bound, collectedTypes, seenMirrors);
+                collectReferencedTypes(bound, collectedTypes, seenMirrors);
             }
             return;
         }
         if (mirror instanceof UnionType unionType) {
             for (var alternative : unionType.getAlternatives()) {
-                collectTypeMirror(alternative, collectedTypes, seenMirrors);
+                collectReferencedTypes(alternative, collectedTypes, seenMirrors);
             }
         }
     }
@@ -1042,11 +1192,11 @@ public class WorkspaceTypeIndex {
     }
 
     private static boolean isValidIndexKey(String key) {
-        return key != null && !key.isBlank() && (key.contains(".") || isPrimitiveTypeName(key));
+        return key != null && !key.isBlank() && (key.contains(".") || TypeNames.isPrimitive(key));
     }
 
     private static void addSyntheticLombokAccessors(
-            String ownerQualifiedName, ClassTree declaration, Map<String, Member> seen) {
+            String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
         if (declaration == null || !LombokAnnotations.hasAccessorLombokAnnotation(declaration.getModifiers())) {
             return;
         }
@@ -1074,50 +1224,68 @@ public class WorkspaceTypeIndex {
             var accessorInfo = accessors.get();
             if (accessorInfo.hasGetter()) {
                 var getterName = accessorInfo.getterName();
-                var fieldKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
+                var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
                 putSyntheticMethod(
                         seen,
-                        new Member(
+                        new IndexedMember(
                                 ownerQualifiedName,
                                 getterName,
                                 CompletionItemKind.Method,
                                 false,
                                 false,
+                                false,
+                                true,
+                                false,
                                 0,
                                 fieldType + " " + getterName + "()",
                                 fieldType,
+                                fieldType,
                                 new String[0],
                                 new String[0],
-                                canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Method, getterName, new String[0]),
+                                new String[0],
+                                IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, getterName, new String[0]),
                                 fieldKey,
                                 fieldName,
-                                true));
+                                true,
+                                IndexedMember.Origin.LOMBOK_ACCESSOR,
+                                Set.of(Modifier.PUBLIC),
+                                null,
+                                null));
             }
             if (accessorInfo.hasSetter()) {
                 var setterName = accessorInfo.setterName();
                 var erasedParameterTypes = new String[] {TypeNames.normalize(accessorInfo.fieldType())};
-                var fieldKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
+                var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
                 putSyntheticMethod(
                         seen,
-                        new Member(
+                        new IndexedMember(
                                 ownerQualifiedName,
                                 setterName,
                                 CompletionItemKind.Method,
                                 false,
                                 false,
+                                false,
+                                true,
+                                false,
                                 0,
                                 "void " + setterName + "(" + fieldType + " " + fieldName + ")",
                                 "void",
+                                "void",
                                 new String[] {fieldName},
                                 erasedParameterTypes,
-                                canonicalMemberKey(
+                                new String[] {fieldType},
+                                IndexedMember.canonicalKey(
                                         ownerQualifiedName,
                                         CompletionItemKind.Method,
                                         setterName,
                                         erasedParameterTypes),
                                 fieldKey,
                                 fieldName,
-                                true));
+                                true,
+                                IndexedMember.Origin.LOMBOK_ACCESSOR,
+                                Set.of(Modifier.PUBLIC),
+                                null,
+                                null));
             }
         }
     }
@@ -1127,8 +1295,8 @@ public class WorkspaceTypeIndex {
             ClassTree declaration,
             Path sourcePath,
             boolean fromCompiledRoot,
-            Map<String, Member> ownerMembers,
-            Map<String, TypeInfo> typeEntries,
+            Map<String, IndexedMember> ownerMembers,
+            Map<String, IndexedType> typeEntries,
             Map<String, Path> rootDeclaredTypeSources,
             Map<String, TypeElement> collectedTypes) {
         if (declaration == null || !LombokAnnotations.hasBuilderLombokAnnotation(declaration.getModifiers())) {
@@ -1148,74 +1316,102 @@ public class WorkspaceTypeIndex {
 
         putSyntheticMethod(
                 ownerMembers,
-                new Member(
+                new IndexedMember(
                         ownerQualifiedName,
                         "builder",
                         CompletionItemKind.Method,
                         true,
                         false,
+                        false,
+                        true,
+                        false,
                         0,
                         builderQualifiedName + " builder()",
                         builderQualifiedName,
+                        builderQualifiedName,
                         new String[0],
                         new String[0],
-                        canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]),
-                        canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]),
+                        new String[0],
+                        IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]),
+                        IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]),
                         null,
-                        true));
+                        true,
+                        IndexedMember.Origin.LOMBOK_BUILDER,
+                        Set.of(Modifier.PUBLIC, Modifier.STATIC),
+                        null,
+                        null));
 
-        var builderMembers = new ArrayList<Member>();
+        var builderMembers = new ArrayList<IndexedMember>();
         for (var field : fields) {
-            var fieldKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, field.name, null);
+            var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, field.name, null);
             var erasedParameterTypes = new String[] {TypeNames.normalize(field.type)};
             builderMembers.add(
-                    new Member(
+                    new IndexedMember(
                             builderQualifiedName,
                             field.name,
                             CompletionItemKind.Method,
                             false,
                             false,
+                            false,
+                            true,
+                            false,
                             0,
                             builderQualifiedName + " " + field.name + "(" + field.type + " " + field.name + ")",
                             builderQualifiedName,
+                            builderQualifiedName,
                             new String[] {field.name},
                             erasedParameterTypes,
-                            canonicalMemberKey(
+                            new String[] {field.type},
+                            IndexedMember.canonicalKey(
                                     builderQualifiedName,
                                     CompletionItemKind.Method,
                                     field.name,
                                     erasedParameterTypes),
                             fieldKey,
                             field.name,
-                            true));
+                            true,
+                            IndexedMember.Origin.LOMBOK_BUILDER,
+                            Set.of(Modifier.PUBLIC),
+                            null,
+                            null));
         }
         builderMembers.add(
-                new Member(
+                new IndexedMember(
                         builderQualifiedName,
                         "build",
                         CompletionItemKind.Method,
                         false,
                         false,
+                        false,
+                        true,
+                        false,
                         0,
                         ownerQualifiedName + " build()",
                         ownerQualifiedName,
+                        ownerQualifiedName,
                         new String[0],
                         new String[0],
-                        canonicalMemberKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
-                        canonicalMemberKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
+                        new String[0],
+                        IndexedMember.canonicalKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
+                        IndexedMember.canonicalKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
                         null,
-                        true));
-        sortMembers(builderMembers);
+                        true,
+                        IndexedMember.Origin.LOMBOK_BUILDER,
+                        Set.of(Modifier.PUBLIC),
+                        null,
+                        null));
+        IndexedMember.sort(builderMembers);
         typeEntries.put(
                 builderQualifiedName,
-                new TypeInfo(
+                new IndexedType(
                         builderQualifiedName,
                         TypeNames.simpleName(builderQualifiedName),
                         builderMembers,
                         fromCompiledRoot,
                         sourcePath,
                         null,
-                        List.of()));
+                        List.of(),
+                        IndexedMember.Provenance.WORKSPACE));
         if (sourcePath != null) {
             rootDeclaredTypeSources.put(builderQualifiedName, sourcePath);
         }
@@ -1227,7 +1423,7 @@ public class WorkspaceTypeIndex {
     }
 
     private static void normalizeLombokBuilderTypes(
-            Map<String, TypeInfo> typeEntries,
+            Map<String, IndexedType> typeEntries,
             Map<String, ClassTree> rootDeclaredTypeTrees,
             Map<String, Path> rootDeclaredTypeSources) {
         for (var entry : rootDeclaredTypeTrees.entrySet()) {
@@ -1262,29 +1458,30 @@ public class WorkspaceTypeIndex {
         }
     }
 
-    private static TypeInfo createSyntheticLombokBuilderType(
+    private static IndexedType createSyntheticLombokBuilderType(
             String ownerQualifiedName, List<DeclaredField> fields, Path sourcePath) {
         var builderQualifiedName = builderQualifiedName(ownerQualifiedName);
-        var builderMembers = new ArrayList<Member>();
+        var builderMembers = new ArrayList<IndexedMember>();
         for (var field : fields) {
             builderMembers.add(linkedBuilderSetter(ownerQualifiedName, builderQualifiedName, field));
         }
         builderMembers.add(builderBuildMethod(ownerQualifiedName, builderQualifiedName));
-        sortMembers(builderMembers);
-        return new TypeInfo(
+        IndexedMember.sort(builderMembers);
+        return new IndexedType(
                 builderQualifiedName,
                 TypeNames.simpleName(builderQualifiedName),
                 builderMembers,
                 sourcePath != null,
                 sourcePath,
                 null,
-                List.of());
+                List.of(),
+                IndexedMember.Provenance.WORKSPACE);
     }
 
-    private static TypeInfo normalizeLombokBuilderType(
-            TypeInfo existing, String ownerQualifiedName, List<DeclaredField> fields, Path sourcePath) {
+    private static IndexedType normalizeLombokBuilderType(
+            IndexedType existing, String ownerQualifiedName, List<DeclaredField> fields, Path sourcePath) {
         var builderQualifiedName = existing.qualifiedName;
-        var members = new Object2ObjectLinkedOpenHashMap<String, Member>();
+        var members = new Object2ObjectLinkedOpenHashMap<String, IndexedMember>();
         for (var member : existing.members) {
             members.put(memberStorageKey(member), member);
         }
@@ -1301,85 +1498,113 @@ public class WorkspaceTypeIndex {
         var buildKey = memberStorageKey(builderBuildMethod(ownerQualifiedName, builderQualifiedName));
         members.putIfAbsent(buildKey, builderBuildMethod(ownerQualifiedName, builderQualifiedName));
         var normalizedMembers = new ArrayList<>(members.values());
-        sortMembers(normalizedMembers);
-        return new TypeInfo(
+        IndexedMember.sort(normalizedMembers);
+        return new IndexedType(
                 builderQualifiedName,
                 existing.simpleName,
                 normalizedMembers,
                 existing.fromCompiledRoot || sourcePath != null,
                 existing.sourcePath != null ? existing.sourcePath : sourcePath,
                 existing.superclass,
-                existing.interfaces);
+                existing.interfaces,
+                existing.provenance);
     }
 
-    private static Member linkedBuilderSetter(
+    private static IndexedMember linkedBuilderSetter(
             String ownerQualifiedName, String builderQualifiedName, DeclaredField field) {
-        var fieldKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, field.name, null);
+        var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, field.name, null);
         var erasedParameterTypes = new String[] {TypeNames.normalize(field.type)};
-        return new Member(
+        return new IndexedMember(
                 builderQualifiedName,
                 field.name,
                 CompletionItemKind.Method,
                 false,
                 false,
+                false,
+                true,
+                false,
                 0,
                 builderQualifiedName + " " + field.name + "(" + field.type + " " + field.name + ")",
                 builderQualifiedName,
+                builderQualifiedName,
                 new String[] {field.name},
                 erasedParameterTypes,
-                canonicalMemberKey(
+                new String[] {field.type},
+                IndexedMember.canonicalKey(
                         builderQualifiedName,
                         CompletionItemKind.Method,
                         field.name,
                         erasedParameterTypes),
                 fieldKey,
                 field.name,
-                true);
+                true,
+                IndexedMember.Origin.LOMBOK_BUILDER,
+                Set.of(Modifier.PUBLIC),
+                null,
+                null);
     }
 
-    private static Member builderBuildMethod(String ownerQualifiedName, String builderQualifiedName) {
-        return new Member(
+    private static IndexedMember builderBuildMethod(String ownerQualifiedName, String builderQualifiedName) {
+        return new IndexedMember(
                 builderQualifiedName,
                 "build",
                 CompletionItemKind.Method,
                 false,
                 false,
+                false,
+                true,
+                false,
                 0,
                 ownerQualifiedName + " build()",
                 ownerQualifiedName,
+                ownerQualifiedName,
                 new String[0],
                 new String[0],
-                canonicalMemberKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
-                canonicalMemberKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
+                new String[0],
+                IndexedMember.canonicalKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
+                IndexedMember.canonicalKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
                 null,
-                true);
+                true,
+                IndexedMember.Origin.LOMBOK_BUILDER,
+                Set.of(Modifier.PUBLIC),
+                null,
+                null);
     }
 
     private static void addSyntheticSlf4jLoggerField(
-            String ownerQualifiedName, ClassTree declaration, Map<String, Member> seen) {
+            String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
         if (declaration == null || !LombokAnnotations.hasLoggingOnlyLombokAnnotation(declaration.getModifiers())) {
             return;
         }
         var next =
-                new Member(
+                new IndexedMember(
                         ownerQualifiedName,
                         "log",
                         CompletionItemKind.Field,
                         true,
                         true,
+                        false,
+                        false,
+                        false,
                         0,
                         "org.slf4j.Logger log",
                         "org.slf4j.Logger",
+                        "org.slf4j.Logger",
                         null,
                         null,
-                        canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
-                        canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
                         null,
-                        true);
+                        IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
+                        IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
+                        null,
+                        true,
+                        IndexedMember.Origin.LOMBOK_LOGGER,
+                        Set.of(Modifier.PRIVATE, Modifier.STATIC),
+                        null,
+                        null);
         seen.putIfAbsent(memberStorageKey(next), next);
     }
 
-    private static void putSyntheticMethod(Map<String, Member> seen, Member next) {
+    private static void putSyntheticMethod(Map<String, IndexedMember> seen, IndexedMember next) {
         var key = memberStorageKey(next);
         var existing = seen.get(key);
         if (existing == null) {
@@ -1394,51 +1619,73 @@ public class WorkspaceTypeIndex {
     }
 
     private static void addRecordComponentAccessors(
-            String ownerQualifiedName, TypeElement type, Map<String, Member> seen) {
+            String ownerQualifiedName, TypeElement type, Map<String, IndexedMember> seen) {
         for (var component : type.getRecordComponents()) {
             var accessor = component.getAccessor();
             if (accessor == null) {
                 continue;
             }
             var accessorName = accessor.getSimpleName().toString();
-            var key = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Method, accessorName, new String[0]);
+            var key = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, accessorName, new String[0]);
             var existing = seen.get(key);
-            var logicalKey = canonicalMemberKey(ownerQualifiedName, CompletionItemKind.Field, component.getSimpleName().toString(), null);
+            var logicalKey =
+                    IndexedMember.canonicalKey(
+                            ownerQualifiedName,
+                            CompletionItemKind.Field,
+                            component.getSimpleName().toString(),
+                            null);
             if (existing == null) {
                 seen.put(
                         key,
-                        new Member(
+                        new IndexedMember(
                                 ownerQualifiedName,
                                 accessorName,
                                 CompletionItemKind.Method,
                                 accessor.getModifiers().contains(Modifier.STATIC),
                                 accessor.getModifiers().contains(Modifier.PRIVATE),
+                                accessor.getModifiers().contains(Modifier.PROTECTED),
+                                accessor.getModifiers().contains(Modifier.PUBLIC),
+                                accessor.getModifiers().contains(Modifier.ABSTRACT),
                                 0,
                                 accessor.getReturnType() + " " + accessorName + "()",
                                 typeName(accessor.getReturnType()),
+                                normalizeDeclaredType(accessor.getReturnType()),
+                                new String[0],
                                 new String[0],
                                 new String[0],
                                 key,
                                 logicalKey,
                                 component.getSimpleName().toString(),
-                                false));
+                                true,
+                                IndexedMember.Origin.RECORD_COMPONENT,
+                                Set.copyOf(accessor.getModifiers()),
+                                null,
+                                null));
                 continue;
             }
             if (existing.backingFieldName == null || existing.backingFieldName.isBlank()) {
-                seen.put(key, mergeFieldLink(existing, logicalKey, component.getSimpleName().toString(), false));
+                seen.put(
+                        key,
+                        mergeFieldLink(
+                                existing,
+                                logicalKey,
+                                component.getSimpleName().toString(),
+                                true,
+                                IndexedMember.Origin.RECORD_COMPONENT));
             }
         }
     }
 
-    private static String memberStorageKey(Member member) {
-        return canonicalMemberKey(member.ownerType, member.kind, member.name, member.erasedParameterTypes);
+    private static String memberStorageKey(IndexedMember member) {
+        return IndexedMember.canonicalKey(
+                member.ownerType, member.kind, member.name, member.erasedParameterTypes);
     }
 
     private static String builderQualifiedName(String ownerQualifiedName) {
         return ownerQualifiedName + "." + TypeNames.simpleName(ownerQualifiedName) + "Builder";
     }
 
-    private static List<DeclaredField> declaredInstanceFields(ClassTree declaration, Map<String, Member> seen) {
+    private static List<DeclaredField> declaredInstanceFields(ClassTree declaration, Map<String, IndexedMember> seen) {
         var fields = new ArrayList<DeclaredField>();
         if (declaration == null) {
             return fields;
@@ -1462,7 +1709,7 @@ public class WorkspaceTypeIndex {
         return fields;
     }
 
-    private static String resolvedFieldType(VariableTree variable, String fieldName, Map<String, Member> seen) {
+    private static String resolvedFieldType(VariableTree variable, String fieldName, Map<String, IndexedMember> seen) {
         var fieldType = variable.getType() == null ? "java.lang.Object" : variable.getType().toString();
         for (var existing : seen.values()) {
             if (existing.kind != CompletionItemKind.Field || existing.isStatic) {
@@ -1481,36 +1728,54 @@ public class WorkspaceTypeIndex {
 
     private record DeclaredField(String name, String type) {}
 
-    private static Map<String, Member> membersByStorageKey(List<Member> members) {
-        var seen = new Object2ObjectOpenHashMap<String, Member>();
+    private static Map<String, IndexedMember> membersByStorageKey(List<IndexedMember> members) {
+        var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
         for (var member : members) {
             seen.put(memberStorageKey(member), member);
         }
         return seen;
     }
 
-    private static Member mergeLombokFieldLink(Member existing, Member synthetic) {
-        return mergeFieldLink(existing, synthetic.logicalKey, synthetic.backingFieldName, synthetic.synthetic);
+    private static IndexedMember mergeLombokFieldLink(IndexedMember existing, IndexedMember synthetic) {
+        return mergeFieldLink(
+                existing,
+                synthetic.logicalKey,
+                synthetic.backingFieldName,
+                synthetic.synthetic,
+                synthetic.origin);
     }
 
-    private static Member mergeFieldLink(
-            Member existing, String logicalKey, String backingFieldName, boolean synthetic) {
-        return new Member(
+    private static IndexedMember mergeFieldLink(
+            IndexedMember existing,
+            String logicalKey,
+            String backingFieldName,
+            boolean synthetic,
+            IndexedMember.Origin origin) {
+        return new IndexedMember(
                 existing.ownerType,
                 existing.name,
                 existing.kind,
                 existing.isStatic,
                 existing.isPrivate,
+                existing.isProtected,
+                existing.isPublic,
+                existing.isAbstract,
                 existing.priority,
                 existing.detail,
                 existing.returnType,
+                existing.declaredReturnType,
                 existing.parameterNames,
                 existing.erasedParameterTypes,
+                existing.declaredParameterTypes,
                 existing.canonicalKey,
                 logicalKey != null && !logicalKey.isBlank()
                         ? logicalKey
                         : existing.logicalKey,
                 backingFieldName,
-                        existing.synthetic || synthetic);
+                existing.synthetic || synthetic,
+                origin == null ? existing.origin : origin,
+                existing.modifiers,
+                existing.sourceUri,
+                existing.declarationRange);
     }
 }
