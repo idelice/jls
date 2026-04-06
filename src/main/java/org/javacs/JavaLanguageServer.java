@@ -136,6 +136,7 @@ class JavaLanguageServer extends LanguageServer {
      * this counter and yields instead of racing the explicit save request.
      */
     private final AtomicInteger didSaveDiagnosticsInFlight = new AtomicInteger();
+    private final Set<String> shownWorkspaceWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private enum CompletionIndexRefreshMode {
         ACTIVE_DOCUMENT_BOOTSTRAP,
@@ -690,9 +691,11 @@ class JavaLanguageServer extends LanguageServer {
 
         var externalDependencies = externalDependencies();
         var classPath = classPath();
-        var extraArgs = extraCompilerArgs();
+        var userExtraArgs = extraCompilerArgs();
         var addExports = addExports();
         var lombokEnabled = lombokEnabled();
+        var compilerArgs = selectCompilerArgs(userExtraArgs, externalDependencies);
+        var extraArgs = compilerArgs.args();
         var settingsLoaded = Instant.now();
         Set<Path> resolvedDocPath;
         // If classpath is specified by the user, don't infer anything
@@ -728,6 +731,13 @@ class JavaLanguageServer extends LanguageServer {
         var inferenceFinished = Instant.now();
         endWorkDoneProgress(progressToken, "Configured javac");
         LOG.info(String.format("[perf] lombok_setting enabled=%s", lombokEnabled));
+        LOG.info(
+                String.format(
+                        "[perf] compiler_args source=%s count=%d mixed_modules=%s",
+                        compilerArgs.source(),
+                        extraArgs.size(),
+                        compilerArgs.mixedModules()));
+        LOG.info(String.format("[perf] compiler_args_values args=%s", extraArgs));
         cacheCompiler =
                 new JavaCompilerService(
                         classPath,
@@ -735,7 +745,8 @@ class JavaLanguageServer extends LanguageServer {
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "interactive");
+                        "interactive",
+                        message -> warnUserOnce("lombok_runtime_incompatible", message));
         var diagnosticsStarted = Instant.now();
         diagnosticsCompiler =
                 new JavaCompilerService(
@@ -744,7 +755,8 @@ class JavaLanguageServer extends LanguageServer {
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "diagnostics");
+                        "diagnostics",
+                        message -> warnUserOnce("lombok_runtime_incompatible", message));
         LOG.info(String.format(
                 "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms total=%dms",
                 classPath.size(),
@@ -778,15 +790,59 @@ class JavaLanguageServer extends LanguageServer {
         return paths;
     }
 
-    private Set<String> extraCompilerArgs() {
-        if (!settings.has("extraCompilerArgs")) return Set.of();
+    private List<String> extraCompilerArgs() {
+        if (!settings.has("extraCompilerArgs")) return List.of();
         var array = settings.getAsJsonArray("extraCompilerArgs");
-        var args = new HashSet<String>();
+        var args = new ArrayList<String>();
         for (var each : array) {
             // split "a b  c" to ["a","b","c"]
-            args.addAll(Arrays.asList(each.getAsString().split("\\s+")));
+            args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
         }
-        return args;
+        return List.copyOf(args);
+    }
+
+    private InferConfig.MavenCompilerArgs selectCompilerArgs(List<String> userExtraArgs, Set<String> externalDependencies) {
+        if (hasExplicitJavaLevelOverride(userExtraArgs)) {
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "user", false);
+        }
+        var pomXml = workspaceRoot.resolve("pom.xml");
+        if (!Files.exists(pomXml)) {
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "none", false);
+        }
+        var inferred = new InferConfig(workspaceRoot, externalDependencies).compilerArgs();
+        if (inferred.mixedModules()) {
+            warnUserOnce(
+                    "maven_mixed_release_fallback",
+                    "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.");
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "fallback_mixed_modules", true);
+        }
+        if (inferred.args().isEmpty()) {
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "none", false);
+        }
+        var merged = new ArrayList<String>(userExtraArgs);
+        merged.addAll(inferred.args());
+        return new InferConfig.MavenCompilerArgs(List.copyOf(merged), inferred.source(), false);
+    }
+
+    private static boolean hasExplicitJavaLevelOverride(List<String> extraArgs) {
+        for (var i = 0; i < extraArgs.size(); i++) {
+            var arg = extraArgs.get(i);
+            if ("--release".equals(arg) || "-source".equals(arg) || "-target".equals(arg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void warnUserOnce(String key, String message) {
+        if (!shownWorkspaceWarnings.add(key)) {
+            return;
+        }
+        var params = new ShowMessageParams();
+        params.type = MessageType.Warning;
+        params.message = message;
+        client.showMessage(params);
+        LOG.warning(message);
     }
 
     private Set<Path> docPath() {

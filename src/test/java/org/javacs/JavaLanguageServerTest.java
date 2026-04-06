@@ -3762,6 +3762,50 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void completionInfersLambdaItemTypeInComplexInferredMavenWorkspace() throws Exception {
+        var workspace = Files.createTempDirectory("jls-complex-lambda-release");
+        try {
+            writeInferredDemoPom(workspace);
+            var sources = new java.util.HashMap<>(lombokBuilderDefinitionReplaySources());
+            var servicePath = "src/main/java/com/example/demo/complex/service/ComplexScenarioService.java";
+            var serviceText =
+                    sources.get(servicePath)
+                            .replace(
+                                    "var formatter = new ComplexStatics.NestedFormatter();",
+                                    "var direct = new LineItem();\n"
+                                            + "                            direct.\n"
+                                            + "                            var formatter = new ComplexStatics.NestedFormatter();")
+                            .replace(
+                                    "envelope.getItems().stream().map(i -> i.getFamily()).collect(Collectors.toList());",
+                                    "envelope.getItems().stream().map(i -> i.).collect(Collectors.toList());");
+            sources.put(servicePath, serviceText);
+            writeSources(workspace, sources);
+
+            var service = workspace.resolve(servicePath);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, service);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before complex inferred Maven lambda completion",
+                    awaitCompletionIndexAdvance(server, 0, 15, TimeUnit.SECONDS));
+
+            var directCompletion = completionAtMarker(server, service, serviceText, "direct.");
+            var directLabels = completionLabels(directCompletion);
+            Assert.assertTrue("complex direct completion: " + directLabels, directLabels.contains("getFamily"));
+            Assert.assertTrue("complex direct completion: " + directLabels, directLabels.contains("getFlags"));
+            Assert.assertTrue("complex direct completion: " + directLabels, directLabels.contains("getQuantity"));
+
+            var completion = completionAtMarker(server, service, serviceText, "map(i -> i.");
+            var labels = completionLabels(completion);
+            Assert.assertTrue("complex lambda completion: " + labels, labels.contains("getFamily"));
+            Assert.assertTrue("complex lambda completion: " + labels, labels.contains("getFlags"));
+            Assert.assertTrue("complex lambda completion: " + labels, labels.contains("getQuantity"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void completionOffersLombokBuilderMembersFromIndex() throws Exception {
         var workspace = Files.createTempDirectory("jls-lombok-builder-members");
         try {
@@ -4550,6 +4594,223 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void userReleaseOverridesInferredMavenRelease() throws Exception {
+        var workspace = Files.createTempDirectory("jls-maven-release-override");
+        try {
+            Files.writeString(
+                    workspace.resolve("pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <groupId>example</groupId>
+                      <artifactId>override</artifactId>
+                      <version>1</version>
+                      <properties>
+                        <maven.compiler.release>21</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingMessageClient());
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var extra = new com.google.gson.JsonArray();
+            extra.add("--release 17");
+            java.add("extraCompilerArgs", extra);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            var compiler = cacheCompiler(server);
+            Assert.assertEquals(List.of("--release", "17"), compiler.extraArgs);
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void didChangeRefreshesCompletionIndexWithInferredMavenRelease() throws Exception {
+        var workspace = Files.createTempDirectory("jls-maven-release-didchange");
+        var sourceRoot = Files.createDirectories(workspace.resolve("src/main/java/example"));
+        var file = sourceRoot.resolve("App.java");
+        try {
+            Files.writeString(
+                    workspace.resolve("pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <groupId>example</groupId>
+                      <artifactId>release-didchange</artifactId>
+                      <version>1</version>
+                      <properties>
+                        <maven.compiler.release>21</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+            var original =
+                    """
+                    package example;
+
+                    class App {
+                        String value() {
+                            return "ok";
+                        }
+                    }
+                    """;
+            Files.writeString(file, original);
+
+            var logger = Logger.getLogger("main");
+            var previousLevel = logger.getLevel();
+            logger.setLevel(Level.FINE);
+            var capture = new TestLogCapture();
+            logger.addHandler(capture);
+            try {
+                var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+                Assert.assertEquals(List.of("--release", "21"), cacheCompiler(server).extraArgs);
+
+                var open = new DidOpenTextDocumentParams();
+                open.textDocument.uri = file.toUri();
+                open.textDocument.version = 1;
+                open.textDocument.languageId = "java";
+                open.textDocument.text = original;
+                server.didOpenTextDocument(open);
+
+                Assert.assertTrue(
+                        "expected initial workspace bootstrap before didChange",
+                        awaitCompletionIndexAdvance(server, 0, 15, TimeUnit.SECONDS));
+
+                var before = completionIndexVersion(server);
+                var changed =
+                        """
+                        package example;
+
+                        class App {
+                            String value() {
+                                return "ok";
+                            }
+
+                            String title() {
+                                return value();
+                            }
+                        }
+                        """;
+                var change = new DidChangeTextDocumentParams();
+                change.textDocument.uri = file.toUri();
+                change.textDocument.version = 2;
+                var delta = new TextDocumentContentChangeEvent();
+                delta.text = changed;
+                change.contentChanges.add(delta);
+                server.didChangeTextDocument(change);
+
+                Assert.assertTrue(
+                        "didChange should still refresh the completion index with inferred --release",
+                        awaitCompletionIndexAdvance(server, before, 15, TimeUnit.SECONDS));
+                Assert.assertEquals(
+                        "completion refresh should not combine --source with inferred --release",
+                        0,
+                        capture.countContaining("option --source cannot be used together with --release"));
+                Assert.assertEquals(
+                        "completion refresh should not leave the compiler locked after an option failure",
+                        0,
+                        capture.countContaining("Compiler is already in-use!"));
+            } finally {
+                logger.removeHandler(capture);
+                logger.setLevel(previousLevel);
+            }
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void mixedMavenModulesWarnOnceAndFallBackGracefully() throws Exception {
+        var workspace = Files.createTempDirectory("jls-mixed-maven-warning");
+        try {
+            Files.createDirectories(workspace.resolve("mod17"));
+            Files.createDirectories(workspace.resolve("mod21"));
+            Files.writeString(
+                    workspace.resolve("pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <groupId>example</groupId>
+                      <artifactId>mixed-parent</artifactId>
+                      <version>1</version>
+                      <packaging>pom</packaging>
+                      <modules>
+                        <module>mod17</module>
+                        <module>mod21</module>
+                      </modules>
+                    </project>
+                    """);
+            Files.writeString(
+                    workspace.resolve("mod17/pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <parent>
+                        <groupId>example</groupId>
+                        <artifactId>mixed-parent</artifactId>
+                        <version>1</version>
+                      </parent>
+                      <artifactId>mod17</artifactId>
+                      <properties>
+                        <maven.compiler.release>17</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+            Files.writeString(
+                    workspace.resolve("mod21/pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <parent>
+                        <groupId>example</groupId>
+                        <artifactId>mixed-parent</artifactId>
+                        <version>1</version>
+                      </parent>
+                      <artifactId>mod21</artifactId>
+                      <properties>
+                        <maven.compiler.release>21</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+
+            var client = new RecordingMessageClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            Assert.assertEquals(1, client.messages.size());
+            Assert.assertThat(
+                    client.messages.get(0).message,
+                    org.hamcrest.Matchers.containsString("mixed Maven module Java levels"));
+            Assert.assertEquals(List.of(), cacheCompiler(server).extraArgs);
+
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            java.addProperty("lombokEnabled", false);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            Assert.assertEquals("warning should be shown only once per workspace session", 1, client.messages.size());
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void configurationChangeSchedulesWorkspaceRefreshForActiveFiles() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
@@ -5085,6 +5346,12 @@ public class JavaLanguageServerTest {
         var method = JavaLanguageServer.class.getDeclaredMethod("cancelPendingCompletionIndex", String.class);
         method.setAccessible(true);
         method.invoke(server, reason);
+    }
+
+    private JavaCompilerService cacheCompiler(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
+        field.setAccessible(true);
+        return (JavaCompilerService) field.get(server);
     }
 
     private void invokeCompileAndPublish(
@@ -6661,6 +6928,24 @@ public class JavaLanguageServerTest {
         List<Diagnostic> diagnostics(java.net.URI uri) {
             return diagnosticsByUri.getOrDefault(uri, List.of());
         }
+    }
+
+    private static final class RecordingMessageClient implements LanguageClient {
+        private final List<ShowMessageParams> messages = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @Override
+        public void publishDiagnostics(PublishDiagnosticsParams params) {}
+
+        @Override
+        public void showMessage(ShowMessageParams params) {
+            messages.add(params);
+        }
+
+        @Override
+        public void registerCapability(String method, com.google.gson.JsonElement options) {}
+
+        @Override
+        public void customNotification(String method, com.google.gson.JsonElement params) {}
     }
 
     private static class TestLogCapture extends Handler {

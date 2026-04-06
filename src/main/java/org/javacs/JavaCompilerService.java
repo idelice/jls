@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -26,7 +27,7 @@ class JavaCompilerService implements CompilerProvider {
     // Not modifiable! If you want to edit these, you need to create a new instance
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
-    final Set<String> extraArgs;
+    final List<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
     final ReusableCompiler diagnosticsNoExpansionCompiler = new ReusableCompiler();
     final Docs docs;
@@ -34,6 +35,7 @@ class JavaCompilerService implements CompilerProvider {
     final boolean lombokConfiguredEnabled;
     final boolean lombokPresentOnClasspath;
     final String compilerRole;
+    private final Consumer<String> warningSink;
     private volatile boolean lombokApEnabled;
     // Diagnostics from the last compilation task
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
@@ -41,33 +43,34 @@ class JavaCompilerService implements CompilerProvider {
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
 
+    JavaCompilerService(
+            Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
+        this(classPath, docPath, addExports, extraArgs, true, "standalone", __ -> {});
+    }
+
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
-        this(classPath, docPath, addExports, extraArgs, true, "standalone");
+        this(classPath, docPath, addExports, (Collection<String>) extraArgs);
+    }
+
+    JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs, boolean lombokConfiguredEnabled) {
+        this(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, "standalone", __ -> {});
     }
 
     JavaCompilerService(
             Set<Path> classPath,
             Set<Path> docPath,
             Set<String> addExports,
-            Set<String> extraArgs,
-            boolean lombokConfiguredEnabled) {
-        this(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, "standalone");
-    }
-
-    JavaCompilerService(
-            Set<Path> classPath,
-            Set<Path> docPath,
-            Set<String> addExports,
-            Set<String> extraArgs,
+            Collection<String> extraArgs,
             boolean lombokConfiguredEnabled,
-            String compilerRole) {
+            String compilerRole,
+            Consumer<String> warningSink) {
         var constructorStarted = Instant.now();
 
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
         this.classPath = Collections.unmodifiableSet(classPath);
         this.docPath = Collections.unmodifiableSet(docPath);
         this.addExports = Collections.unmodifiableSet(addExports);
-        this.extraArgs = Collections.unmodifiableSet(extraArgs);
+        this.extraArgs = normalizedArgs(extraArgs);
         this.docs = new Docs(docPath);
         var docsReady = Instant.now();
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
@@ -75,6 +78,7 @@ class JavaCompilerService implements CompilerProvider {
         this.lombokConfiguredEnabled = lombokConfiguredEnabled;
         this.lombokPresentOnClasspath = hasLombokJar(classPath);
         this.compilerRole = compilerRole;
+        this.warningSink = warningSink == null ? __ -> {} : warningSink;
         this.lombokApEnabled = this.lombokPresentOnClasspath && this.lombokConfiguredEnabled;
         this.fileManager = new SourceFileManager();
         LOG.info(
@@ -88,6 +92,26 @@ class JavaCompilerService implements CompilerProvider {
                         Duration.between(constructorStarted, Instant.now()).toMillis(),
                         lombokPresentOnClasspath,
                         lombokApEnabled));
+    }
+
+    JavaCompilerService(
+            Set<Path> classPath,
+            Set<Path> docPath,
+            Set<String> addExports,
+            List<String> extraArgs,
+            boolean lombokConfiguredEnabled,
+            String compilerRole,
+            Consumer<String> warningSink) {
+        this(classPath, docPath, addExports, (Collection<String>) extraArgs, lombokConfiguredEnabled, compilerRole, warningSink);
+    }
+
+    private static List<String> normalizedArgs(Collection<String> extraArgs) {
+        if (extraArgs instanceof Set<?>) {
+            var sorted = new ArrayList<>(extraArgs);
+            Collections.sort(sorted);
+            return List.copyOf(sorted);
+        }
+        return List.copyOf(extraArgs);
     }
 
     private static final int MAX_CACHE_SIZE = 1000;
@@ -762,6 +786,11 @@ class JavaCompilerService implements CompilerProvider {
                         "[lombok] annotation processing disabled phase=%s reason=%s root=%s",
                         phase, failure.getMessage(), root.toString());
         LOG.fine(message);
+        warningSink.accept(
+                String.format(
+                        "Project Lombok annotation processing failed on runtime JDK %d. Upgrade the project's Lombok dependency for correct generated-member support. Root cause: %s",
+                        Runtime.version().feature(),
+                        root));
     }
 
     private static Throwable rootCause(Throwable t) {

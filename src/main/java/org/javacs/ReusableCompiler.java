@@ -120,23 +120,47 @@ class ReusableCompiler {
         List<String> opts =
                 StreamSupport.stream(options.spliterator(), false).collect(Collectors.toCollection(ArrayList::new));
         var key = List.copyOf(opts);
-        var state = contexts.get(key);
+        var state = hasExplicitJavaLevelOption(opts) ? null : contexts.get(key);
         if (state == null) {
             state = new ReusableContextState(new ReusableContext(opts));
-            contexts.put(key, state);
+            if (!hasExplicitJavaLevelOption(opts)) {
+                contexts.put(key, state);
+            }
         }
         if (state.checkedOut) {
             throw new RuntimeException("Compiler is already in-use!");
         }
         state.checkedOut = true;
-        JavacTaskImpl task =
-                (JavacTaskImpl)
-                        systemProvider.getTask(
-                                null, fileManager, diagnosticListener, opts, classes, compilationUnits, state.context);
+        JavacTaskImpl task;
+        try {
+            task =
+                    (JavacTaskImpl)
+                            systemProvider.getTask(
+                                    null,
+                                    fileManager,
+                                    diagnosticListener,
+                                    opts,
+                                    classes,
+                                    compilationUnits,
+                                    state.context);
+        } catch (RuntimeException e) {
+            state.checkedOut = false;
+            LOG.warning(String.format("[perf] javac_get_task_failed options=%s reason=%s", opts, e.getMessage()));
+            throw e;
+        }
 
         task.addTaskListener(state.context);
 
         return new Borrow(task, state);
+    }
+
+    private static boolean hasExplicitJavaLevelOption(List<String> options) {
+        for (var option : options) {
+            if ("--release".equals(option) || "-source".equals(option) || "-target".equals(option)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     class Borrow implements AutoCloseable {

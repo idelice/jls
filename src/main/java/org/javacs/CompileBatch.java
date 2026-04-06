@@ -373,7 +373,7 @@ public class CompileBatch implements AutoCloseable {
     }
 
     private static List<String> options(
-            Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, boolean lombokPresent) {
+            Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
@@ -406,9 +406,7 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        var sortedExtraArgs = new ArrayList<>(extraArgs);
-        Collections.sort(sortedExtraArgs);
-        list.addAll(sortedExtraArgs);
+        list.addAll(extraArgs);
         var sortedExports = new ArrayList<>(addExports);
         Collections.sort(sortedExports);
         for (var export : sortedExports) {
@@ -420,7 +418,7 @@ public class CompileBatch implements AutoCloseable {
     }
 
     private static List<String> optionsForFastAp(
-            Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, boolean lombokPresent) {
+            Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
         var list = options(classPath, addExports, extraArgs, lombokPresent);
         if (lombokPresent) {
             // Run AP + attribution, but stop before FLOW so completion stays lightweight.
@@ -445,7 +443,7 @@ public class CompileBatch implements AutoCloseable {
      * Create compilation options with annotation processing disabled.
      * Used for retrying compilation after AP failure.
      */
-    static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs) {
+    static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();
         Collections.addAll(list, "-classpath", joinPath(classPath));
         Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
@@ -462,9 +460,7 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        var sortedExtraArgs = new ArrayList<>(extraArgs);
-        Collections.sort(sortedExtraArgs);
-        list.addAll(sortedExtraArgs);
+        list.addAll(extraArgs);
         var sortedExports = new ArrayList<>(addExports);
         Collections.sort(sortedExports);
         for (var export : sortedExports) {

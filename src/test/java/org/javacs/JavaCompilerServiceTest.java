@@ -51,6 +51,30 @@ public class JavaCompilerServiceTest {
         assertThat(service.lombokConfiguredEnabled, is(true));
     }
 
+    @Test
+    public void disablingLombokAnnotationProcessingReportsUpgradeWarningOnce() throws Exception {
+        var warnings = new ArrayList<String>();
+        var service =
+                new JavaCompilerService(
+                        Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        List.of(),
+                        true,
+                        "test",
+                        warnings::add);
+        var method =
+                JavaCompilerService.class.getDeclaredMethod(
+                        "disableLombokAnnotationProcessing", String.class, RuntimeException.class);
+        method.setAccessible(true);
+
+        method.invoke(service, "phase-one", new RuntimeException("boom"));
+        method.invoke(service, "phase-two", new RuntimeException("boom again"));
+
+        assertThat(warnings, hasSize(1));
+        assertThat(warnings.get(0), containsString("Upgrade the project's Lombok dependency"));
+    }
+
     static Path simpleProjectSrc() {
         return Paths.get("src/test/examples/simple-project").normalize();
     }
@@ -162,8 +186,62 @@ public class JavaCompilerServiceTest {
         var fastContexts = reusableCompilerContexts(fastService.compiler);
         assertThat(
                 "repeated fast AP compiles should not keep creating new reusable contexts",
-                fastContexts.size(),
-                lessThanOrEqualTo(2));
+                    fastContexts.size(),
+                    lessThanOrEqualTo(2));
+    }
+
+    @Test
+    public void reusableCompilerUnlocksAfterTaskCreationFailure() {
+        var reusable = new ReusableCompiler();
+
+        try {
+            reusable.getTask(
+                    compiler.fileManager,
+                    diagnostic -> {},
+                    List.of("--release", "21", "-source", "21"),
+                    List.of(),
+                    List.of());
+            fail("expected javac option parsing to fail");
+        } catch (RuntimeException expected) {
+            assertThat(expected.getMessage(), containsString("--release"));
+        }
+
+        try (var borrow =
+                reusable.getTask(
+                        compiler.fileManager,
+                        diagnostic -> {},
+                        List.of("--release", "21"),
+                        List.of(),
+                        List.of())) {
+            assertThat("compiler should unlock after getTask failure", borrow, notNullValue());
+        }
+    }
+
+    @Test
+    public void compileTwiceWithReleaseArgsReusesNoStaleCompilerState() throws Exception {
+        var file = Files.createTempFile("release-compile-", ".java");
+        try {
+            Files.writeString(
+                    file,
+                    """
+                    class ReleaseCompile {
+                        String value() {
+                            return "ok";
+                        }
+                    }
+                    """);
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            List.of("--release", "21"));
+
+            try (var ignored = service.compile(file)) {}
+            try (var ignored = service.compile(file)) {}
+        } finally {
+            Files.deleteIfExists(file);
+        }
     }
 
     @Test
@@ -420,7 +498,7 @@ public class JavaCompilerServiceTest {
     }
 
     private static boolean quickMaybeUsesLombok(JavaCompilerService service, Path file) throws Exception {
-        Method method = JavaCompilerService.class.getDeclaredMethod("quickMaybeUsesLombok", Path.class);
+        Method method = JavaCompilerService.class.getDeclaredMethod("hasLombokAnnotation", Path.class);
         method.setAccessible(true);
         return (boolean) method.invoke(service, file);
     }

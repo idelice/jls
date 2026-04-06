@@ -73,6 +73,267 @@ public class InferConfigTest {
     }
 
     @Test
+    public void inferCompilerArgsUsesMavenCompilerRelease() throws Exception {
+        var workspace = temp.newFolder("release-workspace").toPath();
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>example</groupId>
+                  <artifactId>release-workspace</artifactId>
+                  <version>1</version>
+                  <properties>
+                    <maven.compiler.release>21</maven.compiler.release>
+                  </properties>
+                </project>
+                """);
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+
+        var inferred =
+                InferConfig.inferMavenCompilerArgs(
+                        workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
+
+        assertThat(inferred.source(), equalTo("maven_release"));
+        assertThat(inferred.args(), contains("--release", "21"));
+        assertThat(inferred.mixedModules(), equalTo(false));
+    }
+
+    @Test
+    public void inferCompilerArgsUsesSpringBootJavaVersionViaEffectivePom() throws Exception {
+        var workspace = temp.newFolder("spring-boot-workspace").toPath();
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <parent>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-parent</artifactId>
+                    <version>4.0.1</version>
+                    <relativePath/>
+                  </parent>
+                  <groupId>example</groupId>
+                  <artifactId>spring-boot-workspace</artifactId>
+                  <version>1</version>
+                  <properties>
+                    <java.version>21</java.version>
+                  </properties>
+                </project>
+                """);
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+
+        var inferred =
+                InferConfig.inferMavenCompilerArgs(
+                        workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
+
+        assertThat(inferred.source(), equalTo("maven_release"));
+        assertThat(inferred.args(), contains("--release", "21"));
+    }
+
+    @Test
+    public void inferCompilerArgsUsesSourceAndTargetWhenReleaseMissing() throws Exception {
+        var workspace = temp.newFolder("source-target-workspace").toPath();
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>example</groupId>
+                  <artifactId>source-target-workspace</artifactId>
+                  <version>1</version>
+                  <properties>
+                    <maven.compiler.source>17</maven.compiler.source>
+                    <maven.compiler.target>17</maven.compiler.target>
+                  </properties>
+                </project>
+                """);
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+
+        var inferred =
+                InferConfig.inferMavenCompilerArgs(
+                        workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
+
+        assertThat(inferred.source(), equalTo("maven_source_target"));
+        assertThat(inferred.args(), contains("-source", "17", "-target", "17"));
+    }
+
+    @Test
+    public void inferCompilerArgsFallsBackForMixedModuleLevels() throws Exception {
+        var workspace = temp.newFolder("mixed-workspace").toPath();
+        Files.createDirectories(workspace.resolve("mod17"));
+        Files.createDirectories(workspace.resolve("mod21"));
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>example</groupId>
+                  <artifactId>mixed-workspace</artifactId>
+                  <version>1</version>
+                  <packaging>pom</packaging>
+                  <modules>
+                    <module>mod17</module>
+                    <module>mod21</module>
+                  </modules>
+                </project>
+                """);
+        Files.writeString(
+                workspace.resolve("mod17/pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <parent>
+                    <groupId>example</groupId>
+                    <artifactId>mixed-workspace</artifactId>
+                    <version>1</version>
+                  </parent>
+                  <artifactId>mod17</artifactId>
+                  <properties>
+                    <maven.compiler.release>17</maven.compiler.release>
+                  </properties>
+                </project>
+                """);
+        Files.writeString(
+                workspace.resolve("mod21/pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <parent>
+                    <groupId>example</groupId>
+                    <artifactId>mixed-workspace</artifactId>
+                    <version>1</version>
+                  </parent>
+                  <artifactId>mod21</artifactId>
+                  <properties>
+                    <maven.compiler.release>21</maven.compiler.release>
+                  </properties>
+                </project>
+                """);
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+
+        var inferred =
+                InferConfig.inferMavenCompilerArgs(
+                        workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
+
+        assertThat(inferred.source(), equalTo("fallback_mixed_modules"));
+        assertThat(inferred.args(), empty());
+        assertThat(inferred.mixedModules(), equalTo(true));
+    }
+
+    @Test
+    public void inferCompilerArgsIgnoresPlaceholderChildModuleLevelsWhenParentIsUniform() throws Exception {
+        var workspace = temp.newFolder("placeholder-modules-workspace").toPath();
+        Files.createDirectories(workspace.resolve("modA"));
+        Files.createDirectories(workspace.resolve("modB"));
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>example</groupId>
+                  <artifactId>placeholder-modules-workspace</artifactId>
+                  <version>1</version>
+                  <packaging>pom</packaging>
+                  <properties>
+                    <maven.compiler.release>21</maven.compiler.release>
+                  </properties>
+                  <modules>
+                    <module>modA</module>
+                    <module>modB</module>
+                  </modules>
+                </project>
+                """);
+        Files.writeString(
+                workspace.resolve("modA/pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <parent>
+                    <groupId>example</groupId>
+                    <artifactId>placeholder-modules-workspace</artifactId>
+                    <version>1</version>
+                  </parent>
+                  <artifactId>modA</artifactId>
+                  <properties>
+                    <maven.compiler.release>${maven.compiler.release}</maven.compiler.release>
+                  </properties>
+                </project>
+                """);
+        Files.writeString(
+                workspace.resolve("modB/pom.xml"),
+                """
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <parent>
+                    <groupId>example</groupId>
+                    <artifactId>placeholder-modules-workspace</artifactId>
+                    <version>1</version>
+                  </parent>
+                  <artifactId>modB</artifactId>
+                  <properties>
+                    <maven.compiler.release>${maven.compiler.release}</maven.compiler.release>
+                  </properties>
+                </project>
+                """);
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+
+        var inferred =
+                InferConfig.inferMavenCompilerArgs(
+                        workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
+
+        assertThat(inferred.source(), equalTo("maven_release"));
+        assertThat(inferred.args(), contains("--release", "21"));
+        assertThat(inferred.mixedModules(), equalTo(false));
+    }
+
+    @Test
+    public void inferCompilerArgsFailsClosedOnMalformedPom() throws Exception {
+        var workspace = temp.newFolder("malformed-pom-workspace").toPath();
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <project>
+                  <modelVersion>4.0.0</modelVersion>
+                  <groupId>example</groupId>
+                  <artifactId>broken
+                """);
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+
+        var inferred =
+                InferConfig.inferMavenCompilerArgs(
+                        workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
+
+        assertThat(inferred.source(), equalTo("none"));
+        assertThat(inferred.args(), empty());
+        assertThat(inferred.mixedModules(), equalTo(false));
+    }
+
+    @Test
     public void classpathFromEnvironmentVariable() {
         String dummyPath1 = "target/dummy1.jar";
         String dummyPath2 = "target/dummy2.jar";
@@ -381,5 +642,12 @@ public class InferConfigTest {
         var result = (Path) method.invoke(null, env);
 
         assertThat(result, equalTo(Paths.get("/tmp/jls-cache")));
+    }
+
+    private static Map<String, String> envWithCacheHome(Path cacheHome) {
+        Map<String, String> env = new HashMap<>(System.getenv());
+        env.put("PATH", System.getenv("PATH"));
+        env.put("XDG_CACHE_HOME", cacheHome.toString());
+        return env;
     }
 }

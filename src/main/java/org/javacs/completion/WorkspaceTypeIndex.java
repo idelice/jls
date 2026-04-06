@@ -1718,10 +1718,12 @@ public class WorkspaceTypeIndex {
             if (!fieldName.equals(existing.name)) {
                 continue;
             }
-            if (existing.returnType == null || existing.returnType.isBlank()) {
-                continue;
+            if (existing.declaredReturnType != null && !existing.declaredReturnType.isBlank()) {
+                return existing.declaredReturnType;
             }
-            return existing.returnType;
+            if (existing.returnType != null && !existing.returnType.isBlank()) {
+                return existing.returnType;
+            }
         }
         return fieldType;
     }
