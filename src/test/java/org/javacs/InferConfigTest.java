@@ -4,6 +4,8 @@ import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
 import java.io.File;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -188,5 +190,196 @@ public class InferConfigTest {
         assertThat(
                 InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
                 empty());
+    }
+
+    @Test
+    public void mavenCacheReturnsEmptyWhenCacheFileMissing() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var cacheHome = temp.newFolder("cache-home").toPath();
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                empty());
+    }
+
+    @Test
+    public void mavenCacheHandlesMalformedCacheFile() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var cacheFile = InferConfig.workspaceCacheFile(workspace, cacheHome);
+        Files.createDirectories(cacheFile.getParent());
+        Files.writeString(cacheFile, "{not-json");
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                empty());
+    }
+
+    @Test
+    public void mavenCacheKeepsSeparateEntriesPerGoal() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var listJar = workspace.resolve("lib/list.jar");
+        var sourcesJar = workspace.resolve("lib/list-sources.jar");
+
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(listJar));
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, Set.of(sourcesJar));
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                hasItem(listJar.toAbsolutePath().normalize()));
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                hasItem(sourcesJar.toAbsolutePath().normalize()));
+    }
+
+    @Test
+    public void mavenCacheInvalidatesWhenSettingsFileAppears() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var jar = workspace.resolve("lib/example.jar");
+
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(jar));
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                hasItem(jar.toAbsolutePath().normalize()));
+
+        Thread.sleep(5);
+        Files.writeString(m2.resolve("settings.xml"), "<settings/>");
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                empty());
+    }
+
+    @Test
+    public void mavenCacheIgnoresDifferentWorkspaceWithSameGoal() throws Exception {
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var m2 = temp.newFolder("m2").toPath();
+        var workspaceOne = temp.newFolder("workspace-one").toPath();
+        var workspaceTwo = temp.newFolder("workspace-two").toPath();
+        Files.writeString(workspaceOne.resolve("pom.xml"), "<project><name>one</name></project>");
+        Files.writeString(workspaceTwo.resolve("pom.xml"), "<project><name>two</name></project>");
+        var jar = workspaceOne.resolve("lib/example.jar");
+
+        InferConfig.storeCachedMavenDependencies(
+                workspaceOne.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(jar));
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspaceTwo.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                empty());
+    }
+
+    @Test
+    public void mavenCacheReturnsEmptyWhenCacheEntriesAreMissing() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var cacheHome = temp.newFolder("cache-home").toPath();
+        var cacheFile = InferConfig.workspaceCacheFile(workspace, cacheHome);
+        Files.createDirectories(cacheFile.getParent());
+        Files.writeString(cacheFile, "{\"workspaceRoot\":\"" + workspace.toAbsolutePath().normalize() + "\"}");
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(
+                        workspace.resolve("pom.xml"), "dependency:list", temp.newFolder("m2").toPath(), cacheHome),
+                empty());
+    }
+
+    @Test
+    public void mavenCacheReturnsEmptyWhenGoalEntryIsMissing() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var cacheHome = temp.newFolder("cache-home").toPath();
+
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(workspace.resolve("lib/example.jar")));
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                empty());
+    }
+
+    @Test
+    public void mavenCacheStoreMergesExistingEntries() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var cacheHome = temp.newFolder("cache-home").toPath();
+
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(workspace.resolve("lib/list.jar")));
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, Set.of(workspace.resolve("lib/src.jar")));
+
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                hasItem(workspace.resolve("lib/list.jar").toAbsolutePath().normalize()));
+        assertThat(
+                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                hasItem(workspace.resolve("lib/src.jar").toAbsolutePath().normalize()));
+    }
+
+    @Test
+    public void mavenCacheStoreIgnoresUnwritableCacheLocation() throws Exception {
+        var workspace = temp.newFolder("workspace").toPath();
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>");
+        var m2 = temp.newFolder("m2").toPath();
+        var blockingFile = temp.newFile("cache-root-file").toPath();
+
+        InferConfig.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, blockingFile, Set.of(workspace.resolve("lib/list.jar")));
+
+        var cacheFile = InferConfig.workspaceCacheFile(workspace, blockingFile);
+        assertThat(Files.exists(cacheFile), equalTo(false));
+    }
+
+    @Test
+    public void workspaceCacheFileUsesWorkspaceFallbackNameForRootPath() {
+        var cacheFile = InferConfig.workspaceCacheFile(Paths.get("/"), Paths.get("/tmp/cache-home"));
+        assertThat(cacheFile.getParent().getFileName().toString(), startsWith("workspace-"));
+    }
+
+    @Test
+    public void invalidDependencyLineReturnsNotFound() {
+        assertThat(InferConfig.readDependency("not a dependency line"), equalTo(Paths.get("")));
+    }
+
+    @Test
+    public void fingerprintExistingFileThrowsForMissingPath() throws Exception {
+        var method = InferConfig.class.getDeclaredMethod("fingerprintExistingFile", Path.class);
+        method.setAccessible(true);
+
+        try {
+            method.invoke(null, temp.getRoot().toPath().resolve("missing-file"));
+        } catch (InvocationTargetException e) {
+            assertThat(e.getCause(), instanceOf(RuntimeException.class));
+            return;
+        }
+        throw new AssertionError("Expected RuntimeException for missing file fingerprint");
+    }
+
+    @Test
+    public void cacheHomeUsesXdgCacheHomeWhenProvided() throws Exception {
+        var method = InferConfig.class.getDeclaredMethod("cacheHome", Map.class);
+        method.setAccessible(true);
+        Map<String, String> env = new HashMap<>();
+        env.put("XDG_CACHE_HOME", "/tmp/jls-cache");
+
+        var result = (Path) method.invoke(null, env);
+
+        assertThat(result, equalTo(Paths.get("/tmp/jls-cache")));
     }
 }

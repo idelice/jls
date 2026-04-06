@@ -50,10 +50,6 @@ class Cache<K, V> {
         this.name = name;
     }
 
-    boolean has(Path file, K k) {
-        return !needs(file, k);
-    }
-
     boolean needs(Path file, K k) {
         // If key is not in map, it needs to be loaded
         var key = new Key<K>(file, k);
