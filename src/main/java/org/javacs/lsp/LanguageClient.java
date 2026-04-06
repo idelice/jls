@@ -10,4 +10,6 @@ public interface LanguageClient {
     void registerCapability(String method, JsonElement options);
 
     void customNotification(String method, JsonElement params);
+
+    default void sendRequest(String method, JsonElement params) {}
 }

@@ -412,7 +412,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void getOrCreateCompilerRecreationKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
+    public void configurationChangeKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
         FileStore.reset();
         var server = LanguageServerFixture.getJavaLanguageServer();
         var beforeVersion = completionIndexVersion(server);
@@ -429,8 +429,6 @@ public class JavaLanguageServerTest {
         var change = new DidChangeConfigurationParams();
         change.settings = settings;
         server.didChangeConfiguration(change);
-
-        server.getOrCreateCompiler();
 
         var refreshedExternal = externalBinaryIndex(server);
         Assert.assertNotSame("compiler recreation should refresh the external binary index", initialExternal, refreshedExternal);
@@ -4471,7 +4469,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void concurrentCompilerCallsAfterSettingsChangeRecreateGetOrCreateCompilerOnce() throws Exception {
+    public void concurrentCompilerCallsAfterSettingsChangeReuseAlreadyRecreatedCompiler() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var logger = Logger.getLogger("main");
         var capture = new TestLogCapture();
@@ -4518,7 +4516,11 @@ public class JavaLanguageServerTest {
             Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
 
             Assert.assertEquals(
-                    "settings change should recreate compiler exactly once under concurrency",
+                    "settings change should recreate compiler immediately and only once",
+                    1,
+                    capture.countContaining("[perf] compiler_recreate trigger=didChangeConfiguration"));
+            Assert.assertEquals(
+                    "concurrent getters should reuse the already recreated compiler",
                     1,
                     capture.countContaining("[perf] lombok_setting enabled="));
         } finally {
@@ -4548,7 +4550,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void getOrCreateCompilerRecreatedSchedulesWorkspaceBootstrapForActiveFiles() throws Exception {
+    public void configurationChangeSchedulesWorkspaceRefreshForActiveFiles() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
@@ -4576,7 +4578,6 @@ public class JavaLanguageServerTest {
             change.settings = settings;
             server.didChangeConfiguration(change);
 
-            server.getOrCreateCompiler();
             var line = capture.lastLineContaining("[perf] diagnostics_debounce trigger=compilerRecreated");
             Assert.assertTrue("expected compilerRecreated diagnostics debounce log", line != null);
             Assert.assertTrue(
@@ -4596,7 +4597,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void startupGetOrCreateCompilerRecreatedRefreshIsLazyWhenNoActiveDocs() throws Exception {
+    public void initializedDoesNotScheduleCompilerRecreatedRefreshWithoutActiveDocs() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
@@ -4631,13 +4632,13 @@ public class JavaLanguageServerTest {
                     0,
                     capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
             Assert.assertEquals(
-                    "startup should not schedule a deferred compilerRecreated refresh without active docs",
+                    "startup should not schedule compilerRecreated refresh without active docs",
                     0,
                     capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
-            Assert.assertTrue(
-                    "startup should log that compilerRecreated refresh is deferred until real demand",
-                    capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs")
-                            > 0);
+            Assert.assertEquals(
+                    "startup should not log a compilerRecreated defer path",
+                    0,
+                    capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated"));
 
             server.shutdown();
         } finally {
@@ -4647,7 +4648,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didOpenDoesNotOverlapWithGetOrCreateCompilerRecreatedProjectIndexCompile() throws Exception {
+    public void didOpenDoesNotOverlapWithCompilerRecreatedProjectIndexCompile() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
         var capture = new TestLogCapture();
@@ -4669,15 +4670,122 @@ public class JavaLanguageServerTest {
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
 
             Assert.assertEquals(
-                    "startup should not skip a compilerRecreated refresh after already doing the expensive work",
+                    "startup should not run compilerRecreated refresh during first didOpen bootstrap",
                     0,
-                    capture.countContaining("completion_index_refresh_skip trigger=compilerRecreated"));
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
             Assert.assertEquals(
                     "didOpen bootstrap should not schedule a second declaration refresh compile",
                     0,
                     capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
         } finally {
             logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    public void watchedGradleBuildChangeRecreatesCompilerImmediatelyWithoutActiveDocs() throws Exception {
+        var workspace = Files.createTempDirectory("jls-watched-gradle-recreate");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var src = workspace.resolve("src/main/java/p");
+            Files.createDirectories(src);
+            Files.writeString(src.resolve("App.java"), "package p;\nclass App {}\n");
+            var buildGradle = workspace.resolve("build.gradle");
+            Files.writeString(buildGradle, "plugins { id 'java' }\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
+            var initialExternal = externalBinaryIndex(server);
+
+            var changed = new FileEvent();
+            changed.uri = buildGradle.toUri();
+            changed.type = FileChangeType.Changed;
+            var watched = new DidChangeWatchedFilesParams();
+            watched.changes = List.of(changed);
+            server.didChangeWatchedFiles(watched);
+
+            var refreshedExternal = externalBinaryIndex(server);
+            Assert.assertNotSame(
+                    "watched Gradle build changes should recreate the compiler immediately",
+                    initialExternal,
+                    refreshedExternal);
+            Assert.assertTrue(
+                    "expected explicit compiler recreation log for watched Gradle build change",
+                    capture.countContaining("[perf] compiler_recreate trigger=didChangeWatchedFiles") > 0);
+            Assert.assertEquals(
+                    "watched Gradle build change without active docs should not schedule compilerRecreated refresh",
+                    0,
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void reopeningAfterConfigurationChangeWithNoActiveDocsBootstrapsWorkspaceAgain() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+            var text = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = text;
+            server.didOpenTextDocument(open);
+            Assert.assertTrue(
+                    "expected first didOpen bootstrap to publish an index",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var close = new DidCloseTextDocumentParams();
+            close.textDocument.uri = file.toUri();
+            server.didCloseTextDocument(close);
+
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var extra = new com.google.gson.JsonArray();
+            extra.add("-Xlint:deprecation");
+            java.add("extraCompilerArgs", extra);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            Assert.assertSame(
+                    "compiler recreation without active docs should clear the workspace snapshot",
+                    WorkspaceTypeIndex.EMPTY,
+                    workspaceIndex(server));
+
+            var beforeReopen = completionIndexVersion(server);
+            var reopen = new DidOpenTextDocumentParams();
+            reopen.textDocument.uri = file.toUri();
+            reopen.textDocument.version = 2;
+            reopen.textDocument.languageId = "java";
+            reopen.textDocument.text = text;
+            server.didOpenTextDocument(reopen);
+
+            Assert.assertTrue(
+                    "reopening after config change should bootstrap the workspace again",
+                    awaitCompletionIndexAdvance(server, beforeReopen, 10, TimeUnit.SECONDS));
+            Assert.assertEquals(
+                    "expected didOpen bootstrap to run once before and once after config change",
+                    2,
+                    capture.countContaining("[perf] workspace bootstrap started trigger=didOpenBootstrap"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 

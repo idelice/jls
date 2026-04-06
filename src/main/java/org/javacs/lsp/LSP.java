@@ -168,6 +168,17 @@ public class LSP {
         }
 
         @Override
+        public void sendRequest(String method, JsonElement params) {
+            var jsonText = toJson(params);
+            var id = new Random().nextInt();
+            var messageText =
+                    String.format(
+                            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}",
+                            id, method, jsonText);
+            writeClient(send, messageText);
+        }
+
+        @Override
         public void customNotification(String method, JsonElement params) {
             notifyClient(send, method, params);
         }

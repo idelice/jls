@@ -429,10 +429,14 @@ public class JavaCompilerServiceTest {
     private static List<Path> expandedSourcesForLombokAp(JavaCompilerService service, Path file) throws Exception {
         Method method =
                 JavaCompilerService.class.getDeclaredMethod(
-                        "expandSourcesForLombokAP", Collection.class, boolean.class);
+                        "expandSourcesForLombokAPDetails", Collection.class, boolean.class);
         method.setAccessible(true);
         var sources = List.of((JavaFileObject) new SourceFileObject(file));
-        var expanded = (Collection<? extends JavaFileObject>) method.invoke(service, sources, true);
+        var expandedResult = method.invoke(service, sources, true);
+        var expandedSourcesMethod = expandedResult.getClass().getDeclaredMethod("sources");
+        expandedSourcesMethod.setAccessible(true);
+        var expanded =
+                (Collection<? extends JavaFileObject>) expandedSourcesMethod.invoke(expandedResult);
         var paths = new ArrayList<Path>();
         for (var source : expanded) {
             paths.add(Paths.get(source.toUri()));

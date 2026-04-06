@@ -209,6 +209,11 @@ public class MarkdownHelper {
                 case "literal":
                     parseInner(in, out);
                     break;
+                case "inheritDoc":
+                    // The inherited content is not available from this local inline-tag parser.
+                    // Treat it as a known tag and render nothing instead of warning noisily.
+                    parseInner(in, out);
+                    break;
                 default:
                     LOG.warning(String.format("Unknown tag `@%s`", tag));
                     parseInner(in, out);

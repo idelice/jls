@@ -1,7 +1,5 @@
 package org.javacs;
 
-import static org.javacs.JsonHelper.GSON;
-
 import com.google.gson.*;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
@@ -104,10 +102,9 @@ class JavaLanguageServer extends LanguageServer {
     private JavaCompilerService cacheCompiler;
     private JavaCompilerService diagnosticsCompiler;
 
-    private JsonObject cacheSettings;
+    private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
-
-    private boolean modifiedBuild = true;
+    private boolean workDoneProgressSupported;
 
     private final ScheduledExecutorService diagnosticsExecutor =
             Executors.newSingleThreadScheduledExecutor(
@@ -152,24 +149,9 @@ class JavaLanguageServer extends LanguageServer {
         WORKSPACE
     }
 
-    /**
-     * Return the current interactive compiler, recreating compiler/index state first when the build
-     * or compiler settings changed.
-     */
+    /** Return the current interactive compiler. Compiler recreation happens at explicit event boundaries. */
     synchronized JavaCompilerService getOrCreateCompiler() {
-        if (needsCompiler()) {
-            createCompilers();
-            var currentSnapshot = completionSnapshotRef.get();
-            publishCompletionSnapshot(
-                    currentSnapshot.workspaceIndex(),
-                    new ExternalBinaryTypeIndex(cacheCompiler),
-                    currentSnapshot.version(),
-                    currentSnapshot.scope());
-            completionIndexScheduler.cancel("compilerRecreated");
-            cacheSettings = compilerSettingsSnapshot(settings);
-            modifiedBuild = false;
-            refreshCompletionIndexForCompilerRecreated();
-        }
+        Objects.requireNonNull(cacheCompiler, "Compiler has not been initialized");
         return cacheCompiler;
     }
 
@@ -181,18 +163,6 @@ class JavaLanguageServer extends LanguageServer {
         var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, version, scope);
         completionIndexVersion.set(snapshot.version());
         completionSnapshotRef.set(snapshot);
-    }
-
-    private boolean needsCompiler() {
-        if (modifiedBuild) {
-            return true;
-        }
-        var currentCompilerSettings = compilerSettingsSnapshot(settings);
-        if (!currentCompilerSettings.equals(cacheSettings)) {
-            LOG.info(String.format("Settings\n\t%s\nis different than\n\t%s", settings, cacheSettings));
-            return true;
-        }
-        return false;
     }
 
     private JsonObject compilerSettingsSnapshot(JsonObject source) {
@@ -218,13 +188,49 @@ class JavaLanguageServer extends LanguageServer {
         target.add(key, source.get(key).deepCopy());
     }
 
-    private void refreshCompletionIndexForCompilerRecreated() {
+    private void publishExternalBinaryIndexSnapshot() {
+        var currentSnapshot = completionSnapshotRef.get();
+        publishCompletionSnapshot(
+                currentSnapshot.workspaceIndex(),
+                new ExternalBinaryTypeIndex(getOrCreateCompiler()),
+                currentSnapshot.version(),
+                currentSnapshot.scope());
+    }
+
+    private synchronized void initializeCompilers() {
+        createCompilers();
+        appliedCompilerSettings = compilerSettingsSnapshot(settings);
+        publishExternalBinaryIndexSnapshot();
+    }
+
+    private synchronized void recreateCompilersAndRefreshState(String trigger) {
+        LOG.info(String.format("[perf] compiler_recreate trigger=%s", trigger));
+        diagnosticsScheduler.cancel(trigger);
+        completionIndexScheduler.cancel(trigger);
+        createCompilers();
+        appliedCompilerSettings = compilerSettingsSnapshot(settings);
+        publishExternalBinaryIndexSnapshot();
+        refreshStateForCompilerRecreated();
+    }
+
+    private void refreshStateForCompilerRecreated() {
+        var currentSnapshot = completionSnapshotRef.get();
         var active = filterJavaFiles(FileStore.activeDocuments());
         if (active.isEmpty()) {
+            if (currentSnapshot.scope() != CompletionIndexScope.EMPTY) {
+                publishCompletionSnapshot(
+                        WorkspaceTypeIndex.EMPTY,
+                        currentSnapshot.externalIndex(),
+                        currentSnapshot.version(),
+                        CompletionIndexScope.EMPTY);
+            }
             LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
             return;
         }
-        diagnosticsScheduler.cancel("compilerRecreated");
+        if (currentSnapshot.scope() == CompletionIndexScope.EMPTY) {
+            LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=empty_scope");
+            return;
+        }
         diagnosticsScheduler.schedule(active, "compilerRecreated", 0);
         completionIndexScheduler.scheduleRefresh(
                 FileStore.all(), "compilerRecreated", 0, CompletionIndexRefreshMode.FULL_REBUILD);
@@ -239,7 +245,8 @@ class JavaLanguageServer extends LanguageServer {
         completionIndexScheduler.cancel("foreground");
         getOrCreateCompiler();
         diagnosticsScheduler.compileAndPublish(javaFiles, diagnosticsCompiler, "foreground", -1, javaFiles.size(), 0);
-        if (completionSnapshotRef.get().version() == 0 && !FileStore.activeDocuments().isEmpty()) {
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
+                && !FileStore.activeDocuments().isEmpty()) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("lintBootstrap");
         }
     }
@@ -548,6 +555,9 @@ class JavaLanguageServer extends LanguageServer {
         if (workspaceFiles.isEmpty()) {
             return;
         }
+        var bootstrapStarted = Instant.now();
+        var progressToken = beginWorkDoneProgress("Bootstrap workspace", "Compiling workspace");
+        var progressEnded = false;
         getOrCreateCompiler();
         diagnosticsScheduler.cancel("didOpenBootstrap");
         completionIndexScheduler.cancel("didOpenBootstrap");
@@ -557,44 +567,40 @@ class JavaLanguageServer extends LanguageServer {
         CompileTask task = null;
         synchronized (diagnosticsCompileMutex) {
             try {
-                LOG.fine(String.format(
-                        "[perf] diagnostics_compile trigger=%s requested=%d dirty_open=%d batch=%d",
-                        "didOpenBootstrap",
-                        workspaceFiles.size(),
-                        0,
-                        workspaceFiles.size()));
-                task = diagnosticsCompiler.compile(workspaceFiles.toArray(Path[]::new));
-                var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
-                LOG.info(String.format(
-                        "[perf] diagnostics_summary trigger=didOpenBootstrap requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s parse=%dms enter=%dms analyze=%dms",
-                        workspaceFiles.size(),
-                        0,
-                        workspaceFiles.size(),
-                        task.roots.size(),
-                        compileTelemetry.annotationProcessingEnabled(),
-                        compileTelemetry.expandedSources(),
-                        compileTelemetry.path(),
-                        compileTelemetry.cacheName(),
-                        compileTelemetry.parseMs(),
-                        compileTelemetry.enterMs(),
-                        compileTelemetry.analyzeMs()));
-
-                diagnosticsScheduler.publishFromTask(task, List.of(file), "didOpenBootstrap", -1);
-
+                var compileStarted = Instant.now();
+                task =
+                        diagnosticsCompiler.compileDiagnostics(
+                                workspaceFiles.stream().map(SourceFileObject::new).toList());
+                var compileFinished = Instant.now();
                 var indexStarted = Instant.now();
+                reportWorkDoneProgress(progressToken, "Building workspace index");
                 var nextIndex = WorkspaceTypeIndex.workspaceDeclarations(task);
-
+                var indexFinished = Instant.now();
                 var indexVersion = completionIndexVersion.incrementAndGet();
                 completionIndexScheduler.installTypeMemberIndex(
                         nextIndex,
                         indexVersion,
                         "didOpenBootstrap",
-                        Duration.between(indexStarted, Instant.now()),
+                        Duration.between(indexStarted, indexFinished),
                         CompletionIndexScope.WORKSPACE);
+                var publishStarted = Instant.now();
+                reportWorkDoneProgress(progressToken, "Publishing diagnostics");
+                diagnosticsScheduler.publishFromTask(task, List.of(file), "didOpenBootstrap", -1);
+                var finished = Instant.now();
+                endWorkDoneProgress(progressToken, "Workspace ready");
+                progressEnded = true;
                 LOG.info(String.format(
-                        "[perf] workspace index installed trigger=didOpenBootstrap version=%d types=%d",
-                        indexVersion, nextIndex == null ? 0 : nextIndex.size()));
+                        "[perf] workspace index installed trigger=didOpenBootstrap version=%d types=%d compile=%dms index=%dms publish=%dms total=%dms",
+                        indexVersion,
+                        nextIndex == null ? 0 : nextIndex.size(),
+                        Duration.between(compileStarted, compileFinished).toMillis(),
+                        Duration.between(indexStarted, indexFinished).toMillis(),
+                        Duration.between(publishStarted, finished).toMillis(),
+                        Duration.between(bootstrapStarted, finished).toMillis()));
             } finally {
+                if (!progressEnded) {
+                    endWorkDoneProgress(progressToken, "Workspace bootstrap finished");
+                }
                 if (task != null) {
                     task.close();
                 }
@@ -680,12 +686,7 @@ class JavaLanguageServer extends LanguageServer {
     private void createCompilers() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
         var started = Instant.now();
-
-        client.customNotification(
-                "java/startProgress", GSON.toJsonTree(new JavaStartProgressParams("Configure javac")));
-        client.customNotification(
-                "java/reportProgress",
-                GSON.toJsonTree(new JavaReportProgressParams("Finding source roots")));
+        var progressToken = beginWorkDoneProgress("Configure javac", "Finding source roots");
 
         var externalDependencies = externalDependencies();
         var classPath = classPath();
@@ -707,16 +708,12 @@ class JavaLanguageServer extends LanguageServer {
         else {
             var infer = new InferConfig(workspaceRoot, externalDependencies);
 
-            client.customNotification(
-                    "java/reportProgress",
-                    GSON.toJsonTree(new JavaReportProgressParams("Inferring class path")));
+            reportWorkDoneProgress(progressToken, "Inferring class path");
             var inferClassPathStarted = Instant.now();
             classPath = infer.classPath();
             var inferredClassPath = Instant.now();
 
-            client.customNotification(
-                    "java/reportProgress",
-                    GSON.toJsonTree(new JavaReportProgressParams("Inferring doc path")));
+            reportWorkDoneProgress(progressToken, "Inferring doc path");
             var inferDocPathStarted = Instant.now();
             resolvedDocPath = infer.buildDocPath();
             LOG.info(String.format(
@@ -729,7 +726,7 @@ class JavaLanguageServer extends LanguageServer {
                     Duration.between(settingsLoaded, Instant.now()).toMillis()));
         }
         var inferenceFinished = Instant.now();
-        client.customNotification("java/endProgress", JsonNull.INSTANCE);
+        endWorkDoneProgress(progressToken, "Configured javac");
         LOG.info(String.format("[perf] lombok_setting enabled=%s", lombokEnabled));
         cacheCompiler =
                 new JavaCompilerService(
@@ -828,9 +825,72 @@ class JavaLanguageServer extends LanguageServer {
         return true;
     }
 
+    private static boolean supportsWorkDoneProgress(JsonElement capabilities) {
+        if (capabilities == null || !capabilities.isJsonObject()) {
+            return false;
+        }
+        var root = capabilities.getAsJsonObject();
+        if (!root.has("window") || !root.get("window").isJsonObject()) {
+            return false;
+        }
+        var window = root.getAsJsonObject("window");
+        return window.has("workDoneProgress") && window.get("workDoneProgress").getAsBoolean();
+    }
+
+    private String beginWorkDoneProgress(String title, String message) {
+        if (!workDoneProgressSupported) {
+            return null;
+        }
+        var token = UUID.randomUUID().toString();
+        var create = new JsonObject();
+        create.addProperty("token", token);
+        client.sendRequest("window/workDoneProgress/create", create);
+
+        var value = new JsonObject();
+        value.addProperty("kind", "begin");
+        value.addProperty("title", title);
+        value.addProperty("message", message);
+        value.addProperty("cancellable", false);
+        var progress = new JsonObject();
+        progress.addProperty("token", token);
+        progress.add("value", value);
+        client.customNotification("$/progress", progress);
+        return token;
+    }
+
+    private void reportWorkDoneProgress(String token, String message) {
+        if (token == null) {
+            return;
+        }
+        var value = new JsonObject();
+        value.addProperty("kind", "report");
+        value.addProperty("message", message);
+        value.addProperty("cancellable", false);
+        var progress = new JsonObject();
+        progress.addProperty("token", token);
+        progress.add("value", value);
+        client.customNotification("$/progress", progress);
+    }
+
+    private void endWorkDoneProgress(String token, String message) {
+        if (token == null) {
+            return;
+        }
+        var value = new JsonObject();
+        value.addProperty("kind", "end");
+        if (message != null && !message.isBlank()) {
+            value.addProperty("message", message);
+        }
+        var progress = new JsonObject();
+        progress.addProperty("token", token);
+        progress.add("value", value);
+        client.customNotification("$/progress", progress);
+    }
+
     @Override
     public InitializeResult initialize(InitializeParams params) {
         this.workspaceRoot = Paths.get(params.rootUri);
+        this.workDoneProgressSupported = supportsWorkDoneProgress(params.capabilities);
         FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
 
         var c = new JsonObject();
@@ -866,7 +926,15 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private static final String[] watchFiles = {
-        "**/*.java", "**/pom.xml", "**/BUILD", "**/javaconfig.json", "**/WORKSPACE"
+        "**/*.java",
+        "**/pom.xml",
+        "**/BUILD",
+        "**/WORKSPACE",
+        "**/javaconfig.json",
+        "**/build.gradle",
+        "**/build.gradle.kts",
+        "**/settings.gradle",
+        "**/settings.gradle.kts"
     };
 
     @Override
@@ -881,7 +949,7 @@ class JavaLanguageServer extends LanguageServer {
         options.add("watchers", watchers);
         client.registerCapability("workspace/didChangeWatchedFiles", options);
         LOG.info(String.format("[perf] client_attached workspace=%s watchers=%d", workspaceRoot, watchFiles.length));
-        getOrCreateCompiler();
+        initializeCompilers();
     }
 
     @Override
@@ -914,17 +982,25 @@ class JavaLanguageServer extends LanguageServer {
     public void didChangeConfiguration(DidChangeConfigurationParams change) {
         var java = change.settings.getAsJsonObject().get("java");
         LOG.info(String.format("Received java settings %s", java));
+        var nextSettings = new JsonObject();
         if (java != null && !java.isJsonNull()) {
-            settings = java.getAsJsonObject();
+            nextSettings = java.getAsJsonObject();
+        }
+        var nextCompilerSettings = compilerSettingsSnapshot(nextSettings);
+        settings = nextSettings;
+        if (!nextCompilerSettings.equals(appliedCompilerSettings)) {
+            recreateCompilersAndRefreshState("didChangeConfiguration");
         }
     }
 
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
+        var activeDocuments = FileStore.activeDocuments();
+        var refreshActiveDiagnostics = false;
+        var compilerInputsChanged = false;
         for (var c : params.changes) {
             var file = Paths.get(c.uri);
             if (FileStore.isJavaFile(file)) {
-                var activeDocuments = FileStore.activeDocuments();
                 var activeJavaDocument = activeDocuments.contains(file);
                 var suppressActiveDocumentWork = activeJavaDocument && c.type != FileChangeType.Deleted;
                 switch (c.type) {
@@ -982,20 +1058,38 @@ class JavaLanguageServer extends LanguageServer {
                                 "[perf] diagnostics_watched_skip reason=active_document file="
                                         + file);
                     } else {
-                        diagnosticsScheduler.markDirty(activeDocuments, "didChangeWatchedFiles");
-                        diagnosticsScheduler.schedule(activeDocuments, "didChangeWatchedFiles", DIAGNOSTIC_DEBOUNCE_MS);
+                        refreshActiveDiagnostics = true;
                     }
                 }
-                return;
+                continue;
             }
             var name = file.getFileName().toString();
-            switch (name) {
-                case "BUILD":
-                case "pom.xml":
-                    LOG.info(String.format("Compiler needs to be re-created because %s has changed", file));
-                    modifiedBuild = true;
+            if (isCompilerConfigFile(name)) {
+                LOG.info(String.format("Compiler needs to be re-created because %s has changed", file));
+                compilerInputsChanged = true;
             }
         }
+        if (refreshActiveDiagnostics) {
+            diagnosticsScheduler.markDirty(activeDocuments, "didChangeWatchedFiles");
+            diagnosticsScheduler.schedule(activeDocuments, "didChangeWatchedFiles", DIAGNOSTIC_DEBOUNCE_MS);
+        }
+        if (compilerInputsChanged) {
+            recreateCompilersAndRefreshState("didChangeWatchedFiles");
+        }
+    }
+
+    private boolean isCompilerConfigFile(String name) {
+        return switch (name) {
+            case "BUILD",
+                    "WORKSPACE",
+                    "pom.xml",
+                    "javaconfig.json",
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                    "settings.gradle.kts" -> true;
+            default -> false;
+        };
     }
 
     @Override
@@ -1255,7 +1349,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        if (completionSnapshotRef.get().version() == 0) {
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
             bootstrapWorkspaceOnDidOpen(file);
             return;
         }
@@ -1269,7 +1363,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var refreshCompletionIndex = analyzeActiveDocumentChange(file);
         markOtherActiveDiagnosticsDirty(file, "didChange");
-        if (completionSnapshotRef.get().version() == 0) {
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didChangeActiveBootstrap");
         } else if (refreshCompletionIndex) {
             completionIndexScheduler.scheduleRefresh(
@@ -1320,7 +1414,8 @@ class JavaLanguageServer extends LanguageServer {
         } finally {
             didSaveDiagnosticsInFlight.updateAndGet(current -> Math.max(0, current - 1));
         }
-        if (completionSnapshotRef.get().version() == 0 && !FileStore.activeDocuments().isEmpty()) {
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
+                && !FileStore.activeDocuments().isEmpty()) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didSaveBootstrap");
         } else {
             completionIndexScheduler.scheduleRefresh(

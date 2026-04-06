@@ -13,10 +13,14 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import org.javacs.guava.ClassPath;
 
 class ScanClassPath {
+    private static final java.util.Map<Path, Set<String>> JDK_TOP_LEVEL_CLASSES_CACHE = new ConcurrentHashMap<>();
+    private static final java.util.Map<Set<Path>, Set<String>> CLASS_PATH_TOP_LEVEL_CLASSES_CACHE =
+            new ConcurrentHashMap<>();
 
     // TODO delete this and implement findPublicTypeDeclarationInJdk some other way
     /** All exported modules that are present in JDK 10 or 11 */
@@ -114,6 +118,13 @@ class ScanClassPath {
     };
 
     static Set<String> jdkTopLevelClasses() {
+        var javaHome = JavaHomeHelper.javaHome();
+        var cached = JDK_TOP_LEVEL_CLASSES_CACHE.get(javaHome);
+        if (cached != null) {
+            CacheAudit.hit("scan_classpath.jdk_top_level");
+            return cached;
+        }
+        CacheAudit.miss("scan_classpath.jdk_top_level");
         LOG.info("Searching for top-level classes in the JDK");
         var started = Instant.now();
 
@@ -142,10 +153,21 @@ class ScanClassPath {
                         "[perf] jdk_class_scan modules=%d classes=%d took=%dms",
                         JDK_MODULES.length, classes.size(), Duration.between(started, Instant.now()).toMillis()));
 
-        return classes;
+        var immutable = Set.copyOf(classes);
+        JDK_TOP_LEVEL_CLASSES_CACHE.put(javaHome, immutable);
+        CacheAudit.load("scan_classpath.jdk_top_level");
+        CacheAudit.store("scan_classpath.jdk_top_level");
+        return immutable;
     }
 
     static Set<String> classPathTopLevelClasses(Set<Path> classPath) {
+        var key = Set.copyOf(classPath);
+        var cached = CLASS_PATH_TOP_LEVEL_CLASSES_CACHE.get(key);
+        if (cached != null) {
+            CacheAudit.hit("scan_classpath.classpath_top_level");
+            return cached;
+        }
+        CacheAudit.miss("scan_classpath.classpath_top_level");
         LOG.info(String.format("Searching for top-level classes in %d classpath locations", classPath.size()));
         var started = Instant.now();
 
@@ -167,7 +189,11 @@ class ScanClassPath {
                         "[perf] classpath_scan locations=%d classes=%d took=%dms",
                         classPath.size(), classes.size(), Duration.between(started, Instant.now()).toMillis()));
 
-        return classes;
+        var immutable = Set.copyOf(classes);
+        CLASS_PATH_TOP_LEVEL_CLASSES_CACHE.put(key, immutable);
+        CacheAudit.load("scan_classpath.classpath_top_level");
+        CacheAudit.store("scan_classpath.classpath_top_level");
+        return immutable;
     }
 
     private static URL toUrl(Path p) {

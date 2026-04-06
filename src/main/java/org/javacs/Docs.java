@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import javax.tools.*;
 
@@ -35,23 +36,38 @@ public class Docs {
     }
 
     static final Path NOT_FOUND = Paths.get("");
-    private static Path cacheSrcZipVirtualPath;
+    private static final Map<Path, Path> SRC_ZIP_CACHE = new ConcurrentHashMap<>();
+    private static final Map<Path, Path> SRC_ZIP_VIRTUAL_PATH_CACHE = new ConcurrentHashMap<>();
 
     private static Path srcZipVirtualPath(Path srcZipFile) {
-        if (cacheSrcZipVirtualPath == null) {
-            try {
-                var fs = FileSystems.newFileSystem(srcZipFile, Docs.class.getClassLoader());
-                cacheSrcZipVirtualPath = fs.getPath("/");
-            } catch (IOException e) {
-                LOG.warning("Failed to create virtual filesystem for " + srcZipFile + ": " + e.getMessage());
-                cacheSrcZipVirtualPath = NOT_FOUND;
-            }
+        var cached = SRC_ZIP_VIRTUAL_PATH_CACHE.get(srcZipFile);
+        if (cached != null) {
+            CacheAudit.hit("docs.src_zip_virtual_path");
+            return cached;
         }
-        return cacheSrcZipVirtualPath;
+        CacheAudit.miss("docs.src_zip_virtual_path");
+        Path virtualPath;
+        try {
+            var fs = FileSystems.newFileSystem(srcZipFile, Docs.class.getClassLoader());
+            virtualPath = fs.getPath("/");
+        } catch (IOException e) {
+            LOG.warning("Failed to create virtual filesystem for " + srcZipFile + ": " + e.getMessage());
+            virtualPath = NOT_FOUND;
+        }
+        SRC_ZIP_VIRTUAL_PATH_CACHE.put(srcZipFile, virtualPath);
+        CacheAudit.load("docs.src_zip_virtual_path");
+        CacheAudit.store("docs.src_zip_virtual_path");
+        return virtualPath;
     }
 
     static Path findSrcZip() {
         var javaHome = JavaHomeHelper.javaHome();
+        var cached = SRC_ZIP_CACHE.get(javaHome);
+        if (cached != null) {
+            CacheAudit.hit("docs.find_src_zip");
+            return cached;
+        }
+        CacheAudit.miss("docs.find_src_zip");
         String[] locations = {
             "lib/src.zip", "src.zip", "libexec/openjdk.jdk/Contents/Home/lib/src.zip"
         };
@@ -59,10 +75,16 @@ public class Docs {
             var abs = javaHome.resolve(rel);
             if (Files.exists(abs)) {
                 LOG.info("Found " + abs);
+                SRC_ZIP_CACHE.put(javaHome, abs);
+                CacheAudit.load("docs.find_src_zip");
+                CacheAudit.store("docs.find_src_zip");
                 return abs;
             }
         }
         LOG.warning("Couldn't find src.zip in " + javaHome);
+        SRC_ZIP_CACHE.put(javaHome, NOT_FOUND);
+        CacheAudit.load("docs.find_src_zip");
+        CacheAudit.store("docs.find_src_zip");
         return NOT_FOUND;
     }
 
