@@ -3,16 +3,21 @@ package org.javacs;
 import com.google.devtools.build.lib.analysis.AnalysisProtos;
 import com.google.devtools.build.lib.analysis.AnalysisProtosV2;
 import com.google.devtools.build.lib.analysis.AnalysisProtosV2.PathFragment;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import java.io.File;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors; // Added for Collectors.toSet()
@@ -20,11 +25,7 @@ import java.util.stream.Stream;
 
 class InferConfig {
     private static final Logger LOG = Logger.getLogger("main");
-    private static final Map<String, MavenDependencyCacheEntry> MVN_DEPENDENCY_CACHE =
-            new ConcurrentHashMap<>();
-
-    private record MavenDependencyCacheEntry(long pomLastModifiedMillis, Set<Path> dependencies) {
-    }
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
 
     /** Root of the workspace that is currently open in VSCode */
     private final Path workspaceRoot;
@@ -103,7 +104,7 @@ class InferConfig {
         // Maven
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:list", this.envVars);
+            return mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars);
         }
 
         // Bazel
@@ -144,7 +145,7 @@ class InferConfig {
         // Maven
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:sources", this.envVars);
+            return mvnDependencies(pomXml, "dependency:sources", mavenHome, this.envVars);
         }
 
         // Bazel
@@ -207,23 +208,20 @@ class InferConfig {
         return artifact.artifactId + '-' + artifact.version + (source ? "-sources" : "") + ".jar";
     }
 
-    static Set<Path> mvnDependencies(Path pomXml, String goal, Map<String, String> envVars) {
+    static Set<Path> mvnDependencies(Path pomXml, String goal, Path mavenHome, Map<String, String> envVars) {
         Objects.requireNonNull(pomXml, "pom.xml path is null");
+        Objects.requireNonNull(mavenHome, "mavenHome is null");
         var started = Instant.now();
         try {
-            var pomAbsolute = pomXml.toAbsolutePath().normalize();
-            var pomLastModifiedMillis = Files.getLastModifiedTime(pomAbsolute).toMillis();
-            var cacheKey = pomAbsolute + "|" + goal;
-            var cached = MVN_DEPENDENCY_CACHE.get(cacheKey);
-            if (cached != null && cached.pomLastModifiedMillis == pomLastModifiedMillis) {
+            var cacheHome = cacheHome(envVars);
+            var cached = loadCachedMavenDependencies(pomXml, goal, mavenHome, cacheHome);
+            if (!cached.isEmpty()) {
                 CacheAudit.hit("infer_config.maven_dependencies");
-                LOG.info(
-                        String.format(
-                                "[perf] infer_config_maven goal=%s source=cache dependencies=%d took=%dms",
-                                goal,
-                                cached.dependencies.size(),
-                                Duration.between(started, Instant.now()).toMillis()));
-                return cached.dependencies;
+                CacheAudit.load("infer_config.maven_dependencies");
+                LOG.info(String.format(
+                        "[perf] infer_config_maven goal=%s source=cache_disk dependencies=%d took=%dms",
+                        goal, cached.size(), Duration.between(started, Instant.now()).toMillis()));
+                return cached;
             }
             CacheAudit.miss("infer_config.maven_dependencies");
 
@@ -253,7 +251,7 @@ class InferConfig {
             if (result != 0) {
                 LOG.warning(
                         String.format(
-                                "[perf] infer_config_maven goal=%s source=process exit=%d took=%dms",
+                                "[perf] infer_config_maven goal=%s source=fresh exit=%d took=%dms",
                                 goal, result, Duration.between(started, Instant.now()).toMillis()));
                 return Set.of();
             }
@@ -265,19 +263,247 @@ class InferConfig {
                     dependencies.add(jar);
                 }
             }
-            var immutable = Set.copyOf(dependencies);
-            MVN_DEPENDENCY_CACHE.put(cacheKey, new MavenDependencyCacheEntry(pomLastModifiedMillis, immutable));
-            CacheAudit.load("infer_config.maven_dependencies");
-            CacheAudit.store("infer_config.maven_dependencies");
             LOG.info(
                     String.format(
-                            "[perf] infer_config_maven goal=%s source=process dependencies=%d process=%dms total=%dms",
+                            "[perf] infer_config_maven goal=%s source=fresh dependencies=%d process=%dms total=%dms",
                             goal,
-                            immutable.size(),
+                            dependencies.size(),
                             Duration.between(processStarted, Instant.now()).toMillis(),
                             Duration.between(started, Instant.now()).toMillis()));
+            var immutable = Set.copyOf(dependencies);
+            storeCachedMavenDependencies(pomXml, goal, mavenHome, cacheHome, immutable);
+            CacheAudit.store("infer_config.maven_dependencies");
             return immutable;
         } catch (InterruptedException | IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static final class FileFingerprint {
+        String path;
+        long lastModifiedMillis;
+        long size;
+
+        FileFingerprint() {}
+
+        FileFingerprint(String path, long lastModifiedMillis, long size) {
+            this.path = path;
+            this.lastModifiedMillis = lastModifiedMillis;
+            this.size = size;
+        }
+
+        String path() {
+            return path;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (!(other instanceof FileFingerprint that)) {
+                return false;
+            }
+            return lastModifiedMillis == that.lastModifiedMillis
+                    && size == that.size
+                    && Objects.equals(path, that.path);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(path, lastModifiedMillis, size);
+        }
+    }
+
+    static final class MavenInferenceCacheEntry {
+        String goal;
+        String workspaceRoot;
+        List<FileFingerprint> pomInputs;
+        FileFingerprint settings;
+        List<String> dependencies;
+
+        MavenInferenceCacheEntry() {}
+
+        MavenInferenceCacheEntry(
+                String goal,
+                String workspaceRoot,
+                List<FileFingerprint> pomInputs,
+                FileFingerprint settings,
+                List<String> dependencies) {
+            this.goal = goal;
+            this.workspaceRoot = workspaceRoot;
+            this.pomInputs = pomInputs;
+            this.settings = settings;
+            this.dependencies = dependencies;
+        }
+
+        String workspaceRoot() {
+            return workspaceRoot;
+        }
+
+        List<FileFingerprint> pomInputs() {
+            return pomInputs;
+        }
+
+        FileFingerprint settings() {
+            return settings;
+        }
+
+        List<String> dependencies() {
+            return dependencies;
+        }
+    }
+
+    static final class MavenInferenceCacheFile {
+        String workspaceRoot;
+        Map<String, MavenInferenceCacheEntry> entries;
+
+        MavenInferenceCacheFile() {}
+
+        MavenInferenceCacheFile(String workspaceRoot, Map<String, MavenInferenceCacheEntry> entries) {
+            this.workspaceRoot = workspaceRoot;
+            this.entries = entries;
+        }
+
+        Map<String, MavenInferenceCacheEntry> entries() {
+            return entries;
+        }
+    }
+
+    static Set<Path> loadCachedMavenDependencies(Path pomXml, String goal, Path mavenHome, Path cacheHome) {
+        var workspaceRoot = normalizePath(pomXml).getParent();
+        var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome);
+        if (!Files.exists(cacheFile)) {
+            return Set.of();
+        }
+        try (Reader reader = Files.newBufferedReader(cacheFile)) {
+            var cache = GSON.fromJson(reader, MavenInferenceCacheFile.class);
+            if (cache == null || cache.entries() == null) {
+                return Set.of();
+            }
+            var entry = cache.entries().get(goal);
+            if (entry == null) {
+                return Set.of();
+            }
+            if (!Objects.equals(entry.workspaceRoot(), workspaceRoot.toString())) {
+                return Set.of();
+            }
+            if (!Objects.equals(entry.pomInputs(), workspacePomFingerprints(workspaceRoot))) {
+                return Set.of();
+            }
+            if (!Objects.equals(entry.settings(), fingerprintIfExists(mavenHome.resolve("settings.xml")))) {
+                return Set.of();
+            }
+            var result = new LinkedHashSet<Path>();
+            for (var dependency : entry.dependencies()) {
+                result.add(Paths.get(dependency));
+            }
+            return Set.copyOf(result);
+        } catch (IOException e) {
+            LOG.fine(String.format("Failed to read Maven cache %s: %s", cacheFile, e.getMessage()));
+            return Set.of();
+        }
+    }
+
+    static void storeCachedMavenDependencies(
+            Path pomXml, String goal, Path mavenHome, Path cacheHome, Set<Path> dependencies) {
+        var workspaceRoot = normalizePath(pomXml).getParent();
+        var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome);
+        var cache = readCacheFile(cacheFile);
+        var entries = new LinkedHashMap<String, MavenInferenceCacheEntry>();
+        if (cache != null && cache.entries() != null) {
+            entries.putAll(cache.entries());
+        }
+        var dependencyStrings =
+                dependencies.stream()
+                        .map(path -> path.toAbsolutePath().normalize().toString())
+                        .sorted()
+                        .toList();
+        entries.put(
+                goal,
+                new MavenInferenceCacheEntry(
+                        goal,
+                        workspaceRoot.toString(),
+                        workspacePomFingerprints(workspaceRoot),
+                        fingerprintIfExists(mavenHome.resolve("settings.xml")),
+                        dependencyStrings));
+        try {
+            Files.createDirectories(cacheFile.getParent());
+            try (Writer writer = Files.newBufferedWriter(cacheFile)) {
+                GSON.toJson(new MavenInferenceCacheFile(workspaceRoot.toString(), entries), writer);
+            }
+        } catch (IOException e) {
+            LOG.fine(String.format("Failed to write Maven cache %s: %s", cacheFile, e.getMessage()));
+        }
+    }
+
+    private static MavenInferenceCacheFile readCacheFile(Path cacheFile) {
+        if (!Files.exists(cacheFile)) {
+            return null;
+        }
+        try (Reader reader = Files.newBufferedReader(cacheFile)) {
+            return GSON.fromJson(reader, MavenInferenceCacheFile.class);
+        } catch (IOException e) {
+            LOG.fine(String.format("Failed to read Maven cache file %s: %s", cacheFile, e.getMessage()));
+            return null;
+        }
+    }
+
+    static Path workspaceCacheFile(Path workspaceRoot, Path cacheHome) {
+        var normalizedRoot = normalizePath(workspaceRoot);
+        return workspaceCacheDirectory(normalizedRoot, cacheHome).resolve("maven-inference.json");
+    }
+
+    private static Path workspaceCacheDirectory(Path workspaceRoot, Path cacheHome) {
+        var name = workspaceRoot.getFileName() == null ? "workspace" : workspaceRoot.getFileName().toString();
+        return cacheHome.resolve("jls").resolve(name + "-" + shortHash(workspaceRoot.toString()));
+    }
+
+    private static Path cacheHome(Map<String, String> envVars) {
+        var xdg = envVars.get("XDG_CACHE_HOME");
+        if (xdg != null && !xdg.isBlank()) {
+            return Paths.get(xdg);
+        }
+        return Paths.get(System.getProperty("user.home")).resolve(".cache");
+    }
+
+    private static Path normalizePath(Path path) {
+        return path.toAbsolutePath().normalize();
+    }
+
+    private static List<FileFingerprint> workspacePomFingerprints(Path workspaceRoot) {
+        try (Stream<Path> files = Files.walk(workspaceRoot)) {
+            return files.filter(path -> path.getFileName().toString().equals("pom.xml"))
+                    .map(InferConfig::fingerprintExistingFile)
+                    .sorted(Comparator.comparing(FileFingerprint::path))
+                    .toList();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static FileFingerprint fingerprintExistingFile(Path path) {
+        try {
+            var normalized = normalizePath(path);
+            return new FileFingerprint(
+                    normalized.toString(),
+                    Files.getLastModifiedTime(normalized).toMillis(),
+                    Files.size(normalized));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static FileFingerprint fingerprintIfExists(Path path) {
+        return Files.exists(path) ? fingerprintExistingFile(path) : null;
+    }
+
+    private static String shortHash(String value) {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            var hex = new StringBuilder();
+            for (int i = 0; i < 4; i++) {
+                hex.append(String.format("%02x", digest[i]));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException e) {
             throw new RuntimeException(e);
         }
     }
