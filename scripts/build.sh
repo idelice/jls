@@ -2,6 +2,8 @@
 
 set -e
 
+LOGGING_CONFIG="$(cd "$(dirname "$0")" && pwd)/logging.properties"
+
 JDK_VERSION="25"
 JDK_VERSION_FULL="25.0.2"
 
@@ -69,6 +71,8 @@ if [ -z "$JAVA_HOME" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
     exit 1
 fi
 
-JAVA_HOME="$JAVA_HOME" PATH="$JAVA_HOME/bin:$PATH" mvn package -DskipTests
+JAVA_HOME="$JAVA_HOME" PATH="$JAVA_HOME/bin:$PATH" \
+  MAVEN_OPTS="-Djava.util.logging.config.file=$LOGGING_CONFIG ${MAVEN_OPTS:-}" \
+  mvn package -DskipTests
 
 echo "JLS build completed with Java $JDK_VERSION_FULL"
