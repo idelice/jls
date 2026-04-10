@@ -47,6 +47,7 @@ public class CompileBatch implements AutoCloseable {
     final List<CompilationUnitTree> roots;
     final Map<Path, CompileTask.SourceStamp> sourceStamps;
     final AnalysisMode analysisMode;
+    final boolean annotationProcessingEnabled;
     final long parseMs;
     final long enterMs;
     final long analyzeMs;
@@ -66,6 +67,7 @@ public class CompileBatch implements AutoCloseable {
         this.roots = new ArrayList<>();
         this.sourceStamps = collectSourceStamps(files);
         this.analysisMode = analysisMode;
+        this.annotationProcessingEnabled = allowAP;
 
         long parseNanos = 0;
         long enterNanos = 0;

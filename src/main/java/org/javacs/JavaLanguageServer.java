@@ -830,8 +830,7 @@ class JavaLanguageServer extends LanguageServer {
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "interactive",
-                        message -> warnUserOnce("lombok_runtime_incompatible", message));
+                        "interactive");
         var diagnosticsStarted = Instant.now();
         diagnosticsCompiler =
                 new JavaCompilerService(
@@ -840,8 +839,7 @@ class JavaLanguageServer extends LanguageServer {
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "diagnostics",
-                        message -> warnUserOnce("lombok_runtime_incompatible", message));
+                        "diagnostics");
         LOG.info(String.format(
                 "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms total=%dms",
                 classPath.size(),
@@ -1622,9 +1620,20 @@ class JavaLanguageServer extends LanguageServer {
                             requestedCount,
                             dirtyOpenCount,
                             javaFiles.size()));
-                    task =
-                            diagnosticsCompiler.compileDiagnostics(
-                                    javaFiles.stream().map(SourceFileObject::new).toList());
+                    try {
+                        task =
+                                diagnosticsCompiler.compileDiagnostics(
+                                        javaFiles.stream().map(SourceFileObject::new).toList());
+                    } catch (RuntimeException | AssertionError e) {
+                        LOG.fine(
+                                String.format(
+                                        "[perf] diagnostics_compile_skip trigger=%s files=%d reason=%s message=%s",
+                                        trigger,
+                                        javaFiles.size(),
+                                        e.getClass().getSimpleName(),
+                                        e.getMessage()));
+                        return;
+                    }
                     var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
                     LOG.fine(String.format(
                             "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s parse=%dms enter=%dms analyze=%dms",
@@ -1834,8 +1843,8 @@ class JavaLanguageServer extends LanguageServer {
                         request.contentRevision(),
                         request.requestedCount(),
                         request.dirtyOpenCount());
-            } catch (Exception e) {
-                LOG.info("Async lint failed for " + files + ": " + e.getMessage());
+            } catch (RuntimeException e) {
+                LOG.fine("Async lint failed for " + files + ": " + e.getMessage());
             }
         }
     }

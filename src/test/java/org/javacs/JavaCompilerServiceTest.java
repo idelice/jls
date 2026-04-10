@@ -51,30 +51,6 @@ public class JavaCompilerServiceTest {
         assertThat(service.lombokConfiguredEnabled, is(true));
     }
 
-    @Test
-    public void disablingLombokAnnotationProcessingReportsUpgradeWarningOnce() throws Exception {
-        var warnings = new ArrayList<String>();
-        var service =
-                new JavaCompilerService(
-                        Set.of(Paths.get("lib/lombok-1.18.30.jar")),
-                        Collections.emptySet(),
-                        Collections.emptySet(),
-                        List.of(),
-                        true,
-                        "test",
-                        warnings::add);
-        var method =
-                JavaCompilerService.class.getDeclaredMethod(
-                        "disableLombokAnnotationProcessing", String.class, RuntimeException.class);
-        method.setAccessible(true);
-
-        method.invoke(service, "phase-one", new RuntimeException("boom"));
-        method.invoke(service, "phase-two", new RuntimeException("boom again"));
-
-        assertThat(warnings, hasSize(1));
-        assertThat(warnings.get(0), containsString("Upgrade the project's Lombok dependency"));
-    }
-
     static Path simpleProjectSrc() {
         return Paths.get("src/test/examples/simple-project").normalize();
     }

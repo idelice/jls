@@ -16,7 +16,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -35,8 +34,6 @@ class JavaCompilerService implements CompilerProvider {
     final boolean lombokConfiguredEnabled;
     final boolean lombokPresentOnClasspath;
     final String compilerRole;
-    private final Consumer<String> warningSink;
-    private volatile boolean lombokApEnabled;
     // Diagnostics from the last compilation task
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
     // Use the same file manager for multiple tasks, so we don't repeatedly re-compile the same files
@@ -45,7 +42,7 @@ class JavaCompilerService implements CompilerProvider {
 
     JavaCompilerService(
             Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
-        this(classPath, docPath, addExports, extraArgs, true, "standalone", __ -> {});
+        this(classPath, docPath, addExports, extraArgs, true, "standalone");
     }
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
@@ -53,7 +50,7 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs, boolean lombokConfiguredEnabled) {
-        this(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, "standalone", __ -> {});
+        this(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, "standalone");
     }
 
     JavaCompilerService(
@@ -62,8 +59,7 @@ class JavaCompilerService implements CompilerProvider {
             Set<String> addExports,
             Collection<String> extraArgs,
             boolean lombokConfiguredEnabled,
-            String compilerRole,
-            Consumer<String> warningSink) {
+            String compilerRole) {
         var constructorStarted = Instant.now();
 
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
@@ -78,12 +74,10 @@ class JavaCompilerService implements CompilerProvider {
         this.lombokConfiguredEnabled = lombokConfiguredEnabled;
         this.lombokPresentOnClasspath = hasLombokJar(classPath);
         this.compilerRole = compilerRole;
-        this.warningSink = warningSink == null ? __ -> {} : warningSink;
-        this.lombokApEnabled = this.lombokPresentOnClasspath && this.lombokConfiguredEnabled;
         this.fileManager = new SourceFileManager();
         LOG.info(
                 String.format(
-                        "[perf] compiler_service_init role=%s classpath=%d docpath=%d docs=%dms classpath_scan=%dms total=%dms lombok_present=%s lombok_enabled=%s",
+                        "[perf] compiler_service_init role=%s classpath=%d docpath=%d docs=%dms classpath_scan=%dms total=%dms lombok_present=%s lombok_configured=%s",
                         compilerRole,
                         classPath.size(),
                         docPath.size(),
@@ -91,7 +85,7 @@ class JavaCompilerService implements CompilerProvider {
                         Duration.between(docsReady, classPathScanReady).toMillis(),
                         Duration.between(constructorStarted, Instant.now()).toMillis(),
                         lombokPresentOnClasspath,
-                        lombokApEnabled));
+                        lombokConfiguredEnabled));
     }
 
     JavaCompilerService(
@@ -100,9 +94,8 @@ class JavaCompilerService implements CompilerProvider {
             Set<String> addExports,
             List<String> extraArgs,
             boolean lombokConfiguredEnabled,
-            String compilerRole,
-            Consumer<String> warningSink) {
-        this(classPath, docPath, addExports, (Collection<String>) extraArgs, lombokConfiguredEnabled, compilerRole, warningSink);
+            String compilerRole) {
+        this(classPath, docPath, addExports, (Collection<String>) extraArgs, lombokConfiguredEnabled, compilerRole);
     }
 
     private static List<String> normalizedArgs(Collection<String> extraArgs) {
@@ -246,20 +239,7 @@ class JavaCompilerService implements CompilerProvider {
             ReusableCompiler compilerInstance) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
 
-        CompileBatch firstAttempt;
-        try {
-            firstAttempt = new CompileBatch(this, sources, allowAP, mode, compilerInstance);
-        } catch (CompileBatch.APFailureException e) {
-            // AP failed - retry without AP if Lombok is present
-            if (allowAP && lombokPresentOnClasspath) {
-                disableLombokAnnotationProcessing("first-attempt", e);
-                return doCompile(sources, mode, false, expandAdditionalSources, compilerInstance);
-            }
-            throw e;
-        } catch (RuntimeException e) {
-            // Other compilation errors
-            throw e;
-        }
+        var firstAttempt = compileBatchAttempt(sources, mode, allowAP, compilerInstance, "first-attempt");
 
         if (mode == CompileBatch.AnalysisMode.ATTR || !expandAdditionalSources) {
             return firstAttempt;
@@ -288,25 +268,36 @@ class JavaCompilerService implements CompilerProvider {
             moreSources.add(new SourceFileObject(add));
         }
 
-        CompileBatch secondAttempt;
-        try {
-            secondAttempt = new CompileBatch(this, moreSources, allowAP, mode, compilerInstance);
-        } catch (CompileBatch.APFailureException e) {
-            // AP failed on second attempt too - retry without AP
-            if (allowAP && lombokPresentOnClasspath) {
-                disableLombokAnnotationProcessing("second-attempt", e);
-                return doCompile(moreSources, mode, false, true, compilerInstance);
-            }
-            throw e;
-        } catch (RuntimeException e) {
-            // Other compilation errors
-            throw e;
-        }
-
-        return secondAttempt;
+        return compileBatchAttempt(moreSources, mode, allowAP, compilerInstance, "second-attempt");
     }
 
-    private void loadCompile(
+    private CompileBatch compileBatchAttempt(
+            Collection<? extends JavaFileObject> sources,
+            CompileBatch.AnalysisMode mode,
+            boolean allowAP,
+            ReusableCompiler compilerInstance,
+            String phase) {
+        try {
+            return new CompileBatch(this, sources, allowAP, mode, compilerInstance);
+        } catch (CompileBatch.APFailureException e) {
+            if (!allowAP) {
+                throw e;
+            }
+            var root = rootCause(e);
+            LOG.fine(
+                    String.format(
+                            "[lombok] ap_fallback phase=%s role=%s mode=%s sources=%d reason=%s root=%s",
+                            phase,
+                            compilerRole,
+                            mode,
+                            sources.size(),
+                            e.getMessage(),
+                            root));
+            return new CompileBatch(this, sources, false, mode, compilerInstance);
+        }
+    }
+
+    private CompileBatch loadCompile(
             Collection<? extends JavaFileObject> sources,
             CompileBatch.AnalysisMode mode,
             boolean allowAP,
@@ -333,9 +324,22 @@ class JavaCompilerService implements CompilerProvider {
             if (!compileCache.closed) {
                 throw new RuntimeException("Compiler is still in-use!");
             }
-            compileCache.borrow.close();
         }
         var loaded = doCompile(sources, mode, allowAP, expandAdditionalSources, compilerForMode);
+        var fallbackWithoutAp = allowAP && !loaded.annotationProcessingEnabled;
+        if (fallbackWithoutAp) {
+            LOG.fine(
+                    String.format(
+                            "[lombok] ap_fallback_not_cached role=%s mode=%s expand=%s revision=%d",
+                            compilerRole,
+                            mode,
+                            expandAdditionalSources,
+                            contentRevision));
+            return loaded;
+        }
+        if (compileCache != null) {
+            compileCache.borrow.close();
+        }
         if (mode == CompileBatch.AnalysisMode.FULL && !expandAdditionalSources) {
             cachedCompileNoExpansion = loaded;
             cachedCompileNoExpansionContentRevision = contentRevision;
@@ -353,6 +357,7 @@ class JavaCompilerService implements CompilerProvider {
         for (var f : sources) {
             modifiedCache.put(f, fingerprint(f));
         }
+        return loaded;
     }
 
     private CompileBatch selectedCompileBatch(
@@ -390,28 +395,10 @@ class JavaCompilerService implements CompilerProvider {
             CompileBatch.AnalysisMode mode,
             boolean allowAP,
             boolean expandAdditionalSources) {
-        boolean useAP = allowAP && lombokApEnabled;
+        var useAP = allowAP && lombokPresentOnClasspath && lombokConfiguredEnabled;
         var expandedSources = expandSourcesForLombokAPDetails(sources, useAP);
         var effectiveSources = expandedSources.sources();
         var cacheName = cacheMetricName(mode, useAP, expandAdditionalSources);
-        var useFreshDiagnosticsLombokCompile =
-                shouldUseFreshDiagnosticsLombokCompile(mode, useAP, expandedSources.lombokExpansionUsed());
-        if (useFreshDiagnosticsLombokCompile) {
-            CacheAudit.miss(cacheName);
-            CacheAudit.load(cacheName);
-            CacheAudit.store(cacheName);
-            if ("diagnostics".equals(compilerRole) && mode == CompileBatch.AnalysisMode.FULL) {
-                LOG.fine(String.format("[diag-trace] compile_batch decision=fresh_diagnostics_lombok cache=%s", cacheName));
-            }
-            var compile = doCompile(
-                    freezeSourcesForBatch(effectiveSources),
-                    mode,
-                    useAP,
-                    expandAdditionalSources,
-                    new ReusableCompiler());
-            lastCompileTelemetry = compileTelemetry(cacheName, "fresh_diagnostics_lombok", useAP, expandedSources, compile);
-            return compile;
-        }
         var attrWithoutAp = mode == CompileBatch.AnalysisMode.ATTR && !useAP;
         var modifiedCache =
                 mode == CompileBatch.AnalysisMode.FULL && !expandAdditionalSources
@@ -437,16 +424,21 @@ class JavaCompilerService implements CompilerProvider {
                                 modifiedCache.size()));
             }
             CacheAudit.miss(cacheName);
-            loadCompile(effectiveSources, mode, useAP, expandAdditionalSources, currentContentRevision);
+            var loaded = loadCompile(effectiveSources, mode, useAP, expandAdditionalSources, currentContentRevision);
             CacheAudit.load(cacheName);
-            CacheAudit.store(cacheName);
+            if (loaded.annotationProcessingEnabled == useAP) {
+                CacheAudit.store(cacheName);
+            }
+            var compilerPath =
+                    useAP && !loaded.annotationProcessingEnabled ? "ap_fallback_no_cache" : "cache_refresh";
             lastCompileTelemetry =
                     compileTelemetry(
                             cacheName,
-                            "cache_refresh",
-                            useAP,
+                            compilerPath,
+                            loaded.annotationProcessingEnabled,
                             expandedSources,
-                            selectedCompileBatch(mode, useAP, expandAdditionalSources));
+                            loaded);
+            return loaded;
         } else {
             if ("diagnostics".equals(compilerRole) && mode == CompileBatch.AnalysisMode.FULL) {
                 LOG.fine(
@@ -467,34 +459,6 @@ class JavaCompilerService implements CompilerProvider {
             return expandAdditionalSources ? "javac.full" : "javac.full_no_expansion";
         }
         return useAP ? "javac.attr" : "javac.attr_no_ap";
-    }
-
-    private boolean shouldUseFreshDiagnosticsLombokCompile(
-            CompileBatch.AnalysisMode mode, boolean useAP, boolean lombokExpansionUsed) {
-        return "diagnostics".equals(compilerRole)
-                && mode == CompileBatch.AnalysisMode.FULL
-                && useAP
-                && lombokExpansionUsed;
-    }
-
-    private Collection<? extends JavaFileObject> freezeSourcesForBatch(
-            Collection<? extends JavaFileObject> sources) {
-        var frozen = new ArrayList<JavaFileObject>(sources.size());
-        for (var source : sources) {
-            if (source instanceof SourceFileObject sourceFile) {
-                frozen.add(freezeSourceFile(sourceFile));
-            } else {
-                frozen.add(source);
-            }
-        }
-        return frozen;
-    }
-
-    private JavaFileObject freezeSourceFile(SourceFileObject sourceFile) {
-        var contents = sourceFile.getCharContent(false).toString();
-        var modifiedMillis = sourceFile.getLastModified();
-        var modified = modifiedMillis > 0 ? Instant.ofEpochMilli(modifiedMillis) : Instant.EPOCH;
-        return new SourceFileObject(sourceFile.path, contents, modified, sourceFile.contentVersion());
     }
 
     private ExpandedSources expandSourcesForLombokAPDetails(
@@ -783,49 +747,12 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
-    private void disableLombokAnnotationProcessing(String phase, RuntimeException failure) {
-        if (!lombokApEnabled) {
-            return;
-        }
-        lombokApEnabled = false;
-        dropCachedCompilation(cachedCompile, cachedModified);
-        cachedCompile = null;
-        cachedCompileContentRevision = -1;
-        dropCachedCompilation(cachedCompileNoExpansion, cachedCompileNoExpansionModified);
-        cachedCompileNoExpansion = null;
-        cachedCompileNoExpansionContentRevision = -1;
-        dropCachedCompilation(cachedFastCompile, cachedFastModified);
-        cachedFastCompile = null;
-        cachedFastCompileContentRevision = -1;
-        dropCachedCompilation(cachedFastCompileNoAp, cachedFastNoApModified);
-        cachedFastCompileNoAp = null;
-        cachedFastCompileNoApContentRevision = -1;
-        var root = rootCause(failure);
-        var message =
-                String.format(
-                        "[lombok] annotation processing disabled phase=%s reason=%s root=%s",
-                        phase, failure.getMessage(), root.toString());
-        LOG.fine(message);
-        warningSink.accept(
-                String.format(
-                        "Project Lombok annotation processing failed on runtime JDK %d. Upgrade the project's Lombok dependency for correct generated-member support. Root cause: %s",
-                        Runtime.version().feature(),
-                        root));
-    }
-
     private static Throwable rootCause(Throwable t) {
         var current = t;
         while (current.getCause() != null && current.getCause() != current) {
             current = current.getCause();
         }
         return current;
-    }
-
-    private void dropCachedCompilation(CompileBatch cached, Map<JavaFileObject, SourceFingerprint> modifiedCache) {
-        if (cached != null && cached.closed) {
-            cached.borrow.close();
-        }
-        modifiedCache.clear();
     }
 
     private static final Pattern PACKAGE_EXTRACTOR = Pattern.compile("^([a-z][_a-zA-Z0-9]*\\.)*[a-z][_a-zA-Z0-9]*");
