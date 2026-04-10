@@ -1,9 +1,11 @@
 package org.javacs;
 
 import com.google.gson.*;
+import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
+import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -252,9 +254,99 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
-    private boolean analyzeActiveDocumentChange(Path file) {
+    private boolean analyzeActiveDocumentChange(
+            Path file, List<TextDocumentContentChangeEvent> contentChanges) {
         try {
             var parse = getOrCreateCompiler().parse(file);
+            var contents = FileStore.contents(file);
+            if (hasLikelyIncompleteSource(FileStore.contents(file))) {
+                LOG.fine(
+                        "[perf] completion_index_didChange_skip file="
+                                + file.getFileName()
+                                + " reason=incomplete_source");
+                return false;
+            }
+            if (contentChanges != null && !contentChanges.isEmpty()) {
+                var positions = Trees.instance(parse.task()).getSourcePositions();
+                var spans = new ArrayList<long[]>();
+                new TreePathScanner<Void, Void>() {
+                    @Override
+                    public Void visitMethod(MethodTree method, Void unused) {
+                        if (method.getBody() != null) {
+                            addSpan(method.getBody());
+                        }
+                        return super.visitMethod(method, unused);
+                    }
+
+                    @Override
+                    public Void visitBlock(BlockTree block, Void unused) {
+                        var parent = getCurrentPath().getParentPath();
+                        if (parent != null && parent.getLeaf() instanceof ClassTree) {
+                            addSpan(block);
+                        }
+                        return super.visitBlock(block, unused);
+                    }
+
+                    @Override
+                    public Void visitVariable(VariableTree variable, Void unused) {
+                        var parent = getCurrentPath().getParentPath();
+                        if (parent != null
+                                && parent.getLeaf() instanceof ClassTree
+                                && variable.getInitializer() != null) {
+                            addSpan(variable.getInitializer());
+                        }
+                        return super.visitVariable(variable, unused);
+                    }
+
+                    private void addSpan(com.sun.source.tree.Tree tree) {
+                        var start = positions.getStartPosition(parse.root(), tree);
+                        var end = positions.getEndPosition(parse.root(), tree);
+                        if (start >= 0 && end >= start) {
+                            spans.add(new long[] {start, end});
+                        }
+                    }
+                }.scan(parse.root(), null);
+                if (!spans.isEmpty()) {
+                    var executableOnlyChange = true;
+                    for (var change : contentChanges) {
+                        if (change.range == null) {
+                            executableOnlyChange = false;
+                            break;
+                        }
+                        var start =
+                                FileStore.offset(
+                                        contents,
+                                        change.range.start.line + 1,
+                                        change.range.start.character + 1);
+                        var end =
+                                FileStore.offset(
+                                        contents,
+                                        change.range.end.line + 1,
+                                        change.range.end.character + 1);
+                        if (end < start) {
+                            end = start;
+                        }
+                        var covered = false;
+                        for (var span : spans) {
+                            if (start >= span[0] && end <= span[1]) {
+                                covered = true;
+                                break;
+                            }
+                        }
+                        if (!covered) {
+                            executableOnlyChange = false;
+                            break;
+                        }
+                    }
+                    if (executableOnlyChange) {
+                        LOG.fine(
+                                "[perf] completion_index_didChange_skip file="
+                                        + file.getFileName()
+                                        + " reason=executable_only_change");
+                        return false;
+                    }
+                }
+            }
             var shapes = declaredTypeShapes(parse);
             var hasStructuralLombokType = shapes.stream().anyMatch(DeclaredTypeShape::structuralLombok);
             if (hasStructuralLombokType) {
@@ -263,13 +355,6 @@ class JavaLanguageServer extends LanguageServer {
                                 + file.getFileName()
                                 + " reason=structural_lombok");
                 return true;
-            }
-            if (hasLikelyIncompleteSource(FileStore.contents(file))) {
-                LOG.fine(
-                        "[perf] completion_index_didChange_skip file="
-                                + file.getFileName()
-                                + " reason=incomplete_source");
-                return false;
             }
             var declarationDrift = hasDeclarationDrift(file, shapes);
             if (declarationDrift) {
@@ -1417,7 +1502,7 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.change(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        var refreshCompletionIndex = analyzeActiveDocumentChange(file);
+        var refreshCompletionIndex = analyzeActiveDocumentChange(file, params.contentChanges);
         markOtherActiveDiagnosticsDirty(file, "didChange");
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didChangeActiveBootstrap");
@@ -1453,6 +1538,8 @@ class JavaLanguageServer extends LanguageServer {
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
+        // Save-triggered diagnostics should not reuse a stale didChange compile for the same buffer text.
+        FileStore.save(file);
         markOtherActiveDiagnosticsDirty(file, "didSave");
         diagnosticsScheduler.cancel("didSave");
         completionIndexScheduler.cancel("didSave");

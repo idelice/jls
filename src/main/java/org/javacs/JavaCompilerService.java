@@ -400,6 +400,9 @@ class JavaCompilerService implements CompilerProvider {
             CacheAudit.miss(cacheName);
             CacheAudit.load(cacheName);
             CacheAudit.store(cacheName);
+            if ("diagnostics".equals(compilerRole) && mode == CompileBatch.AnalysisMode.FULL) {
+                LOG.fine(String.format("[diag-trace] compile_batch decision=fresh_diagnostics_lombok cache=%s", cacheName));
+            }
             var compile = doCompile(
                     freezeSourcesForBatch(effectiveSources),
                     mode,
@@ -424,6 +427,15 @@ class JavaCompilerService implements CompilerProvider {
                         ? cachedCompileContentRevision
                         : attrWithoutAp ? cachedFastCompileNoApContentRevision : cachedFastCompileContentRevision;
         if (cachedContentRevision != currentContentRevision || needsCompile(effectiveSources, modifiedCache)) {
+            if ("diagnostics".equals(compilerRole) && mode == CompileBatch.AnalysisMode.FULL) {
+                LOG.fine(
+                        String.format(
+                                "[diag-trace] compile_batch decision=cache_refresh cache=%s cached_revision=%d current_revision=%d cache_size=%d",
+                                cacheName,
+                                cachedContentRevision,
+                                currentContentRevision,
+                                modifiedCache.size()));
+            }
             CacheAudit.miss(cacheName);
             loadCompile(effectiveSources, mode, useAP, expandAdditionalSources, currentContentRevision);
             CacheAudit.load(cacheName);
@@ -436,6 +448,14 @@ class JavaCompilerService implements CompilerProvider {
                             expandedSources,
                             selectedCompileBatch(mode, useAP, expandAdditionalSources));
         } else {
+            if ("diagnostics".equals(compilerRole) && mode == CompileBatch.AnalysisMode.FULL) {
+                LOG.fine(
+                        String.format(
+                                "[diag-trace] compile_batch decision=cache_hit cache=%s revision=%d cache_size=%d",
+                                cacheName,
+                                currentContentRevision,
+                                modifiedCache.size()));
+            }
             CacheAudit.hit(cacheName);
             lastCompileTelemetry = compileTelemetry(cacheName, "cache_hit", useAP, expandedSources, null);
         }

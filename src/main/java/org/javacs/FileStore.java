@@ -263,6 +263,13 @@ public class FileStore {
         bumpContentRevision();
     }
 
+    static void save(Path file) {
+        if (!isJavaFile(file)) {
+            return;
+        }
+        bumpContentRevision();
+    }
+
     static Set<Path> activeDocuments() {
         return activeDocuments.keySet();
     }

@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.StringJoiner;
 import java.util.function.Predicate;
+import java.util.logging.Logger;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
@@ -32,6 +33,7 @@ import org.javacs.lsp.SignatureHelp;
 import org.javacs.lsp.SignatureInformation;
 
 public class SignatureProvider {
+    private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
 
@@ -81,6 +83,12 @@ public class SignatureProvider {
                 var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
                 return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
+            return NOT_SUPPORTED;
+        } catch (RuntimeException | AssertionError e) {
+            LOG.fine(
+                    String.format(
+                            "[perf] signature_help_skip file=%s reason=%s message=%s",
+                            file.getFileName(), e.getClass().getSimpleName(), e.getMessage()));
             return NOT_SUPPORTED;
         }
     }
