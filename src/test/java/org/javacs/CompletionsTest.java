@@ -15,9 +15,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.tools.JavaFileObject;
-import org.javacs.completion.CompletionProvider;
-import org.javacs.completion.TypeIndexRouter;
-import org.javacs.hover.HoverProvider;
+import org.javacs.provider.CompletionProvider;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.*;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -210,7 +209,7 @@ public class CompletionsTest extends CompletionsBase {
         var source = new SourceFileObject(FindResource.path("/org/javacs/example/Goto.java"));
         var delegate = LanguageServerFixture.getCompilerProvider();
         var provider =
-                new HoverProvider(
+                new CompletionProvider(
                         new CompilerProvider() {
                             @Override
                             public Set<String> imports() {
@@ -280,7 +279,8 @@ public class CompletionsTest extends CompletionsBase {
                                 return delegate.compile(sources);
                             }
                         },
-                        TypeIndexRouter.EMPTY);
+                        TypeIndexRouter.EMPTY,
+                        0L);
         provider.resolveCompletionItem(item);
         assertThat(item.label, equalTo("Goto"));
     }

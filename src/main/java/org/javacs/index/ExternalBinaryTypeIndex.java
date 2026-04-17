@@ -1,4 +1,4 @@
-package org.javacs.completion;
+package org.javacs.index;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -36,8 +36,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.CacheAudit;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
-import org.javacs.index.IndexedMember;
-import org.javacs.index.IndexedType;
+import org.javacs.completion.ExternalBinaryDecompiler;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.TypeNames;
 
@@ -247,6 +246,10 @@ public final class ExternalBinaryTypeIndex {
         }
 
         return TypeNames.resolveSimpleName(raw, root, this::containsType);
+    }
+
+    public Optional<IndexedType> resolveType(String typeName, CompilationUnitTree root) {
+        return resolveTypeName(typeName, root).flatMap(this::typeInfo);
     }
 
     public Optional<Path> decompiledSourcePath(String qualifiedName) {

@@ -24,11 +24,11 @@ import java.util.Set;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import javax.tools.ToolProvider;
-import org.javacs.completion.TypeIndexRouter;
-import org.javacs.completion.CompletionProvider;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
-import org.javacs.navigation.DefinitionProvider;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.provider.CompletionProvider;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.provider.DefinitionProvider;
 import org.junit.Assert;
 import org.junit.Test;
 

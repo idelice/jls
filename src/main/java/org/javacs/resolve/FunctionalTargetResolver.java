@@ -24,9 +24,8 @@ import java.util.ArrayDeque;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.logging.Logger;
-import org.javacs.completion.TypeIndexRouter;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.resolve.ParseTypeResolver.MethodReferenceTarget;
 import org.javacs.resolve.ParseTypeResolver.TypeResolution;
 

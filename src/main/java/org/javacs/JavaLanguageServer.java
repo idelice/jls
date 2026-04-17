@@ -23,20 +23,20 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
 import org.javacs.action.CodeActionProvider;
-import org.javacs.completion.CompletionProvider;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.SignatureProvider;
-import org.javacs.completion.WorkspaceTypeIndex;
-import org.javacs.completion.TypeIndexRouter;
+import org.javacs.provider.CompletionProvider;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.provider.SignatureProvider;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.fold.FoldProvider;
-import org.javacs.hover.HoverProvider;
+import org.javacs.provider.HoverProvider;
 import org.javacs.index.IndexedType;
-import org.javacs.index.SymbolProvider;
+import org.javacs.provider.SymbolProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ErrorProvider;
-import org.javacs.navigation.DefinitionProvider;
-import org.javacs.navigation.ReferenceProvider;
+import org.javacs.provider.DefinitionProvider;
+import org.javacs.provider.ReferenceProvider;
 import org.javacs.rewrite.*;
 
 /**
@@ -1257,7 +1257,8 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public CompletionItem resolveCompletionItem(CompletionItem unresolved) {
         var snapshot = completionSnapshotRef.get();
-        new HoverProvider(getOrCreateCompiler(), snapshot.typeIndex()).resolveCompletionItem(unresolved);
+        new CompletionProvider(getOrCreateCompiler(), snapshot.typeIndex(), snapshot.version())
+                .resolveCompletionItem(unresolved);
         return unresolved;
     }
 
@@ -1268,6 +1269,7 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
+        ensureTypeIndexReady("hoverBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
         var content = new HoverProvider(getOrCreateCompiler(), snapshot.typeIndex()).hover(file, line, column);
         if (content == null) {
@@ -1395,7 +1397,7 @@ class JavaLanguageServer extends LanguageServer {
                 return Optional.empty();
             }
             var response = new RenameResponse();
-            response.range = FindHelper.location(task, path).range;
+            response.range = FindHelper.location(task, path, "").range;
             response.placeholder = el.getSimpleName().toString();
             return Optional.of(response);
         }

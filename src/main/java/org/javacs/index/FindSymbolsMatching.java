@@ -11,14 +11,14 @@ import org.javacs.lsp.Range;
 import org.javacs.lsp.SymbolInformation;
 import org.javacs.lsp.SymbolKind;
 
-class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>> {
+public class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>> {
 
     private final ParseTask task;
     private final String query;
     private CompilationUnitTree root;
     private CharSequence containerName;
 
-    FindSymbolsMatching(ParseTask task, String query) {
+    public FindSymbolsMatching(ParseTask task, String query) {
         this.task = task;
         this.query = query;
     }

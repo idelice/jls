@@ -19,9 +19,10 @@ import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindNameAt;
 import org.javacs.ParseTask;
-import org.javacs.completion.TypeIndexRouter;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.IndexedMember;
 import org.javacs.lsp.CompletionItemKind;
+import org.javacs.provider.DefinitionProvider;
 import org.javacs.resolve.ParseTypeResolver;
 import org.javacs.resolve.TypeNames;
 
@@ -33,10 +34,10 @@ import org.javacs.resolve.TypeNames;
  * aliases. Plain type-name formatting belongs to {@link TypeNames} and is called directly at
  * usage sites.
  */
-final class NavigationSymbolSupport {
+public final class NavigationSymbolSupport {
     private NavigationSymbolSupport() {}
 
-    static List<String> targetParameterTypes(
+    public static List<String> targetParameterTypes(
             CompilerProvider compiler,
             TypeIndexRouter completionIndex,
             DefinitionProvider.ResolvedSymbol target) {
@@ -64,7 +65,7 @@ final class NavigationSymbolSupport {
         return declaredParameterTypes(parse, path, method, completionIndex, compiler);
     }
 
-    static List<String> occurrenceParameterTypes(
+    public static List<String> occurrenceParameterTypes(
             ParseTask parse,
             TreePath path,
             TypeIndexRouter completionIndex,
@@ -83,7 +84,7 @@ final class NavigationSymbolSupport {
         return List.of();
     }
 
-    static List<String> declaredParameterTypes(
+    public static List<String> declaredParameterTypes(
             ParseTask parse,
             TreePath path,
             MethodTree method,
@@ -104,7 +105,7 @@ final class NavigationSymbolSupport {
         return result;
     }
 
-    static List<String> argumentTypes(List<? extends ExpressionTree> arguments, ParseTypeResolver resolver) {
+    public static List<String> argumentTypes(List<? extends ExpressionTree> arguments, ParseTypeResolver resolver) {
         var result = new ArrayList<String>(arguments.size());
         for (var argument : arguments) {
             var resolved = resolver.resolveExpression(argument);
@@ -115,7 +116,7 @@ final class NavigationSymbolSupport {
         return result;
     }
 
-    static String methodCanonicalKey(
+    public static String methodCanonicalKey(
             DefinitionProvider.ResolvedSymbol resolved,
             ParseTask parse,
             TreePath path,
@@ -142,7 +143,7 @@ final class NavigationSymbolSupport {
                 parameterTypes.toArray(String[]::new));
     }
 
-    static Optional<String> fieldLogicalKey(DefinitionProvider.ResolvedSymbol symbol) {
+    public static Optional<String> fieldLogicalKey(DefinitionProvider.ResolvedSymbol symbol) {
         if (symbol == null || symbol.qualifiedType() == null || symbol.memberName() == null) {
             return Optional.empty();
         }
@@ -159,7 +160,7 @@ final class NavigationSymbolSupport {
         return Optional.empty();
     }
 
-    static String logicalKey(DefinitionProvider.ResolvedSymbol symbol) {
+    public static String logicalKey(DefinitionProvider.ResolvedSymbol symbol) {
         if (symbol.indexMember() != null && symbol.indexMember().logicalKey != null) {
             return symbol.indexMember().logicalKey;
         }
@@ -170,7 +171,7 @@ final class NavigationSymbolSupport {
         return null;
     }
 
-    static Set<String> accessorNames(String fieldName) {
+    public static Set<String> accessorNames(String fieldName) {
         if (fieldName == null || fieldName.isEmpty()) {
             return Set.of();
         }

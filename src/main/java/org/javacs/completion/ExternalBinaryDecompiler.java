@@ -16,20 +16,20 @@ import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.extern.IResultSaver;
 
-final class ExternalBinaryDecompiler {
+public final class ExternalBinaryDecompiler {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final Set<Path> classPathRoots;
     private final String classPathFingerprint;
     private final ClassLoader classLoader;
 
-    ExternalBinaryDecompiler(Set<Path> classPathRoots, String classPathFingerprint, ClassLoader classLoader) {
+    public ExternalBinaryDecompiler(Set<Path> classPathRoots, String classPathFingerprint, ClassLoader classLoader) {
         this.classPathRoots = classPathRoots == null ? Set.of() : Set.copyOf(classPathRoots);
         this.classPathFingerprint = classPathFingerprint == null ? "" : classPathFingerprint;
         this.classLoader = classLoader == null ? ExternalBinaryDecompiler.class.getClassLoader() : classLoader;
     }
 
-    Optional<Path> decompileSourcePath(String qualifiedName) {
+    public Optional<Path> decompileSourcePath(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || classPathRoots.isEmpty()) {
             return Optional.empty();
         }

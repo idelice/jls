@@ -17,11 +17,11 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.logging.LogRecord;
-import org.javacs.completion.TypeIndexRouter;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.IndexedMember;
-import org.javacs.navigation.DefinitionProvider;
+import org.javacs.provider.DefinitionProvider;
 import org.javacs.lsp.Location;
 import org.junit.Test;
 
@@ -67,6 +67,58 @@ public class DefinitionProviderFlowTest {
         assertThat(
                 gotoDefinition("/org/javacs/example/Goto.java", "other.method()", "other.".length()),
                 hasItem("GotoOther.java:9"));
+    }
+
+    @Test
+    public void resolvesMemberSelectFromAnnotatedLocalReceiver() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-annotated-local-receiver");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var annotation = pkg.resolve("Marker.java");
+            Files.writeString(
+                    annotation,
+                    "package com.example.demo;\n"
+                            + "import java.lang.annotation.ElementType;\n"
+                            + "import java.lang.annotation.Retention;\n"
+                            + "import java.lang.annotation.RetentionPolicy;\n"
+                            + "import java.lang.annotation.Target;\n"
+                            + "@Target(ElementType.TYPE_USE)\n"
+                            + "@Retention(RetentionPolicy.RUNTIME)\n"
+                            + "public @interface Marker {}\n");
+
+            var receiver = pkg.resolve("AnnotatedReceiver.java");
+            Files.writeString(
+                    receiver,
+                    "package com.example.demo;\n"
+                            + "public class AnnotatedReceiver {\n"
+                            + "  public String value() { return \"ok\"; }\n"
+                            + "  public int field = 1;\n"
+                            + "}\n");
+
+            var service = pkg.resolve("AnnotatedReceiverUsage.java");
+            Files.writeString(
+                    service,
+                    "package com.example.demo;\n"
+                            + "class AnnotatedReceiverUsage {\n"
+                            + "  void test() {\n"
+                            + "    @Marker AnnotatedReceiver receiver = new AnnotatedReceiver();\n"
+                            + "    receiver.value();\n"
+                            + "    receiver.field++;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var context = navigationContext(workspace);
+            assertThat(
+                    gotoDefinition(context, service, "receiver.value()", "receiver.".length()),
+                    hasItem("AnnotatedReceiver.java:3"));
+            assertThat(
+                    gotoDefinition(context, service, "receiver.field++", "receiver.".length()),
+                    hasItem("AnnotatedReceiver.java:4"));
+        } finally {
+            deleteRecursively(workspace);
+        }
     }
 
     @Test
@@ -322,6 +374,108 @@ public class DefinitionProviderFlowTest {
             assertThat(
                     gotoDefinition(navigationContext(workspace), service, "seed.length()", 0),
                     hasItem("ComplexScenarioService.java:4"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesConstructorIdentifierFromNewClassExpression() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-constructor-identifier");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("ConstructorIdentifier.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "class ConstructorIdentifier {\n"
+                            + "  ConstructorIdentifier() {}\n"
+                            + "  static ConstructorIdentifier create() {\n"
+                            + "    return new ConstructorIdentifier();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), file, "new ConstructorIdentifier()", "new ".length()),
+                    hasItem("ConstructorIdentifier.java:3"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesSameFileNestedConstructorIdentifierFromNewClassExpression() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-same-file-nested-constructor");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("NestedConstructorIdentifier.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "class NestedConstructorIdentifier {\n"
+                            + "  static class Nested {\n"
+                            + "    Nested() {}\n"
+                            + "  }\n"
+                            + "  Nested create() {\n"
+                            + "    return new Nested();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), file, "new Nested()", "new ".length()),
+                    hasItem("NestedConstructorIdentifier.java:4"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesWorkspaceAnnotationTypeFromAnnotationUse() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-annotation-type");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+            Files.writeString(
+                    pkg.resolve("Marker.java"),
+                    "package com.example.demo;\n"
+                            + "public @interface Marker {}\n");
+            var file = pkg.resolve("UseMarker.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "@Marker\n"
+                            + "class UseMarker {}\n");
+
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), file, "@Marker", 1),
+                    hasItem("Marker.java:2"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesWorkspaceStaticMethodFromQualifiedInvocation() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-qualified-static-method");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("StaticCall.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "class StaticCall {\n"
+                            + "  static String helper(String value) { return value; }\n"
+                            + "  String use() {\n"
+                            + "    return StaticCall.helper(\"x\");\n"
+                            + "  }\n"
+                            + "}\n");
+
+            assertThat(
+                    gotoDefinition(navigationContext(workspace), file, "StaticCall.helper", "StaticCall.".length()),
+                    hasItem("StaticCall.java:3"));
         } finally {
             deleteRecursively(workspace);
         }
@@ -584,6 +738,78 @@ public class DefinitionProviderFlowTest {
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void resolvesDeclarationTargetsWithoutPublishedIndexes() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-no-index-declarations");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("DeclarationOnly.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "class DeclarationOnly {\n"
+                            + "  private String field;\n"
+                            + "  String method(String input) {\n"
+                            + "    var local = input + field;\n"
+                            + "    return local;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            FileStore.reset();
+            FileStore.setWorkspaceRoots(Set.of(workspace));
+            var infer = new InferConfig(workspace);
+            var compiler =
+                    new JavaCompilerService(
+                            infer.classPath(),
+                            infer.buildDocPath(),
+                            java.util.Collections.emptySet(),
+                            java.util.Collections.emptySet());
+
+            var methodCursor = cursor(file, "method(String input)", 0);
+            assertThat(
+                    new DefinitionProvider(
+                                    compiler,
+                                    TypeIndexRouter.EMPTY,
+                                    file,
+                                    methodCursor.line,
+                                    methodCursor.character)
+                            .find(),
+                    org.hamcrest.Matchers.not(org.hamcrest.Matchers.empty()));
+
+            var fieldCursor = cursor(file, "field;", 0);
+            assertThat(
+                    new DefinitionProvider(
+                                    compiler,
+                                    TypeIndexRouter.EMPTY,
+                                    file,
+                                    fieldCursor.line,
+                                    fieldCursor.character)
+                            .find(),
+                    org.hamcrest.Matchers.not(org.hamcrest.Matchers.empty()));
+
+            var localUseCursor = cursor(file, "return local;", "return ".length());
+            var localLocations =
+                    new DefinitionProvider(
+                                    compiler,
+                                    TypeIndexRouter.EMPTY,
+                                    file,
+                                    localUseCursor.line,
+                                    localUseCursor.character)
+                            .find();
+            var renderedLocalLocations = new ArrayList<String>();
+            for (var location : localLocations) {
+                renderedLocalLocations.add(
+                        StringSearch.fileName(location.uri) + ":" + (location.range.start.line + 1));
+            }
+            assertThat(
+                    renderedLocalLocations,
+                    hasItem("DeclarationOnly.java:5"));
+        } finally {
             deleteRecursively(workspace);
         }
     }

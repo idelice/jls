@@ -1,4 +1,4 @@
-package org.javacs.navigation;
+package org.javacs.provider;
 
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberReferenceTree;
@@ -13,8 +13,9 @@ import java.util.*;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.ParseTask;
-import org.javacs.completion.TypeIndexRouter;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.Location;
+import org.javacs.navigation.NavigationSymbolSupport;
 import org.javacs.resolve.ParseTypeResolver;
 import org.javacs.resolve.TypeNames;
 
@@ -230,8 +231,8 @@ public class ReferenceProvider {
         }
         return typeIndexRouter.directSupertypes(resolvedOwner).contains(targetOwner)
                 || typeIndexRouter.directSupertypes(targetOwner).contains(resolvedOwner)
-                || typeIndexRouter.subtypes(targetOwner).contains(resolvedOwner)
-                || typeIndexRouter.subtypes(resolvedOwner).contains(targetOwner);
+                || typeIndexRouter.workspaceSubTypes(targetOwner).contains(resolvedOwner)
+                || typeIndexRouter.workspaceSubTypes(resolvedOwner).contains(targetOwner);
     }
 
     private boolean matchesFieldReference(
@@ -246,7 +247,7 @@ public class ReferenceProvider {
         if (resolved.locations().isEmpty() || target.locations().isEmpty()) {
             return false;
         }
-        return sameLocation(target.locations().get(0), resolved.locations().get(0));
+        return sameLocation(target.locations().getFirst(), resolved.locations().getFirst());
     }
 
     private DefinitionProvider.ResolvedSymbol resolveOccurrence(

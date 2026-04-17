@@ -1,4 +1,4 @@
-package org.javacs.completion;
+package org.javacs.index;
 
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ClassTree;
@@ -42,11 +42,8 @@ import javax.lang.model.type.WildcardType;
 import org.javacs.CompileTask;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
-import org.javacs.index.IndexedMember;
-import org.javacs.index.IndexedType;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
-import org.javacs.lsp.Range;
 import org.javacs.resolve.TypeNames;
 
 /**
@@ -610,6 +607,10 @@ public class WorkspaceTypeIndex {
         return TypeNames.resolveSimpleName(raw, root, typesByQualifiedName::containsKey);
     }
 
+    public Optional<IndexedType> resolveType(String typeName, CompilationUnitTree root) {
+        return resolveTypeName(typeName, root).flatMap(this::typeInfo);
+    }
+
     private static Optional<String> staticImportOwnerType(String imported, String memberName) {
         if (imported == null || imported.isBlank()) {
             return Optional.empty();
@@ -825,7 +826,7 @@ public class WorkspaceTypeIndex {
                 }
                 continue;
             }
-            var type = elements.getTypeElement(qualifiedName);
+            var type = safeTypeElement(elements, qualifiedName);
             if (type == null) {
                 type = collected;
             } else if (type != collected) {
@@ -1185,9 +1186,18 @@ public class WorkspaceTypeIndex {
         if (!isValidIndexKey(qualifiedName) || collectedTypes.containsKey(qualifiedName)) {
             return;
         }
-        var type = elements.getTypeElement(qualifiedName);
+        var type = safeTypeElement(elements, qualifiedName);
         if (type != null) {
             collectedTypes.put(qualifiedName, type);
+        }
+    }
+
+    private static TypeElement safeTypeElement(javax.lang.model.util.Elements elements, String qualifiedName) {
+        try {
+            return elements.getTypeElement(qualifiedName);
+        } catch (AssertionError e) {
+            LOG.fine(String.format("[completion] failed to resolve type element %s from javac elements", qualifiedName));
+            return null;
         }
     }
 

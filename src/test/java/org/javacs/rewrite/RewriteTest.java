@@ -38,6 +38,22 @@ public class RewriteTest {
     }
 
     @Test
+    public void renameFieldAfterRenameMethod() {
+        var methodClass = "org.javacs.rewrite.TestRenameMethod";
+        var methodName = "foo";
+        String[] erasedParameterTypes = {};
+        var methodRenamer = new RenameMethod(methodClass, methodName, erasedParameterTypes, "bar");
+        methodRenamer.rewrite(compiler);
+
+        var fieldClass = "org.javacs.rewrite.TestRenameField";
+        var fieldName = "foo";
+        var fieldRenamer = new RenameField(fieldClass, fieldName, "bar");
+        var edits = fieldRenamer.rewrite(compiler);
+        assertThat(edits.keySet(), hasSize(1));
+        assertThat(edits, hasKey(file("TestRenameField.java")));
+    }
+
+    @Test
     public void renameMethod() {
         var className = "org.javacs.rewrite.TestRenameMethod";
         var methodName = "foo";

@@ -138,16 +138,12 @@ public class FindHelper {
         return true;
     }
 
-    public static Location location(CompileTask task, TreePath path) {
-        return location(task, path, "");
-    }
-
     public static Location location(ParseTask task, TreePath path) {
         return location(task.task(), path, "", false);
     }
 
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
-        return location(task, path, name, false);
+        return location(task.task, path, name, false);
     }
 
     public static Location location(ParseTask task, TreePath path, CharSequence name) {
@@ -158,15 +154,7 @@ public class FindHelper {
         return location(task.task(), path, name, true);
     }
 
-    public static URI normalizeLocationUri(URI uri) {
-        return normalizeUri(uri);
-    }
-
-    private static Location location(CompileTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
-        return location(task.task, path, name, strictNameMatch);
-    }
-
-    private static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
+    public static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
         var pos = Trees.instance(task).getSourcePositions();
         var root = path.getCompilationUnit();
         var start = -1;
@@ -200,7 +188,7 @@ public class FindHelper {
         return new Location(uri, range);
     }
 
-    private static URI normalizeUri(URI uri) {
+    public static URI normalizeUri(URI uri) {
         if (uri == null) return null;
         if (!"jar".equals(uri.getScheme())) return uri;
         var cached = jarUriCache.get(uri);

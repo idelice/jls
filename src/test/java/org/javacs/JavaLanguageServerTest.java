@@ -33,9 +33,9 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
-import org.javacs.completion.TypeIndexRouter;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.IndexedMember;
 import org.javacs.index.IndexedType;
 import org.javacs.markup.ErrorProvider;
@@ -3806,6 +3806,64 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void completionInfersLambdaItemTypeAtUnfinishedLineEnd() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-line-end");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var plainService = serviceDir.resolve("PlainService.java");
+            var useFile = serviceDir.resolve("PlainUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    plainService,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.List;\n"
+                            + "class PlainService {\n"
+                            + "  List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "class PlainUse {\n"
+                            + "  void test(PlainService service) {\n"
+                            + "    var qqw = service.getItems().stream().map(i -> i.)\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, plainService);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before unfinished lambda completion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var completion = completionAtMarker(server, useFile, useText, "map(i -> i.");
+            var labels = completionLabels(completion);
+            Assert.assertTrue("unfinished lambda completion: " + labels, labels.contains("getSku"));
+            Assert.assertTrue("unfinished lambda completion: " + labels, labels.contains("getQuantity"));
+            Assert.assertTrue("unfinished lambda completion: " + labels, labels.contains("getFamily"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void completionOffersLombokBuilderMembersFromIndex() throws Exception {
         var workspace = Files.createTempDirectory("jls-lombok-builder-members");
         try {
@@ -4570,6 +4628,80 @@ public class JavaLanguageServerTest {
         } finally {
             logger.removeHandler(capture);
         }
+    }
+
+    @Test
+    public void completionRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var tracking = replaceCacheCompilerWithTracking(server);
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var before = completionIndexVersion(server);
+        openJavaFile(server, file);
+        Assert.assertTrue(
+                "completion index should bootstrap before the request-path assertion",
+                awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
+
+        tracking.resetCounters();
+        var result =
+                server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+
+        Assert.assertTrue("completion request should succeed", result.isPresent());
+        Assert.assertTrue("completion should parse the active file", tracking.parseCalls.get() > 0);
+        Assert.assertEquals("completion should not use full compile", 0, tracking.compileCalls.get());
+        Assert.assertEquals("completion should not use fast compile", 0, tracking.compileFastCalls.get());
+        Assert.assertEquals(
+                "completion should not use fast compile with processors",
+                0,
+                tracking.compileFastWithProcessorsCalls.get());
+    }
+
+    @Test
+    public void hoverRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var tracking = replaceCacheCompilerWithTracking(server);
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var before = completionIndexVersion(server);
+        openJavaFile(server, file);
+        Assert.assertTrue(
+                "completion index should bootstrap before the request-path assertion",
+                awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
+
+        tracking.resetCounters();
+        var result =
+                server.hover(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
+
+        Assert.assertTrue("hover request should succeed", result.isPresent());
+        Assert.assertTrue("hover should parse source rather than compile", tracking.parseCalls.get() > 0);
+        Assert.assertEquals("hover should not use full compile", 0, tracking.compileCalls.get());
+        Assert.assertEquals("hover should not use fast compile", 0, tracking.compileFastCalls.get());
+        Assert.assertEquals(
+                "hover should not use fast compile with processors",
+                0,
+                tracking.compileFastWithProcessorsCalls.get());
+    }
+
+    @Test
+    public void signatureHelpUsesFastCompileWithProcessorsNotFastCompile() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var tracking = replaceCacheCompilerWithTracking(server);
+        var file = FindResource.path("org/javacs/example/SignatureHelp.java");
+
+        tracking.resetCounters();
+        var result =
+                server.signatureHelp(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(7, 38)));
+
+        Assert.assertTrue("signature help request should succeed", result.isPresent());
+        Assert.assertEquals("signature help should not use full compile", 0, tracking.compileCalls.get());
+        Assert.assertEquals("signature help should not use fast compile", 0, tracking.compileFastCalls.get());
+        Assert.assertTrue(
+                "signature help should use fast compile with processors",
+                tracking.compileFastWithProcessorsCalls.get() > 0);
     }
 
     @Test
@@ -5352,6 +5484,26 @@ public class JavaLanguageServerTest {
         var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
         field.setAccessible(true);
         return (JavaCompilerService) field.get(server);
+    }
+
+    private void setCacheCompiler(JavaLanguageServer server, JavaCompilerService compiler) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
+        field.setAccessible(true);
+        field.set(server, compiler);
+    }
+
+    private MethodTrackingCompiler replaceCacheCompilerWithTracking(JavaLanguageServer server) throws Exception {
+        var original = cacheCompiler(server);
+        var tracking =
+                new MethodTrackingCompiler(
+                        original.classPath,
+                        original.docPath,
+                        original.addExports,
+                        original.extraArgs,
+                        original.lombokConfiguredEnabled,
+                        original.compilerRole);
+        setCacheCompiler(server, tracking);
+        return tracking;
     }
 
     private void invokeCompileAndPublish(
@@ -7036,6 +7188,79 @@ public class JavaLanguageServerTest {
 
         int maxConcurrentCompiles() {
             return maxInFlight.get();
+        }
+    }
+
+    private static class MethodTrackingCompiler extends JavaCompilerService {
+        final AtomicInteger parseCalls = new AtomicInteger();
+        final AtomicInteger compileCalls = new AtomicInteger();
+        final AtomicInteger compileFastCalls = new AtomicInteger();
+        final AtomicInteger compileFastWithProcessorsCalls = new AtomicInteger();
+
+        MethodTrackingCompiler(
+                Set<Path> classPath,
+                Set<Path> docPath,
+                Set<String> addExports,
+                List<String> extraArgs,
+                boolean lombokConfiguredEnabled,
+                String compilerRole) {
+            super(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, compilerRole);
+        }
+
+        void resetCounters() {
+            parseCalls.set(0);
+            compileCalls.set(0);
+            compileFastCalls.set(0);
+            compileFastWithProcessorsCalls.set(0);
+        }
+
+        @Override
+        public ParseTask parse(Path file) {
+            parseCalls.incrementAndGet();
+            return super.parse(file);
+        }
+
+        @Override
+        public ParseTask parse(javax.tools.JavaFileObject file) {
+            parseCalls.incrementAndGet();
+            return super.parse(file);
+        }
+
+        @Override
+        public CompileTask compile(Path... files) {
+            compileCalls.incrementAndGet();
+            return super.compile(files);
+        }
+
+        @Override
+        public CompileTask compile(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+            compileCalls.incrementAndGet();
+            return super.compile(sources);
+        }
+
+        @Override
+        public CompileTask compileFast(Path... files) {
+            compileFastCalls.incrementAndGet();
+            return super.compileFast(files);
+        }
+
+        @Override
+        public CompileTask compileFast(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+            compileFastCalls.incrementAndGet();
+            return super.compileFast(sources);
+        }
+
+        @Override
+        public CompileTask compileFastWithProcessors(Path... files) {
+            compileFastWithProcessorsCalls.incrementAndGet();
+            return super.compileFastWithProcessors(files);
+        }
+
+        @Override
+        public CompileTask compileFastWithProcessors(
+                java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+            compileFastWithProcessorsCalls.incrementAndGet();
+            return super.compileFastWithProcessors(sources);
         }
     }
 }

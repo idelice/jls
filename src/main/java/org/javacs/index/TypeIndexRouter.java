@@ -1,13 +1,13 @@
-package org.javacs.completion;
+package org.javacs.index;
 
 import com.sun.source.tree.CompilationUnitTree;
 import java.nio.file.Path;
+import java.util.Set;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
-import org.javacs.index.IndexedMember;
-import org.javacs.index.IndexedType;
-import java.util.Set;
+
+import static org.javacs.index.TypeIndexRouter.OwnerStore.*;
 
 /**
  * Read-only view over the published completion/navigation indexes.
@@ -18,6 +18,12 @@ import java.util.Set;
  * facade as a fallback chooser.
  */
 public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIndex external) {
+    public enum OwnerStore {
+        WORKSPACE,
+        EXTERNAL,
+        NONE
+    }
+
     public static final TypeIndexRouter EMPTY =
             new TypeIndexRouter(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY);
 
@@ -59,6 +65,30 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return external.resolveTypeName(typeName, root);
     }
 
+    public Optional<IndexedType> resolveType(String typeName, CompilationUnitTree root) {
+        var workspaceType = workspace.resolveType(typeName, root);
+        if (workspaceType.isPresent()) {
+            return workspaceType;
+        }
+
+        if (looksLikeWorkspaceMemberAccess(typeName, root)) {
+            return Optional.empty();
+        }
+        return external.resolveType(typeName, root);
+    }
+
+    private boolean looksLikeWorkspaceMemberAccess(String typeName, CompilationUnitTree root) {
+        if (typeName == null || root == null) {
+            return false;
+        }
+        var split = typeName.lastIndexOf('.');
+        if (split <= 0 || split == typeName.length() - 1) {
+            return false;
+        }
+        var owner = typeName.substring(0, split);
+        return workspace.resolveType(owner, root).isPresent();
+    }
+
     public boolean containsType(String qualifiedName) {
         return workspace.containsType(qualifiedName) || external.containsType(qualifiedName);
     }
@@ -74,6 +104,24 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return workspace.ownsTypeOrEnclosingType(qualifiedName);
     }
 
+    public OwnerStore ownerStore(String qualifiedName) {
+        if (qualifiedName == null || qualifiedName.isBlank()) {
+            return NONE;
+        }
+        if (isWorkspaceOwnedType(qualifiedName)) {
+            return WORKSPACE;
+        }
+        return external.containsType(qualifiedName) ? EXTERNAL : NONE;
+    }
+
+    public Optional<IndexedType> ownerTypeInfo(String qualifiedType) {
+        return switch (ownerStore(qualifiedType)) {
+            case WORKSPACE -> workspace().typeInfo(qualifiedType);
+            case EXTERNAL -> external().typeInfo(qualifiedType);
+            case NONE -> Optional.empty();
+        };
+    }
+
     public Optional<IndexedType> typeInfo(String qualifiedName) {
         var workspaceType = workspace.typeInfo(qualifiedName);
         if (workspaceType.isPresent() || isWorkspaceOwnedType(qualifiedName)) {
@@ -82,7 +130,7 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return external.typeInfo(qualifiedName);
     }
 
-    public Set<String> subtypes(String qualifiedName) {
+    public Set<String> workspaceSubTypes(String qualifiedName) {
         return workspace.subtypes(qualifiedName);
     }
 
@@ -114,4 +162,29 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         var candidate = ownerType + "." + simpleName;
         return workspace.containsType(candidate) ? Optional.of(candidate) : Optional.empty();
     }
-}
+
+    public Optional<IndexedMember> ownerMember(String ownerType, String name, boolean staticContext) {
+        return switch (ownerStore(ownerType)) {
+            case WORKSPACE -> workspace().member(ownerType, name, staticContext);
+            case EXTERNAL -> external().member(ownerType, name, staticContext);
+            case NONE -> Optional.empty();
+        };
+    }
+
+    public Optional<IndexedMember> ownerMember(
+            String ownerType, String name, boolean staticContext, String[] erasedParameterTypes) {
+        return switch (ownerStore(ownerType)) {
+            case WORKSPACE -> workspace().member(ownerType, name, staticContext, erasedParameterTypes);
+            case EXTERNAL -> external().member(ownerType, name, staticContext, erasedParameterTypes);
+            case NONE -> Optional.empty();
+        };
+    }
+
+    public List<IndexedMember> ownerMembers(String ownerType, boolean staticContext) {
+        return switch (ownerStore(ownerType)) {
+            case WORKSPACE -> workspace().members(ownerType, staticContext);
+            case EXTERNAL -> external().members(ownerType, staticContext);
+            case NONE -> List.of();
+        };
+
+    }}

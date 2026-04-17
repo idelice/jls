@@ -7,10 +7,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import org.javacs.completion.TypeIndexRouter;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
-import org.javacs.navigation.ReferenceProvider;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.provider.ReferenceProvider;
 import org.junit.Test;
 
 public class FindReferencesTest {

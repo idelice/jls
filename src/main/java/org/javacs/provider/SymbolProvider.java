@@ -1,4 +1,4 @@
-package org.javacs.index;
+package org.javacs.provider;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
 import org.javacs.ParseTask;
+import org.javacs.index.FindSymbolsMatching;
 import org.javacs.lsp.SymbolInformation;
 
 public class SymbolProvider {

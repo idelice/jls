@@ -1,4 +1,4 @@
-package org.javacs.completion;
+package org.javacs.provider;
 
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
@@ -27,6 +27,8 @@ import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.MarkdownHelper;
+import org.javacs.completion.FindInvocationAt;
+import org.javacs.completion.ScopeHelper;
 import org.javacs.hover.ShortTypePrinter;
 import org.javacs.lsp.ParameterInformation;
 import org.javacs.lsp.SignatureHelp;

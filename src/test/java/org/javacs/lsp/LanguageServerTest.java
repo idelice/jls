@@ -6,10 +6,13 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import java.io.IOException;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.javacs.Main;
 import org.junit.After;
 import org.junit.Before;
@@ -28,6 +31,52 @@ public class LanguageServerTest {
         public InitializeResult initialize(InitializeParams params) {
             receivedInitialize.complete(null);
             return new InitializeResult();
+        }
+    }
+
+    class SequentialRequestServer extends TestLanguageServer {
+        final AtomicInteger inFlight = new AtomicInteger();
+        final AtomicInteger maxInFlight = new AtomicInteger();
+        final CountDownLatch handled = new CountDownLatch(2);
+
+        @Override
+        public Optional<Hover> hover(TextDocumentPositionParams params) {
+            enter();
+            try {
+                sleepBriefly();
+                return Optional.empty();
+            } finally {
+                exit();
+            }
+        }
+
+        @Override
+        public Optional<CompletionList> completion(TextDocumentPositionParams params) {
+            enter();
+            try {
+                sleepBriefly();
+                return Optional.of(new CompletionList(false, java.util.List.of()));
+            } finally {
+                exit();
+            }
+        }
+
+        private void enter() {
+            var active = inFlight.incrementAndGet();
+            maxInFlight.accumulateAndGet(active, Math::max);
+        }
+
+        private void exit() {
+            inFlight.decrementAndGet();
+            handled.countDown();
+        }
+
+        private void sleepBriefly() {
+            try {
+                Thread.sleep(120);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -56,6 +105,9 @@ public class LanguageServerTest {
     }
 
     private LanguageServer serverFactory(LanguageClient client) {
+        if (mockServer != null) {
+            return mockServer;
+        }
         mockServer = new TestLanguageServer();
         return mockServer;
     }
@@ -93,5 +145,21 @@ public class LanguageServerTest {
         // Wait for exit
         main.join(10_000);
         assertThat("Main thread has quit", main.isAlive(), equalTo(false));
+    }
+
+    @Test
+    public void requestDispatchIsSequential() throws Exception {
+        mockServer = new SequentialRequestServer();
+        sendToServer(initializeMessage);
+        receivedInitialize.get(10, TimeUnit.SECONDS);
+
+        sendToServer(
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///Test.java\"},\"position\":{\"line\":0,\"character\":0}}}");
+        sendToServer(
+                "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///Test.java\"},\"position\":{\"line\":0,\"character\":0}}}");
+
+        var server = (SequentialRequestServer) mockServer;
+        assertThat("both requests should complete", server.handled.await(10, TimeUnit.SECONDS), equalTo(true));
+        assertThat("LSP request processing should stay single-threaded", server.maxInFlight.get(), equalTo(1));
     }
 }

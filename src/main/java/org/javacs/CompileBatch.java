@@ -346,6 +346,7 @@ public class CompileBatch implements AutoCloseable {
 
     @Override
     public void close() {
+        borrow.close();
         closed = true;
     }
 
@@ -379,7 +380,9 @@ public class CompileBatch implements AutoCloseable {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
-        Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        if (!targetsJava8OrEarlier(extraArgs)) {
+            Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        }
         // Collections.addAll(list, "-verbose");
 
         if (lombokPresent) {
@@ -448,7 +451,9 @@ public class CompileBatch implements AutoCloseable {
     static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();
         Collections.addAll(list, "-classpath", joinPath(classPath));
-        Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        if (!targetsJava8OrEarlier(extraArgs)) {
+            Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        }
         Collections.addAll(list, "-proc:none");
         Collections.addAll(list, "-g");
         Collections.addAll(
@@ -470,6 +475,34 @@ public class CompileBatch implements AutoCloseable {
             list.add(export + "=ALL-UNNAMED");
         }
         return list;
+    }
+
+    private static boolean targetsJava8OrEarlier(List<String> extraArgs) {
+        for (int i = 0; i < extraArgs.size() - 1; i++) {
+            var arg = extraArgs.get(i);
+            if (!"--release".equals(arg) && !"-source".equals(arg) && !"-target".equals(arg)) {
+                continue;
+            }
+            var level = parseJavaLevel(extraArgs.get(i + 1));
+            if (level > 0) {
+                return level <= 8;
+            }
+        }
+        return false;
+    }
+
+    private static int parseJavaLevel(String value) {
+        if (value == null || value.isBlank()) {
+            return -1;
+        }
+        if (value.startsWith("1.")) {
+            value = value.substring(2);
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     private boolean isValidFileRange(javax.tools.Diagnostic<? extends JavaFileObject> d) {

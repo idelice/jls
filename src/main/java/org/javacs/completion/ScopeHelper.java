@@ -10,7 +10,7 @@ import javax.lang.model.element.Modifier;
 import javax.lang.model.type.DeclaredType;
 import org.javacs.CompileTask;
 
-class ScopeHelper {
+public class ScopeHelper {
     /**
      * Return lexical scopes that participate in Java member lookup.
      *
@@ -31,7 +31,7 @@ class ScopeHelper {
         return scopes;
     }
 
-    static List<Element> scopeMembers(CompileTask task, Scope inner, Predicate<CharSequence> filter) {
+    public static List<Element> scopeMembers(CompileTask task, Scope inner, Predicate<CharSequence> filter) {
         var trees = Trees.instance(task.task);
         var elements = task.task.getElements();
         var isStatic = false;

@@ -6,7 +6,9 @@ import com.sun.source.tree.ArrayTypeTree;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.CatchTree;
 import com.sun.source.tree.EnhancedForLoopTree;
+import com.sun.source.tree.ForLoopTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.LambdaExpressionTree;
 import com.sun.source.tree.LiteralTree;
@@ -38,15 +40,14 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import javax.lang.model.element.Modifier;
+
 import org.javacs.CompilerProvider;
 import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
-import org.javacs.completion.TypeIndexRouter;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.completion.FindCompletionsAt;
-import org.javacs.completion.WorkspaceTypeIndex;
 import org.javacs.index.IndexedMember;
+import org.javacs.index.IndexedType;
 import org.javacs.lsp.CompletionItemKind;
 
 /**
@@ -78,19 +79,9 @@ public final class ParseTypeResolver {
 
     public record MethodReferenceTarget(TypeResolution receiverType, int argumentCount) {}
 
-    private record CandidateType(TypeResolution resolution, int depth, long start) {}
+    private record VisibleVariable(VariableTree tree, TreePath path, int depth, long start) {}
 
-    private static final class CandidatePath {
-        TreePath path;
-        int depth;
-        long start;
-
-        CandidatePath(TreePath path, int depth, long start) {
-            this.path = path;
-            this.depth = depth;
-            this.start = start;
-        }
-    }
+    private record ScopeSnapshot(TreePath enclosingClassPath, java.util.List<VisibleVariable> visibleVariables) {}
 
     private static final int MAX_RESOLVE_DEPTH = 24;
 
@@ -101,6 +92,7 @@ public final class ParseTypeResolver {
     private final FunctionalTargetResolver functionalTargetResolver;
     private final long cursor;
     private final TreePath cursorPath;
+    private ScopeSnapshot scopeSnapshot;
     private ClassLoader externalClassLoader;
     private TypeResolution thisType;
     private TypeResolution superType;
@@ -163,7 +155,26 @@ public final class ParseTypeResolver {
         if (fallbackIdentifier == null || fallbackIdentifier.isBlank()) {
             return Optional.empty();
         }
-        return resolveIdentifier(fallbackIdentifier, 0);
+        if ("this".equals(fallbackIdentifier)) {
+            return resolveThisType();
+        }
+        if ("super".equals(fallbackIdentifier)) {
+            return resolveSuperType();
+        }
+        var variable = resolveVisibleVariable(fallbackIdentifier, 1);
+        if (variable.isPresent()) {
+            return variable;
+        }
+        var implicitLogger = resolveImplicitSlf4jLogger(fallbackIdentifier);
+        if (implicitLogger.isPresent()) {
+            return implicitLogger;
+        }
+        var enclosingField = resolveEnclosingField(fallbackIdentifier);
+        if (enclosingField.isPresent()) {
+            return enclosingField;
+        }
+        return resolveIdentifier(fallbackIdentifier)
+                .map(type -> new TypeResolution(type.qualifiedName, true, false));
     }
 
     public Optional<TypeResolution> resolveExpression(Tree expression) {
@@ -197,7 +208,26 @@ public final class ParseTypeResolver {
             return resolveExpressionAtDepth(parenthesized.getExpression(), depth + 1);
         }
         if (expression instanceof IdentifierTree identifier) {
-            return resolveIdentifier(identifier.getName().toString(), depth + 1);
+            var name = identifier.getName().toString();
+            if ("this".equals(name)) {
+                return resolveThisType();
+            }
+            if ("super".equals(name)) {
+                return resolveSuperType();
+            }
+            var variable = resolveVisibleVariable(name, depth + 1);
+            if (variable.isPresent()) {
+                return variable;
+            }
+            var implicitLogger = resolveImplicitSlf4jLogger(name);
+            if (implicitLogger.isPresent()) {
+                return implicitLogger;
+            }
+            var enclosingField = resolveEnclosingField(name);
+            if (enclosingField.isPresent()) {
+                return enclosingField;
+            }
+            return resolveIdentifier(name).map(type -> new TypeResolution(type.qualifiedName, true, false));
         }
         if (expression instanceof NewClassTree newClassTree) {
             return resolveTypeTree(newClassTree.getIdentifier(), root, false);
@@ -271,31 +301,13 @@ public final class ParseTypeResolver {
         return resolveDirectMemberType(receiver.get(), memberSelectTree.getIdentifier().toString());
     }
 
-    private Optional<TypeResolution> resolveIdentifier(String identifier, int depth) {
-        if ("this".equals(identifier)) {
-            return resolveThisType();
-        }
-        if ("super".equals(identifier)) {
-            return resolveSuperType();
-        }
-        var variable = resolveVisibleVariable(identifier, depth + 1);
-        if (variable.isPresent()) {
-            return variable;
-        }
-        var implicitLogger = resolveImplicitSlf4jLogger(identifier);
-        if (implicitLogger.isPresent()) {
-            return implicitLogger;
-        }
-        var enclosingField = resolveEnclosingField(identifier);
-        if (enclosingField.isPresent()) {
-            return enclosingField;
-        }
+    private Optional<IndexedType> resolveIdentifier(String identifier) {
         var nested = resolveNestedTypeInEnclosingScopes(identifier);
         if (nested.isPresent()) {
-            return Optional.of(new TypeResolution(nested.get(), true, false));
+            return index.typeInfo(nested.get());
         }
-        var type = resolveTypeNameInSource(identifier, root).or(() -> index.resolveTypeName(identifier, root));
-        return type.map(s -> new TypeResolution(s, true, false));
+        var sourceType = resolveTypeNameInSource(identifier, root);
+        return sourceType.flatMap(index::typeInfo).or(() -> index.resolveType(identifier, root));
     }
 
     private Optional<TypeResolution> resolveEnclosingField(String identifier) {
@@ -397,83 +409,15 @@ public final class ParseTypeResolver {
 
     // Lexical scope resolution.
     private Optional<TypeResolution> resolveVisibleVariable(String targetName, int depth) {
-        final CandidateType[] best = new CandidateType[1];
-        new TreePathScanner<Void, Void>() {
-            @Override
-            public Void visitClass(ClassTree classTree, Void p) {
-                if (!containsCursor(classTree)) {
-                    return null;
-                }
-                for (var member : classTree.getMembers()) {
-                    if (member instanceof VariableTree) {
-                        scan(member, p);
-                    } else if (containsCursor(member)) {
-                        scan(member, p);
-                    }
-                }
-                return null;
-            }
-
-            @Override
-            public Void visitMethod(MethodTree methodTree, Void p) {
-                if (!containsCursor(methodTree)) {
-                    return null;
-                }
-                for (var parameter : methodTree.getParameters()) {
-                    consider(parameter, getCurrentPath(), depth + 1);
-                }
-                if (methodTree.getBody() != null) {
-                    scan(methodTree.getBody(), p);
-                }
-                return null;
-            }
-
-            @Override
-            public Void visitBlock(BlockTree blockTree, Void p) {
-                if (!containsCursor(blockTree)) {
-                    return null;
-                }
-                for (var statement : blockTree.getStatements()) {
-                    var start = startOf(statement);
-                    if (start >= 0 && start >= cursor) {
-                        break;
-                    }
-                    scan(statement, p);
-                }
-                return null;
-            }
-
-            @Override
-            public Void visitVariable(VariableTree variableTree, Void p) {
-                consider(variableTree, getCurrentPath(), depth + 1);
-                return null;
-            }
-
-            private void consider(VariableTree variableTree, TreePath path, int nextDepth) {
-                if (!variableTree.getName().contentEquals(targetName)) {
-                    return;
-                }
-                var start = startOf(variableTree);
-                if (start < 0 || start >= cursor) {
-                    return;
-                }
-                var resolved = resolveVariableType(variableTree, path, nextDepth);
-                if (resolved.isEmpty()) {
-                    return;
-                }
-                var candidate = new CandidateType(resolved.get(), depth(path), start);
-                if (best[0] == null
-                        || candidate.depth() > best[0].depth()
-                        || (candidate.depth() == best[0].depth() && candidate.start() > best[0].start())) {
-                    best[0] = candidate;
-                }
-            }
-        }.scan(root, null);
-
-        if (best[0] == null) {
+        var best = findVisibleVariable(targetName);
+        if (best.isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(best[0].resolution());
+        var variableTree = best.get().tree();
+        if (variableTree.getType() != null && !"var".equals(variableTree.getType().toString())) {
+            return resolveDeclaredTypeName(variableTree.getType().toString());
+        }
+        return resolveVariableType(variableTree, best.get().path(), depth + 1);
     }
 
     private Optional<TypeResolution> resolveVariableType(VariableTree variableTree, TreePath path, int depth) {
@@ -574,9 +518,21 @@ public final class ParseTypeResolver {
             return component.map(typeResolution -> new TypeResolution(typeResolution.qualifiedType(), staticContext, true));
         }
         var typeName = tree.toString();
-        var resolved = sourceRoot == root
-                ? resolveTypeNameInSource(typeName, sourceRoot).or(() -> index.resolveTypeName(typeName, sourceRoot))
-                : index.resolveTypeName(typeName, sourceRoot);
+        switch (typeName) {
+            case "boolean", "byte", "char", "double", "float", "int", "long", "short", "void" ->
+                    {
+                        return Optional.of(new TypeResolution(typeName, staticContext, false));
+                    }
+            default -> {}
+        }
+        var resolved =
+                sourceRoot == root
+                        ? resolveTypeNameInSource(typeName, sourceRoot)
+                                .or(
+                                        () ->
+                                                index.resolveType(typeName, sourceRoot)
+                                                        .map(indexed -> indexed.qualifiedName))
+                        : index.resolveType(typeName, sourceRoot).map(indexed -> indexed.qualifiedName);
         if (resolved.isEmpty() && sourceRoot != root) {
             resolved = resolveTypeNameInSource(typeName, sourceRoot);
         }
@@ -1173,7 +1129,9 @@ public final class ParseTypeResolver {
         if (normalized.isEmpty()) {
             return Optional.empty();
         }
-        var resolved = resolveTypeNameInSource(normalized, root).or(() -> index.resolveTypeName(normalized, root));
+        var resolved =
+                resolveTypeNameInSource(normalized, root)
+                        .or(() -> index.resolveType(normalized, root).map(indexed -> indexed.qualifiedName));
         if (resolved.isEmpty()) {
             return Optional.empty();
         }
@@ -1290,8 +1248,17 @@ public final class ParseTypeResolver {
 
     // Cursor and scope utilities.
     private TreePath enclosingClassPath() {
-        final TreePath[] best = new TreePath[1];
-        final int[] bestDepth = {-1};
+        return scopeSnapshot().enclosingClassPath();
+    }
+
+    private ScopeSnapshot scopeSnapshot() {
+        if (scopeSnapshot != null) {
+            return scopeSnapshot;
+        }
+
+        final TreePath[] enclosingClass = {parentClassPath(cursorPath)};
+        final int[] bestDepth = {enclosingClass[0] == null ? -1 : depth(enclosingClass[0])};
+        var visibleVariables = new ArrayList<VisibleVariable>();
         new TreePathScanner<Void, Void>() {
             @Override
             public Void visitClass(ClassTree classTree, Void p) {
@@ -1301,12 +1268,137 @@ public final class ParseTypeResolver {
                 var depth = depth(getCurrentPath());
                 if (depth > bestDepth[0]) {
                     bestDepth[0] = depth;
-                    best[0] = getCurrentPath();
+                    enclosingClass[0] = getCurrentPath();
                 }
-                return super.visitClass(classTree, p);
+                for (var member : classTree.getMembers()) {
+                    if (member instanceof VariableTree) {
+                        scan(member, p);
+                    } else if (containsCursor(member)) {
+                        scan(member, p);
+                    }
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitMethod(MethodTree methodTree, Void p) {
+                if (!containsCursor(methodTree)) {
+                    return null;
+                }
+                for (var parameter : methodTree.getParameters()) {
+                    addVisibleVariable(parameter, new TreePath(getCurrentPath(), parameter));
+                }
+                if (methodTree.getBody() != null) {
+                    scan(methodTree.getBody(), p);
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitLambdaExpression(LambdaExpressionTree lambdaTree, Void p) {
+                if (!containsCursor(lambdaTree)) {
+                    return null;
+                }
+                for (var parameter : lambdaTree.getParameters()) {
+                    addVisibleVariable(parameter, new TreePath(getCurrentPath(), parameter));
+                }
+                scan(lambdaTree.getBody(), p);
+                return null;
+            }
+
+            @Override
+            public Void visitBlock(BlockTree blockTree, Void p) {
+                if (!containsCursor(blockTree)) {
+                    return null;
+                }
+                for (var statement : blockTree.getStatements()) {
+                    var start = startOf(statement);
+                    if (start >= 0 && start >= cursor) {
+                        break;
+                    }
+                    if (containsCursor(statement)) {
+                        scan(statement, p);
+                        break;
+                    }
+                    if (statement instanceof VariableTree variableTree) {
+                        addVisibleVariable(variableTree, new TreePath(getCurrentPath(), variableTree));
+                    }
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitEnhancedForLoop(EnhancedForLoopTree loopTree, Void p) {
+                if (!containsCursor(loopTree)) {
+                    return null;
+                }
+                addVisibleVariable(loopTree.getVariable(), new TreePath(getCurrentPath(), loopTree.getVariable()));
+                if (containsCursor(loopTree.getStatement())) {
+                    scan(loopTree.getStatement(), p);
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitForLoop(ForLoopTree loopTree, Void p) {
+                if (!containsCursor(loopTree)) {
+                    return null;
+                }
+                for (var initializer : loopTree.getInitializer()) {
+                    if (containsCursor(initializer)) {
+                        scan(initializer, p);
+                        continue;
+                    }
+                    if (initializer instanceof VariableTree variableTree) {
+                        addVisibleVariable(variableTree, new TreePath(getCurrentPath(), variableTree));
+                    }
+                }
+                if (loopTree.getCondition() != null && containsCursor(loopTree.getCondition())) {
+                    scan(loopTree.getCondition(), p);
+                }
+                for (var update : loopTree.getUpdate()) {
+                    if (containsCursor(update)) {
+                        scan(update, p);
+                    }
+                }
+                if (containsCursor(loopTree.getStatement())) {
+                    scan(loopTree.getStatement(), p);
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitCatch(CatchTree catchTree, Void p) {
+                if (!containsCursor(catchTree)) {
+                    return null;
+                }
+                addVisibleVariable(catchTree.getParameter(), new TreePath(getCurrentPath(), catchTree.getParameter()));
+                if (catchTree.getBlock() != null) {
+                    scan(catchTree.getBlock(), p);
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitVariable(VariableTree variableTree, Void p) {
+                if (variableTree.getInitializer() != null && containsCursor(variableTree.getInitializer())) {
+                    scan(variableTree.getInitializer(), p);
+                    return null;
+                }
+                addVisibleVariable(variableTree, getCurrentPath());
+                return null;
+            }
+
+            private void addVisibleVariable(VariableTree variableTree, TreePath path) {
+                var start = startOf(variableTree);
+                if (start < 0 || start >= cursor) {
+                    return;
+                }
+                visibleVariables.add(new VisibleVariable(variableTree, path, depth(path), start));
             }
         }.scan(root, null);
-        return best[0];
+        scopeSnapshot = new ScopeSnapshot(enclosingClass[0], java.util.List.copyOf(visibleVariables));
+        return scopeSnapshot;
     }
 
     private String qualifiedClassName(CompilationUnitTree sourceRoot, TreePath classPath) {
@@ -1364,80 +1456,7 @@ public final class ParseTypeResolver {
 
     /** Return the nearest local declaration that is visible at the cursor position. */
     public Optional<TreePath> resolveVisibleDeclaration(String targetName) {
-        var best = new CandidatePath(null, -1, -1);
-        new TreePathScanner<Void, Void>() {
-            @Override
-            public Void visitClass(ClassTree classTree, Void p) {
-                if (!containsCursor(classTree)) {
-                    return null;
-                }
-                for (var member : classTree.getMembers()) {
-                    if (member instanceof VariableTree) {
-                        scan(member, p);
-                    } else if (containsCursor(member)) {
-                        scan(member, p);
-                    }
-                }
-                return null;
-            }
-
-            @Override
-            public Void visitMethod(MethodTree methodTree, Void p) {
-                if (!containsCursor(methodTree)) {
-                    return null;
-                }
-                for (var parameter : methodTree.getParameters()) {
-                    consider(parameter, new TreePath(getCurrentPath(), parameter));
-                }
-                if (methodTree.getBody() != null) {
-                    scan(methodTree.getBody(), p);
-                }
-                return null;
-            }
-
-            @Override
-            public Void visitBlock(BlockTree blockTree, Void p) {
-                if (!containsCursor(blockTree)) {
-                    return null;
-                }
-                for (var statement : blockTree.getStatements()) {
-                    var start = startOf(statement);
-                    if (start >= 0 && start >= cursor) {
-                        break;
-                    }
-                    if (statement instanceof VariableTree variableTree) {
-                        consider(variableTree, new TreePath(getCurrentPath(), variableTree));
-                    }
-                    if (containsCursor(statement)) {
-                        scan(statement, p);
-                    }
-                }
-                return null;
-            }
-
-            @Override
-            public Void visitVariable(VariableTree variableTree, Void p) {
-                consider(variableTree, getCurrentPath());
-                return null;
-            }
-
-            private void consider(VariableTree variableTree, TreePath path) {
-                if (!variableTree.getName().contentEquals(targetName)) {
-                    return;
-                }
-                var start = startOf(variableTree);
-                if (start < 0 || start >= cursor) {
-                    return;
-                }
-                var candidate = new CandidatePath(path, depth(path), start);
-                if (isBetter(candidate, best)) {
-                    best.path = candidate.path;
-                    best.depth = candidate.depth;
-                    best.start = candidate.start;
-                }
-            }
-        }.scan(root, null);
-        return Optional.ofNullable(best.path);
+        return findVisibleVariable(targetName).map(VisibleVariable::path);
     }
 
     public Optional<IndexedMember> resolveInheritedFieldMember(String identifier) {
@@ -1453,9 +1472,18 @@ public final class ParseTypeResolver {
         return resolveTypeTree(tree, root, staticContext);
     }
 
-    private boolean isBetter(CandidatePath next, CandidatePath existing) {
-        return existing.path == null
-                || next.depth > existing.depth
-                || (next.depth == existing.depth && next.start > existing.start);
+    public Optional<VisibleVariable> findVisibleVariable(String targetName) {
+        VisibleVariable best = null;
+        for (var candidate : scopeSnapshot().visibleVariables()) {
+            if (!candidate.tree().getName().contentEquals(targetName)) {
+                continue;
+            }
+            if (best == null
+                    || candidate.depth() > best.depth()
+                    || (candidate.depth() == best.depth() && candidate.start() > best.start())) {
+                best = candidate;
+            }
+        }
+        return Optional.ofNullable(best);
     }
 }
