@@ -24,6 +24,7 @@ import javax.tools.*;
 class JavaCompilerService implements CompilerProvider {
     private static final Logger LOG = Logger.getLogger("main");
     private static final int MAX_CACHE_SIZE = 1000;
+    private static final int MAX_PARSE_CACHE_SIZE = 200;
 
     private record CompilerServiceConfig(
             Set<Path> classPath,
@@ -179,7 +180,15 @@ class JavaCompilerService implements CompilerProvider {
     private final Map<JavaFileObject, SourceFingerprint> cachedFastNoApModified = newModifiedCache();
     private long cachedFastCompileNoApContentRevision = -1;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
-    final Map<Path, ParsedUnit> parsedUnits = new ConcurrentHashMap<>();
+    final Map<Path, ParsedUnit> parsedUnits =
+            Collections.synchronizedMap(
+                    new LinkedHashMap<>(16, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(
+                                Map.Entry<Path, ParsedUnit> eldest) {
+                            return size() > MAX_PARSE_CACHE_SIZE;
+                        }
+                    });
     private volatile long lombokTypeIndexContentRevision = -1;
     private volatile LombokTypeIndex lombokTypeIndex = LombokTypeIndex.empty();
     private volatile CompileTelemetry lastCompileTelemetry = CompileTelemetry.empty();

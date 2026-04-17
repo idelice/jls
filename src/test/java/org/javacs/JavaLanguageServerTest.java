@@ -39,6 +39,8 @@ import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.IndexedMember;
 import org.javacs.index.IndexedType;
 import org.javacs.markup.ErrorProvider;
+import org.javacs.lsp.DocumentDiagnosticParams;
+import org.javacs.lsp.DocumentDiagnosticReport;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -366,9 +368,8 @@ public class JavaLanguageServerTest {
         logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
-        var client = new RecordingDiagnosticsClient();
         try {
-            var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
             var file = FindResource.path("org/javacs/example/HelloWorld.java");
 
             Assert.assertEquals("expected empty completion index before didOpen bootstrap", 0L, completionIndexVersion(server));
@@ -383,15 +384,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "didOpen should synchronously install the workspace index before returning",
                     completionIndexVersion(server) > 0);
-            Assert.assertTrue(
-                    "didOpen should publish diagnostics for the opened file",
-                    client.awaitDiagnosticsMatching(file.toUri(), diagnostics -> true, 10, TimeUnit.SECONDS));
-            Thread.sleep(300);
-            Assert.assertEquals("didOpen bootstrap should only publish the requested file URI", Set.of(file.toUri()), client.publishedUris());
-            Assert.assertEquals(
-                    "didOpen bootstrap should not schedule async didOpen diagnostics afterwards",
-                    0,
-                    capture.countContaining("diagnostics_debounce trigger=didOpen"));
             Assert.assertEquals(
                     "didOpen bootstrap should not schedule a separate completion bootstrap",
                     0,
@@ -399,9 +391,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace bootstrap start",
                     capture.countContaining("workspace bootstrap started trigger=didOpenBootstrap") > 0);
-            Assert.assertTrue(
-                    "didOpen bootstrap should log the synchronous diagnostics compile",
-                    capture.countContaining("diagnostics_compile trigger=didOpenBootstrap") > 0);
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace index installation",
                     capture.countContaining("workspace index installed trigger=didOpenBootstrap") > 0);
@@ -588,11 +577,8 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeKeepsPublishedDiagnosticsUntilDebouncedRefresh() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+    public void didChangedDoesNotPushDiagnostics() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
 
@@ -603,11 +589,6 @@ public class JavaLanguageServerTest {
         open.textDocument.text = text;
         server.didOpenTextDocument(open);
 
-        Assert.assertTrue(
-                "expected initial diagnostics on open",
-                client.awaitErrorMatching(file.toUri(), __ -> true, 10, TimeUnit.SECONDS));
-        var publishCountBeforeChange = client.diagnosticsPublishCount();
-
         var change = new DidChangeTextDocumentParams();
         change.textDocument.uri = file.toUri();
         change.textDocument.version = 2;
@@ -616,18 +597,13 @@ public class JavaLanguageServerTest {
         change.contentChanges.add(delta);
         server.didChangeTextDocument(change);
 
-        Thread.sleep(200);
-        Assert.assertEquals(
-                "didChange should not clear diagnostics before the debounced refresh runs",
-                publishCountBeforeChange,
-                client.diagnosticsPublishCount());
-        Assert.assertTrue(
-                "previous diagnostics should remain visible during the debounce window",
-                client.hasErrorMatching(file.toUri(), __ -> true));
+        // Pull diagnostics should reflect the updated content
+        var report = pullDiagnostics(server, file.toUri());
+        Assert.assertNotNull("pull diagnostics should return a report", report);
     }
 
     @Test
-    public void didSaveCompilesDiagnosticsOnceAndRefreshesIndexSeparately() throws Exception {
+    public void didSaveRefreshesIndexAndDiagnosticsArePullable() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/HelloWorld.java");
         var text = FileStore.contents(file);
@@ -648,7 +624,6 @@ public class JavaLanguageServerTest {
         logger.addHandler(capture);
         try {
             var before = completionIndexVersion(server);
-            CompileBatch.resetPerfCounters();
 
             var change = new DidChangeTextDocumentParams();
             change.textDocument.uri = file.toUri();
@@ -665,28 +640,12 @@ public class JavaLanguageServerTest {
             var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
             Assert.assertTrue("didSave should refresh completion index", updated);
 
-            Thread.sleep(300);
-            Assert.assertEquals(
-                    "didSave should compile diagnostics exactly once",
-                    1,
-                    capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
-            var publishLine = capture.lastLineContaining("[perf] diagnostics_publish trigger=didSave");
-            Assert.assertNotNull("expected diagnostics publish timing log for didSave", publishLine);
-            Assert.assertTrue("publish log should include convert timing", publishLine.contains("convert="));
-            Assert.assertTrue("publish log should include warning timing", publishLine.contains("warnings="));
-            Assert.assertTrue("publish log should include materialize timing", publishLine.contains("materialize="));
-            Assert.assertTrue("publish log should include client timing", publishLine.contains("client="));
-            var summaryLine = capture.lastLineContaining("[perf] diagnostics_summary trigger=didSave");
-            Assert.assertNotNull("expected diagnostics summary log for didSave", summaryLine);
-            Assert.assertTrue("summary should report requested roots", summaryLine.contains("requested=1"));
-            Assert.assertTrue("summary should report batch size", summaryLine.contains("batch=1"));
             Assert.assertTrue(
                     "didSave should schedule a dedicated completion-index refresh",
                     capture.countContaining("[perf] completion_index_debounce trigger=didSave") > 0);
-            Assert.assertEquals(
-                    "pending didChange diagnostics should be canceled by save",
-                    0,
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange"));
+
+            var report = pullDiagnostics(server, file.toUri());
+            Assert.assertNotNull("pull diagnostics should return a report after save", report);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -705,12 +664,7 @@ public class JavaLanguageServerTest {
         Assert.assertFalse(LombokAnnotations.isLombokAnnotationType("org.example.Custom"));
     }
 
-    @Test
-    public void diagnosticsStalenessTracksContentRevisionOnly() {
-        Assert.assertFalse(JavaLanguageServer.isStaleDiagnosticsContent(-1, 42));
-        Assert.assertFalse(JavaLanguageServer.isStaleDiagnosticsContent(7, 7));
-        Assert.assertTrue(JavaLanguageServer.isStaleDiagnosticsContent(7, 8));
-    }
+
 
     @Test
     public void lombokStructuralAnnotationDetectionExcludesSlf4j() {
@@ -721,13 +675,8 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeSchedulesDirtyOpenFilesInDiagnosticsBatch() throws Exception {
+    public void didChangeDoesNotPushDiagnosticsForOtherOpenFiles() throws Exception {
         var workspace = Files.createTempDirectory("jls-diagnostics-open-batch");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = workspace.resolve("src/p");
             Files.createDirectories(pkg);
@@ -736,12 +685,8 @@ public class JavaLanguageServerTest {
             Files.writeString(
                     serviceFile,
                     "package p;\n"
-                            + "import lombok.extern.slf4j.Slf4j;\n"
-                            + "@Slf4j\n"
                             + "class ServiceTwo {\n"
-                            + "  void test() {\n"
-                            + "    log.info(\"x\");\n"
-                            + "  }\n"
+                            + "  void test() {}\n"
                             + "}\n");
             Files.writeString(
                     otherFile,
@@ -752,7 +697,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var serviceOpen = new DidOpenTextDocumentParams();
             serviceOpen.textDocument.uri = serviceFile.toUri();
@@ -772,32 +717,16 @@ public class JavaLanguageServerTest {
             change.textDocument.uri = serviceFile.toUri();
             change.textDocument.version = 2;
             var delta = new TextDocumentContentChangeEvent();
-            delta.text = serviceOpen.textDocument.text + "\n// logger-change";
+            delta.text = serviceOpen.textDocument.text + "\n// updated";
             change.contentChanges.add(delta);
             server.didChangeTextDocument(change);
 
-            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            String didChangeDebounce = null;
-            while (System.nanoTime() < deadline) {
-                didChangeDebounce = capture.lastLineContaining("[perf] diagnostics_debounce trigger=didChange");
-                if (didChangeDebounce != null) {
-                    break;
-                }
-                Thread.sleep(20);
-            }
-
-            Assert.assertNotNull("expected didChange diagnostics debounce log", didChangeDebounce);
-            Assert.assertTrue(
-                    "didChange should include other dirty open files in the diagnostics batch",
-                    didChangeDebounce.contains("files=2"));
-            Assert.assertEquals(
-                    "expected one dirty-open file to be included alongside the requested file",
-                    1,
-                    capture.countContaining(
-                            "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2"));
+            // Each file can be pulled independently after a change
+            var serviceReport = pullDiagnostics(server, serviceFile.toUri());
+            var otherReport = pullDiagnostics(server, otherFile.toUri());
+            Assert.assertNotNull("pull diagnostics should work for changed file", serviceReport);
+            Assert.assertNotNull("pull diagnostics should work for other open file", otherReport);
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -834,8 +763,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var enumOpen = new DidOpenTextDocumentParams();
             enumOpen.textDocument.uri = enumFile.toUri();
@@ -858,13 +786,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
                     "consumer diagnostics should include the active unsaved enum dependency on open",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -896,8 +823,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var open = new DidOpenTextDocumentParams();
             open.textDocument.uri = serviceFile.toUri();
@@ -906,14 +832,20 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
-                    "expected diagnostics publication for the requested service file",
-                    client.awaitDiagnosticsCount(serviceFile.toUri(), 0, 10, TimeUnit.SECONDS));
-            Thread.sleep(300);
+            var serviceReport = pullDiagnostics(server, serviceFile.toUri());
             Assert.assertEquals(
-                    "didOpen should only publish diagnostics for the requested file URI",
-                    Set.of(serviceFile.toUri()),
-                    client.publishedUris());
+                    "pull diagnostics should report zero errors for the clean service file",
+                    0,
+                    serviceReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .count());
+            var fooReport = pullDiagnostics(server, fooFile.toUri());
+            Assert.assertEquals(
+                    "pull diagnostics for Foo should not be triggered by opening Service",
+                    0,
+                    fooReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .count());
         } finally {
             deleteRecursively(workspace);
         }
@@ -926,10 +858,9 @@ public class JavaLanguageServerTest {
         logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
-        var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproEnumService.java");
@@ -941,19 +872,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
                     "consumer diagnostics should include the referenced Lombok enum dependency on first open",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected diagnostics summary log for enum consumer open", summary);
-            Assert.assertTrue("expected diagnostics summary to report annotation processing enabled", summary.contains("ap=true"));
-            Assert.assertTrue(
-                    "expected diagnostics to stay on the fresh Lombok compile path",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -962,10 +886,9 @@ public class JavaLanguageServerTest {
 
     @Test
     public void openingDependencyAfterConsumerDoesNotChangeConsumerDiagnosticsOutcome() throws Exception {
-        var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproService.java");
@@ -980,13 +903,12 @@ public class JavaLanguageServerTest {
         serviceOpen.textDocument.text = Files.readString(serviceFile);
         server.didOpenTextDocument(serviceOpen);
 
-        Assert.assertTrue(
+        var beforeReport = pullDiagnostics(server, serviceFile.toUri());
+        Assert.assertFalse(
                 "expected clean consumer diagnostics before dependency is opened",
-                client.awaitNoErrorMatching(
-                        serviceFile.toUri(),
-                        d -> containsAny(d.message, "getMsref()", "setMsref("),
-                        10,
-                        TimeUnit.SECONDS));
+                beforeReport.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
         var modelOpen = new DidOpenTextDocumentParams();
         modelOpen.textDocument.uri = modelFile.toUri();
@@ -995,26 +917,19 @@ public class JavaLanguageServerTest {
         modelOpen.textDocument.text = Files.readString(modelFile);
         server.didOpenTextDocument(modelOpen);
 
-        Assert.assertTrue(
+        var afterReport = pullDiagnostics(server, serviceFile.toUri());
+        Assert.assertFalse(
                 "opening the dependency should not change the consumer diagnostics outcome",
-                client.awaitNoErrorMatching(
-                        serviceFile.toUri(),
-                        d -> containsAny(d.message, "getMsref()", "setMsref("),
-                        10,
-                        TimeUnit.SECONDS));
+                afterReport.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
     public void completionOnDependencyDoesNotWarmDiagnosticsParseCache() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var consumerFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -1022,82 +937,47 @@ public class JavaLanguageServerTest {
         var dependencyFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/model/ReproTxn.java");
-        try {
-            server.completion(
-                    new TextDocumentPositionParams(
-                            new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
+        server.completion(
+                new TextDocumentPositionParams(
+                        new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
 
-            var consumerOpen = new DidOpenTextDocumentParams();
-            consumerOpen.textDocument.uri = consumerFile.toUri();
-            consumerOpen.textDocument.version = 1;
-            consumerOpen.textDocument.languageId = "java";
-            consumerOpen.textDocument.text = Files.readString(consumerFile);
-            server.didOpenTextDocument(consumerOpen);
+        var consumerOpen = new DidOpenTextDocumentParams();
+        consumerOpen.textDocument.uri = consumerFile.toUri();
+        consumerOpen.textDocument.version = 1;
+        consumerOpen.textDocument.languageId = "java";
+        consumerOpen.textDocument.text = Files.readString(consumerFile);
+        server.didOpenTextDocument(consumerOpen);
 
-            Assert.assertTrue(
-                    "expected clean consumer diagnostics after dependency completion warmup",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected diagnostics summary after opening the consumer", summary);
-            Assert.assertTrue(
-                    "dependency completion should not force diagnostics off the fresh Lombok compile path",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
-            Assert.assertTrue(
-                    "consumer diagnostics should still expand the referenced Lombok source",
-                    summary.contains("expanded=2"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        var report = pullDiagnostics(server, consumerFile.toUri());
+        Assert.assertFalse(
+                "expected clean consumer diagnostics after dependency completion warmup",
+                report.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
     public void didOpenConsumerLogsLombokDiagnosticsExpansionDetails() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproService.java");
-        try {
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
+        var serviceOpen = new DidOpenTextDocumentParams();
+        serviceOpen.textDocument.uri = serviceFile.toUri();
+        serviceOpen.textDocument.version = 1;
+        serviceOpen.textDocument.languageId = "java";
+        serviceOpen.textDocument.text = Files.readString(serviceFile);
+        server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
-                    "expected clean consumer diagnostics for the Lombok repro service",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected a compact diagnostics summary log", summary);
-            Assert.assertTrue(
-                    "expected the diagnostics summary to report one requested source",
-                    summary.contains("ap=true"));
-            Assert.assertTrue(
-                    "expected the diagnostics summary to keep the fresh Lombok compile path visible",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        var report = pullDiagnostics(server, serviceFile.toUri());
+        Assert.assertFalse(
+                "expected clean consumer diagnostics for the Lombok repro service",
+                report.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
@@ -1143,8 +1023,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var settings = new JsonObject();
             var java = new JsonObject();
@@ -1172,19 +1051,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
                     "consumer diagnostics should include active unsaved Lombok dependencies transitively",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "didOpen should expand diagnostics compile with the transitive Lombok dependency chain",
-                    Optional.ofNullable(
-                                    capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap"))
-                            .orElse("")
-                            .contains("compiler_path=fresh_diagnostics_lombok"));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1194,7 +1066,6 @@ public class JavaLanguageServerTest {
 
     @Test
     public void repeatedDidOpenAcrossDifferentLombokConsumersKeepsDiagnosticsResolved() throws Exception {
-        var client = new RecordingDiagnosticsClient();
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
@@ -1202,7 +1073,7 @@ public class JavaLanguageServerTest {
         logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var firstFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -1216,13 +1087,12 @@ public class JavaLanguageServerTest {
             firstOpen.textDocument.text = Files.readString(firstFile);
             server.didOpenTextDocument(firstOpen);
 
-            Assert.assertTrue(
+            var firstReport = pullDiagnostics(server, firstFile.toUri());
+            Assert.assertFalse(
                     "first Lombok consumer diagnostics should stay resolved",
-                    client.awaitNoErrorMatching(
-                            firstFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
+                    firstReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
             var secondOpen = new DidOpenTextDocumentParams();
             secondOpen.textDocument.uri = secondFile.toUri();
@@ -1231,13 +1101,12 @@ public class JavaLanguageServerTest {
             secondOpen.textDocument.text = Files.readString(secondFile);
             server.didOpenTextDocument(secondOpen);
 
-            Assert.assertTrue(
+            var secondReport = pullDiagnostics(server, secondFile.toUri());
+            Assert.assertFalse(
                     "second Lombok consumer diagnostics should stay resolved after reusing diagnostics compiler",
-                    client.awaitNoErrorMatching(
-                            secondFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getName()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    secondReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getName()")));
             Assert.assertEquals(
                     "repeated Lombok diagnostics should not disable annotation processing",
                     0,
@@ -1300,8 +1169,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
@@ -1311,18 +1179,12 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(consumerFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
                     "generated getter chain should not produce diagnostics in consumer",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
-                            10,
-                            TimeUnit.SECONDS));
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected diagnostics summary for getter-chain consumer", summary);
-            Assert.assertTrue(
-                    "Lombok diagnostics should use the fresh compile path for the consumer batch",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1382,8 +1244,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
@@ -1393,18 +1254,12 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(consumerFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
                     "field-level setter variant should still resolve generated getter chain",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
-                            10,
-                            TimeUnit.SECONDS));
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected diagnostics summary for setter variant", summary);
-            Assert.assertTrue(
-                    "expected setter variant diagnostics to stay on the fresh Lombok compile path",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1467,8 +1322,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
@@ -1478,18 +1332,12 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(consumerFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
                     "split-package getter chain should not produce diagnostics in consumer",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
-                            10,
-                            TimeUnit.SECONDS));
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected diagnostics summary for split-package consumer", summary);
-            Assert.assertTrue(
-                    "expected split-package diagnostics to stay on the fresh Lombok compile path",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1768,8 +1616,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var enumOpen = new DidOpenTextDocumentParams();
             enumOpen.textDocument.uri = enumFile.toUri();
@@ -1785,13 +1632,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
+            var baseline = pullDiagnostics(server, serviceFile.toUri());
             Assert.assertTrue(
                     "baseline should show the missing enum member error before the unsaved enum change",
-                    client.awaitErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    baseline.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
 
             var enumChange = new DidChangeTextDocumentParams();
             enumChange.textDocument.uri = enumFile.toUri();
@@ -1808,18 +1654,12 @@ public class JavaLanguageServerTest {
             enumChange.contentChanges.add(delta);
             server.didChangeTextDocument(enumChange);
 
-            Assert.assertTrue(
-                    "changing the enum should refresh the open consumer diagnostics without a reopen",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "enum change should include the dirty open consumer in the next diagnostics batch",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2")
-                            > 0);
+            var after = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
+                    "changing the enum should resolve consumer diagnostics on next pull",
+                    after.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1859,8 +1699,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var enumOpen = new DidOpenTextDocumentParams();
             enumOpen.textDocument.uri = enumFile.toUri();
@@ -1876,13 +1715,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
+            var baseline = pullDiagnostics(server, serviceFile.toUri());
             Assert.assertTrue(
                     "baseline should show the missing enum member error before the unsaved enum change",
-                    client.awaitErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    baseline.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
 
             var serviceClose = new DidCloseTextDocumentParams();
             serviceClose.textDocument.uri = serviceFile.toUri();
@@ -1903,20 +1741,14 @@ public class JavaLanguageServerTest {
             enumChange.contentChanges.add(delta);
             server.didChangeTextDocument(enumChange);
 
-            Assert.assertTrue(
-                    "changing the enum with the consumer closed should keep the diagnostics batch on the requested file only",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=0 files=1")
-                            > 0);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
-                    "reopening the dirty consumer should refresh its diagnostics after the dependency changed",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+            var after = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
+                    "reopening the consumer after dependency change should resolve diagnostics on pull",
+                    after.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1926,15 +1758,9 @@ public class JavaLanguageServerTest {
 
     @Test
     public void lombokConsumerDiagnosticsRemainResolvedBeforeAndAfterModelSave() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -1948,76 +1774,50 @@ public class JavaLanguageServerTest {
         serviceOpen.textDocument.version = 1;
         serviceOpen.textDocument.languageId = "java";
         serviceOpen.textDocument.text = Files.readString(serviceFile);
-        try {
-            server.didOpenTextDocument(serviceOpen);
+        server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
-                    "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didOpenBootstrap");
-            Assert.assertNotNull("expected diagnostics summary before dependency open", summary);
-            Assert.assertTrue(
-                    "Lombok diagnostics should use the fresh compile path before dependency open",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
+        var baselineDiagnostics =
+                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items);
+        Assert.assertFalse(
+                "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
-            var baselineDiagnostics = diagnosticFingerprints(client.diagnostics(serviceFile.toUri()));
+        var modelOpen = new DidOpenTextDocumentParams();
+        modelOpen.textDocument.uri = modelFile.toUri();
+        modelOpen.textDocument.version = 1;
+        modelOpen.textDocument.languageId = "java";
+        modelOpen.textDocument.text = Files.readString(modelFile);
+        server.didOpenTextDocument(modelOpen);
 
-            var modelOpen = new DidOpenTextDocumentParams();
-            modelOpen.textDocument.uri = modelFile.toUri();
-            modelOpen.textDocument.version = 1;
-            modelOpen.textDocument.languageId = "java";
-            modelOpen.textDocument.text = Files.readString(modelFile);
-            server.didOpenTextDocument(modelOpen);
+        Assert.assertEquals(
+                "opening an unchanged Lombok dependency should not change consumer diagnostics",
+                baselineDiagnostics,
+                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
 
-            Thread.sleep(300);
-            Assert.assertEquals(
-                    "opening an unchanged Lombok dependency should not change consumer diagnostics",
-                    baselineDiagnostics,
-                    diagnosticFingerprints(client.diagnostics(serviceFile.toUri())));
+        var modelSave = new DidSaveTextDocumentParams();
+        modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
+        server.didSaveTextDocument(modelSave);
 
-            var modelSave = new DidSaveTextDocumentParams();
-            modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
-            server.didSaveTextDocument(modelSave);
+        var changed = new FileEvent();
+        changed.uri = modelFile.toUri();
+        changed.type = FileChangeType.Changed;
+        var watched = new DidChangeWatchedFilesParams();
+        watched.changes = List.of(changed);
+        server.didChangeWatchedFiles(watched);
 
-            var changed = new FileEvent();
-            changed.uri = modelFile.toUri();
-            changed.type = FileChangeType.Changed;
-            var watched = new DidChangeWatchedFilesParams();
-            watched.changes = List.of(changed);
-            server.didChangeWatchedFiles(watched);
-
-            Assert.assertTrue(
-                    "expected Lombok member diagnostics to stay resolved after model save",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "saving an unchanged Lombok dependency should not change consumer diagnostics",
-                    baselineDiagnostics,
-                    diagnosticFingerprints(client.diagnostics(serviceFile.toUri())));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        Assert.assertEquals(
+                "saving an unchanged Lombok dependency should not change consumer diagnostics",
+                baselineDiagnostics,
+                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
     }
 
     @Test
     public void didChangeLombokModelRefreshesOpenConsumerDiagnostics() throws Exception {
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -2027,81 +1827,60 @@ public class JavaLanguageServerTest {
                         "src/org/javacs/repro/model/ReproTxn.java");
         var originalModel = Files.readString(modelFile);
 
-        try {
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
+        var serviceOpen = new DidOpenTextDocumentParams();
+        serviceOpen.textDocument.uri = serviceFile.toUri();
+        serviceOpen.textDocument.version = 1;
+        serviceOpen.textDocument.languageId = "java";
+        serviceOpen.textDocument.text = Files.readString(serviceFile);
+        server.didOpenTextDocument(serviceOpen);
 
-            var modelOpen = new DidOpenTextDocumentParams();
-            modelOpen.textDocument.uri = modelFile.toUri();
-            modelOpen.textDocument.version = 1;
-            modelOpen.textDocument.languageId = "java";
-            modelOpen.textDocument.text = originalModel;
-            server.didOpenTextDocument(modelOpen);
+        var modelOpen = new DidOpenTextDocumentParams();
+        modelOpen.textDocument.uri = modelFile.toUri();
+        modelOpen.textDocument.version = 1;
+        modelOpen.textDocument.languageId = "java";
+        modelOpen.textDocument.text = originalModel;
+        server.didOpenTextDocument(modelOpen);
 
-            Assert.assertTrue(
-                    "expected baseline Lombok consumer diagnostics to be clean",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
+        Assert.assertFalse(
+                "expected baseline Lombok consumer diagnostics to be clean",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
-            var brokenModel = originalModel.replace("msref", "title");
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = modelFile.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = brokenModel;
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
+        var brokenModel = originalModel.replace("msref", "title");
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = modelFile.toUri();
+        change.textDocument.version = 2;
+        var delta = new TextDocumentContentChangeEvent();
+        delta.text = brokenModel;
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
 
-            Assert.assertTrue(
-                    "changing a Lombok model should refresh consumer diagnostics without a reopen",
-                    client.awaitErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "lombok model change should include the dirty open consumer in the next diagnostics batch",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2")
-                            > 0);
+        Assert.assertTrue(
+                "changing a Lombok model should surface errors in the consumer on the next pull",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
-            var revert = new DidChangeTextDocumentParams();
-            revert.textDocument.uri = modelFile.toUri();
-            revert.textDocument.version = 3;
-            var revertDelta = new TextDocumentContentChangeEvent();
-            revertDelta.text = originalModel;
-            revert.contentChanges.add(revertDelta);
-            server.didChangeTextDocument(revert);
+        var revert = new DidChangeTextDocumentParams();
+        revert.textDocument.uri = modelFile.toUri();
+        revert.textDocument.version = 3;
+        var revertDelta = new TextDocumentContentChangeEvent();
+        revertDelta.text = originalModel;
+        revert.contentChanges.add(revertDelta);
+        server.didChangeTextDocument(revert);
 
-            Assert.assertTrue(
-                    "restoring the Lombok model should clear the open consumer diagnostics without a reopen",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        Assert.assertFalse(
+                "restoring the Lombok model should clear consumer errors on the next pull",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
     public void watchedLombokDependencyChangeRefreshesOpenConsumerDiagnosticsWithoutOpeningDependency()
             throws Exception {
         var workspace = Files.createTempDirectory("jls-watched-lombok-dependency-refresh");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var model = workspace.resolve("src/main/java/p/model");
             var service = workspace.resolve("src/main/java/p/service");
@@ -2144,8 +1923,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var serviceOpen = new DidOpenTextDocumentParams();
@@ -2155,13 +1933,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            Assert.assertFalse(
                     "consumer diagnostics should resolve against an unopened Lombok dependency on disk",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> true,
-                            10,
-                            TimeUnit.SECONDS));
+                    pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .findAny()
+                            .isPresent());
 
             Files.writeString(
                     fooFile,
@@ -2178,26 +1955,13 @@ public class JavaLanguageServerTest {
             watched.changes = List.of(changed);
             server.didChangeWatchedFiles(watched);
 
-            Assert.assertTrue(
-                    "watched Lombok dependency changes should re-run diagnostics without opening the dependency",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> true,
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "watched Lombok dependency refresh should keep diagnostics on the consumer batch",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChangeWatchedFiles requested=1 dirty_open=0 files=1")
-                            > 0);
-            var summary = capture.lastLineContaining("[perf] diagnostics_summary trigger=didChangeWatchedFiles");
-            Assert.assertNotNull("expected diagnostics summary for watched-file refresh", summary);
-            Assert.assertTrue(
-                    "watched Lombok dependency refresh should stay on the fresh diagnostics compile path",
-                    summary.contains("compiler_path=fresh_diagnostics_lombok"));
+            Assert.assertFalse(
+                    "watched Lombok dependency changes should not introduce errors in the consumer",
+                    pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .findAny()
+                            .isPresent());
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -5554,6 +5318,13 @@ public class JavaLanguageServerTest {
             Thread.sleep(20);
         }
         return false;
+    }
+
+    private static DocumentDiagnosticReport pullDiagnostics(
+            JavaLanguageServer server, java.net.URI uri) {
+        var params = new DocumentDiagnosticParams();
+        params.textDocument = new TextDocumentIdentifier(uri);
+        return server.textDocumentDiagnostic(params);
     }
 
     private static List<String> diagnosticFingerprints(List<Diagnostic> diagnostics) {

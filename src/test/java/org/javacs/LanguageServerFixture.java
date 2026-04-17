@@ -28,6 +28,10 @@ public class LanguageServerFixture {
         return getJavaLanguageServer(DEFAULT_WORKSPACE_ROOT, onError);
     }
 
+    static JavaLanguageServer getJavaLanguageServer(Path workspaceRoot) {
+        return getJavaLanguageServer(workspaceRoot, diagnostic -> LOG.info(diagnostic.message));
+    }
+
     static JavaLanguageServer getJavaLanguageServer(Path workspaceRoot, Consumer<Diagnostic> onError) {
         return getJavaLanguageServer(
                 workspaceRoot,

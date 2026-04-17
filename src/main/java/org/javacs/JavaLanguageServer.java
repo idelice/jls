@@ -17,7 +17,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
@@ -50,15 +49,11 @@ import org.javacs.rewrite.*;
 class JavaLanguageServer extends LanguageServer {
     private static final Logger LOG = Logger.getLogger("main");
 
-    private static final long DIAGNOSTIC_DEBOUNCE_MS = 250;
     private static final long COMPLETION_INDEX_DEBOUNCE_MS = 100;
     private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 700;
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private static final long NAVIGATION_BOOTSTRAP_WAIT_MS = 1500;
 
-    private record ScheduledDiagnosticsRequest(
-            long scheduleRevision, long contentRevision, int requestedCount, int dirtyOpenCount) {}
-    private record DiagnosticsBatch(List<Path> files, int requestedCount, int dirtyOpenCount) {}
     private record TypeIndexAvailability(
             long versionBefore, long versionAfter, CompletionIndexScope scopeBefore, CompletionIndexScope scopeAfter, long waitMs) {}
     private record DeclaredTypeShape(
@@ -96,11 +91,10 @@ class JavaLanguageServer extends LanguageServer {
     // TODO allow multiple workspace roots
     private Path workspaceRoot;
     private final LanguageClient client;
-    private final DiagnosticsScheduler diagnosticsScheduler = new DiagnosticsScheduler();
     private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
 
-    // Interactive requests reuse the cache compiler, while diagnostics batches stay on a separate
-    // compiler service so foreground lookup and background publication do not fight over one task.
+    // Interactive requests use cacheCompiler; pull-diagnostics requests use diagnosticsCompiler so
+    // the completion-index background thread and the LSP main thread do not contend on one context.
     private JavaCompilerService cacheCompiler;
     private JavaCompilerService diagnosticsCompiler;
 
@@ -108,36 +102,20 @@ class JavaLanguageServer extends LanguageServer {
     private JsonObject settings = new JsonObject();
     private boolean workDoneProgressSupported;
 
-    private final ScheduledExecutorService diagnosticsExecutor =
-            Executors.newSingleThreadScheduledExecutor(
-                    Thread.ofPlatform().daemon().name("javacs-diagnostics").factory());
     private final ScheduledExecutorService completionIndexExecutor =
             Executors.newSingleThreadScheduledExecutor(
                     Thread.ofPlatform().daemon().name("javacs-completion-index").factory());
 
-    /** Monotonic revision for queued async diagnostics work; newer schedules cancel older runs. */
-    private final AtomicLong diagnosticsRevision = new AtomicLong();
     /** Monotonic revision for queued completion-index refreshes; newer schedules cancel older runs. */
     private final AtomicLong completionIndexRevision = new AtomicLong();
     private final AtomicLong completionIndexVersion = new AtomicLong();
     private final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
-    private final AtomicInteger diagnosticsCompilesInFlight = new AtomicInteger();
-
-    /** Serialize diagnostics compilation/publish so one batch owns the diagnostics compiler at a time. */
-    private final Object diagnosticsCompileMutex = new Object();
     /** Serialize completion-index refreshes so one compile/index install owns the refresh lane. */
     private final Object completionIndexCompileMutex = new Object();
 
-    private ScheduledFuture<?> pendingDiagnostics;
     private ScheduledFuture<?> pendingCompletionIndex;
 
-    private final Set<Path> dirtyDiagnosticsFiles = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /**
-     * Foreground didSave diagnostics take priority over queued async publishes; async work checks
-     * this counter and yields instead of racing the explicit save request.
-     */
-    private final AtomicInteger didSaveDiagnosticsInFlight = new AtomicInteger();
     private final Set<String> shownWorkspaceWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private enum CompletionIndexRefreshMode {
@@ -208,12 +186,12 @@ class JavaLanguageServer extends LanguageServer {
 
     private synchronized void recreateCompilersAndRefreshState(String trigger) {
         LOG.info(String.format("[perf] compiler_recreate trigger=%s", trigger));
-        diagnosticsScheduler.cancel(trigger);
         completionIndexScheduler.cancel(trigger);
         createCompilers();
         appliedCompilerSettings = compilerSettingsSnapshot(settings);
         publishExternalBinaryIndexSnapshot();
         refreshStateForCompilerRecreated();
+        client.customNotification("workspace/diagnostic/refresh", null);
     }
 
     private void refreshStateForCompilerRecreated() {
@@ -234,7 +212,6 @@ class JavaLanguageServer extends LanguageServer {
             LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=empty_scope");
             return;
         }
-        diagnosticsScheduler.schedule(active, "compilerRecreated", 0);
         completionIndexScheduler.scheduleRefresh(
                 FileStore.all(), "compilerRecreated", 0, CompletionIndexRefreshMode.FULL_REBUILD);
     }
@@ -244,10 +221,23 @@ class JavaLanguageServer extends LanguageServer {
         if (javaFiles.isEmpty()) {
             return;
         }
-        diagnosticsScheduler.cancel("foreground");
         completionIndexScheduler.cancel("foreground");
         getOrCreateCompiler();
-        diagnosticsScheduler.compileAndPublish(javaFiles, diagnosticsCompiler, "foreground", -1, javaFiles.size(), 0);
+        CompileTask task = null;
+        try {
+            task = diagnosticsCompiler.compileDiagnostics(
+                    javaFiles.stream().map(SourceFileObject::new).toList());
+            var requestedUris = new HashSet<java.net.URI>();
+            for (var file : javaFiles) {
+                requestedUris.add(file.toUri());
+            }
+            var report = new ErrorProvider(task).errors(requestedUris);
+            for (var params : report.diagnostics()) {
+                client.publishDiagnostics(params);
+            }
+        } finally {
+            if (task != null) task.close();
+        }
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
                 && !FileStore.activeDocuments().isEmpty()) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("lintBootstrap");
@@ -603,98 +593,6 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     /**
-     * Mark the changed file and any other open Java files as needing a fresh diagnostics publish.
-     *
-     * <p>The next scheduled diagnostics batch keeps the explicit requested file first and then pulls
-     * in any other open files that were marked dirty by earlier edits or saves.
-     */
-    private void markOtherActiveDiagnosticsDirty(Path file, String trigger) {
-        diagnosticsScheduler.markDirty(List.of(file), trigger);
-        var others = otherActiveDocuments(file);
-        if (!others.isEmpty()) {
-            diagnosticsScheduler.markDirty(others, trigger + ":openFiles");
-            LOG.fine(String.format(
-                    "[perf] diagnostics_dirty_open_files trigger=%s file=%s files=%d",
-                    trigger, file.getFileName(), others.size()));
-        }
-    }
-
-    /**
-     * Let queued async diagnostics yield to an active didSave compile/publish cycle so the explicit
-     * save request wins.
-     */
-    private boolean shouldYieldToDidSaveDiagnostics(String trigger, String phase) {
-        if (!trigger.startsWith("async:")) {
-            return false;
-        }
-        if (didSaveDiagnosticsInFlight.get() <= 0) {
-            return false;
-        }
-        LOG.fine(String.format(
-                "[perf] diagnostics_yield trigger=%s phase=%s reason=didSave_pending",
-                trigger, phase));
-        return true;
-    }
-
-    private void bootstrapWorkspaceOnDidOpen(Path file) {
-        var workspaceFiles = filterJavaFiles(FileStore.all());
-        if (workspaceFiles.isEmpty()) {
-            return;
-        }
-        var bootstrapStarted = Instant.now();
-        var progressToken = beginWorkDoneProgress("Bootstrap workspace", "Compiling workspace");
-        var progressEnded = false;
-        getOrCreateCompiler();
-        diagnosticsScheduler.cancel("didOpenBootstrap");
-        completionIndexScheduler.cancel("didOpenBootstrap");
-        LOG.info(String.format(
-                "[perf] workspace bootstrap started trigger=didOpenBootstrap files=%d",
-                workspaceFiles.size()));
-        CompileTask task = null;
-        synchronized (diagnosticsCompileMutex) {
-            try {
-                var compileStarted = Instant.now();
-                task =
-                        diagnosticsCompiler.compileDiagnostics(
-                                workspaceFiles.stream().map(SourceFileObject::new).toList());
-                var compileFinished = Instant.now();
-                var indexStarted = Instant.now();
-                reportWorkDoneProgress(progressToken, "Building workspace index");
-                var nextIndex = WorkspaceTypeIndex.workspaceDeclarations(task);
-                var indexFinished = Instant.now();
-                var indexVersion = completionIndexVersion.incrementAndGet();
-                completionIndexScheduler.installTypeMemberIndex(
-                        nextIndex,
-                        indexVersion,
-                        "didOpenBootstrap",
-                        Duration.between(indexStarted, indexFinished),
-                        CompletionIndexScope.WORKSPACE);
-                var publishStarted = Instant.now();
-                reportWorkDoneProgress(progressToken, "Publishing diagnostics");
-                diagnosticsScheduler.publishFromTask(task, List.of(file), "didOpenBootstrap", -1);
-                var finished = Instant.now();
-                endWorkDoneProgress(progressToken, "Workspace ready");
-                progressEnded = true;
-                LOG.info(String.format(
-                        "[perf] workspace index installed trigger=didOpenBootstrap version=%d types=%d compile=%dms index=%dms publish=%dms total=%dms",
-                        indexVersion,
-                        nextIndex == null ? 0 : nextIndex.size(),
-                        Duration.between(compileStarted, compileFinished).toMillis(),
-                        Duration.between(indexStarted, indexFinished).toMillis(),
-                        Duration.between(publishStarted, finished).toMillis(),
-                        Duration.between(bootstrapStarted, finished).toMillis()));
-            } finally {
-                if (!progressEnded) {
-                    endWorkDoneProgress(progressToken, "Workspace bootstrap finished");
-                }
-                if (task != null) {
-                    task.close();
-                }
-            }
-        }
-    }
-
-    /**
      * Wait briefly for an asynchronously scheduled completion-index bootstrap to publish a newer
      * snapshot version.
      */
@@ -744,30 +642,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     /**
-     * Ignore diagnostics work produced for an older document revision after the file changed again.
-     *
-     * <p>The same check is intentionally repeated before publish and during the publish loops
-     * because file content can change while diagnostics are being materialized or sent to the
-     * client.
-     */
-    private boolean shouldSkipStaleDiagnostics(long expectedContentRevision, String trigger, String phase) {
-        var current = FileStore.contentRevision();
-        if (!isStaleDiagnosticsContent(expectedContentRevision, current)) {
-            return false;
-        }
-        LOG.fine(String.format(
-                "[perf] diagnostics_skip_stale trigger=%s phase=%s expected_content=%d current_content=%d",
-                trigger, phase, expectedContentRevision, current));
-        return true;
-    }
-
-    static boolean isStaleDiagnosticsContent(long expectedContentRevision, long currentContentRevision) {
-        return expectedContentRevision >= 0 && expectedContentRevision != currentContentRevision;
-    }
-
-    /**
-     * Recreate the paired compiler services used for interactive requests and diagnostics
-     * publication.
+     * Recreate the paired compiler services used for interactive requests and pull-diagnostics.
      */
     private void createCompilers() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
@@ -1060,6 +935,10 @@ class JavaLanguageServer extends LanguageServer {
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
         c.add("renameProvider", renameOptions);
+        var diagnosticOptions = new JsonObject();
+        diagnosticOptions.addProperty("interFileDependencies", false);
+        diagnosticOptions.addProperty("workspaceDiagnostics", false);
+        c.add("diagnosticProvider", diagnosticOptions);
 
         return new InitializeResult(c);
     }
@@ -1094,16 +973,11 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void shutdown() {
         synchronized (this) {
-            if (pendingDiagnostics != null) {
-                pendingDiagnostics.cancel(false);
-                pendingDiagnostics = null;
-            }
             if (pendingCompletionIndex != null) {
                 pendingCompletionIndex.cancel(false);
                 pendingCompletionIndex = null;
             }
         }
-        diagnosticsExecutor.shutdownNow();
         completionIndexExecutor.shutdownNow();
         CacheAudit.logSummary(LOG);
     }
@@ -1200,8 +1074,7 @@ class JavaLanguageServer extends LanguageServer {
                         refreshActiveDiagnostics = true;
                     }
                 }
-                continue;
-            }
+                continue;            }
             var name = file.getFileName().toString();
             if (isCompilerConfigFile(name)) {
                 LOG.info(String.format("Compiler needs to be re-created because %s has changed", file));
@@ -1209,8 +1082,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         if (refreshActiveDiagnostics) {
-            diagnosticsScheduler.markDirty(activeDocuments, "didChangeWatchedFiles");
-            diagnosticsScheduler.schedule(activeDocuments, "didChangeWatchedFiles", DIAGNOSTIC_DEBOUNCE_MS);
+            client.customNotification("workspace/diagnostic/refresh", null);
         }
         if (compilerInputsChanged) {
             recreateCompilersAndRefreshState("didChangeWatchedFiles");
@@ -1242,14 +1114,13 @@ class JavaLanguageServer extends LanguageServer {
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(String.format(
-                "[perf] completion_request file=%s wait=%dms index_before=%d index_after=%d scope_before=%s scope_after=%s diagnostics_active=%s took=%dms",
+                "[perf] completion_request file=%s wait=%dms index_before=%d index_after=%d scope_before=%s scope_after=%s took=%dms",
                 file.getFileName(),
                 readiness.waitMs(),
                 readiness.versionBefore(),
                 readiness.versionAfter(),
                 readiness.scopeBefore().name().toLowerCase(),
                 readiness.scopeAfter().name().toLowerCase(),
-                diagnosticsCompilesInFlight.get() > 0,
                 Duration.between(started, Instant.now()).toMillis()));
         return Optional.of(list);
     }
@@ -1486,15 +1357,48 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     @Override
+    public DocumentDiagnosticReport textDocumentDiagnostic(DocumentDiagnosticParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) {
+            return new DocumentDiagnosticReport(List.of());
+        }
+        var file = Paths.get(params.textDocument.uri);
+        var fileUri = file.toUri();
+        var started = Instant.now();
+        CompileTask task = null;
+        try {
+            task = diagnosticsCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
+            var requestedUris = Set.of(fileUri);
+            var report = new ErrorProvider(task).errors(requestedUris);
+            var diagnostics = report.diagnostics().stream()
+                    .filter(p -> fileUri.equals(p.uri))
+                    .flatMap(p -> p.diagnostics.stream())
+                    .collect(java.util.stream.Collectors.toList());
+            LOG.fine(String.format(
+                    "[perf] pull_diagnostics file=%s count=%d took=%dms",
+                    file.getFileName(),
+                    diagnostics.size(),
+                    Duration.between(started, Instant.now()).toMillis()));
+            return new DocumentDiagnosticReport(diagnostics);
+        } catch (RuntimeException | AssertionError e) {
+            LOG.fine(String.format(
+                    "[perf] pull_diagnostics_skip file=%s reason=%s",
+                    file.getFileName(), e.getMessage()));
+            return new DocumentDiagnosticReport(List.of());
+        } finally {
+            if (task != null) task.close();
+        }
+    }
+
+    @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
-        var file = Paths.get(params.textDocument.uri);
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
-            bootstrapWorkspaceOnDidOpen(file);
+            completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
             return;
         }
-        diagnosticsScheduler.schedule(List.of(file), "didOpen", DIAGNOSTIC_DEBOUNCE_MS);
+        // Completion index is already populated; no extra work needed.
+        // Diagnostics are pull-based — the client requests them when ready.
     }
 
     @Override
@@ -1503,7 +1407,6 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         var refreshCompletionIndex = analyzeActiveDocumentChange(file, params.contentChanges);
-        markOtherActiveDiagnosticsDirty(file, "didChange");
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didChangeActiveBootstrap");
         } else if (refreshCompletionIndex) {
@@ -1513,15 +1416,11 @@ class JavaLanguageServer extends LanguageServer {
                     COMPLETION_INDEX_DEBOUNCE_MS,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
         }
-        diagnosticsScheduler.schedule(List.of(file), "didChange", DIAGNOSTIC_DEBOUNCE_MS);
     }
 
     @Override
     public void didCloseTextDocument(DidCloseTextDocumentParams params) {
         FileStore.close(params);
-        if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
-        dirtyDiagnosticsFiles.remove(Paths.get(params.textDocument.uri));
-        client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
     }
 
     @Override
@@ -1538,25 +1437,7 @@ class JavaLanguageServer extends LanguageServer {
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        // Save-triggered diagnostics should not reuse a stale didChange compile for the same buffer text.
         FileStore.save(file);
-        markOtherActiveDiagnosticsDirty(file, "didSave");
-        diagnosticsScheduler.cancel("didSave");
-        completionIndexScheduler.cancel("didSave");
-        getOrCreateCompiler();
-        var batch = diagnosticsScheduler.expandRequestedBatch(List.of(file), "didSave");
-        didSaveDiagnosticsInFlight.incrementAndGet();
-        try {
-            diagnosticsScheduler.compileAndPublish(
-                    batch.files(),
-                    diagnosticsCompiler,
-                    "didSave",
-                    -1,
-                    batch.requestedCount(),
-                    batch.dirtyOpenCount());
-        } finally {
-            didSaveDiagnosticsInFlight.updateAndGet(current -> Math.max(0, current - 1));
-        }
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
                 && !FileStore.activeDocuments().isEmpty()) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didSaveBootstrap");
@@ -1566,288 +1447,6 @@ class JavaLanguageServer extends LanguageServer {
                     "didSave",
                     0,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-        }
-    }
-
-    /**
-     * Diagnostics scheduling and publication stay together so debounce, dirty-file tracking,
-     * didSave priority, and stale-publish guards evolve as one unit.
-     *
-     * <p>The flow is:
-     * normalize requested files -> expand with dirty open files -> debounce or run immediately ->
-     * compile on the diagnostics compiler -> publish only the requested/dirty batch ->
-     * clear successfully refreshed dirty entries.
-     */
-    final class DiagnosticsScheduler {
-        DiagnosticsScheduler() {}
-
-        /**
-         * Compile the requested diagnostics batch and publish only the files that were explicitly
-         * requested or pulled in as dirty open files.
-         *
-         * <p>This method owns compile serialization only. Stale-content and didSave-priority checks
-         * are re-checked inside {@link #publishFromTask(CompileTask, Collection, String, long)}
-         * immediately before publishing so diagnostics do not leak after the buffer changes or a
-         * save-triggered compile takes over.
-         */
-        void compileAndPublish(
-                Collection<Path> files,
-                JavaCompilerService diagnosticsCompiler,
-                String trigger,
-                long expectedContentRevision,
-                int requestedCount,
-                int dirtyOpenCount) {
-            if (shouldYieldToDidSaveDiagnostics(trigger, "pre_lock")) {
-                return;
-            }
-            var waitStarted = Instant.now();
-            synchronized (diagnosticsCompileMutex) {
-                if (shouldYieldToDidSaveDiagnostics(trigger, "post_lock")) {
-                    return;
-                }
-                var waited = Duration.between(waitStarted, Instant.now()).toMillis();
-                LOG.fine(String.format(
-                        "[perf] diagnostics_compile_wait trigger=%s waited=%dms",
-                        trigger,
-                        waited));
-                var javaFiles = JavaLanguageServer.filterJavaFiles(files);
-                if (javaFiles.isEmpty()) return;
-                LOG.info(String.format("Lint %d files...", javaFiles.size()));
-                CompileTask task = null;
-                try {
-                    diagnosticsCompilesInFlight.incrementAndGet();
-                    LOG.fine(String.format(
-                            "[perf] diagnostics_compile trigger=%s requested=%d dirty_open=%d batch=%d",
-                            trigger,
-                            requestedCount,
-                            dirtyOpenCount,
-                            javaFiles.size()));
-                    try {
-                        task =
-                                diagnosticsCompiler.compileDiagnostics(
-                                        javaFiles.stream().map(SourceFileObject::new).toList());
-                    } catch (RuntimeException | AssertionError e) {
-                        LOG.fine(
-                                String.format(
-                                        "[perf] diagnostics_compile_skip trigger=%s files=%d reason=%s message=%s",
-                                        trigger,
-                                        javaFiles.size(),
-                                        e.getClass().getSimpleName(),
-                                        e.getMessage()));
-                        return;
-                    }
-                    var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
-                    LOG.fine(String.format(
-                            "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s parse=%dms enter=%dms analyze=%dms",
-                            trigger,
-                            requestedCount,
-                            dirtyOpenCount,
-                            javaFiles.size(),
-                            task.roots.size(),
-                            compileTelemetry.annotationProcessingEnabled(),
-                            compileTelemetry.expandedSources(),
-                            compileTelemetry.path(),
-                            compileTelemetry.cacheName(),
-                            compileTelemetry.parseMs(),
-                            compileTelemetry.enterMs(),
-                            compileTelemetry.analyzeMs()));
-                    publishFromTask(task, javaFiles, trigger, expectedContentRevision);
-                } finally {
-                    diagnosticsCompilesInFlight.updateAndGet(current -> Math.max(0, current - 1));
-                    if (task != null) {
-                        task.close();
-                    }
-                }
-            }
-        }
-
-        /**
-         * Publish diagnostics for the requested batch only and clear files that no longer report any
-         * diagnostics.
-         */
-        void publishFromTask(
-                CompileTask task, Collection<Path> requestedFiles, String trigger, long expectedContentRevision) {
-            var requestedJavaFiles = JavaLanguageServer.filterJavaFiles(requestedFiles);
-            if (requestedJavaFiles.isEmpty()) {
-                return;
-            }
-            var publishStarted = Instant.now();
-            if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "pre_publish")) {
-                return;
-            }
-            if (shouldYieldToDidSaveDiagnostics(trigger, "pre_publish")) {
-                return;
-            }
-            var diagnosticsCount = 0;
-            var publishedUris = new HashSet<java.net.URI>();
-            var requestedUris = new HashSet<java.net.URI>();
-            for (var file : requestedJavaFiles) {
-                requestedUris.add(file.toUri());
-            }
-            var materializeStarted = Instant.now();
-            var report = new ErrorProvider(task).errors(requestedUris);
-            var materializeMs = Duration.between(materializeStarted, Instant.now()).toMillis();
-            var clientStarted = Instant.now();
-            for (var errs : report.diagnostics()) {
-                if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_loop")) {
-                    return;
-                }
-                client.publishDiagnostics(errs);
-                diagnosticsCount += errs.diagnostics.size();
-                publishedUris.add(errs.uri);
-            }
-            for (var file : requestedJavaFiles) {
-                if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_clear_loop")) {
-                    return;
-                }
-                if (!FileStore.isJavaFile(file)) continue;
-                var uri = file.toUri();
-                if (publishedUris.contains(uri)) continue;
-                client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
-                publishedUris.add(uri);
-            }
-            LOG.fine(String.format(
-                    "[perf] diagnostics_publish trigger=%s requested_roots=%d compiled_roots=%d processed_roots=%d published_roots=%d diagnostics=%d convert=%dms warnings=%dms materialize=%dms client=%dms took=%dms",
-                    trigger,
-                    requestedJavaFiles.size(),
-                    report.compiledRoots(),
-                    report.processedRoots(),
-                    publishedUris.size(),
-                    diagnosticsCount,
-                    report.convertMs(),
-                    report.warningMs(),
-                    materializeMs,
-                    Duration.between(clientStarted, Instant.now()).toMillis(),
-                    Duration.between(publishStarted, Instant.now()).toMillis()));
-            clearDirty(requestedJavaFiles);
-        }
-
-        /** Debounce diagnostics work so typing collapses into one queued async publish. */
-        void schedule(Collection<Path> files, String trigger, long delayMs) {
-            var batch = expandRequestedBatch(files, trigger);
-            if (batch.files().isEmpty()) return;
-            var request =
-                    new ScheduledDiagnosticsRequest(
-                            diagnosticsRevision.incrementAndGet(),
-                            FileStore.contentRevision(),
-                            batch.requestedCount(),
-                            batch.dirtyOpenCount());
-            var filesBatch = batch.files();
-            synchronized (JavaLanguageServer.this) {
-                if (pendingDiagnostics != null) {
-                    pendingDiagnostics.cancel(false);
-                }
-                pendingDiagnostics =
-                        diagnosticsExecutor.schedule(
-                                () -> run(filesBatch, request, trigger),
-                                delayMs,
-                                TimeUnit.MILLISECONDS);
-            }
-            LOG.fine(String.format(
-                    "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms revision=%d content_revision=%d",
-                    trigger,
-                    filesBatch.size(),
-                    delayMs,
-                    request.scheduleRevision(),
-                    request.contentRevision()));
-        }
-
-        /** Remember which open Java files need to be refreshed in the next diagnostics batch. */
-        void markDirty(Collection<Path> files, String trigger) {
-            var javaFiles = JavaLanguageServer.filterJavaFiles(files);
-            if (javaFiles.isEmpty()) {
-                return;
-            }
-            if (javaFiles.size() == 1) {
-                var file = javaFiles.getFirst();
-                if (dirtyDiagnosticsFiles.add(file)) {
-                    LOG.fine(String.format(
-                            "[perf] diagnostics_dirty_mark trigger=%s file=%s",
-                            trigger,
-                            file.getFileName()));
-                }
-                return;
-            }
-            var marked = 0;
-            for (var file : javaFiles) {
-                if (dirtyDiagnosticsFiles.add(file)) {
-                    marked++;
-                }
-            }
-            if (marked > 0) {
-                LOG.fine(String.format("[perf] diagnostics_dirty_batch trigger=%s files=%d", trigger, marked));
-            }
-        }
-
-        void clearDirty(Collection<Path> files) {
-            for (var file : files) {
-                dirtyDiagnosticsFiles.remove(file);
-            }
-        }
-
-        /** Cancel any queued async diagnostics run and bump the revision so stale work is dropped. */
-        void cancel(String reason) {
-            synchronized (JavaLanguageServer.this) {
-                if (pendingDiagnostics == null) {
-                    return;
-                }
-                diagnosticsRevision.incrementAndGet();
-                pendingDiagnostics.cancel(false);
-                pendingDiagnostics = null;
-            }
-            LOG.fine(String.format("[perf] diagnostics_cancel reason=%s", reason));
-        }
-
-        /**
-         * Expand the explicitly requested files with any other open Java files already marked dirty.
-         *
-         * <p>This keeps diagnostics responsive for the current file while letting the next publish
-         * refresh other open files whose diagnostics may have become stale due to cross-file edits.
-         */
-        DiagnosticsBatch expandRequestedBatch(Collection<Path> files, String trigger) {
-            var requested = JavaLanguageServer.filterJavaFiles(files);
-            if (requested.isEmpty()) {
-                return new DiagnosticsBatch(List.of(), 0, 0);
-            }
-            var batch = new LinkedHashSet<>(requested);
-            var activeJavaFiles = new LinkedHashSet<>(JavaLanguageServer.filterJavaFiles(FileStore.activeDocuments()));
-            var dirtyOpenCount = 0;
-            if (!activeJavaFiles.isEmpty()) {
-                for (var dirty : dirtyDiagnosticsFiles) {
-                    if (!activeJavaFiles.contains(dirty) || batch.contains(dirty)) {
-                        continue;
-                    }
-                    batch.add(dirty);
-                    dirtyOpenCount++;
-                }
-            }
-            var filesBatch = List.copyOf(batch);
-            LOG.fine(String.format(
-                    "[perf] diagnostics_batch trigger=%s requested=%d dirty_open=%d files=%d",
-                    trigger,
-                    requested.size(),
-                    dirtyOpenCount,
-                    filesBatch.size()));
-            return new DiagnosticsBatch(filesBatch, requested.size(), dirtyOpenCount);
-        }
-
-        /** Execute one queued async diagnostics run if its scheduled revision is still current. */
-        void run(List<Path> files, ScheduledDiagnosticsRequest request, String trigger) {
-            if (request.scheduleRevision() != diagnosticsRevision.get()) {
-                return;
-            }
-            getOrCreateCompiler();
-            try {
-                compileAndPublish(
-                        files,
-                        diagnosticsCompiler,
-                        "async:" + trigger,
-                        request.contentRevision(),
-                        request.requestedCount(),
-                        request.dirtyOpenCount());
-            } catch (RuntimeException e) {
-                LOG.fine("Async lint failed for " + files + ": " + e.getMessage());
-            }
         }
     }
 

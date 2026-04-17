@@ -116,5 +116,9 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public DocumentDiagnosticReport textDocumentDiagnostic(DocumentDiagnosticParams params) {
+        return new DocumentDiagnosticReport(List.of());
+    }
+
     public void doAsyncWork() {}
 }
