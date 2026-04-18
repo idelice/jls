@@ -59,7 +59,9 @@ public class DefinitionProviderTest {
                         IndexedMember.Provenance.WORKSPACE,
                         Set.of(),
                         Path.of("Owner.java").toUri(),
-                        range);
+                        range,
+                        "test.Owner",
+                        IndexedMember.canonicalKey("test.Owner", CompletionItemKind.Method, "call", new String[0]));
         var type =
                 new IndexedType(
                         "test.Owner",

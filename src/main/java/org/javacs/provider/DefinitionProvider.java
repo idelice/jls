@@ -140,12 +140,28 @@ public class DefinitionProvider {
             }
             if (parent instanceof MethodInvocationTree invocation
                     && invocation.getMethodSelect() == identifier) {
-                var resolved =  Optional.of(
-                        resolveUnqualifiedMethodInvocation(
-                                parse, types, invocation, identifier.getName().toString()));
-                if (resolved.isPresent()) {
-                    return resolved.get();
+                var enclosingOwner = types.currentEnclosingTypeName();
+                if (enclosingOwner.isPresent()) {
+                    var earlyMethod =
+                            methodEarlyReturn(
+                                            enclosingOwner.get(),
+                                            identifier.getName().toString(),
+                                            false,
+                                            invocation.getArguments().size())
+                                    .or(
+                                            () ->
+                                                    methodEarlyReturn(
+                                                            enclosingOwner.get(),
+                                                            identifier.getName().toString(),
+                                                            true,
+                                                            invocation.getArguments().size()));
+                    if (earlyMethod.isPresent()) {
+                        return earlyMethod.get();
+                    }
                 }
+                var resolved = resolveUnqualifiedMethodInvocation(
+                        parse, types, invocation, identifier.getName().toString());
+                return resolved;
             }
 
             return resolveIdentifier(parse, path, identifier, types);
@@ -193,11 +209,11 @@ public class DefinitionProvider {
         var inheritedField = types.resolveInheritedFieldMember(name)
                 .map(
                         member -> {
-                            var indexedField = member.declarationLocation();
+                    var indexedField = bestMemberDeclarationLocation(member);
                             if (indexedField.isPresent() && !hasBackingField(member)) {
                                 return new ResolvedSymbol(
                                         List.of(indexedField.get()),
-                                        indexedOwner(member.ownerType, member),
+                                        member.declarationOwnerType,
                                         name,
                                         false,
                                         member,
@@ -236,14 +252,14 @@ public class DefinitionProvider {
             member = candidate;
         }
         if (member == null
-                || member.declarationLocation().isEmpty()
+            || bestMemberDeclarationLocation(member).isEmpty()
                 || hasBackingField(member)) {
             return Optional.empty();
         }
         return Optional.of(
                 new ResolvedSymbol(
-                        List.of(member.declarationLocation().get()),
-                        indexedOwner(ownerType, member),
+                List.of(bestMemberDeclarationLocation(member).get()),
+                        member.declarationOwnerType,
                         methodName,
                         true,
                         member,
@@ -342,8 +358,8 @@ public class DefinitionProvider {
                     .filter(this::isFieldLikeMember)
                     .orElse(null);
             if (member != null) {
-                var targetOwner = indexedOwner(receiver.get().qualifiedType(), member);
-                var indexedField = member.declarationLocation();
+                var targetOwner = member.declarationOwnerType;
+                var indexedField = bestMemberDeclarationLocation(member);
                 if (indexedField.isPresent() && !hasBackingField(member)) {
                     return new ResolvedSymbol(
                             List.of(indexedField.get()), targetOwner, name, false, member, name);
@@ -548,46 +564,44 @@ public class DefinitionProvider {
         if (member == null) {
             return Optional.empty();
         }
-        var targetOwner = indexedOwner(ownerType, member);
-        var indexedLinked = indexedLinkedFieldLocation(member);
-        if (indexedLinked.isPresent()) {
+        var targetOwner = member.declarationOwnerType;
+        var indexedLocation = bestMemberDeclarationLocation(member);
+        if (indexedLocation.isEmpty()) {
+            return Optional.empty();
+        }
+        if (member.backingFieldName != null && !member.backingFieldName.isBlank()) {
             return Optional.of(
                     new ResolvedSymbol(
-                            List.of(indexedLinked.get()),
-                            linkedFieldOwner(targetOwner, member),
+                            List.of(indexedLocation.get()),
+                            targetOwner,
                             member.backingFieldName,
                             false,
                             member,
                             member.backingFieldName));
         }
-        var indexedMethod = member.declarationLocation();
-        if (indexedMethod.isPresent()) {
-            return Optional.of(
-                    new ResolvedSymbol(
-                            List.of(indexedMethod.get()),
-                            targetOwner,
-                            methodName,
-                            true,
-                            member,
-                            methodName));
-        }
-        return Optional.empty();
+        return Optional.of(
+                new ResolvedSymbol(
+                        List.of(indexedLocation.get()),
+                        targetOwner,
+                        methodName,
+                        true,
+                        member,
+                        methodName));
     }
 
     private ResolvedSymbol materializeSelectedMethod(SelectedMethod selected) {
-        var targetOwner = indexedOwner(selected.ownerType(), selected.member());
-        if (hasBackingField(selected.member())) {
-            var linkedOwner = linkedFieldOwner(targetOwner, selected.member());
-            var linkedField = selected.member().backingFieldName;
-            var linkedLocations = findFieldLocations(linkedOwner, linkedField);
+        var member = selected.member();
+        var targetOwner = member != null ? member.declarationOwnerType : selected.ownerType();
+        if (hasBackingField(member)) {
+            var linkedLocations = findFieldLocations(targetOwner, member.backingFieldName);
             if (!linkedLocations.isEmpty()) {
                 return new ResolvedSymbol(
                         linkedLocations,
-                        linkedOwner,
-                        linkedField,
+                        targetOwner,
+                        member.backingFieldName,
                         false,
-                        selected.member(),
-                        linkedField);
+                        member,
+                        member.backingFieldName);
             }
         }
         var direct =
@@ -602,7 +616,7 @@ public class DefinitionProvider {
                     targetOwner,
                     selected.methodName(),
                     true,
-                    selected.member(),
+                    member,
                     selected.methodName());
         }
         return new ResolvedSymbol(
@@ -610,7 +624,7 @@ public class DefinitionProvider {
                 targetOwner,
                 selected.methodName(),
                 true,
-                selected.member(),
+                member,
                 selected.methodName());
     }
 
@@ -692,7 +706,7 @@ public class DefinitionProvider {
         if (type == null) {
             return unsupported(simpleName);
         }
-        var declaration = type.declarationLocation();
+        var declaration = bestTypeDeclarationLocation(type, simpleName);
         if (declaration.isPresent()) {
             return new ResolvedSymbol(
                     List.of(declaration.get()), type.qualifiedName, null, false, null, simpleName);
@@ -701,7 +715,9 @@ public class DefinitionProvider {
     }
 
     private ResolvedSymbol resolveTypeName(String qualifiedType, String simpleName) {
-        var indexedType = typeIndexRouter.ownerTypeInfo(qualifiedType).flatMap(IndexedType::declarationLocation);
+        var indexedType =
+            typeIndexRouter.ownerTypeInfo(qualifiedType)
+                .flatMap(type -> bestTypeDeclarationLocation(type, simpleName));
         if (indexedType.isPresent()) {
             return new ResolvedSymbol(
                     List.of(indexedType.get()), qualifiedType, null, false, null, simpleName);
@@ -721,11 +737,11 @@ public class DefinitionProvider {
                     .orElse(null);
             ResolvedSymbol resolved;
             if (member != null) {
-                var indexedField = member.declarationLocation();
+                var indexedField = bestMemberDeclarationLocation(member);
                 if (indexedField.isPresent() && !hasBackingField(member)) {
                     resolved = new ResolvedSymbol(
                             List.of(indexedField.get()),
-                            indexedOwner(ownerType, member),
+                            member.declarationOwnerType,
                             fieldName,
                             false,
                             member,
@@ -754,8 +770,8 @@ public class DefinitionProvider {
             return Optional.empty();
         }
         var indexed = member.get();
-        var targetOwner = indexedOwner(ownerType, indexed);
-        var location = indexed.declarationLocation();
+        var targetOwner = indexed.declarationOwnerType;
+        var location = bestMemberDeclarationLocation(indexed);
         if (location.isPresent() && !hasBackingField(indexed)) {
             return Optional.of(
                     new ResolvedSymbol(
@@ -802,6 +818,19 @@ public class DefinitionProvider {
                             false);
             if (currentOwner.isPresent()) {
                 return currentOwner;
+            }
+            // Also probe static methods on the enclosing type — unqualified calls to static
+            // methods in the same class are valid in static field initializers and static methods.
+            var staticOwner =
+                    selectMethodOnOwner(
+                            currentOwnerType.get(),
+                            methodName,
+                            true,
+                            argCount,
+                            argTypes,
+                            false);
+            if (staticOwner.isPresent()) {
+                return staticOwner;
             }
         }
         return selectStaticImportMethodSymbol(root, methodName, argCount, argTypes);
@@ -888,12 +917,12 @@ public class DefinitionProvider {
                 .filter(this::isFieldLikeMember)
                 .orElse(null);
         if (staticMember != null) {
-            var indexedField = staticMember.declarationLocation();
+            var indexedField = bestMemberDeclarationLocation(staticMember);
             if (indexedField.isPresent() && !hasBackingField(staticMember)) {
                 return Optional.of(
                         new ResolvedSymbol(
                                 List.of(indexedField.get()),
-                                indexedOwner(ownerType.get(), staticMember),
+                                staticMember.declarationOwnerType,
                                 fieldName,
                                 false,
                                 staticMember,
@@ -909,12 +938,12 @@ public class DefinitionProvider {
                 .filter(this::isFieldLikeMember)
                 .orElse(null);
         if (instanceMember != null) {
-            var indexedField = instanceMember.declarationLocation();
+            var indexedField = bestMemberDeclarationLocation(instanceMember);
             if (indexedField.isPresent() && !hasBackingField(instanceMember)) {
                 return Optional.of(
                         new ResolvedSymbol(
                                 List.of(indexedField.get()),
-                                indexedOwner(ownerType.get(), instanceMember),
+                                instanceMember.declarationOwnerType,
                                 fieldName,
                                 false,
                                 instanceMember,
@@ -1023,12 +1052,12 @@ public class DefinitionProvider {
         if (member == null) {
             return Optional.empty();
         }
-        var indexedField = member.declarationLocation();
+        var indexedField = bestMemberDeclarationLocation(member);
         if (indexedField.isPresent() && !hasBackingField(member)) {
             return Optional.of(
                     new ResolvedSymbol(
                             List.of(indexedField.get()),
-                            indexedOwner(ownerType.get(), member),
+                            member.declarationOwnerType,
                             fieldName,
                             false,
                             member,
@@ -1173,41 +1202,29 @@ public class DefinitionProvider {
 
     private ResolvedSymbol resolveField(
             String ownerType, String fieldName, IndexedMember member) {
-        var targetOwner = indexedOwner(ownerType, member);
-        var indexedLinked = indexedLinkedFieldLocation(member);
-        if (indexedLinked.isPresent()) {
+        var targetOwner = member != null ? member.declarationOwnerType : ownerType;
+        var indexedLocation = typeIndexRouter.memberDeclarationLocation(member);
+        if (indexedLocation.isPresent()) {
+            var displayName = (member != null && member.backingFieldName != null && !member.backingFieldName.isBlank())
+                    ? member.backingFieldName : fieldName;
             return new ResolvedSymbol(
-                    List.of(indexedLinked.get()),
-                    linkedFieldOwner(targetOwner, member),
-                    member.backingFieldName,
+                    List.of(indexedLocation.get()),
+                    targetOwner,
+                    displayName,
                     false,
                     member,
-                    member.backingFieldName);
-        }
-        if (member != null) {
-            var indexedField = member.declarationLocation();
-            if (indexedField.isPresent()) {
-                return new ResolvedSymbol(
-                        List.of(indexedField.get()),
-                        targetOwner,
-                        fieldName,
-                        false,
-                        member,
-                        fieldName);
-            }
+                    displayName);
         }
         if (hasBackingField(member)) {
-            var linkedOwner = linkedFieldOwner(targetOwner, member);
-            var linkedField = member.backingFieldName;
-            var linkedLocations = findFieldLocations(linkedOwner, linkedField);
+            var linkedLocations = findFieldLocations(targetOwner, member.backingFieldName);
             if (!linkedLocations.isEmpty()) {
                 return new ResolvedSymbol(
                         linkedLocations,
-                        linkedOwner,
-                        linkedField,
+                        targetOwner,
+                        member.backingFieldName,
                         false,
                         member,
-                        linkedField);
+                        member.backingFieldName);
             }
         }
         var fieldLocations = findFieldLocations(targetOwner, fieldName);
@@ -1238,6 +1255,52 @@ public class DefinitionProvider {
         return member != null
                 && member.backingFieldName != null
                 && !member.backingFieldName.isBlank();
+    }
+
+    private Optional<Location> bestTypeDeclarationLocation(IndexedType type, String simpleName) {
+        if (type == null) {
+            return Optional.empty();
+        }
+        if (typeIndexRouter.ownerStore(type.qualifiedName) == TypeIndexRouter.OwnerStore.WORKSPACE) {
+            var locations = findTypeLocations(type.qualifiedName, simpleName);
+            if (!locations.isEmpty()) {
+                return Optional.of(locations.get(0));
+            }
+        }
+        return type.declarationLocation();
+    }
+
+    private Optional<Location> bestMemberDeclarationLocation(IndexedMember member) {
+        if (member == null) {
+            return Optional.empty();
+        }
+        var workspaceLocation = currentWorkspaceMemberDeclarationLocation(member);
+        if (workspaceLocation.isPresent()) {
+            return workspaceLocation;
+        }
+        return typeIndexRouter.memberDeclarationLocation(member);
+    }
+
+    private Optional<Location> currentWorkspaceMemberDeclarationLocation(IndexedMember member) {
+        if (member == null
+                || typeIndexRouter.ownerStore(member.declarationOwnerType) != TypeIndexRouter.OwnerStore.WORKSPACE) {
+            return Optional.empty();
+        }
+        if (member.kind == CompletionItemKind.Method) {
+            var argCount = member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length;
+            var argTypes = member.declaredParameterTypes == null ? List.<String>of() : List.of(member.declaredParameterTypes);
+            var locations = findMethodLocations(member.declarationOwnerType, member.name, argCount, argTypes);
+            if (!locations.isEmpty()) {
+                return Optional.of(locations.get(0));
+            }
+        }
+        if (member.kind == CompletionItemKind.Field && !hasBackingField(member)) {
+            var locations = findFieldLocations(member.declarationOwnerType, member.name);
+            if (!locations.isEmpty()) {
+                return Optional.of(locations.get(0));
+            }
+        }
+        return Optional.empty();
     }
 
     // Location opening and declaration matching.
@@ -1640,33 +1703,6 @@ public class DefinitionProvider {
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    private String indexedOwner(String ownerType, IndexedMember member) {
-        if (member != null && member.ownerType != null && !member.ownerType.isBlank()) {
-            return member.ownerType;
-        }
-        return ownerType;
-    }
-
-    private String linkedFieldOwner(String ownerType, IndexedMember member) {
-        if (member != null && member.logicalKey != null && !member.logicalKey.isBlank()) {
-            var split = member.logicalKey.indexOf('#');
-            if (split > 0) {
-                return member.logicalKey.substring(0, split);
-            }
-        }
-        return ownerType;
-    }
-
-    private Optional<Location> indexedLinkedFieldLocation(
-            IndexedMember member) {
-        if (member == null || !hasBackingField(member) || member.logicalKey == null || member.logicalKey.isBlank()) {
-            return Optional.empty();
-        }
-        return typeIndexRouter.workspace()
-                .memberByCanonicalKey(member.logicalKey)
-                .flatMap(IndexedMember::declarationLocation);
     }
 
 }

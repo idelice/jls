@@ -659,7 +659,9 @@ public final class ExternalBinaryTypeIndex {
                 IndexedMember.Provenance.EXTERNAL_BINARY,
                 member.modifiers,
                 member.sourceUri,
-                member.declarationRange);
+                member.declarationRange,
+                member.declarationOwnerType,
+                member.targetDeclarationKey);
     }
 
     private IndexedType applySourceLinks(IndexedType raw) {
@@ -797,7 +799,13 @@ public final class ExternalBinaryTypeIndex {
                                         IndexedMember.Provenance.EXTERNAL_BINARY,
                                         Set.of(javax.lang.model.element.Modifier.PUBLIC),
                                         null,
-                                        null));
+                                        null,
+                                        qualifiedName,
+                                        IndexedMember.canonicalKey(
+                                                qualifiedName,
+                                                CompletionItemKind.Field,
+                                                fieldName,
+                                                null)));
                     }
                 }
                 if (accessorInfo.hasSetter()) {
@@ -846,7 +854,13 @@ public final class ExternalBinaryTypeIndex {
                                         IndexedMember.Provenance.EXTERNAL_BINARY,
                                         Set.of(javax.lang.model.element.Modifier.PUBLIC),
                                         null,
-                                        null));
+                                        null,
+                                        qualifiedName,
+                                        IndexedMember.canonicalKey(
+                                                qualifiedName,
+                                                CompletionItemKind.Field,
+                                                fieldName,
+                                                null)));
                     }
                 }
             }

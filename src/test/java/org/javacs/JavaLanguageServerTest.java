@@ -2289,6 +2289,129 @@ public class JavaLanguageServerTest {
                 completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
     }
 
+        @Test
+        public void definitionTracksUnsavedMethodDeclarationLineShiftInOpenFile() throws Exception {
+                var workspace = Files.createTempDirectory("jls-unsaved-definition-line-shift");
+                try {
+                        var source = workspace.resolve("org/javacs/InferConfigReplay.java");
+                        Files.createDirectories(source.getParent());
+
+                        var original =
+                                        """
+                                        package org.javacs;
+
+                                        import java.nio.file.Path;
+
+                                        class InferConfigReplay {
+                                                private final Path workspaceRoot;
+
+                                                InferConfigReplay(Path workspaceRoot) {
+                                                        this.workspaceRoot = workspaceRoot;
+                                                }
+
+                                                Path classPath() {
+                                                        return bazelWorkspaceRoot();
+                                                }
+
+                                                private Path bazelWorkspaceRoot() {
+                                                        return workspaceRoot;
+                                                }
+                                        }
+                                        """;
+                        Files.writeString(source, original);
+
+                        var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+                        var open = new DidOpenTextDocumentParams();
+                        open.textDocument.uri = source.toUri();
+                        open.textDocument.version = 1;
+                        open.textDocument.languageId = "java";
+                        open.textDocument.text = original;
+                        server.didOpenTextDocument(open);
+
+                        Assert.assertTrue(
+                                        "expected completion index bootstrap before unsaved definition shift check",
+                                        awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+                        assertDefinitionAtMarker(
+                                        server,
+                                        source,
+                                        original,
+                                        "bazelWorkspaceRoot();",
+                                        source.toUri(),
+                                        positionAtMarker(original, "private Path bazelWorkspaceRoot()").line);
+
+                        var changed =
+                                        original.replace(
+                                                        "\n    private Path bazelWorkspaceRoot()",
+                                                        "\n\n    private Path bazelWorkspaceRoot()");
+                        var change = new DidChangeTextDocumentParams();
+                        change.textDocument.uri = source.toUri();
+                        change.textDocument.version = 2;
+                        var delta = new TextDocumentContentChangeEvent();
+                        delta.text = changed;
+                        change.contentChanges.add(delta);
+                        server.didChangeTextDocument(change);
+
+                        assertDefinitionAtMarker(
+                                        server,
+                                        source,
+                                        changed,
+                                        "bazelWorkspaceRoot();",
+                                        source.toUri(),
+                                        positionAtMarker(changed, "private Path bazelWorkspaceRoot()").line);
+                } finally {
+                        deleteRecursively(workspace);
+                }
+        }
+
+            @Test
+            public void definitionTracksUnsavedMethodDeclarationLineShiftInRepoFile() throws Exception {
+                var workspace = Paths.get("").toAbsolutePath().normalize();
+                var file = workspace.resolve("src/main/java/org/javacs/InferConfig.java");
+                var original = FileStore.contents(file);
+
+                FileStore.reset();
+                var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+                var open = new DidOpenTextDocumentParams();
+                open.textDocument.uri = file.toUri();
+                open.textDocument.version = 1;
+                open.textDocument.languageId = "java";
+                open.textDocument.text = original;
+                server.didOpenTextDocument(open);
+
+                Assert.assertTrue(
+                        "expected completion index bootstrap before repo unsaved definition shift check",
+                        awaitCompletionIndexAdvance(server, 0, 180, TimeUnit.SECONDS));
+
+                assertDefinitionAtMarker(
+                        server,
+                        file,
+                        original,
+                        "bazelWorkspaceRoot();",
+                        file.toUri(),
+                        positionAtMarker(original, "private Path bazelWorkspaceRoot()").line);
+
+                var changed =
+                        original.replace(
+                                "\n    private Path bazelWorkspaceRoot()",
+                                "\n\n    private Path bazelWorkspaceRoot()");
+                var change = new DidChangeTextDocumentParams();
+                change.textDocument.uri = file.toUri();
+                change.textDocument.version = 2;
+                var delta = new TextDocumentContentChangeEvent();
+                delta.text = changed;
+                change.contentChanges.add(delta);
+                server.didChangeTextDocument(change);
+
+                assertDefinitionAtMarker(
+                        server,
+                        file,
+                        changed,
+                        "bazelWorkspaceRoot();",
+                        file.toUri(),
+                        positionAtMarker(changed, "private Path bazelWorkspaceRoot()").line);
+            }
+
     @Test
     public void incompleteBodyEditDoesNotTriggerDeclarationDriftRefresh() throws Exception {
         FileStore.reset();

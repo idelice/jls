@@ -1531,6 +1531,11 @@ class JavaLanguageServer extends LanguageServer {
             if (completionSnapshotRef.get().scope() == CompletionIndexScope.WORKSPACE) {
                 return;
             }
+            synchronized (JavaLanguageServer.this) {
+                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
+                    return;
+                }
+            }
             scheduleRefresh(FileStore.all(), trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
         }
 
@@ -1581,9 +1586,11 @@ class JavaLanguageServer extends LanguageServer {
             synchronized (completionIndexCompileMutex) {
                 var started = Instant.now();
                 CompileTask task = null;
+                String bootstrapProgressToken = null;
                 try {
                     if (workspaceBootstrap) {
                         LOG.info(String.format("[perf] workspace bootstrap started trigger=%s files=%d", trigger, files.size()));
+                        bootstrapProgressToken = beginWorkDoneProgress("Bootstrap index", "Indexing workspace");
                     }
                     var compiler = getOrCreateCompiler();
                     task = compiler.compileFast(files.toArray(Path[]::new));
@@ -1593,6 +1600,7 @@ class JavaLanguageServer extends LanguageServer {
                                 trigger,
                                 revision,
                                 completionIndexRevision.get()));
+                        endWorkDoneProgress(bootstrapProgressToken, null);
                         return;
                     }
                     var indexStarted = Instant.now();
@@ -1603,6 +1611,7 @@ class JavaLanguageServer extends LanguageServer {
                                 trigger,
                                 revision,
                                 completionIndexRevision.get()));
+                        endWorkDoneProgress(bootstrapProgressToken, null);
                         return;
                     }
                     var indexVersion = completionIndexVersion.incrementAndGet();
@@ -1624,6 +1633,7 @@ class JavaLanguageServer extends LanguageServer {
                                 trigger,
                                 indexVersion,
                                 nextIndex == null ? 0 : nextIndex.size()));
+                        endWorkDoneProgress(bootstrapProgressToken, "Index ready");
                     }
                     var totalMs = Duration.between(started, Instant.now()).toMillis();
                     LOG.fine(String.format(
@@ -1635,13 +1645,14 @@ class JavaLanguageServer extends LanguageServer {
                             Duration.between(started, indexStarted).toMillis(),
                             totalMs));
                 } catch (Exception e) {
+                    endWorkDoneProgress(bootstrapProgressToken, "Index failed");
                     LOG.warning(
                             String.format(
                                     "[completion] index refresh failed trigger=%s files=%d reason=%s",
                                     trigger,
                                     files.size(),
                                     e.getMessage()));
-                    LOG.log(java.util.logging.Level.FINE, "", e);
+                    LOG.fine(e.toString());
                 } finally {
                     if (task != null) {
                         task.close();

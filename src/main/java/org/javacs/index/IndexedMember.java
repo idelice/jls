@@ -60,6 +60,8 @@ public final class IndexedMember {
     public final Set<Modifier> modifiers;
     public final URI sourceUri;
     public final Range declarationRange;
+    public final String declarationOwnerType;
+    public final String targetDeclarationKey;
 
     public IndexedMember(
             String ownerType,
@@ -134,7 +136,9 @@ public final class IndexedMember {
                 provenance,
                 Set.of(),
                 null,
-                null);
+                null,
+                ownerType,
+                canonicalKey);
     }
 
     public IndexedMember(
@@ -185,7 +189,9 @@ public final class IndexedMember {
                 Provenance.WORKSPACE,
                 modifiers,
                 sourceUri,
-                declarationRange);
+                declarationRange,
+                ownerType,
+                canonicalKey);
     }
 
     public IndexedMember(
@@ -212,7 +218,9 @@ public final class IndexedMember {
             Provenance provenance,
             Set<Modifier> modifiers,
             URI sourceUri,
-            Range declarationRange) {
+            Range declarationRange,
+            String declarationOwnerType,
+            String targetDeclarationKey) {
         this.ownerType = ownerType;
         this.name = name;
         this.kind = kind;
@@ -237,6 +245,18 @@ public final class IndexedMember {
         this.modifiers = modifiers == null ? Set.of() : Set.copyOf(modifiers);
         this.sourceUri = sourceUri;
         this.declarationRange = declarationRange;
+        this.declarationOwnerType = declarationOwnerType != null ? declarationOwnerType : ownerType;
+        this.targetDeclarationKey = targetDeclarationKey != null ? targetDeclarationKey : canonicalKey;
+    }
+
+    public IndexedMember withNavigation(String declarationOwnerType, String targetDeclarationKey) {
+        return new IndexedMember(
+                ownerType, name, kind, isStatic, isPrivate, isProtected, isPublic, isAbstract,
+                priority, detail, returnType, declaredReturnType,
+                parameterNames, erasedParameterTypes, declaredParameterTypes,
+                canonicalKey, logicalKey, backingFieldName, synthetic,
+                origin, provenance, modifiers, sourceUri, declarationRange,
+                declarationOwnerType, targetDeclarationKey);
     }
 
     public static String canonicalKey(

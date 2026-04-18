@@ -6,6 +6,7 @@ import java.util.Set;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import org.javacs.lsp.Location;
 
 import static org.javacs.index.TypeIndexRouter.OwnerStore.*;
 
@@ -187,4 +188,28 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
             case NONE -> List.of();
         };
 
-    }}
+    }
+
+    /**
+     * Returns the declaration {@link Location} for a member, routing through the correct store.
+     *
+     * <p>For members where {@code targetDeclarationKey} differs from {@code canonicalKey} (i.e.
+     * synthetic members such as Lombok accessors and builder setters), the linked declaration is
+     * looked up by key on the store that owns {@code declarationOwnerType}. For directly declared
+     * members the member's own {@code declarationLocation()} is returned.
+     */
+    public Optional<Location> memberDeclarationLocation(IndexedMember member) {
+        if (member == null) {
+            return Optional.empty();
+        }
+        var targetKey = member.targetDeclarationKey;
+        if (targetKey != null && !targetKey.equals(member.canonicalKey)) {
+            return switch (ownerStore(member.declarationOwnerType)) {
+                case WORKSPACE -> workspace.memberByCanonicalKey(targetKey)
+                        .flatMap(IndexedMember::declarationLocation);
+                case EXTERNAL, NONE -> Optional.empty();
+            };
+        }
+        return member.declarationLocation();
+    }
+}

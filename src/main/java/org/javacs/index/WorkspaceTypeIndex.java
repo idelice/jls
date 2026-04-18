@@ -1260,7 +1260,7 @@ public class WorkspaceTypeIndex {
                                 IndexedMember.Origin.LOMBOK_ACCESSOR,
                                 Set.of(Modifier.PUBLIC),
                                 null,
-                                null));
+                                null).withNavigation(ownerQualifiedName, fieldKey));
             }
             if (accessorInfo.hasSetter()) {
                 var setterName = accessorInfo.setterName();
@@ -1295,7 +1295,7 @@ public class WorkspaceTypeIndex {
                                 IndexedMember.Origin.LOMBOK_ACCESSOR,
                                 Set.of(Modifier.PUBLIC),
                                 null,
-                                null));
+                                null).withNavigation(ownerQualifiedName, fieldKey));
             }
         }
     }
@@ -1383,7 +1383,7 @@ public class WorkspaceTypeIndex {
                             IndexedMember.Origin.LOMBOK_BUILDER,
                             Set.of(Modifier.PUBLIC),
                             null,
-                            null));
+                            null).withNavigation(ownerQualifiedName, fieldKey));
         }
         builderMembers.add(
                 new IndexedMember(
@@ -1551,7 +1551,7 @@ public class WorkspaceTypeIndex {
                 IndexedMember.Origin.LOMBOK_BUILDER,
                 Set.of(Modifier.PUBLIC),
                 null,
-                null);
+                null).withNavigation(ownerQualifiedName, fieldKey);
     }
 
     private static IndexedMember builderBuildMethod(String ownerQualifiedName, String builderQualifiedName) {
@@ -1670,7 +1670,7 @@ public class WorkspaceTypeIndex {
                                 IndexedMember.Origin.RECORD_COMPONENT,
                                 Set.copyOf(accessor.getModifiers()),
                                 null,
-                                null));
+                                null).withNavigation(ownerQualifiedName, logicalKey));
                 continue;
             }
             if (existing.backingFieldName == null || existing.backingFieldName.isBlank()) {
@@ -1681,7 +1681,8 @@ public class WorkspaceTypeIndex {
                                 logicalKey,
                                 component.getSimpleName().toString(),
                                 true,
-                                IndexedMember.Origin.RECORD_COMPONENT));
+                                IndexedMember.Origin.RECORD_COMPONENT)
+                                        .withNavigation(ownerQualifiedName, logicalKey));
             }
         }
     }
@@ -1750,11 +1751,12 @@ public class WorkspaceTypeIndex {
 
     private static IndexedMember mergeLombokFieldLink(IndexedMember existing, IndexedMember synthetic) {
         return mergeFieldLink(
-                existing,
-                synthetic.logicalKey,
-                synthetic.backingFieldName,
-                synthetic.synthetic,
-                synthetic.origin);
+                        existing,
+                        synthetic.logicalKey,
+                        synthetic.backingFieldName,
+                        synthetic.synthetic,
+                        synthetic.origin)
+                .withNavigation(synthetic.declarationOwnerType, synthetic.targetDeclarationKey);
     }
 
     private static IndexedMember mergeFieldLink(
