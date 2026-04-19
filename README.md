@@ -12,6 +12,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Find references** - Find all usages of symbols
 - **Diagnostics** - Real-time linting and error reporting
 - **Signature help** - Parameter information for method calls
+- **Inlay hints** - Parameter name hints at call sites (workspace files only; Lombok-generated calls are suppressed)
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
 - **Private repository support** - Seamless integration with Maven repositories requiring authentication
 - **JAR navigation** - Go-to-definition works on dependency JARs with source files

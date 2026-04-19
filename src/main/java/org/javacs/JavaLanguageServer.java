@@ -35,6 +35,7 @@ import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.provider.DefinitionProvider;
+import org.javacs.provider.InlayHintProvider;
 import org.javacs.provider.ReferenceProvider;
 import org.javacs.rewrite.*;
 
@@ -930,7 +931,7 @@ class JavaLanguageServer extends LanguageServer {
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
-        // c.addProperty("inlayHintProvider", true);
+        c.addProperty("inlayHintProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
@@ -1231,6 +1232,13 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
         return new FoldProvider(getOrCreateCompiler()).foldingRanges(file);
+    }
+
+    @Override
+    public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
+        var file = Paths.get(params.textDocument.uri);
+        return Optional.of(new InlayHintProvider(getOrCreateCompiler()).inlayHints(file, params.range));
     }
 
     @Override
