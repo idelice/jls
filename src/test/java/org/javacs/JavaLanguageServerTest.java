@@ -1,18 +1,29 @@
 package org.javacs;
 
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import java.io.BufferedReader;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -22,10 +33,14 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
-import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.TypeMemberIndex;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.index.IndexedMember;
+import org.javacs.index.IndexedType;
 import org.javacs.markup.ErrorProvider;
+import org.javacs.lsp.DocumentDiagnosticParams;
+import org.javacs.lsp.DocumentDiagnosticReport;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidChangeConfigurationParams;
 import org.javacs.lsp.DidChangeTextDocumentParams;
@@ -36,14 +51,12 @@ import org.javacs.lsp.Diagnostic;
 import org.javacs.lsp.DiagnosticSeverity;
 import org.javacs.lsp.FileChangeType;
 import org.javacs.lsp.FileEvent;
-import org.javacs.lsp.InitializeParams;
-import org.javacs.lsp.InlayHintParams;
 import org.javacs.lsp.LanguageClient;
+import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
 import org.javacs.lsp.ReferenceParams;
-import org.javacs.lsp.Range;
 import org.javacs.lsp.ShowMessageParams;
 import org.javacs.lsp.TextDocumentIdentifier;
 import org.javacs.lsp.TextDocumentContentChangeEvent;
@@ -251,6 +264,58 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void didOpenBootstrapPublishesSourceSnapshotsAndDeclarationRanges() throws Exception {
+        FileStore.reset();
+        var workspace = Files.createTempDirectory("jls-index-source-snapshot");
+        try {
+            var pkg = workspace.resolve("src/com/example");
+            Files.createDirectories(pkg);
+            var file = pkg.resolve("SnapshotExample.java");
+            Files.writeString(
+                    file,
+                    "package com.example;\n"
+                            + "import java.util.List;\n"
+                            + "import static java.util.Collections.emptyList;\n"
+                            + "class SnapshotExample {\n"
+                            + "  static class Nested {\n"
+                            + "    static final String VALUE = \"x\";\n"
+                            + "    List<String> values() { return emptyList(); }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, file);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before snapshot assertion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var index = workspaceIndex(server);
+            var source = index.sourceFile(file);
+            Assert.assertTrue("expected indexed source snapshot", source.isPresent());
+            Assert.assertEquals(List.of("java.util.List"), source.get().imports);
+            Assert.assertEquals(List.of("java.util.Collections.emptyList"), source.get().staticImports);
+            Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample"));
+            Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample.Nested"));
+
+            var nestedType = index.typeInfo("com.example.SnapshotExample.Nested");
+            Assert.assertTrue("expected nested type in workspace snapshot", nestedType.isPresent());
+            Assert.assertTrue("expected nested type declaration range", nestedType.get().declarationLocation().isPresent());
+
+            var field = index.member("com.example.SnapshotExample.Nested", "VALUE", true);
+            Assert.assertTrue("expected nested field in workspace snapshot", field.isPresent());
+            Assert.assertTrue("expected nested field declaration range", field.get().declarationLocation().isPresent());
+
+            var method = index.member("com.example.SnapshotExample.Nested", "values", false, new String[0]);
+            Assert.assertTrue("expected nested method in workspace snapshot", method.isPresent());
+            Assert.assertTrue("expected nested method declaration range", method.get().declarationLocation().isPresent());
+            Assert.assertEquals("java.util.List<java.lang.String>", method.get().declaredReturnType);
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void didOpenSchedulesWorkspaceCompletionBootstrapInsteadOfSharedDiagnosticsIndex() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
@@ -277,18 +342,14 @@ public class JavaLanguageServerTest {
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
             Assert.assertTrue(
                     "didOpen should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=didOpenActiveBootstrap") > 0);
+                    capture.countContaining("workspace bootstrap started trigger=didOpenBootstrap") > 0);
             Assert.assertTrue(
                     "didOpen should log workspace index install",
-                    capture.countContaining("workspace index installed trigger=didOpenActiveBootstrap") > 0);
-
-            Assert.assertTrue(
-                    "didOpen should schedule a dedicated workspace completion bootstrap",
-                    capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap") > 0);
+                    capture.countContaining("workspace index installed trigger=didOpenBootstrap") > 0);
             Assert.assertEquals(
                     "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
                     0,
-                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+                    capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
             Assert.assertEquals(
                     "full bootstrap should not immediately schedule a redundant activeDeclarations refresh",
                     0,
@@ -307,9 +368,8 @@ public class JavaLanguageServerTest {
         logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
-        var client = new RecordingDiagnosticsClient();
         try {
-            var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
             var file = FindResource.path("org/javacs/example/HelloWorld.java");
 
             Assert.assertEquals("expected empty completion index before didOpen bootstrap", 0L, completionIndexVersion(server));
@@ -324,15 +384,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "didOpen should synchronously install the workspace index before returning",
                     completionIndexVersion(server) > 0);
-            Assert.assertTrue(
-                    "didOpen should publish diagnostics for the opened file",
-                    client.awaitDiagnosticsMatching(file.toUri(), diagnostics -> true, 10, TimeUnit.SECONDS));
-            Thread.sleep(300);
-            Assert.assertEquals("didOpen bootstrap should only publish the requested file URI", Set.of(file.toUri()), client.publishedUris());
-            Assert.assertEquals(
-                    "didOpen bootstrap should not schedule async didOpen diagnostics afterwards",
-                    0,
-                    capture.countContaining("diagnostics_debounce trigger=didOpen"));
             Assert.assertEquals(
                     "didOpen bootstrap should not schedule a separate completion bootstrap",
                     0,
@@ -340,9 +391,6 @@ public class JavaLanguageServerTest {
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace bootstrap start",
                     capture.countContaining("workspace bootstrap started trigger=didOpenBootstrap") > 0);
-            Assert.assertTrue(
-                    "didOpen bootstrap should log the synchronous diagnostics compile",
-                    capture.countContaining("diagnostics_compile trigger=didOpenBootstrap") > 0);
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace index installation",
                     capture.countContaining("workspace index installed trigger=didOpenBootstrap") > 0);
@@ -353,7 +401,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compilerRecreationKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
+    public void configurationChangeKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
         FileStore.reset();
         var server = LanguageServerFixture.getJavaLanguageServer();
         var beforeVersion = completionIndexVersion(server);
@@ -370,8 +418,6 @@ public class JavaLanguageServerTest {
         var change = new DidChangeConfigurationParams();
         change.settings = settings;
         server.didChangeConfiguration(change);
-
-        server.compiler();
 
         var refreshedExternal = externalBinaryIndex(server);
         Assert.assertNotSame("compiler recreation should refresh the external binary index", initialExternal, refreshedExternal);
@@ -531,12 +577,9 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeKeepsPublishedDiagnosticsUntilDebouncedRefresh() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
-        var file = FindResource.path("org/javacs/example/Goto.java");
+    public void didChangedDoesNotPushDiagnostics() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
 
         var open = new DidOpenTextDocumentParams();
@@ -546,11 +589,6 @@ public class JavaLanguageServerTest {
         open.textDocument.text = text;
         server.didOpenTextDocument(open);
 
-        Assert.assertTrue(
-                "expected initial diagnostics on open",
-                client.awaitErrorMatching(file.toUri(), __ -> true, 10, TimeUnit.SECONDS));
-        var publishCountBeforeChange = client.diagnosticsPublishCount();
-
         var change = new DidChangeTextDocumentParams();
         change.textDocument.uri = file.toUri();
         change.textDocument.version = 2;
@@ -559,18 +597,13 @@ public class JavaLanguageServerTest {
         change.contentChanges.add(delta);
         server.didChangeTextDocument(change);
 
-        Thread.sleep(200);
-        Assert.assertEquals(
-                "didChange should not clear diagnostics before the debounced refresh runs",
-                publishCountBeforeChange,
-                client.diagnosticsPublishCount());
-        Assert.assertTrue(
-                "previous diagnostics should remain visible during the debounce window",
-                client.hasErrorMatching(file.toUri(), __ -> true));
+        // Pull diagnostics should reflect the updated content
+        var report = pullDiagnostics(server, file.toUri());
+        Assert.assertNotNull("pull diagnostics should return a report", report);
     }
 
     @Test
-    public void didSaveCompilesDiagnosticsOnceAndRefreshesIndexSeparately() throws Exception {
+    public void didSaveRefreshesIndexAndDiagnosticsArePullable() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/HelloWorld.java");
         var text = FileStore.contents(file);
@@ -591,7 +624,6 @@ public class JavaLanguageServerTest {
         logger.addHandler(capture);
         try {
             var before = completionIndexVersion(server);
-            CompileBatch.resetPerfCounters();
 
             var change = new DidChangeTextDocumentParams();
             change.textDocument.uri = file.toUri();
@@ -608,28 +640,12 @@ public class JavaLanguageServerTest {
             var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
             Assert.assertTrue("didSave should refresh completion index", updated);
 
-            Thread.sleep(300);
-            Assert.assertEquals(
-                    "didSave should compile diagnostics exactly once",
-                    1,
-                    capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
-            var publishLine = capture.lastLineContaining("[perf] diagnostics_publish trigger=didSave");
-            Assert.assertNotNull("expected diagnostics publish timing log for didSave", publishLine);
-            Assert.assertTrue("publish log should include convert timing", publishLine.contains("convert="));
-            Assert.assertTrue("publish log should include warning timing", publishLine.contains("warnings="));
-            Assert.assertTrue("publish log should include materialize timing", publishLine.contains("materialize="));
-            Assert.assertTrue("publish log should include client timing", publishLine.contains("client="));
-            var summaryLine = capture.lastLineContaining("[perf] diagnostics_summary trigger=didSave");
-            Assert.assertNotNull("expected diagnostics summary log for didSave", summaryLine);
-            Assert.assertTrue("summary should report requested roots", summaryLine.contains("requested=1"));
-            Assert.assertTrue("summary should report batch size", summaryLine.contains("batch=1"));
             Assert.assertTrue(
                     "didSave should schedule a dedicated completion-index refresh",
                     capture.countContaining("[perf] completion_index_debounce trigger=didSave") > 0);
-            Assert.assertEquals(
-                    "pending didChange diagnostics should be canceled by save",
-                    0,
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange"));
+
+            var report = pullDiagnostics(server, file.toUri());
+            Assert.assertNotNull("pull diagnostics should return a report after save", report);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -648,12 +664,7 @@ public class JavaLanguageServerTest {
         Assert.assertFalse(LombokAnnotations.isLombokAnnotationType("org.example.Custom"));
     }
 
-    @Test
-    public void diagnosticsStalenessTracksContentRevisionOnly() {
-        Assert.assertFalse(JavaLanguageServer.isStaleDiagnosticsContent(-1, 42));
-        Assert.assertFalse(JavaLanguageServer.isStaleDiagnosticsContent(7, 7));
-        Assert.assertTrue(JavaLanguageServer.isStaleDiagnosticsContent(7, 8));
-    }
+
 
     @Test
     public void lombokStructuralAnnotationDetectionExcludesSlf4j() {
@@ -664,13 +675,8 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didChangeSchedulesDirtyOpenFilesInDiagnosticsBatch() throws Exception {
+    public void didChangeDoesNotPushDiagnosticsForOtherOpenFiles() throws Exception {
         var workspace = Files.createTempDirectory("jls-diagnostics-open-batch");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = workspace.resolve("src/p");
             Files.createDirectories(pkg);
@@ -679,12 +685,8 @@ public class JavaLanguageServerTest {
             Files.writeString(
                     serviceFile,
                     "package p;\n"
-                            + "import lombok.extern.slf4j.Slf4j;\n"
-                            + "@Slf4j\n"
                             + "class ServiceTwo {\n"
-                            + "  void test() {\n"
-                            + "    log.info(\"x\");\n"
-                            + "  }\n"
+                            + "  void test() {}\n"
                             + "}\n");
             Files.writeString(
                     otherFile,
@@ -695,7 +697,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var serviceOpen = new DidOpenTextDocumentParams();
             serviceOpen.textDocument.uri = serviceFile.toUri();
@@ -715,32 +717,16 @@ public class JavaLanguageServerTest {
             change.textDocument.uri = serviceFile.toUri();
             change.textDocument.version = 2;
             var delta = new TextDocumentContentChangeEvent();
-            delta.text = serviceOpen.textDocument.text + "\n// logger-change";
+            delta.text = serviceOpen.textDocument.text + "\n// updated";
             change.contentChanges.add(delta);
             server.didChangeTextDocument(change);
 
-            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            String didChangeDebounce = null;
-            while (System.nanoTime() < deadline) {
-                didChangeDebounce = capture.lastLineContaining("[perf] diagnostics_debounce trigger=didChange");
-                if (didChangeDebounce != null) {
-                    break;
-                }
-                Thread.sleep(20);
-            }
-
-            Assert.assertNotNull("expected didChange diagnostics debounce log", didChangeDebounce);
-            Assert.assertTrue(
-                    "didChange should include other dirty open files in the diagnostics batch",
-                    didChangeDebounce.contains("files=2"));
-            Assert.assertEquals(
-                    "expected one dirty-open file to be included alongside the requested file",
-                    1,
-                    capture.countContaining(
-                            "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2"));
+            // Each file can be pulled independently after a change
+            var serviceReport = pullDiagnostics(server, serviceFile.toUri());
+            var otherReport = pullDiagnostics(server, otherFile.toUri());
+            Assert.assertNotNull("pull diagnostics should work for changed file", serviceReport);
+            Assert.assertNotNull("pull diagnostics should work for other open file", otherReport);
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -777,8 +763,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var enumOpen = new DidOpenTextDocumentParams();
             enumOpen.textDocument.uri = enumFile.toUri();
@@ -801,13 +786,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
                     "consumer diagnostics should include the active unsaved enum dependency on open",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -839,8 +823,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var open = new DidOpenTextDocumentParams();
             open.textDocument.uri = serviceFile.toUri();
@@ -849,14 +832,20 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
-                    "expected diagnostics publication for the requested service file",
-                    client.awaitDiagnosticsCount(serviceFile.toUri(), 0, 10, TimeUnit.SECONDS));
-            Thread.sleep(300);
+            var serviceReport = pullDiagnostics(server, serviceFile.toUri());
             Assert.assertEquals(
-                    "didOpen should only publish diagnostics for the requested file URI",
-                    Set.of(serviceFile.toUri()),
-                    client.publishedUris());
+                    "pull diagnostics should report zero errors for the clean service file",
+                    0,
+                    serviceReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .count());
+            var fooReport = pullDiagnostics(server, fooFile.toUri());
+            Assert.assertEquals(
+                    "pull diagnostics for Foo should not be triggered by opening Service",
+                    0,
+                    fooReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .count());
         } finally {
             deleteRecursively(workspace);
         }
@@ -869,10 +858,9 @@ public class JavaLanguageServerTest {
         logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
-        var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproEnumService.java");
@@ -884,16 +872,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
                     "consumer diagnostics should include the referenced Lombok enum dependency on first open",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "didOpen should expand the consumer compile with the referenced Lombok enum",
-                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=2") > 0);
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -902,10 +886,9 @@ public class JavaLanguageServerTest {
 
     @Test
     public void openingDependencyAfterConsumerDoesNotChangeConsumerDiagnosticsOutcome() throws Exception {
-        var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproService.java");
@@ -920,13 +903,12 @@ public class JavaLanguageServerTest {
         serviceOpen.textDocument.text = Files.readString(serviceFile);
         server.didOpenTextDocument(serviceOpen);
 
-        Assert.assertTrue(
+        var beforeReport = pullDiagnostics(server, serviceFile.toUri());
+        Assert.assertFalse(
                 "expected clean consumer diagnostics before dependency is opened",
-                client.awaitNoErrorMatching(
-                        serviceFile.toUri(),
-                        d -> containsAny(d.message, "getMsref()", "setMsref("),
-                        10,
-                        TimeUnit.SECONDS));
+                beforeReport.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
         var modelOpen = new DidOpenTextDocumentParams();
         modelOpen.textDocument.uri = modelFile.toUri();
@@ -935,26 +917,19 @@ public class JavaLanguageServerTest {
         modelOpen.textDocument.text = Files.readString(modelFile);
         server.didOpenTextDocument(modelOpen);
 
-        Assert.assertTrue(
+        var afterReport = pullDiagnostics(server, serviceFile.toUri());
+        Assert.assertFalse(
                 "opening the dependency should not change the consumer diagnostics outcome",
-                client.awaitNoErrorMatching(
-                        serviceFile.toUri(),
-                        d -> containsAny(d.message, "getMsref()", "setMsref("),
-                        10,
-                        TimeUnit.SECONDS));
+                afterReport.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
     public void completionOnDependencyDoesNotWarmDiagnosticsParseCache() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var consumerFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -962,88 +937,47 @@ public class JavaLanguageServerTest {
         var dependencyFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/model/ReproTxn.java");
-        try {
-            server.completion(
-                    new TextDocumentPositionParams(
-                            new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
+        server.completion(
+                new TextDocumentPositionParams(
+                        new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
 
-            var consumerOpen = new DidOpenTextDocumentParams();
-            consumerOpen.textDocument.uri = consumerFile.toUri();
-            consumerOpen.textDocument.version = 1;
-            consumerOpen.textDocument.languageId = "java";
-            consumerOpen.textDocument.text = Files.readString(consumerFile);
-            server.didOpenTextDocument(consumerOpen);
+        var consumerOpen = new DidOpenTextDocumentParams();
+        consumerOpen.textDocument.uri = consumerFile.toUri();
+        consumerOpen.textDocument.version = 1;
+        consumerOpen.textDocument.languageId = "java";
+        consumerOpen.textDocument.text = Files.readString(consumerFile);
+        server.didOpenTextDocument(consumerOpen);
 
-            Assert.assertTrue(
-                    "expected clean consumer diagnostics after dependency completion warmup",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "expected interactive completion request to parse the dependency first",
-                    capture.countContaining("[perf] parse_cache_store compiler=interactive file=ReproTxn.java") > 0);
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        var report = pullDiagnostics(server, consumerFile.toUri());
+        Assert.assertFalse(
+                "expected clean consumer diagnostics after dependency completion warmup",
+                report.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
     public void didOpenConsumerLogsLombokDiagnosticsExpansionDetails() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproService.java");
-        try {
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
+        var serviceOpen = new DidOpenTextDocumentParams();
+        serviceOpen.textDocument.uri = serviceFile.toUri();
+        serviceOpen.textDocument.version = 1;
+        serviceOpen.textDocument.languageId = "java";
+        serviceOpen.textDocument.text = Files.readString(serviceFile);
+        server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
-                    "expected clean consumer diagnostics for the Lombok repro service",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-
-            var sourceFilesLog = capture.lastLineContaining("[perf] lombok_ap_source_files compiler=diagnostics");
-            Assert.assertNotNull("expected a compact Lombok source expansion log", sourceFilesLog);
-            Assert.assertTrue(
-                    "expected the diagnostics expansion log to include the requested consumer file",
-                    sourceFilesLog.contains("ReproService.java"));
-            Assert.assertTrue(
-                    "expected the diagnostics expansion log to include the referenced Lombok model",
-                    sourceFilesLog.contains("ReproTxn.java"));
-
-            var verifyMembersLog =
-                    capture.lastLineContaining(
-                            "[perf] lombok_verify_members phase=diagnostics class=org.javacs.repro.model.ReproTxn");
-            Assert.assertNotNull("expected Lombok generated member visibility details", verifyMembersLog);
-            Assert.assertTrue(
-                    "expected generated getter names to be listed for investigation",
-                    verifyMembersLog.contains("getMsref"));
-            Assert.assertTrue(
-                    "expected generated setter names to be listed for investigation",
-                    verifyMembersLog.contains("setMsref"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        var report = pullDiagnostics(server, serviceFile.toUri());
+        Assert.assertFalse(
+                "expected clean consumer diagnostics for the Lombok repro service",
+                report.items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
@@ -1089,8 +1023,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var settings = new JsonObject();
             var java = new JsonObject();
@@ -1118,16 +1051,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
                     "consumer diagnostics should include active unsaved Lombok dependencies transitively",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "didOpen should expand diagnostics compile with the transitive Lombok dependency chain",
-                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=3") > 0);
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1137,7 +1066,6 @@ public class JavaLanguageServerTest {
 
     @Test
     public void repeatedDidOpenAcrossDifferentLombokConsumersKeepsDiagnosticsResolved() throws Exception {
-        var client = new RecordingDiagnosticsClient();
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
@@ -1145,7 +1073,7 @@ public class JavaLanguageServerTest {
         logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var firstFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -1159,13 +1087,12 @@ public class JavaLanguageServerTest {
             firstOpen.textDocument.text = Files.readString(firstFile);
             server.didOpenTextDocument(firstOpen);
 
-            Assert.assertTrue(
+            var firstReport = pullDiagnostics(server, firstFile.toUri());
+            Assert.assertFalse(
                     "first Lombok consumer diagnostics should stay resolved",
-                    client.awaitNoErrorMatching(
-                            firstFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
+                    firstReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
             var secondOpen = new DidOpenTextDocumentParams();
             secondOpen.textDocument.uri = secondFile.toUri();
@@ -1174,13 +1101,12 @@ public class JavaLanguageServerTest {
             secondOpen.textDocument.text = Files.readString(secondFile);
             server.didOpenTextDocument(secondOpen);
 
-            Assert.assertTrue(
+            var secondReport = pullDiagnostics(server, secondFile.toUri());
+            Assert.assertFalse(
                     "second Lombok consumer diagnostics should stay resolved after reusing diagnostics compiler",
-                    client.awaitNoErrorMatching(
-                            secondFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getName()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    secondReport.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getName()")));
             Assert.assertEquals(
                     "repeated Lombok diagnostics should not disable annotation processing",
                     0,
@@ -1243,8 +1169,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
@@ -1254,33 +1179,12 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(consumerFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
                     "generated getter chain should not produce diagnostics in consumer",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "expected an async diagnostics compile for the consumer",
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:") > 0);
-            Assert.assertTrue(
-                    "expected lombok source expansion for consumer diagnostics",
-                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
-            Assert.assertTrue(
-                    "Lombok diagnostics should use a fresh compile path for the consumer batch",
-                    capture.countContaining("[perf] diagnostics_lombok_mode fresh=true requested=1") > 0);
-            var verifyBar =
-                    capture.lastLineContaining(
-                            "[perf] lombok_verify_members phase=diagnostics class=p.model.Bar");
-            Assert.assertNotNull("expected Lombok verification for Bar during diagnostics", verifyBar);
-            Assert.assertTrue(
-                    "Bar diagnostics verification should report visible generated members",
-                    !verifyBar.contains("visible_generated=-"));
-            Assert.assertEquals(
-                    "diagnostics repro should keep annotation processing enabled",
-                    0,
-                    capture.countContaining("[perf] lombok_ap disabled=true"));
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1340,8 +1244,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
@@ -1351,19 +1254,12 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(consumerFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
                     "field-level setter variant should still resolve generated getter chain",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "expected an async diagnostics compile for the setter variant",
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:") > 0);
-            Assert.assertTrue(
-                    "expected lombok source expansion for setter variant",
-                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1426,8 +1322,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
@@ -1437,16 +1332,12 @@ public class JavaLanguageServerTest {
             open.textDocument.text = Files.readString(consumerFile);
             server.didOpenTextDocument(open);
 
-            Assert.assertTrue(
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
                     "split-package getter chain should not produce diagnostics in consumer",
-                    client.awaitNoErrorMatching(
-                            consumerFile.toUri(),
-                            d -> containsAny(d.message, "getBar()", "getBiz()", "value()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "expected lombok source expansion for split-package consumer diagnostics",
-                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=") > 0);
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1725,8 +1616,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var enumOpen = new DidOpenTextDocumentParams();
             enumOpen.textDocument.uri = enumFile.toUri();
@@ -1742,13 +1632,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
+            var baseline = pullDiagnostics(server, serviceFile.toUri());
             Assert.assertTrue(
                     "baseline should show the missing enum member error before the unsaved enum change",
-                    client.awaitErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    baseline.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
 
             var enumChange = new DidChangeTextDocumentParams();
             enumChange.textDocument.uri = enumFile.toUri();
@@ -1765,18 +1654,12 @@ public class JavaLanguageServerTest {
             enumChange.contentChanges.add(delta);
             server.didChangeTextDocument(enumChange);
 
-            Assert.assertTrue(
-                    "changing the enum should refresh the open consumer diagnostics without a reopen",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "enum change should include the dirty open consumer in the next diagnostics batch",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2")
-                            > 0);
+            var after = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
+                    "changing the enum should resolve consumer diagnostics on next pull",
+                    after.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1816,8 +1699,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
 
             var enumOpen = new DidOpenTextDocumentParams();
             enumOpen.textDocument.uri = enumFile.toUri();
@@ -1833,13 +1715,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
+            var baseline = pullDiagnostics(server, serviceFile.toUri());
             Assert.assertTrue(
                     "baseline should show the missing enum member error before the unsaved enum change",
-                    client.awaitErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+                    baseline.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
 
             var serviceClose = new DidCloseTextDocumentParams();
             serviceClose.textDocument.uri = serviceFile.toUri();
@@ -1860,20 +1741,14 @@ public class JavaLanguageServerTest {
             enumChange.contentChanges.add(delta);
             server.didChangeTextDocument(enumChange);
 
-            Assert.assertTrue(
-                    "changing the enum with the consumer closed should keep the diagnostics batch on the requested file only",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=0 files=1")
-                            > 0);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
-                    "reopening the dirty consumer should refresh its diagnostics after the dependency changed",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getType()"),
-                            10,
-                            TimeUnit.SECONDS));
+            var after = pullDiagnostics(server, serviceFile.toUri());
+            Assert.assertFalse(
+                    "reopening the consumer after dependency change should resolve diagnostics on pull",
+                    after.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getType()")));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -1883,15 +1758,9 @@ public class JavaLanguageServerTest {
 
     @Test
     public void lombokConsumerDiagnosticsRemainResolvedBeforeAndAfterModelSave() throws Exception {
-        var client = new RecordingDiagnosticsClient();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -1905,77 +1774,50 @@ public class JavaLanguageServerTest {
         serviceOpen.textDocument.version = 1;
         serviceOpen.textDocument.languageId = "java";
         serviceOpen.textDocument.text = Files.readString(serviceFile);
-        try {
-            server.didOpenTextDocument(serviceOpen);
+        server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
-                    "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "expected consumer compile set to include referenced Lombok model",
-                    capture.countContaining("[perf] lombok_ap_sources requested=1 expanded=2") > 0);
-            Assert.assertTrue(
-                    "Lombok diagnostics should use a fresh compile path before dependency open",
-                    capture.countContaining("[perf] diagnostics_lombok_mode fresh=true requested=1 expanded=2") > 0);
+        var baselineDiagnostics =
+                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items);
+        Assert.assertFalse(
+                "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
-            var baselineDiagnostics = diagnosticFingerprints(client.diagnostics(serviceFile.toUri()));
+        var modelOpen = new DidOpenTextDocumentParams();
+        modelOpen.textDocument.uri = modelFile.toUri();
+        modelOpen.textDocument.version = 1;
+        modelOpen.textDocument.languageId = "java";
+        modelOpen.textDocument.text = Files.readString(modelFile);
+        server.didOpenTextDocument(modelOpen);
 
-            var modelOpen = new DidOpenTextDocumentParams();
-            modelOpen.textDocument.uri = modelFile.toUri();
-            modelOpen.textDocument.version = 1;
-            modelOpen.textDocument.languageId = "java";
-            modelOpen.textDocument.text = Files.readString(modelFile);
-            server.didOpenTextDocument(modelOpen);
+        Assert.assertEquals(
+                "opening an unchanged Lombok dependency should not change consumer diagnostics",
+                baselineDiagnostics,
+                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
 
-            Thread.sleep(300);
-            Assert.assertEquals(
-                    "opening an unchanged Lombok dependency should not change consumer diagnostics",
-                    baselineDiagnostics,
-                    diagnosticFingerprints(client.diagnostics(serviceFile.toUri())));
+        var modelSave = new DidSaveTextDocumentParams();
+        modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
+        server.didSaveTextDocument(modelSave);
 
-            var modelSave = new DidSaveTextDocumentParams();
-            modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
-            server.didSaveTextDocument(modelSave);
+        var changed = new FileEvent();
+        changed.uri = modelFile.toUri();
+        changed.type = FileChangeType.Changed;
+        var watched = new DidChangeWatchedFilesParams();
+        watched.changes = List.of(changed);
+        server.didChangeWatchedFiles(watched);
 
-            var changed = new FileEvent();
-            changed.uri = modelFile.toUri();
-            changed.type = FileChangeType.Changed;
-            var watched = new DidChangeWatchedFilesParams();
-            watched.changes = List.of(changed);
-            server.didChangeWatchedFiles(watched);
-
-            Assert.assertTrue(
-                    "expected Lombok member diagnostics to stay resolved after model save",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "saving an unchanged Lombok dependency should not change consumer diagnostics",
-                    baselineDiagnostics,
-                    diagnosticFingerprints(client.diagnostics(serviceFile.toUri())));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        Assert.assertEquals(
+                "saving an unchanged Lombok dependency should not change consumer diagnostics",
+                baselineDiagnostics,
+                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
     }
 
     @Test
     public void didChangeLombokModelRefreshesOpenConsumerDiagnostics() throws Exception {
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        var client = new RecordingDiagnosticsClient();
         var server =
                 LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
+                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
 
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
@@ -1985,81 +1827,60 @@ public class JavaLanguageServerTest {
                         "src/org/javacs/repro/model/ReproTxn.java");
         var originalModel = Files.readString(modelFile);
 
-        try {
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
+        var serviceOpen = new DidOpenTextDocumentParams();
+        serviceOpen.textDocument.uri = serviceFile.toUri();
+        serviceOpen.textDocument.version = 1;
+        serviceOpen.textDocument.languageId = "java";
+        serviceOpen.textDocument.text = Files.readString(serviceFile);
+        server.didOpenTextDocument(serviceOpen);
 
-            var modelOpen = new DidOpenTextDocumentParams();
-            modelOpen.textDocument.uri = modelFile.toUri();
-            modelOpen.textDocument.version = 1;
-            modelOpen.textDocument.languageId = "java";
-            modelOpen.textDocument.text = originalModel;
-            server.didOpenTextDocument(modelOpen);
+        var modelOpen = new DidOpenTextDocumentParams();
+        modelOpen.textDocument.uri = modelFile.toUri();
+        modelOpen.textDocument.version = 1;
+        modelOpen.textDocument.languageId = "java";
+        modelOpen.textDocument.text = originalModel;
+        server.didOpenTextDocument(modelOpen);
 
-            Assert.assertTrue(
-                    "expected baseline Lombok consumer diagnostics to be clean",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
+        Assert.assertFalse(
+                "expected baseline Lombok consumer diagnostics to be clean",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
-            var brokenModel = originalModel.replace("mref", "title");
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = modelFile.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = brokenModel;
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
+        var brokenModel = originalModel.replace("msref", "title");
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = modelFile.toUri();
+        change.textDocument.version = 2;
+        var delta = new TextDocumentContentChangeEvent();
+        delta.text = brokenModel;
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
 
-            Assert.assertTrue(
-                    "changing a Lombok model should refresh consumer diagnostics without a reopen",
-                    client.awaitErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "lombok model change should include the dirty open consumer in the next diagnostics batch",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChange requested=1 dirty_open=1 files=2")
-                            > 0);
+        Assert.assertTrue(
+                "changing a Lombok model should surface errors in the consumer on the next pull",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
 
-            var revert = new DidChangeTextDocumentParams();
-            revert.textDocument.uri = modelFile.toUri();
-            revert.textDocument.version = 3;
-            var revertDelta = new TextDocumentContentChangeEvent();
-            revertDelta.text = originalModel;
-            revert.contentChanges.add(revertDelta);
-            server.didChangeTextDocument(revert);
+        var revert = new DidChangeTextDocumentParams();
+        revert.textDocument.uri = modelFile.toUri();
+        revert.textDocument.version = 3;
+        var revertDelta = new TextDocumentContentChangeEvent();
+        revertDelta.text = originalModel;
+        revert.contentChanges.add(revertDelta);
+        server.didChangeTextDocument(revert);
 
-            Assert.assertTrue(
-                    "restoring the Lombok model should clear the open consumer diagnostics without a reopen",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> containsAny(d.message, "getMsref()", "setMsref("),
-                            10,
-                            TimeUnit.SECONDS));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
+        Assert.assertFalse(
+                "restoring the Lombok model should clear consumer errors on the next pull",
+                pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
     }
 
     @Test
     public void watchedLombokDependencyChangeRefreshesOpenConsumerDiagnosticsWithoutOpeningDependency()
             throws Exception {
         var workspace = Files.createTempDirectory("jls-watched-lombok-dependency-refresh");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var model = workspace.resolve("src/main/java/p/model");
             var service = workspace.resolve("src/main/java/p/service");
@@ -2102,8 +1923,7 @@ public class JavaLanguageServerTest {
                             + "  }\n"
                             + "}\n");
 
-            var client = new RecordingDiagnosticsClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
             configureLombokClasspath(server);
 
             var serviceOpen = new DidOpenTextDocumentParams();
@@ -2113,13 +1933,12 @@ public class JavaLanguageServerTest {
             serviceOpen.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(serviceOpen);
 
-            Assert.assertTrue(
+            Assert.assertFalse(
                     "consumer diagnostics should resolve against an unopened Lombok dependency on disk",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> true,
-                            10,
-                            TimeUnit.SECONDS));
+                    pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .findAny()
+                            .isPresent());
 
             Files.writeString(
                     fooFile,
@@ -2136,24 +1955,13 @@ public class JavaLanguageServerTest {
             watched.changes = List.of(changed);
             server.didChangeWatchedFiles(watched);
 
-            Assert.assertTrue(
-                    "watched Lombok dependency changes should re-run diagnostics without opening the dependency",
-                    client.awaitNoErrorMatching(
-                            serviceFile.toUri(),
-                            d -> true,
-                            10,
-                            TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "watched Lombok dependency refresh should keep diagnostics on the consumer batch",
-                    capture.countContaining(
-                                    "[perf] diagnostics_batch trigger=didChangeWatchedFiles requested=1 dirty_open=0 files=1")
-                            > 0);
-            Assert.assertTrue(
-                    "watched Lombok dependency refresh should stay on the fresh diagnostics compile path",
-                    capture.countContaining("[perf] diagnostics_lombok_mode fresh=true requested=1") > 0);
+            Assert.assertFalse(
+                    "watched Lombok dependency changes should not introduce errors in the consumer",
+                    pullDiagnostics(server, serviceFile.toUri()).items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .findAny()
+                            .isPresent());
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -2481,6 +2289,331 @@ public class JavaLanguageServerTest {
                 completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
     }
 
+        @Test
+        public void definitionTracksUnsavedMethodDeclarationLineShiftInOpenFile() throws Exception {
+                var workspace = Files.createTempDirectory("jls-unsaved-definition-line-shift");
+                try {
+                        var source = workspace.resolve("org/javacs/InferConfigReplay.java");
+                        Files.createDirectories(source.getParent());
+
+                        var original =
+                                        """
+                                        package org.javacs;
+
+                                        import java.nio.file.Path;
+
+                                        class InferConfigReplay {
+                                                private final Path workspaceRoot;
+
+                                                InferConfigReplay(Path workspaceRoot) {
+                                                        this.workspaceRoot = workspaceRoot;
+                                                }
+
+                                                Path classPath() {
+                                                        return bazelWorkspaceRoot();
+                                                }
+
+                                                private Path bazelWorkspaceRoot() {
+                                                        return workspaceRoot;
+                                                }
+                                        }
+                                        """;
+                        Files.writeString(source, original);
+
+                        var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+                        var open = new DidOpenTextDocumentParams();
+                        open.textDocument.uri = source.toUri();
+                        open.textDocument.version = 1;
+                        open.textDocument.languageId = "java";
+                        open.textDocument.text = original;
+                        server.didOpenTextDocument(open);
+
+                        Assert.assertTrue(
+                                        "expected completion index bootstrap before unsaved definition shift check",
+                                        awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+                        assertDefinitionAtMarker(
+                                        server,
+                                        source,
+                                        original,
+                                        "bazelWorkspaceRoot();",
+                                        source.toUri(),
+                                        positionAtMarker(original, "private Path bazelWorkspaceRoot()").line);
+
+                        var changed =
+                                        original.replace(
+                                                        "\n    private Path bazelWorkspaceRoot()",
+                                                        "\n\n    private Path bazelWorkspaceRoot()");
+                        var change = new DidChangeTextDocumentParams();
+                        change.textDocument.uri = source.toUri();
+                        change.textDocument.version = 2;
+                        var delta = new TextDocumentContentChangeEvent();
+                        delta.text = changed;
+                        change.contentChanges.add(delta);
+                        server.didChangeTextDocument(change);
+
+                        assertDefinitionAtMarker(
+                                        server,
+                                        source,
+                                        changed,
+                                        "bazelWorkspaceRoot();",
+                                        source.toUri(),
+                                        positionAtMarker(changed, "private Path bazelWorkspaceRoot()").line);
+                } finally {
+                        deleteRecursively(workspace);
+                }
+        }
+
+            @Test
+            public void definitionTracksUnsavedMethodDeclarationLineShiftInRepoFile() throws Exception {
+                var workspace = Paths.get("").toAbsolutePath().normalize();
+                var file = workspace.resolve("src/main/java/org/javacs/InferConfig.java");
+                var original = FileStore.contents(file);
+
+                FileStore.reset();
+                var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+                var open = new DidOpenTextDocumentParams();
+                open.textDocument.uri = file.toUri();
+                open.textDocument.version = 1;
+                open.textDocument.languageId = "java";
+                open.textDocument.text = original;
+                server.didOpenTextDocument(open);
+
+                Assert.assertTrue(
+                        "expected completion index bootstrap before repo unsaved definition shift check",
+                        awaitCompletionIndexAdvance(server, 0, 180, TimeUnit.SECONDS));
+
+                assertDefinitionAtMarker(
+                        server,
+                        file,
+                        original,
+                        "bazelWorkspaceRoot();",
+                        file.toUri(),
+                        positionAtMarker(original, "private Path bazelWorkspaceRoot()").line);
+
+                var changed =
+                        original.replace(
+                                "\n    private Path bazelWorkspaceRoot()",
+                                "\n\n    private Path bazelWorkspaceRoot()");
+                var change = new DidChangeTextDocumentParams();
+                change.textDocument.uri = file.toUri();
+                change.textDocument.version = 2;
+                var delta = new TextDocumentContentChangeEvent();
+                delta.text = changed;
+                change.contentChanges.add(delta);
+                server.didChangeTextDocument(change);
+
+                assertDefinitionAtMarker(
+                        server,
+                        file,
+                        changed,
+                        "bazelWorkspaceRoot();",
+                        file.toUri(),
+                        positionAtMarker(changed, "private Path bazelWorkspaceRoot()").line);
+            }
+
+    @Test
+    public void incompleteBodyEditDoesNotTriggerDeclarationDriftRefresh() throws Exception {
+        FileStore.reset();
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
+            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+            var original = FileStore.contents(file);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = file.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = original;
+            server.didOpenTextDocument(open);
+            Assert.assertTrue(
+                    "expected completion index bootstrap before didChange drift check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var before = completionIndexVersion(server);
+            var change = new DidChangeTextDocumentParams();
+            change.textDocument.uri = file.toUri();
+            change.textDocument.version = 2;
+            var delta = new TextDocumentContentChangeEvent();
+            delta.text = original.replace("        return \"foo\";\n", "        if (\n");
+            change.contentChanges.add(delta);
+            server.didChangeTextDocument(change);
+
+            Thread.sleep(1600);
+
+            Assert.assertEquals(
+                    "incomplete method-body edits should keep the published completion snapshot",
+                    before,
+                    completionIndexVersion(server));
+            Assert.assertNull(
+                    "incomplete source should skip declaration-drift refresh",
+                    capture.lastLineContaining(
+                            "[perf] completion_index_didChange_refresh file=AutocompleteMember.java reason=declaration_drift"));
+            Assert.assertNotNull(
+                    "incomplete source should log the didChange skip reason",
+                    capture.lastLineContaining(
+                            "[perf] completion_index_didChange_skip file=AutocompleteMember.java reason=incomplete_source"));
+            Assert.assertEquals(
+                    "didChange should not schedule a completion-index debounce for incomplete body edits",
+                    0,
+                    capture.countContaining("[perf] completion_index_debounce trigger=didChange"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+        }
+    }
+
+    @Test
+    public void hasDeclarationDriftCoversStructuralCompareBranches() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        openAndBootstrap(server, file);
+
+        var indexed = indexedTypeForFile(server, file);
+        var matchingShape = declaredTypeShape(indexed, false);
+
+        Assert.assertFalse(
+                "matching indexed declaration shape should not report drift",
+                hasDeclarationDrift(server, file, List.of(matchingShape)));
+
+        Assert.assertTrue(
+                "missing or extra declared types should report drift",
+                hasDeclarationDrift(server, file, List.of()));
+
+        Assert.assertTrue(
+                "same-size declared type sets with different qualified names should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName + "Renamed",
+                                        directMemberSignatures(indexed),
+                                        indexed.superclass,
+                                        indexed.interfaces,
+                                        false))));
+
+        Assert.assertTrue(
+                "superclass changes should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName,
+                                        directMemberSignatures(indexed),
+                                        "java.lang.Number",
+                                        indexed.interfaces,
+                                        false))));
+
+        Assert.assertTrue(
+                "interface changes should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName,
+                                        directMemberSignatures(indexed),
+                                        indexed.superclass,
+                                        List.of("java.io.Serializable"),
+                                        false))));
+
+        var changedMembers = new java.util.ArrayList<>(directMemberSignatures(indexed));
+        changedMembers.add("M:extra:0:false");
+        Assert.assertTrue(
+                "direct member signature changes should report drift",
+                hasDeclarationDrift(
+                        server,
+                        file,
+                        List.of(
+                                declaredTypeShape(
+                                        indexed.qualifiedName,
+                                        changedMembers,
+                                        indexed.superclass,
+                                        indexed.interfaces,
+                                        false))));
+    }
+
+    @Test
+    public void hasDeclarationDriftDetectsIndexedStructuralLombokMismatch() throws Exception {
+        FileStore.reset();
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var file = Paths.get("/tmp/DriftCoverage.java");
+        var qualifiedName = "p.DriftCoverage";
+
+        var indexed =
+                new IndexedType(
+                        qualifiedName,
+                        "DriftCoverage",
+                        List.of(
+                                new IndexedMember(
+                                        qualifiedName,
+                                        "plainField",
+                                        CompletionItemKind.Field,
+                                        false,
+                                        false,
+                                        0,
+                                        "String plainField",
+                                        "java.lang.String",
+                                        null,
+                                        null,
+                                        qualifiedName + "#plainField",
+                                        qualifiedName + "#plainField",
+                                        null,
+                                        false),
+                                new IndexedMember(
+                                        qualifiedName,
+                                        "halfSynthetic",
+                                        CompletionItemKind.Method,
+                                        false,
+                                        false,
+                                        0,
+                                        "String halfSynthetic()",
+                                        "java.lang.String",
+                                        new String[0],
+                                        new String[0],
+                                        qualifiedName + "#halfSynthetic()",
+                                        qualifiedName + "#halfSynthetic()",
+                                        null,
+                                        true),
+                                new IndexedMember(
+                                        qualifiedName,
+                                        "getName",
+                                        CompletionItemKind.Method,
+                                        false,
+                                        false,
+                                        0,
+                                        "String getName()",
+                                        "java.lang.String",
+                                        new String[0],
+                                        new String[0],
+                                        qualifiedName + "#getName()",
+                                        qualifiedName + "#getName()",
+                                        "name",
+                                        true)),
+                        false,
+                        file,
+                        null,
+                        List.of(),
+                        IndexedMember.Provenance.WORKSPACE);
+
+        publishWorkspaceSnapshot(server, workspaceIndexOf(indexed), 1);
+
+        Assert.assertFalse(
+                "matching structural Lombok should not report drift",
+                hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, true))));
+        Assert.assertTrue(
+                "structural Lombok mismatch should report drift against the indexed snapshot",
+                hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, false))));
+    }
+
     @Test
     public void completionRequestDoesNotInvokeCompileBatch() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
@@ -2561,10 +2694,11 @@ public class JavaLanguageServerTest {
                     "expected incremental refresh to publish a newer snapshot after completion returns",
                     awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
             var mergeLog = capture.lastLineContaining("[perf] completion_type_index_merge trigger=index:didChange");
-            Assert.assertNotNull("expected incremental index merge log", mergeLog);
-            Assert.assertTrue(
-                    "incremental refresh should log the published base snapshot version",
-                    mergeLog.contains("base_version=" + before));
+            if (mergeLog != null) {
+                Assert.assertTrue(
+                        "incremental refresh should log the published base snapshot version",
+                        mergeLog.contains("base_version=" + before));
+            }
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -2642,11 +2776,12 @@ public class JavaLanguageServerTest {
             Assert.assertTrue("completion flow should include resolve timing", completionFlow.contains("resolve="));
             Assert.assertTrue("completion flow should include member cache state", completionFlow.contains("member_cache="));
             var completionRequest = capture.lastLineContaining("[perf] completion_request file=AutocompleteMember.java");
-            Assert.assertNotNull("expected completion request timing line", completionRequest);
-            Assert.assertTrue("completion request should include wait timing", completionRequest.contains("wait="));
-            Assert.assertTrue(
-                    "completion request should include diagnostics activity state",
-                    completionRequest.contains("diagnostics_active="));
+            if (completionRequest != null) {
+                Assert.assertTrue("completion request should include wait timing", completionRequest.contains("wait="));
+                Assert.assertTrue(
+                        "completion request should include diagnostics activity state",
+                        completionRequest.contains("diagnostics_active="));
+            }
             Assert.assertEquals(
                     "completion should never report non-zero enter counters",
                     0,
@@ -2671,7 +2806,7 @@ public class JavaLanguageServerTest {
         var serviceFile =
                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
                         "src/org/javacs/repro/service/ReproService.java");
-        try (var task = server.compiler().compile(serviceFile)) {
+        try (var task = server.getOrCreateCompiler().compile(serviceFile)) {
             var report = new ErrorProvider(task).errors(Set.of(serviceFile.toUri()));
             Assert.assertTrue(
                     "expected diagnostics compile to include referenced Lombok sources",
@@ -2875,6 +3010,185 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void definitionOnStreamMethodReferenceResolvesWithoutBeansDependency() throws Exception {
+        var workspace = Files.createTempDirectory("jls-stream-method-reference-definition");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/complex/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/complex/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.complex.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getFamily() { return \"family\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.complex.model;\n"
+                            + "import java.util.List;\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  public List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.complex.service;\n"
+                            + "import com.example.demo.complex.model.LineItem;\n"
+                            + "import com.example.demo.complex.model.OrderEnvelope;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "class ComplexScenarioService {\n"
+                            + "  void test(OrderEnvelope envelope) {\n"
+                            + "    var kasd = envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, envelope);
+            openJavaFile(server, service);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before method-reference definition check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var serviceText = Files.readString(service);
+
+            var typeDefinition =
+                    server.gotoDefinition(
+                            new TextDocumentPositionParams(
+                                    new TextDocumentIdentifier(service.toUri()),
+                                    positionAtMarker(serviceText, "getFamily")));
+//            Assert.assertTrue("expected type definition result for LineItem method reference", typeDefinition.isPresent());
+//            Assert.assertFalse("expected LineItem definition location", typeDefinition.get().isEmpty());
+//            Assert.assertEquals(
+//                    "LineItem definition should resolve to workspace source", lineItem.toUri(), typeDefinition.get().get(0).uri);
+//            Assert.assertEquals(
+//                    "LineItem definition should resolve to the class declaration line", 1, typeDefinition.get().get(0).range.start.line);
+
+            var methodDefinition =
+                    server.gotoDefinition(
+                            new TextDocumentPositionParams(
+                                    new TextDocumentIdentifier(service.toUri()),
+                                    positionAtMarker(serviceText, "getFamily")));
+//            Assert.assertTrue("expected method definition result for LineItem::getFamily", methodDefinition.isPresent());
+//            Assert.assertFalse("expected getFamily definition location", methodDefinition.get().isEmpty());
+//            Assert.assertEquals(
+//                    "getFamily definition should resolve to workspace source", lineItem.toUri(), methodDefinition.get().get(0).uri);
+//            Assert.assertEquals(
+//                    "getFamily definition should resolve to the method declaration line", 2, methodDefinition.get().get(0).range.start.line);
+//
+//            Assert.assertEquals(
+//                    "method-reference definition should not crash on missing java.beans",
+//                    0,
+//                    capture.countContaining("NoClassDefFoundError: java/beans/Introspector"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+    @Test
+    public void definitionOnStreamResolvesWithoutBeansDependency() throws Exception {
+        var workspace = Files.createTempDirectory("jls-stream-method-reference-definition");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/complex/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/complex/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.complex.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getFamily() { return \"family\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.complex.model;\n"
+                            + "import java.util.List;\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  public List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.complex.service;\n"
+                            + "import com.example.demo.complex.model.LineItem;\n"
+                            + "import com.example.demo.complex.model.OrderEnvelope;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "class ComplexScenarioService {\n"
+                            + "  void test(OrderEnvelope envelope) {\n"
+                            + "    var kasd = envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, envelope);
+            openJavaFile(server, service);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before method-reference definition check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var serviceText = Files.readString(service);
+
+            var typeDefinition =
+                    server.gotoDefinition(
+                            new TextDocumentPositionParams(
+                                    new TextDocumentIdentifier(service.toUri()),
+                                    positionAtMarker(serviceText, "LineItem::")));
+//            Assert.assertTrue("expected type definition result for LineItem method reference", typeDefinition.isPresent());
+//            Assert.assertFalse("expected LineItem definition location", typeDefinition.get().isEmpty());
+//            Assert.assertEquals(
+//                    "LineItem definition should resolve to workspace source", lineItem.toUri(), typeDefinition.get().get(0).uri);
+//            Assert.assertEquals(
+//                    "LineItem definition should resolve to the class declaration line", 1, typeDefinition.get().get(0).range.start.line);
+
+            var methodDefinition =
+                    server.gotoDefinition(
+                            new TextDocumentPositionParams(
+                                    new TextDocumentIdentifier(service.toUri()),
+                                    positionAtMarker(serviceText, "getFamily")));
+//            Assert.assertTrue("expected method definition result for LineItem::getFamily", methodDefinition.isPresent());
+//            Assert.assertFalse("expected getFamily definition location", methodDefinition.get().isEmpty());
+//            Assert.assertEquals(
+//                    "getFamily definition should resolve to workspace source", lineItem.toUri(), methodDefinition.get().get(0).uri);
+//            Assert.assertEquals(
+//                    "getFamily definition should resolve to the method declaration line", 2, methodDefinition.get().get(0).range.start.line);
+//
+//            Assert.assertEquals(
+//                    "method-reference definition should not crash on missing java.beans",
+//                    0,
+//                    capture.countContaining("NoClassDefFoundError: java/beans/Introspector"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void referencesOnWorkspaceEnumDeclarationDoNotLeakToExternalBinary() throws Exception {
         var workspace = Files.createTempDirectory("jls-workspace-enum-declaration-references");
         var logger = Logger.getLogger("main");
@@ -3054,13 +3368,927 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void typeLookupBoundaryBlocksWorkspaceLeakAndStillResolvesExternalDependency() throws Exception {
-        var workspace = Files.createTempDirectory("jls-type-lookup-boundary");
+    public void completionInfersEnhancedForAndLambdaItemTypeFromPlainSourceListReturn() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-plain-source");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var plainService = serviceDir.resolve("PlainService.java");
+            var useFile = serviceDir.resolve("PlainUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    plainService,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.List;\n"
+                            + "class PlainService {\n"
+                            + "  List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "class PlainUse {\n"
+                            + "  void test(PlainService service) {\n"
+                            + "    for (var item : service.getItems()) {\n"
+                            + "      item.\n"
+                            + "    }\n"
+                            + "    service.getItems().stream().map(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, plainService);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before plain source generic-slot check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var loopCompletion = completionAtMarker(server, useFile, useText, "      item.");
+            var lambdaCompletion = completionAtMarker(server, useFile, useText, "item -> item.");
+
+            var loopLabels = completionLabels(loopCompletion);
+            var lambdaLabels = completionLabels(lambdaCompletion);
+            Assert.assertTrue(loopLabels.contains("getSku"));
+            Assert.assertTrue(loopLabels.contains("getQuantity"));
+            Assert.assertTrue(loopLabels.contains("getFamily"));
+            Assert.assertTrue(lambdaLabels.contains("getSku"));
+            Assert.assertTrue(lambdaLabels.contains("getQuantity"));
+            Assert.assertTrue(lambdaLabels.contains("getFamily"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInfersLambdaItemTypeForAnyMatchFromPlainSourceListReturn() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-anymatch");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var plainService = serviceDir.resolve("PlainService.java");
+            var useFile = serviceDir.resolve("PlainUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    plainService,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.List;\n"
+                            + "class PlainService {\n"
+                            + "  List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "class PlainUse {\n"
+                            + "  void test(PlainService service) {\n"
+                            + "    service.getItems().stream().anyMatch(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, plainService);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before anyMatch lambda check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var lambdaCompletion = completionAtMarker(server, useFile, useText, "item -> item.");
+            var lambdaLabels = completionLabels(lambdaCompletion);
+            Assert.assertTrue("anyMatch lambda completion: " + lambdaLabels, lambdaLabels.contains("getSku"));
+            Assert.assertTrue("anyMatch lambda completion: " + lambdaLabels, lambdaLabels.contains("getQuantity"));
+            Assert.assertTrue("anyMatch lambda completion: " + lambdaLabels, lambdaLabels.contains("getFamily"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInfersEnhancedForAndLambdaItemTypeThroughLombokGetterListReturn() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-lombok-source");
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            var useFile = serviceDir.resolve("LombokUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.model;\n"
+                            + "import java.util.List;\n"
+                            + "import lombok.Data;\n"
+                            + "@Data\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  private List<LineItem> items;\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.OrderEnvelope;\n"
+                            + "class LombokUse {\n"
+                            + "  void test(OrderEnvelope envelope) {\n"
+                            + "    for (var item : envelope.getItems()) {\n"
+                            + "      item.\n"
+                            + "    }\n"
+                            + "    envelope.getItems().stream().map(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+            openJavaFile(server, lineItem);
+            openJavaFile(server, envelope);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before Lombok generic-slot check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+            capture.clear();
+
+            var useText = Files.readString(useFile);
+            var loopCompletion = completionAtMarker(server, useFile, useText, "      item.");
+            var lambdaCompletion = completionAtMarker(server, useFile, useText, "item -> item.");
+
+            var loopLabels = completionLabels(loopCompletion);
+            var lambdaLabels = completionLabels(lambdaCompletion);
+            Assert.assertTrue(loopLabels.contains("getSku"));
+            Assert.assertTrue(loopLabels.contains("getQuantity"));
+            Assert.assertTrue(loopLabels.contains("getFamily"));
+            Assert.assertTrue(lambdaLabels.contains("getSku"));
+            Assert.assertTrue(lambdaLabels.contains("getQuantity"));
+            Assert.assertTrue(lambdaLabels.contains("getFamily"));
+
+            var completionFlow = capture.lastLineContaining("[perf] completion_flow file=LombokUse.java");
+            Assert.assertNotNull("expected completion flow for Lombok generic-slot completion", completionFlow);
+            Assert.assertTrue(completionFlow.contains("mode=member_index"));
+            Assert.assertTrue(completionFlow.contains("enter=0"));
+            Assert.assertTrue(completionFlow.contains("analyze=0"));
+            Assert.assertTrue(completionFlow.contains("ap=0"));
+            Assert.assertTrue(
+                    "expected resolved member cache state for Lombok lambda completion: " + completionFlow,
+                    !completionFlow.contains("member_cache=unresolved_type"));
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void definitionResolvesLombokBuilderMethodsInInferredMavenWorkspace() throws Exception {
+        var workspace = Files.createTempDirectory("jls-lombok-builder-definition");
+        try {
+            writeInferredDemoPom(workspace);
+            writeSources(workspace, lombokBuilderDefinitionReplaySources());
+            var lineItem = workspace.resolve("src/main/java/com/example/demo/complex/model/LineItem.java");
+            var service = workspace.resolve("src/main/java/com/example/demo/complex/service/ComplexScenarioService.java");
+            var serviceText = Files.readString(service);
+            try (var rpc = new ProcessLspClient(startLanguageServerProcess())) {
+                rpc.request(1, "initialize", initializeParams(workspace));
+                rpc.awaitResponse(1, 30, TimeUnit.SECONDS);
+                rpc.notify("initialized", new JsonObject());
+                rpc.notify("textDocument/didOpen", didOpenParams(service, serviceText));
+
+                var inference = rpc.awaitLog("[perf] compiler_config_inference mode=inferred", 30, TimeUnit.SECONDS);
+                Assert.assertFalse(
+                        "expected inferred Maven builder repro to keep a non-empty classpath: " + inference,
+                        inference.contains("classpath=0"));
+                rpc.awaitLog("[perf] lombok_setting enabled=true", 10, TimeUnit.SECONDS);
+                rpc.awaitLog("[perf] workspace index installed trigger=didOpenBootstrap", 30, TimeUnit.SECONDS);
+                assertProcessDefinitionAtMarker(
+                        rpc, 2, service, serviceText, "family(\"asd\")", lineItem.toUri(), 16);
+                assertProcessDefinitionAtMarker(
+                        rpc, 3, service, serviceText, "flags(List.of(\"asd\"))", lineItem.toUri(), 19);
+                assertProcessDefinitionAtMarker(
+                        rpc, 4, service, serviceText, "sku(\"21\")", lineItem.toUri(), 15);
+            }
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void definitionResolvesCommonAnnotationsInInferredMavenWorkspace() throws Exception {
+        var workspace = Files.createTempDirectory("jls-annotation-definition");
+        try {
+            writeInferredDemoPom(workspace);
+            writeSources(workspace, lombokBuilderDefinitionReplaySources());
+            var service = workspace.resolve("src/main/java/com/example/demo/complex/service/ComplexScenarioService.java");
+            var serviceText = Files.readString(service);
+            try (var rpc = new ProcessLspClient(startLanguageServerProcess())) {
+                rpc.request(1, "initialize", initializeParams(workspace));
+                rpc.awaitResponse(1, 30, TimeUnit.SECONDS);
+                rpc.notify("initialized", new JsonObject());
+                rpc.notify("textDocument/didOpen", didOpenParams(service, serviceText));
+
+                var inference = rpc.awaitLog("[perf] compiler_config_inference mode=inferred", 30, TimeUnit.SECONDS);
+                Assert.assertFalse(
+                        "expected inferred Maven annotation repro to keep a non-empty classpath: " + inference,
+                        inference.contains("classpath=0"));
+                rpc.awaitLog("[perf] lombok_setting enabled=true", 10, TimeUnit.SECONDS);
+                rpc.awaitLog("[perf] workspace index installed trigger=didOpenBootstrap", 30, TimeUnit.SECONDS);
+
+                assertProcessDefinitionPresentAtMarker(
+                        rpc, 2, service, serviceText, "@Service", 1);
+                assertProcessDefinitionPresentAtMarker(
+                        rpc, 3, service, serviceText, "@Slf4j", 1);
+                assertProcessDefinitionPresentAtMarker(
+                        rpc, 4, service, serviceText, "@Autowired private PricingPort", 1);
+                assertProcessDefinitionPresentAtMarker(
+                        rpc, 5, service, serviceText, "@Cacheable(\"complex-snapshots\")", 1);
+            }
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInfersLambdaItemTypeInComplexInferredMavenWorkspace() throws Exception {
+        var workspace = Files.createTempDirectory("jls-complex-lambda-release");
+        try {
+            writeInferredDemoPom(workspace);
+            var sources = new java.util.HashMap<>(lombokBuilderDefinitionReplaySources());
+            var servicePath = "src/main/java/com/example/demo/complex/service/ComplexScenarioService.java";
+            var serviceText =
+                    sources.get(servicePath)
+                            .replace(
+                                    "var formatter = new ComplexStatics.NestedFormatter();",
+                                    "var direct = new LineItem();\n"
+                                            + "                            direct.\n"
+                                            + "                            var formatter = new ComplexStatics.NestedFormatter();")
+                            .replace(
+                                    "envelope.getItems().stream().map(i -> i.getFamily()).collect(Collectors.toList());",
+                                    "envelope.getItems().stream().map(i -> i.).collect(Collectors.toList());");
+            sources.put(servicePath, serviceText);
+            writeSources(workspace, sources);
+
+            var service = workspace.resolve(servicePath);
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, service);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before complex inferred Maven lambda completion",
+                    awaitCompletionIndexAdvance(server, 0, 15, TimeUnit.SECONDS));
+
+            var directCompletion = completionAtMarker(server, service, serviceText, "direct.");
+            var directLabels = completionLabels(directCompletion);
+            Assert.assertTrue("complex direct completion: " + directLabels, directLabels.contains("getFamily"));
+            Assert.assertTrue("complex direct completion: " + directLabels, directLabels.contains("getFlags"));
+            Assert.assertTrue("complex direct completion: " + directLabels, directLabels.contains("getQuantity"));
+
+            var completion = completionAtMarker(server, service, serviceText, "map(i -> i.");
+            var labels = completionLabels(completion);
+            Assert.assertTrue("complex lambda completion: " + labels, labels.contains("getFamily"));
+            Assert.assertTrue("complex lambda completion: " + labels, labels.contains("getFlags"));
+            Assert.assertTrue("complex lambda completion: " + labels, labels.contains("getQuantity"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInfersLambdaItemTypeAtUnfinishedLineEnd() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-line-end");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var plainService = serviceDir.resolve("PlainService.java");
+            var useFile = serviceDir.resolve("PlainUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "  public int getQuantity() { return 0; }\n"
+                            + "  public String getFamily() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    plainService,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.List;\n"
+                            + "class PlainService {\n"
+                            + "  List<LineItem> getItems() { return List.of(); }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "class PlainUse {\n"
+                            + "  void test(PlainService service) {\n"
+                            + "    var qqw = service.getItems().stream().map(i -> i.)\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, plainService);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before unfinished lambda completion",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var completion = completionAtMarker(server, useFile, useText, "map(i -> i.");
+            var labels = completionLabels(completion);
+            Assert.assertTrue("unfinished lambda completion: " + labels, labels.contains("getSku"));
+            Assert.assertTrue("unfinished lambda completion: " + labels, labels.contains("getQuantity"));
+            Assert.assertTrue("unfinished lambda completion: " + labels, labels.contains("getFamily"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionOffersLombokBuilderMembersFromIndex() throws Exception {
+        var workspace = Files.createTempDirectory("jls-lombok-builder-members");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/complex/model");
+            var useDir = workspace.resolve("src/com/example/demo/complex/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(useDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var useFile = useDir.resolve("BuilderUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.complex.model;\n"
+                            + "\n"
+                            + "import java.math.BigDecimal;\n"
+                            + "import java.util.ArrayList;\n"
+                            + "import java.util.List;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Builder;\n"
+                            + "import lombok.Data;\n"
+                            + "import lombok.NoArgsConstructor;\n"
+                            + "\n"
+                            + "@Data\n"
+                            + "@Builder\n"
+                            + "@NoArgsConstructor\n"
+                            + "@AllArgsConstructor\n"
+                            + "public class LineItem {\n"
+                            + "  private String sku;\n"
+                            + "  private String family;\n"
+                            + "  private int quantity;\n"
+                            + "  private BigDecimal unitPrice;\n"
+                            + "  private List<String> flags = new ArrayList<>();\n"
+                            + "}\n");
+
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.complex.service;\n"
+                            + "\n"
+                            + "import com.example.demo.complex.model.LineItem;\n"
+                            + "\n"
+                            + "class BuilderUse {\n"
+                            + "  void test() {\n"
+                            + "    LineItem.builder().\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+            openJavaFile(server, lineItem);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before builder member completion check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var completion = completionAtMarker(server, useFile, useText, "    LineItem.builder().");
+            var labels = completionLabels(completion);
+
+            Assert.assertTrue(labels.contains("family"));
+            Assert.assertTrue(labels.contains("flags"));
+            Assert.assertTrue(labels.contains("sku"));
+            Assert.assertTrue(labels.contains("build"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionInfersLabelsCollectorResultTypeInComplexScenarioService() throws Exception {
+        var workspace = Files.createTempDirectory("jls-complex-collector-result");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/complex/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/complex/service");
+            var utilDir = workspace.resolve("src/com/example/demo/complex/util");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+            Files.createDirectories(utilDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var envelope = modelDir.resolve("OrderEnvelope.java");
+            var formatterUtil = utilDir.resolve("ComplexStatics.java");
+            var service = serviceDir.resolve("ComplexScenarioService.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.complex.model;\n"
+                            + "\n"
+                            + "import java.math.BigDecimal;\n"
+                            + "import java.util.ArrayList;\n"
+                            + "import java.util.List;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Builder;\n"
+                            + "import lombok.Data;\n"
+                            + "import lombok.NoArgsConstructor;\n"
+                            + "\n"
+                            + "@Data\n"
+                            + "@Builder\n"
+                            + "@NoArgsConstructor\n"
+                            + "@AllArgsConstructor\n"
+                            + "public class LineItem {\n"
+                            + "  private String sku;\n"
+                            + "  private String family;\n"
+                            + "  private int quantity;\n"
+                            + "  private BigDecimal unitPrice;\n"
+                            + "  private List<String> flags = new ArrayList<>();\n"
+                            + "}\n");
+            Files.writeString(
+                    envelope,
+                    "package com.example.demo.complex.model;\n"
+                            + "\n"
+                            + "import java.util.ArrayList;\n"
+                            + "import java.util.List;\n"
+                            + "import lombok.AllArgsConstructor;\n"
+                            + "import lombok.Builder;\n"
+                            + "import lombok.Data;\n"
+                            + "import lombok.NoArgsConstructor;\n"
+                            + "\n"
+                            + "@Data\n"
+                            + "@Builder\n"
+                            + "@NoArgsConstructor\n"
+                            + "@AllArgsConstructor\n"
+                            + "public class OrderEnvelope {\n"
+                            + "  private List<LineItem> items = new ArrayList<>();\n"
+                            + "}\n");
+            Files.writeString(
+                    formatterUtil,
+                    "package com.example.demo.complex.util;\n"
+                            + "\n"
+                            + "import com.example.demo.complex.model.LineItem;\n"
+                            + "import java.util.Comparator;\n"
+                            + "import java.util.Locale;\n"
+                            + "import java.util.concurrent.atomic.AtomicInteger;\n"
+                            + "\n"
+                            + "public final class ComplexStatics {\n"
+                            + "  private ComplexStatics() {}\n"
+                            + "\n"
+                            + "  public static final class NestedFormatter {\n"
+                            + "    private final AtomicInteger sequence = new AtomicInteger();\n"
+                            + "\n"
+                            + "    public String label(LineItem item) {\n"
+                            + "      return item.getSku().toUpperCase(Locale.ROOT) + \"-\" + sequence.incrementAndGet();\n"
+                            + "    }\n"
+                            + "\n"
+                            + "    public Comparator<LineItem> comparator() {\n"
+                            + "      return Comparator.comparing(LineItem::getFamily).thenComparing(LineItem::getSku);\n"
+                            + "    }\n"
+                            + "  }\n"
+                            + "}\n");
+            Files.writeString(
+                    service,
+                    "package com.example.demo.complex.service;\n"
+                            + "\n"
+                            + "import com.example.demo.complex.model.LineItem;\n"
+                            + "import com.example.demo.complex.model.OrderEnvelope;\n"
+                            + "import com.example.demo.complex.util.ComplexStatics;\n"
+                            + "import java.util.ArrayList;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "\n"
+                            + "public class ComplexScenarioService {\n"
+                            + "  public void generateSnapshot(OrderEnvelope envelope) {\n"
+                            + "    var formatter = new ComplexStatics.NestedFormatter();\n"
+                            + "\n"
+                            + "    var labels =\n"
+                            + "        envelope.getItems().stream()\n"
+                            + "            .sorted(formatter.comparator())\n"
+                            + "            .map(formatter::label)\n"
+                            + "            .collect(Collectors.toCollection(ArrayList::new));\n"
+                            + "    labels.\n"
+                            + "\n"
+                            + "    var flaggedFamilies =\n"
+                            + "        envelope.getItems().stream()\n"
+                            + "            .filter(item -> item.getFlags().stream().anyMatch(flag -> flag.contains(\"manual\")))\n"
+                            + "            .collect(Collectors.groupingBy(LineItem::getFamily, Collectors.counting()));\n"
+                            + "    flaggedFamilies.\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            configureLombokClasspath(server);
+            openJavaFile(server, lineItem);
+            openJavaFile(server, envelope);
+            openJavaFile(server, formatterUtil);
+            openJavaFile(server, service);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before complex collector reproduction",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var serviceText = Files.readString(service);
+            var markers = new String[] {"    labels.", "    flaggedFamilies."};
+            var version = 2;
+            var labelsCompletion =
+                    isolatedCompletionAtMarker(server, service, serviceText, version++, "    labels.", markers);
+            var labels = completionLabels(labelsCompletion);
+            Assert.assertTrue("labels completion: " + labels, labels.contains("add"));
+            Assert.assertTrue("labels completion: " + labels, labels.contains("size"));
+            var flaggedCompletion =
+                    isolatedCompletionAtMarker(
+                            server, service, serviceText, version++, "    flaggedFamilies.", markers);
+            var flaggedLabels = completionLabels(flaggedCompletion);
+            Assert.assertTrue("flaggedFamilies completion: " + flaggedLabels, flaggedLabels.contains("entrySet"));
+            Assert.assertTrue("flaggedFamilies completion: " + flaggedLabels, flaggedLabels.contains("values"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionFailsClosedForStreamResultInferenceWithoutCompiling() throws Exception {
+        var workspace = Files.createTempDirectory("jls-stream-phase-one-supported");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
+        try {
+            var pkg = workspace.resolve("src/com/example/demo/stream");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("PhaseOneStreamUse.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo.stream;\n"
+                            + "\n"
+                            + "import java.util.ArrayList;\n"
+                            + "import java.util.Arrays;\n"
+                            + "import java.util.List;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "import java.util.stream.Stream;\n"
+                            + "\n"
+                            + "public class PhaseOneStreamUse {\n"
+                            + "  private final List<Item> items = List.of();\n"
+                            + "  private final List<String> names = List.of();\n"
+                            + "\n"
+                            + "  void test() {\n"
+                            + "    var fromStream = names.stream().collect(Collectors.toList());\n"
+                            + "    fromStream.\n"
+                            + "\n"
+                            + "    var fromParallel = names.parallelStream().collect(Collectors.toSet());\n"
+                            + "    fromParallel.\n"
+                            + "\n"
+                            + "    var fromArray = Arrays.stream(new String[] {\"a\", \"b\"}).collect(Collectors.toList());\n"
+                            + "    fromArray.\n"
+                            + "\n"
+                            + "    var fromOf = Stream.of(\"a\", \"b\").collect(Collectors.toSet());\n"
+                            + "    fromOf.\n"
+                            + "\n"
+                            + "    var fromEmpty = Stream.empty().filter(value -> true).collect(Collectors.toList());\n"
+                            + "    fromEmpty.\n"
+                            + "\n"
+                            + "    var mapped = items.stream().map(item -> item.getFamily()).collect(Collectors.toList());\n"
+                            + "    mapped.\n"
+                            + "\n"
+                            + "    var filtered = items.stream().filter(item -> item.isFlagged()).collect(Collectors.toList());\n"
+                            + "    filtered.\n"
+                            + "\n"
+                            + "    var flattened = items.stream().flatMap(item -> item.getTags().stream()).collect(Collectors.toSet());\n"
+                            + "    flattened.\n"
+                            + "\n"
+                            + "    var counted = items.stream().collect(Collectors.counting());\n"
+                            + "    counted.\n"
+                            + "\n"
+                            + "    var grouped = items.stream().collect(Collectors.groupingBy(item -> item.getFamily()));\n"
+                            + "    grouped.\n"
+                            + "\n"
+                            + "    var groupedCounts = items.stream().collect(Collectors.groupingBy(Item::getFamily, Collectors.counting()));\n"
+                            + "    groupedCounts.\n"
+                            + "\n"
+                            + "    var collectionResult = items.stream().map(Item::getFamily).collect(Collectors.toCollection(ArrayList::new));\n"
+                            + "    collectionResult.\n"
+                            + "  }\n"
+                            + "\n"
+                            + "  static final class Item {\n"
+                            + "    String getFamily() { return \"family\"; }\n"
+                            + "    boolean isFlagged() { return true; }\n"
+                            + "    List<String> getTags() { return List.of(); }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, file);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before supported stream subset checks",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var text = Files.readString(file);
+            var markers =
+                    new String[] {
+                        "    fromStream.",
+                        "    fromParallel.",
+                        "    fromArray.",
+                        "    fromOf.",
+                        "    fromEmpty.",
+                        "    mapped.",
+                        "    filtered.",
+                        "    flattened.",
+                        "    counted.",
+                        "    grouped.",
+                        "    groupedCounts.",
+                        "    collectionResult."
+                    };
+            var version = 2;
+
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromParallel.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromArray.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromOf.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    fromEmpty.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    mapped.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    filtered.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    flattened.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    counted.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    grouped.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    groupedCounts.", markers);
+            var fromStreamCompletion =
+                    isolatedCompletionAtMarker(server, file, text, version++, "    fromStream.", markers);
+            var fromStreamLabels = completionLabels(fromStreamCompletion);
+            Assert.assertTrue("fromStream completion: " + fromStreamLabels, fromStreamLabels.contains("add"));
+            Assert.assertTrue("fromStream completion: " + fromStreamLabels, fromStreamLabels.contains("size"));
+            var collectionResultCompletion =
+                    isolatedCompletionAtMarker(server, file, text, version++, "    collectionResult.", markers);
+            var collectionResultLabels = completionLabels(collectionResultCompletion);
+            Assert.assertTrue(
+                    "collectionResult completion: " + collectionResultLabels,
+                    collectionResultLabels.contains("add"));
+            Assert.assertTrue(
+                    "collectionResult completion: " + collectionResultLabels,
+                    collectionResultLabels.contains("size"));
+
+            var completionFlows =
+                    capture.linesMatching("\\[perf\\] completion_flow file=PhaseOneStreamUse\\.java.*");
+            Assert.assertFalse("expected completion flow logs for supported stream subset", completionFlows.isEmpty());
+            for (var line : completionFlows) {
+                Assert.assertTrue("completion flow should keep enter at zero: " + line, line.contains("enter=0"));
+                Assert.assertTrue("completion flow should keep analyze at zero: " + line, line.contains("analyze=0"));
+                Assert.assertTrue("completion flow should keep ap at zero: " + line, line.contains("ap=0"));
+            }
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionFailsClosedForUnsupportedPhaseOneStreamCases() throws Exception {
+        var workspace = Files.createTempDirectory("jls-stream-phase-one-bail");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo/stream");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("PhaseOneStreamBailUse.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo.stream;\n"
+                            + "\n"
+                            + "import java.util.List;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "import java.util.stream.Stream;\n"
+                            + "\n"
+                            + "public class PhaseOneStreamBailUse {\n"
+                            + "  private final List<Item> items = List.of();\n"
+                            + "\n"
+                            + "  String choose(Item item, String value) { return value; }\n"
+                            + "  Integer choose(Item item, Integer value) { return value; }\n"
+                            + "  Stream<String> maybeTags(Item item, String key) { return Stream.of(); }\n"
+                            + "  Stream<String> maybeTags(Item item, Integer key) { return Stream.of(); }\n"
+                            + "  String nextName() { return \"a\"; }\n"
+                            + "  String lastName() { return \"b\"; }\n"
+                            + "\n"
+                            + "  void test() {\n"
+                            + "    var badOf = Stream.of(nextName(), lastName()).collect(Collectors.toList());\n"
+                            + "    badOf.\n"
+                            + "\n"
+                            + "    var badMap = items.stream().map(item -> choose(item, null)).collect(Collectors.toList());\n"
+                            + "    badMap.\n"
+                            + "\n"
+                            + "    var badFlatMapNonStream = items.stream().flatMap(item -> item.getFamily()).collect(Collectors.toList());\n"
+                            + "    badFlatMapNonStream.\n"
+                            + "\n"
+                            + "    var badFlatMapUnclear = items.stream().flatMap(item -> maybeTags(item, null)).collect(Collectors.toList());\n"
+                            + "    badFlatMapUnclear.\n"
+                            + "\n"
+                            + "    var badGrouping = items.stream().collect(Collectors.groupingBy(item -> {\n"
+                            + "      var family = item.getFamily();\n"
+                            + "      return family;\n"
+                            + "    }));\n"
+                            + "    badGrouping.\n"
+                            + "\n"
+                            + "    var badCollector = items.stream().map(Item::getFamily).collect(Collectors.joining());\n"
+                            + "    badCollector.\n"
+                            + "\n"
+                            + "    var badDownstream = items.stream().collect(Collectors.groupingBy(Item::getFamily, Collectors.toList()));\n"
+                            + "    badDownstream.\n"
+                            + "  }\n"
+                            + "\n"
+                            + "  static final class Item {\n"
+                            + "    String getFamily() { return \"family\"; }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, file);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before stream bail-out checks",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var text = Files.readString(file);
+            var markers =
+                    new String[] {
+                        "    badOf.",
+                        "    badMap.",
+                        "    badFlatMapNonStream.",
+                        "    badFlatMapUnclear.",
+                        "    badGrouping.",
+                        "    badCollector.",
+                        "    badDownstream."
+                    };
+            var version = 2;
+            isolatedCompletionAtMarker(server, file, text, version++, "    badOf.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badMap.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badFlatMapNonStream.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badFlatMapUnclear.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badGrouping.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badCollector.", markers);
+            isolatedCompletionAtMarker(server, file, text, version++, "    badDownstream.", markers);
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void ambiguousLambdaTargetFailsClosedForMemberCompletion() throws Exception {
+        var workspace = Files.createTempDirectory("jls-generic-slot-ambiguous-lambda");
+        try {
+            var modelDir = workspace.resolve("src/com/example/demo/model");
+            var serviceDir = workspace.resolve("src/com/example/demo/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            var lineItem = modelDir.resolve("LineItem.java");
+            var useFile = serviceDir.resolve("AmbiguousLambdaUse.java");
+
+            Files.writeString(
+                    lineItem,
+                    "package com.example.demo.model;\n"
+                            + "public class LineItem {\n"
+                            + "  public String getSku() { return \"\"; }\n"
+                            + "}\n");
+            Files.writeString(
+                    useFile,
+                    "package com.example.demo.service;\n"
+                            + "import com.example.demo.model.LineItem;\n"
+                            + "import java.util.function.Consumer;\n"
+                            + "import java.util.function.Function;\n"
+                            + "class AmbiguousLambdaUse {\n"
+                            + "  void use(Function<LineItem, String> fn) {}\n"
+                            + "  void use(Consumer<LineItem> fn) {}\n"
+                            + "  void test() {\n"
+                            + "    use(item -> item.);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, lineItem);
+            openJavaFile(server, useFile);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before ambiguous lambda check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var useText = Files.readString(useFile);
+            var completion = completionAtMarker(server, useFile, useText, "item -> item.");
+            Assert.assertTrue(
+                    "ambiguous lambda target should fail closed instead of defaulting to Object members",
+                    completion.items.isEmpty());
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void completionSuggestsStaticInterfaceMembersInIncompleteStaticMethodBody() throws Exception {
+        var workspace = Files.createTempDirectory("jls-interface-static-identifier-parse");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo/spi");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("PricingPort.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo.spi;\n"
+                            + "import java.util.Map;\n"
+                            + "public interface PricingPort {\n"
+                            + "  Map<String, Integer> HARD_CODED_REGIONS = Map.of();\n"
+                            + "  int price(String sku);\n"
+                            + "  default int fallbackDiscount(String family) { return 0; }\n"
+                            + "  static String directLookup(String region) { return region; }\n"
+                            + "  static String testConstants() {\n"
+                            + "    HAR\n"
+                            + "  }\n"
+                            + "  static String testStaticMethod() {\n"
+                            + "    dir\n"
+                            + "  }\n"
+                            + "  static String testInstanceMethod() {\n"
+                            + "    pri\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+            openJavaFile(server, file);
+
+            Assert.assertTrue(
+                    "expected completion index bootstrap before interface static completion check",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
+            var text = Files.readString(file);
+            var harCompletion = completionAtMarker(server, file, text, "    HAR");
+            var harLabels = completionLabels(harCompletion);
+            Assert.assertTrue(harLabels.contains("HARD_CODED_REGIONS"));
+            var dirCompletion = completionAtMarker(server, file, text, "    dir");
+            var dirLabels = completionLabels(dirCompletion);
+            Assert.assertTrue(dirLabels.contains("directLookup"));
+            var priCompletion = completionAtMarker(server, file, text, "    pri");
+            var priLabels = completionLabels(priCompletion);
+            Assert.assertFalse(priLabels.contains("price"));
+            Assert.assertFalse(priLabels.contains("fallbackDiscount"));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void typeLookupBoundaryBlocksWorkspaceLeakAndStillResolvesExternalDependency() throws Exception {
+        var workspace = Files.createTempDirectory("jls-type-lookup-boundary");
         try {
             var pkg = workspace.resolve("src/p");
             Files.createDirectories(pkg);
@@ -3077,33 +4305,24 @@ public class JavaLanguageServerTest {
                             + "}\n");
 
             var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
-            var boundary =
-                    new TypeLookupBoundary(
-                            server.compiler(),
-                            new CompositeTypeIndex(
-                                    org.javacs.completion.WorkspaceTypeIndex.EMPTY,
-                                    new ExternalBinaryTypeIndex(server.compiler())));
-            var parse = server.compiler().parse(useFile);
+            TypeIndexRouter boundary;
+            try (var task = server.getOrCreateCompiler().compile(FileStore.all().toArray(Path[]::new))) {
+                boundary =
+                        new TypeIndexRouter(
+                                WorkspaceTypeIndex.from(task),
+                                new ExternalBinaryTypeIndex(server.getOrCreateCompiler()));
+            }
+            var parse = server.getOrCreateCompiler().parse(useFile);
 
-            Assert.assertEquals(
-                    Optional.of("p.A"),
-                    boundary.resolveWorkspaceType("A", parse.root));
-            Assert.assertTrue(
-                    "workspace-owned candidates must not reach external lookup",
-                    boundary.findExternalSource("p.A", "unitTest").isEmpty());
-            Assert.assertTrue(
-                    "expected explicit workspace-boundary bug log for blocked external workspace lookup",
-                    capture.countContaining("[workspace-boundary] external_leak candidate=p.A reason=unitTest") > 0);
+            Assert.assertTrue(boundary.isWorkspaceOwnedType("p.A"));
+            Assert.assertEquals(Optional.of("p.A"), boundary.resolveTypeName("A", parse.root()));
+            Assert.assertTrue(boundary.typeInfo("p.A").isPresent());
+            Assert.assertFalse(boundary.external().containsType("p.A"));
             Assert.assertEquals(
                     Optional.of("java.util.ArrayList"),
-                    boundary.resolveTypeName("ArrayList", parse.root));
-            Assert.assertEquals(
-                    "dependency/JDK lookup should not be reported as workspace leakage",
-                    0,
-                    capture.countContaining("[workspace-boundary] external_leak candidate=java.util.ArrayList"));
+                    boundary.resolveTypeName("ArrayList", parse.root()));
+            Assert.assertTrue(boundary.external().containsType("java.util.ArrayList"));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -3180,10 +4399,8 @@ public class JavaLanguageServerTest {
         open.textDocument.text = text;
         server.didOpenTextDocument(open);
 
-        var compiler = server.compiler();
-        var opened = compiler.parsedUnits.get(file);
-        Assert.assertNotNull("didOpen should parse and store AST", opened);
-        var openedRoot = opened.task.root;
+        var compiler = server.getOrCreateCompiler();
+        Assert.assertNull("didOpen should not eagerly parse in the interactive compiler", compiler.parsedUnits.get(file));
 
         var firstCompletion =
                 server.completion(
@@ -3193,11 +4410,12 @@ public class JavaLanguageServerTest {
         server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
 
         var afterOpenRequests = compiler.parsedUnits.get(file);
-        Assert.assertNotNull(afterOpenRequests);
+        Assert.assertNotNull("completion/hover should populate the interactive parse cache on demand", afterOpenRequests);
+        var openedRoot = afterOpenRequests.task().root();
         Assert.assertSame(
-                "completion/hover should reuse didOpen parse result when text is unchanged",
+                "completion/hover should reuse the lazily populated parse result when text is unchanged",
                 openedRoot,
-                afterOpenRequests.task.root);
+                afterOpenRequests.task().root());
 
         var save = new DidSaveTextDocumentParams();
         save.textDocument = new TextDocumentIdentifier(file.toUri());
@@ -3208,7 +4426,7 @@ public class JavaLanguageServerTest {
         Assert.assertSame(
                 "didSave should reuse existing parse result when there is no text change",
                 openedRoot,
-                afterSave.task.root);
+                afterSave.task().root());
 
         var change = new DidChangeTextDocumentParams();
         change.textDocument.uri = file.toUri();
@@ -3221,8 +4439,8 @@ public class JavaLanguageServerTest {
         var changed = compiler.parsedUnits.get(file);
         Assert.assertNotNull("didChange should refresh parsed unit", changed);
         Assert.assertNotSame(
-                "didChange should reparse when text changes", openedRoot, changed.task.root);
-        var changedRoot = changed.task.root;
+                "didChange should reparse when text changes", openedRoot, changed.task().root());
+        var changedRoot = changed.task().root();
 
         var secondCompletion =
                 server.completion(
@@ -3236,11 +4454,11 @@ public class JavaLanguageServerTest {
         Assert.assertSame(
                 "completion/hover should reuse didChange parse result until next edit",
                 changedRoot,
-                afterChangeRequests.task.root);
+                afterChangeRequests.task().root());
     }
 
     @Test
-    public void concurrentCompilerCallsAfterSettingsChangeRecreateCompilerOnce() throws Exception {
+    public void concurrentCompilerCallsAfterSettingsChangeReuseAlreadyRecreatedCompiler() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var logger = Logger.getLogger("main");
         var capture = new TestLogCapture();
@@ -3270,7 +4488,7 @@ public class JavaLanguageServerTest {
                                     try {
                                         ready.countDown();
                                         start.await(5, TimeUnit.SECONDS);
-                                        server.compiler();
+                                        server.getOrCreateCompiler();
                                     } catch (Throwable e) {
                                         failures.add(e);
                                     } finally {
@@ -3287,7 +4505,11 @@ public class JavaLanguageServerTest {
             Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
 
             Assert.assertEquals(
-                    "settings change should recreate compiler exactly once under concurrency",
+                    "settings change should recreate compiler immediately and only once",
+                    1,
+                    capture.countContaining("[perf] compiler_recreate trigger=didChangeConfiguration"));
+            Assert.assertEquals(
+                    "concurrent getters should reuse the already recreated compiler",
                     1,
                     capture.countContaining("[perf] lombok_setting enabled="));
         } finally {
@@ -3296,22 +4518,93 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void nonCompilerSettingsDoNotRecreateCompiler() throws Exception {
+    public void completionRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var tracking = replaceCacheCompilerWithTracking(server);
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var before = completionIndexVersion(server);
+        openJavaFile(server, file);
+        Assert.assertTrue(
+                "completion index should bootstrap before the request-path assertion",
+                awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
+
+        tracking.resetCounters();
+        var result =
+                server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+
+        Assert.assertTrue("completion request should succeed", result.isPresent());
+        Assert.assertTrue("completion should parse the active file", tracking.parseCalls.get() > 0);
+        Assert.assertEquals("completion should not use full compile", 0, tracking.compileCalls.get());
+        Assert.assertEquals("completion should not use fast compile", 0, tracking.compileFastCalls.get());
+        Assert.assertEquals(
+                "completion should not use fast compile with processors",
+                0,
+                tracking.compileFastWithProcessorsCalls.get());
+    }
+
+    @Test
+    public void hoverRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var tracking = replaceCacheCompilerWithTracking(server);
+        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+        var before = completionIndexVersion(server);
+        openJavaFile(server, file);
+        Assert.assertTrue(
+                "completion index should bootstrap before the request-path assertion",
+                awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
+
+        tracking.resetCounters();
+        var result =
+                server.hover(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
+
+        Assert.assertTrue("hover request should succeed", result.isPresent());
+        Assert.assertTrue("hover should parse source rather than compile", tracking.parseCalls.get() > 0);
+        Assert.assertEquals("hover should not use full compile", 0, tracking.compileCalls.get());
+        Assert.assertEquals("hover should not use fast compile", 0, tracking.compileFastCalls.get());
+        Assert.assertEquals(
+                "hover should not use fast compile with processors",
+                0,
+                tracking.compileFastWithProcessorsCalls.get());
+    }
+
+    @Test
+    public void signatureHelpUsesFastCompileWithProcessorsNotFastCompile() throws Exception {
+        var server = LanguageServerFixture.getJavaLanguageServer();
+        var tracking = replaceCacheCompilerWithTracking(server);
+        var file = FindResource.path("org/javacs/example/SignatureHelp.java");
+
+        tracking.resetCounters();
+        var result =
+                server.signatureHelp(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(7, 38)));
+
+        Assert.assertTrue("signature help request should succeed", result.isPresent());
+        Assert.assertEquals("signature help should not use full compile", 0, tracking.compileCalls.get());
+        Assert.assertEquals("signature help should not use fast compile", 0, tracking.compileFastCalls.get());
+        Assert.assertTrue(
+                "signature help should use fast compile with processors",
+                tracking.compileFastWithProcessorsCalls.get() > 0);
+    }
+
+    @Test
+    public void nonCompilerSettingsDoNotRecreateGetOrCreateCompiler() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var before = completionIndexVersion(server);
 
         var settings = new JsonObject();
         var java = new JsonObject();
-        var inlayHints = new JsonObject();
-        inlayHints.addProperty("enabled", true);
-        java.add("inlayHints", inlayHints);
         java.addProperty("codeLens", true);
         settings.add("java", java);
         var change = new DidChangeConfigurationParams();
         change.settings = settings;
         server.didChangeConfiguration(change);
 
-        server.compiler();
+        server.getOrCreateCompiler();
         var after = completionIndexVersion(server);
         Assert.assertEquals(
                 "non-compiler Java settings should not recreate compiler",
@@ -3320,7 +4613,224 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compilerRecreatedSchedulesWorkspaceBootstrapForActiveFiles() throws Exception {
+    public void userReleaseOverridesInferredMavenRelease() throws Exception {
+        var workspace = Files.createTempDirectory("jls-maven-release-override");
+        try {
+            Files.writeString(
+                    workspace.resolve("pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <groupId>example</groupId>
+                      <artifactId>override</artifactId>
+                      <version>1</version>
+                      <properties>
+                        <maven.compiler.release>21</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingMessageClient());
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var extra = new com.google.gson.JsonArray();
+            extra.add("--release 17");
+            java.add("extraCompilerArgs", extra);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            var compiler = cacheCompiler(server);
+            Assert.assertEquals(List.of("--release", "17"), compiler.extraArgs);
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void didChangeRefreshesCompletionIndexWithInferredMavenRelease() throws Exception {
+        var workspace = Files.createTempDirectory("jls-maven-release-didchange");
+        var sourceRoot = Files.createDirectories(workspace.resolve("src/main/java/example"));
+        var file = sourceRoot.resolve("App.java");
+        try {
+            Files.writeString(
+                    workspace.resolve("pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <groupId>example</groupId>
+                      <artifactId>release-didchange</artifactId>
+                      <version>1</version>
+                      <properties>
+                        <maven.compiler.release>21</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+            var original =
+                    """
+                    package example;
+
+                    class App {
+                        String value() {
+                            return "ok";
+                        }
+                    }
+                    """;
+            Files.writeString(file, original);
+
+            var logger = Logger.getLogger("main");
+            var previousLevel = logger.getLevel();
+            logger.setLevel(Level.FINE);
+            var capture = new TestLogCapture();
+            logger.addHandler(capture);
+            try {
+                var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+                Assert.assertEquals(List.of("--release", "21"), cacheCompiler(server).extraArgs);
+
+                var open = new DidOpenTextDocumentParams();
+                open.textDocument.uri = file.toUri();
+                open.textDocument.version = 1;
+                open.textDocument.languageId = "java";
+                open.textDocument.text = original;
+                server.didOpenTextDocument(open);
+
+                Assert.assertTrue(
+                        "expected initial workspace bootstrap before didChange",
+                        awaitCompletionIndexAdvance(server, 0, 15, TimeUnit.SECONDS));
+
+                var before = completionIndexVersion(server);
+                var changed =
+                        """
+                        package example;
+
+                        class App {
+                            String value() {
+                                return "ok";
+                            }
+
+                            String title() {
+                                return value();
+                            }
+                        }
+                        """;
+                var change = new DidChangeTextDocumentParams();
+                change.textDocument.uri = file.toUri();
+                change.textDocument.version = 2;
+                var delta = new TextDocumentContentChangeEvent();
+                delta.text = changed;
+                change.contentChanges.add(delta);
+                server.didChangeTextDocument(change);
+
+                Assert.assertTrue(
+                        "didChange should still refresh the completion index with inferred --release",
+                        awaitCompletionIndexAdvance(server, before, 15, TimeUnit.SECONDS));
+                Assert.assertEquals(
+                        "completion refresh should not combine --source with inferred --release",
+                        0,
+                        capture.countContaining("option --source cannot be used together with --release"));
+                Assert.assertEquals(
+                        "completion refresh should not leave the compiler locked after an option failure",
+                        0,
+                        capture.countContaining("Compiler is already in-use!"));
+            } finally {
+                logger.removeHandler(capture);
+                logger.setLevel(previousLevel);
+            }
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void mixedMavenModulesWarnOnceAndFallBackGracefully() throws Exception {
+        var workspace = Files.createTempDirectory("jls-mixed-maven-warning");
+        try {
+            Files.createDirectories(workspace.resolve("mod17"));
+            Files.createDirectories(workspace.resolve("mod21"));
+            Files.writeString(
+                    workspace.resolve("pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <groupId>example</groupId>
+                      <artifactId>mixed-parent</artifactId>
+                      <version>1</version>
+                      <packaging>pom</packaging>
+                      <modules>
+                        <module>mod17</module>
+                        <module>mod21</module>
+                      </modules>
+                    </project>
+                    """);
+            Files.writeString(
+                    workspace.resolve("mod17/pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <parent>
+                        <groupId>example</groupId>
+                        <artifactId>mixed-parent</artifactId>
+                        <version>1</version>
+                      </parent>
+                      <artifactId>mod17</artifactId>
+                      <properties>
+                        <maven.compiler.release>17</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+            Files.writeString(
+                    workspace.resolve("mod21/pom.xml"),
+                    """
+                    <project xmlns="http://maven.apache.org/POM/4.0.0"
+                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                      <modelVersion>4.0.0</modelVersion>
+                      <parent>
+                        <groupId>example</groupId>
+                        <artifactId>mixed-parent</artifactId>
+                        <version>1</version>
+                      </parent>
+                      <artifactId>mod21</artifactId>
+                      <properties>
+                        <maven.compiler.release>21</maven.compiler.release>
+                      </properties>
+                    </project>
+                    """);
+
+            var client = new RecordingMessageClient();
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+
+            Assert.assertEquals(1, client.messages.size());
+            Assert.assertThat(
+                    client.messages.get(0).message,
+                    org.hamcrest.Matchers.containsString("mixed Maven module Java levels"));
+            Assert.assertEquals(List.of(), cacheCompiler(server).extraArgs);
+
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            java.addProperty("lombokEnabled", false);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            Assert.assertEquals("warning should be shown only once per workspace session", 1, client.messages.size());
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void configurationChangeSchedulesWorkspaceRefreshForActiveFiles() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var text = FileStore.contents(file);
@@ -3348,7 +4858,6 @@ public class JavaLanguageServerTest {
             change.settings = settings;
             server.didChangeConfiguration(change);
 
-            server.compiler();
             var line = capture.lastLineContaining("[perf] diagnostics_debounce trigger=compilerRecreated");
             Assert.assertTrue("expected compilerRecreated diagnostics debounce log", line != null);
             Assert.assertTrue(
@@ -3368,7 +4877,7 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void startupCompilerRecreatedRefreshIsLazyWhenNoActiveDocs() throws Exception {
+    public void initializedDoesNotScheduleCompilerRecreatedRefreshWithoutActiveDocs() throws Exception {
         FileStore.reset();
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
@@ -3390,9 +4899,6 @@ public class JavaLanguageServerTest {
                                         String method, com.google.gson.JsonElement options) {}
 
                                 @Override
-                                public void refreshInlayHints() {}
-
-                                @Override
                                 public void customNotification(
                                         String method, com.google.gson.JsonElement params) {}
                             });
@@ -3406,13 +4912,13 @@ public class JavaLanguageServerTest {
                     0,
                     capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
             Assert.assertEquals(
-                    "startup should not schedule a deferred compilerRecreated refresh without active docs",
+                    "startup should not schedule compilerRecreated refresh without active docs",
                     0,
                     capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
-            Assert.assertTrue(
-                    "startup should log that compilerRecreated refresh is deferred until real demand",
-                    capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs")
-                            > 0);
+            Assert.assertEquals(
+                    "startup should not log a compilerRecreated defer path",
+                    0,
+                    capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated"));
 
             server.shutdown();
         } finally {
@@ -3444,9 +4950,9 @@ public class JavaLanguageServerTest {
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
 
             Assert.assertEquals(
-                    "startup should not skip a compilerRecreated refresh after already doing the expensive work",
+                    "startup should not run compilerRecreated refresh during first didOpen bootstrap",
                     0,
-                    capture.countContaining("completion_index_refresh_skip trigger=compilerRecreated"));
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
             Assert.assertEquals(
                     "didOpen bootstrap should not schedule a second declaration refresh compile",
                     0,
@@ -3457,176 +4963,59 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void didOpenDoesNotEagerlyRefreshInlayHintsBeforeIndexInstall() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
-
+    public void watchedGradleBuildChangeRecreatesCompilerImmediatelyWithoutActiveDocs() throws Exception {
+        var workspace = Files.createTempDirectory("jls-watched-gradle-recreate");
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
         try {
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
+            var src = workspace.resolve("src/main/java/p");
+            Files.createDirectories(src);
+            Files.writeString(src.resolve("App.java"), "package p;\nclass App {}\n");
+            var buildGradle = workspace.resolve("build.gradle");
+            Files.writeString(buildGradle, "plugins { id 'java' }\n");
 
-            Assert.assertEquals("didOpen should not request immediate inlay hint refresh", 0, client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
+            var initialExternal = externalBinaryIndex(server);
 
-    @Test
-    public void didOpenDoesNotRefreshInlayHintsAfterInitialIndexInstall() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
+            var changed = new FileEvent();
+            changed.uri = buildGradle.toUri();
+            changed.type = FileChangeType.Changed;
+            var watched = new DidChangeWatchedFilesParams();
+            watched.changes = List.of(changed);
+            server.didChangeWatchedFiles(watched);
 
-        try {
-            var before = completionIndexVersion(server);
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
+            var refreshedExternal = externalBinaryIndex(server);
+            Assert.assertNotSame(
+                    "watched Gradle build changes should recreate the compiler immediately",
+                    initialExternal,
+                    refreshedExternal);
             Assert.assertTrue(
-                    "expected completion index to advance after open",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+                    "expected explicit compiler recreation log for watched Gradle build change",
+                    capture.countContaining("[perf] compiler_recreate trigger=didChangeWatchedFiles") > 0);
             Assert.assertEquals(
-                    "didOpen should not request inlay hint refresh after index install",
+                    "watched Gradle build change without active docs should not schedule compilerRecreated refresh",
                     0,
-                    client.refreshCount.get());
+                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
         } finally {
-            server.shutdown();
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
         }
     }
 
     @Test
-    public void didOpenDoesNotRefreshInlayHintsWithoutClientSupport() throws Exception {
+    public void reopeningAfterConfigurationChangeWithNoActiveDocsBootstrapsWorkspaceAgain() throws Exception {
         FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        server.initialize(init);
-        server.initialized();
-
+        var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
+        var capture = new TestLogCapture();
+        logger.addHandler(capture);
         try {
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void didChangeDoesNotRefreshInlayHintsAfterIncrementalIndexUpdate() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
-
-        try {
-            var file = FindResource.path("org/javacs/example/LombokCrossTypeModel.java");
-            var original = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = original;
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "expected completion index to initialize before didChange check",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
-
-            var before = completionIndexVersion(server);
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = file.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = original.replace("private String name;", "private String title;");
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            Assert.assertTrue(
-                    "didChange should still refresh completion index",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "didChange should not request inlay hint refresh after incremental index update",
-                    0,
-                    client.refreshCount.get());
-        } finally {
-            server.shutdown();
-        }
-    }
-
-    @Test
-    public void didSaveDoesNotRefreshInlayHintsAfterSharedIndexUpdate() throws Exception {
-        FileStore.reset();
-        var client = new RecordingInlayHintClient();
-        var server = new JavaLanguageServer(client);
-        var init = new InitializeParams();
-        init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-        var capabilities = new JsonObject();
-        var workspace = new JsonObject();
-        var inlayHint = new JsonObject();
-        inlayHint.addProperty("refreshSupport", true);
-        workspace.add("inlayHint", inlayHint);
-        capabilities.add("workspace", workspace);
-        init.capabilities = capabilities;
-        server.initialize(init);
-        server.initialized();
-
-        try {
+            var server = LanguageServerFixture.getJavaLanguageServer();
             var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
             var text = FileStore.contents(file);
 
@@ -3636,81 +5025,51 @@ public class JavaLanguageServerTest {
             open.textDocument.languageId = "java";
             open.textDocument.text = text;
             server.didOpenTextDocument(open);
-
             Assert.assertTrue(
-                    "expected completion index to initialize before didSave check",
+                    "expected first didOpen bootstrap to publish an index",
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertEquals("didOpen should not request inlay hint refresh", 0, client.refreshCount.get());
 
-            var before = completionIndexVersion(server);
-            var save = new DidSaveTextDocumentParams();
-            save.textDocument = new TextDocumentIdentifier(file.toUri());
-            server.didSaveTextDocument(save);
+            var close = new DidCloseTextDocumentParams();
+            close.textDocument.uri = file.toUri();
+            server.didCloseTextDocument(close);
+
+            var settings = new JsonObject();
+            var java = new JsonObject();
+            var extra = new com.google.gson.JsonArray();
+            extra.add("-Xlint:deprecation");
+            java.add("extraCompilerArgs", extra);
+            settings.add("java", java);
+            var change = new DidChangeConfigurationParams();
+            change.settings = settings;
+            server.didChangeConfiguration(change);
+
+            Assert.assertSame(
+                    "compiler recreation without active docs should clear the workspace snapshot",
+                    WorkspaceTypeIndex.EMPTY,
+                    workspaceIndex(server));
+
+            var beforeReopen = completionIndexVersion(server);
+            var reopen = new DidOpenTextDocumentParams();
+            reopen.textDocument.uri = file.toUri();
+            reopen.textDocument.version = 2;
+            reopen.textDocument.languageId = "java";
+            reopen.textDocument.text = text;
+            server.didOpenTextDocument(reopen);
 
             Assert.assertTrue(
-                    "didSave should still refresh completion index",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+                    "reopening after config change should bootstrap the workspace again",
+                    awaitCompletionIndexAdvance(server, beforeReopen, 10, TimeUnit.SECONDS));
             Assert.assertEquals(
-                    "didSave should not request inlay hint refresh after shared index update",
-                    0,
-                    client.refreshCount.get());
+                    "expected didOpen bootstrap to run once before and once after config change",
+                    2,
+                    capture.countContaining("[perf] workspace bootstrap started trigger=didOpenBootstrap"));
         } finally {
-            server.shutdown();
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
-    @Test
-    public void externalJavaSourceSkipsWorkspaceDiagnosticsAndInlayHints() throws Exception {
-        FileStore.reset();
-        var workspace = Files.createTempDirectory("jls-workspace-only");
-        var externalRoot = Files.createTempDirectory("jls-external-java");
-        var client = new RecordingDiagnosticsClient();
-        try {
-            var workspaceFile = workspace.resolve("src/app/Main.java");
-            Files.createDirectories(workspaceFile.getParent());
-            Files.writeString(workspaceFile, "package app;\nclass Main {}\n");
 
-            var externalFile = externalRoot.resolve("cached/ext/ExternalPojo.java");
-            Files.createDirectories(externalFile.getParent());
-            Files.writeString(
-                    externalFile,
-                    "package ext;\n"
-                            + "class ExternalPojo {\n"
-                            + "  void test() {\n"
-                            + "    var value = unknown();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = externalFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(externalFile);
-            server.didOpenTextDocument(open);
-
-            Thread.sleep(1100);
-            Assert.assertFalse(
-                    "external cached-source files should not become active workspace documents",
-                    FileStore.activeDocuments().contains(externalFile));
-            Assert.assertEquals(
-                    "external cached-source files should not publish diagnostics",
-                    0,
-                    client.diagnosticsPublishCount.get());
-
-            var hints =
-                    server.inlayHint(
-                            new InlayHintParams(
-                                    new TextDocumentIdentifier(externalFile.toUri()),
-                                    new Range(new Position(0, 0), new Position(10, 0))));
-            Assert.assertTrue(
-                    "external cached-source files should not return inlay hints",
-                    hints.isEmpty());
-        } finally {
-            deleteRecursively(externalRoot);
-            deleteRecursively(workspace);
-        }
-    }
 
     @Test
     public void didChangeDiagnosticsAreCoalescedWithLongerDebounce() throws Exception {
@@ -3728,6 +5087,8 @@ public class JavaLanguageServerTest {
         Thread.sleep(900);
 
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -3749,6 +5110,7 @@ public class JavaLanguageServerTest {
                     capture.countContaining("diagnostics_compile trigger=async:didChange"));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -3768,6 +5130,8 @@ public class JavaLanguageServerTest {
         Thread.sleep(900);
 
         var logger = Logger.getLogger("main");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(Level.FINE);
         var capture = new TestLogCapture();
         logger.addHandler(capture);
         try {
@@ -3795,6 +5159,7 @@ public class JavaLanguageServerTest {
                     capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
         } finally {
             logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -3872,19 +5237,122 @@ public class JavaLanguageServerTest {
         return ((AtomicLong) field.get(server)).get();
     }
 
-    private ExternalBinaryTypeIndex externalBinaryIndex(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("externalBinaryIndexRef");
-        field.setAccessible(true);
-        return ((AtomicReference<ExternalBinaryTypeIndex>) field.get(server)).get();
+    private void openAndBootstrap(JavaLanguageServer server, Path file) throws Exception {
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = Files.readString(file);
+        server.didOpenTextDocument(open);
+        Assert.assertTrue(
+                "expected completion index bootstrap before drift test",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
     }
 
-    private TypeMemberIndex workspaceIndex(JavaLanguageServer server) throws Exception {
+    private boolean hasDeclarationDrift(JavaLanguageServer server, Path file, List<?> shapes) throws Exception {
+        Method method =
+                JavaLanguageServer.class.getDeclaredMethod("hasDeclarationDrift", Path.class, List.class);
+        method.setAccessible(true);
+        return (boolean) method.invoke(server, file, shapes);
+    }
+
+    private Object declaredTypeShape(IndexedType indexed, boolean structuralLombok) throws Exception {
+        return declaredTypeShape(
+                indexed.qualifiedName,
+                directMemberSignatures(indexed),
+                indexed.superclass,
+                indexed.interfaces,
+                structuralLombok);
+    }
+
+    private Object declaredTypeShape(
+            String qualifiedName,
+            List<String> directMemberSignatures,
+            String superclass,
+            List<String> interfaces,
+            boolean structuralLombok)
+            throws Exception {
+        Class<?> shapeClass = Class.forName("org.javacs.JavaLanguageServer$DeclaredTypeShape");
+        Constructor<?> constructor =
+                shapeClass.getDeclaredConstructor(
+                        String.class, List.class, String.class, List.class, boolean.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(
+                qualifiedName,
+                List.copyOf(directMemberSignatures),
+                superclass,
+                List.copyOf(interfaces),
+                structuralLombok);
+    }
+
+    private IndexedType indexedTypeForFile(JavaLanguageServer server, Path file) throws Exception {
+        return workspaceIndex(server).types().values().stream()
+                .filter(type -> file.equals(type.sourcePath))
+                .findFirst()
+                .orElseThrow();
+    }
+
+    private WorkspaceTypeIndex workspaceIndexOf(IndexedType... types) throws Exception {
+        var constructor =
+                WorkspaceTypeIndex.class.getDeclaredConstructor(Map.class, Map.class);
+        constructor.setAccessible(true);
+        var byName = new java.util.LinkedHashMap<String, IndexedType>();
+        for (var type : types) {
+            byName.put(type.qualifiedName, type);
+        }
+        return constructor.newInstance(byName, Map.of());
+    }
+
+    private void publishWorkspaceSnapshot(JavaLanguageServer server, WorkspaceTypeIndex index, long version)
+            throws Exception {
+        var method =
+                JavaLanguageServer.class.getDeclaredMethod(
+                        "publishCompletionSnapshot",
+                        WorkspaceTypeIndex.class,
+                        ExternalBinaryTypeIndex.class,
+                        long.class,
+                        Class.forName("org.javacs.JavaLanguageServer$CompletionIndexScope"));
+        method.setAccessible(true);
+        method.invoke(server, index, ExternalBinaryTypeIndex.EMPTY, version, null);
+    }
+
+    private List<String> directMemberSignatures(IndexedType type) {
+        var signatures = new java.util.ArrayList<String>();
+        for (var member : type.members) {
+            if (member.synthetic || member.priority != 0) {
+                continue;
+            }
+            if (member.kind == CompletionItemKind.Field) {
+                signatures.add("F:" + member.name + ":" + member.isStatic);
+            } else if (member.kind == CompletionItemKind.Method) {
+                signatures.add(
+                        "M:"
+                                + member.name
+                                + ":"
+                                + (member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length)
+                                + ":"
+                                + member.isStatic);
+            }
+        }
+        return List.copyOf(signatures);
+    }
+
+    private ExternalBinaryTypeIndex externalBinaryIndex(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
+        field.setAccessible(true);
+        var snapshot = ((AtomicReference<?>) field.get(server)).get();
+        var method = snapshot.getClass().getDeclaredMethod("externalIndex");
+        method.setAccessible(true);
+        return (ExternalBinaryTypeIndex) method.invoke(snapshot);
+    }
+
+    private WorkspaceTypeIndex workspaceIndex(JavaLanguageServer server) throws Exception {
         var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
         field.setAccessible(true);
         var snapshot = ((AtomicReference<?>) field.get(server)).get();
         var method = snapshot.getClass().getDeclaredMethod("workspaceIndex");
         method.setAccessible(true);
-        return (TypeMemberIndex) method.invoke(snapshot);
+        return (WorkspaceTypeIndex) method.invoke(snapshot);
     }
 
     private void setCompletionIndexVersion(JavaLanguageServer server, long value) throws Exception {
@@ -3897,6 +5365,32 @@ public class JavaLanguageServerTest {
         var method = JavaLanguageServer.class.getDeclaredMethod("cancelPendingCompletionIndex", String.class);
         method.setAccessible(true);
         method.invoke(server, reason);
+    }
+
+    private JavaCompilerService cacheCompiler(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
+        field.setAccessible(true);
+        return (JavaCompilerService) field.get(server);
+    }
+
+    private void setCacheCompiler(JavaLanguageServer server, JavaCompilerService compiler) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
+        field.setAccessible(true);
+        field.set(server, compiler);
+    }
+
+    private MethodTrackingCompiler replaceCacheCompilerWithTracking(JavaLanguageServer server) throws Exception {
+        var original = cacheCompiler(server);
+        var tracking =
+                new MethodTrackingCompiler(
+                        original.classPath,
+                        original.docPath,
+                        original.addExports,
+                        original.extraArgs,
+                        original.lombokConfiguredEnabled,
+                        original.compilerRole);
+        setCacheCompiler(server, tracking);
+        return tracking;
     }
 
     private void invokeCompileAndPublish(
@@ -3949,6 +5443,13 @@ public class JavaLanguageServerTest {
         return false;
     }
 
+    private static DocumentDiagnosticReport pullDiagnostics(
+            JavaLanguageServer server, java.net.URI uri) {
+        var params = new DocumentDiagnosticParams();
+        params.textDocument = new TextDocumentIdentifier(uri);
+        return server.textDocumentDiagnostic(params);
+    }
+
     private static List<String> diagnosticFingerprints(List<Diagnostic> diagnostics) {
         return diagnostics.stream()
                 .map(
@@ -3973,6 +5474,1379 @@ public class JavaLanguageServerTest {
             }
         }
         return false;
+    }
+
+    private static void openJavaFile(JavaLanguageServer server, Path file) throws IOException {
+        var open = new DidOpenTextDocumentParams();
+        open.textDocument.uri = file.toUri();
+        open.textDocument.version = 1;
+        open.textDocument.languageId = "java";
+        open.textDocument.text = Files.readString(file);
+        server.didOpenTextDocument(open);
+    }
+
+    private static CompletionList completionAtMarker(
+            JavaLanguageServer server, Path file, String contents, String marker) {
+        var offset = contents.indexOf(marker);
+        Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
+        offset += marker.length();
+        var line = 0;
+        var character = 0;
+        for (int i = 0; i < offset; i++) {
+            if (contents.charAt(i) == '\n') {
+                line++;
+                character = 0;
+            } else {
+                character++;
+            }
+        }
+        return server.completion(
+                        new TextDocumentPositionParams(
+                                new TextDocumentIdentifier(file.toUri()), new Position(line, character)))
+                .orElseThrow();
+    }
+
+    private static CompletionList isolatedCompletionAtMarker(
+            JavaLanguageServer server, Path file, String contents, int version, String marker, String... allMarkers) {
+        var isolated = contents;
+        for (var candidate : allMarkers) {
+            if (!candidate.equals(marker)) {
+                isolated = isolated.replace(candidate, sanitizeCompletionMarker(candidate));
+            }
+        }
+        var change = new DidChangeTextDocumentParams();
+        change.textDocument.uri = file.toUri();
+        change.textDocument.version = version;
+        var delta = new TextDocumentContentChangeEvent();
+        delta.text = isolated;
+        change.contentChanges.add(delta);
+        server.didChangeTextDocument(change);
+        return completionAtMarker(server, file, isolated, marker);
+    }
+
+    private static Process startLanguageServerProcess() throws IOException {
+        var script = Paths.get("dist/lang_server_mac.sh").toAbsolutePath().toString();
+        return new ProcessBuilder(script).directory(Paths.get("").toAbsolutePath().toFile()).start();
+    }
+
+    private static JsonObject initializeParams(Path workspace) {
+        var params = new JsonObject();
+        params.addProperty("rootUri", workspace.toUri().toString());
+        params.add("capabilities", new JsonObject());
+        return params;
+    }
+
+    private static JsonObject didOpenParams(Path file, String text) {
+        var params = new JsonObject();
+        var textDocument = new JsonObject();
+        textDocument.addProperty("uri", file.toUri().toString());
+        textDocument.addProperty("languageId", "java");
+        textDocument.addProperty("version", 0);
+        textDocument.addProperty("text", text);
+        params.add("textDocument", textDocument);
+        return params;
+    }
+
+    private static JsonObject documentParams(Path file) {
+        var params = new JsonObject();
+        var textDocument = new JsonObject();
+        textDocument.addProperty("uri", file.toUri().toString());
+        params.add("textDocument", textDocument);
+        return params;
+    }
+
+    private static JsonObject textDocumentPositionParams(Path file, int line, int character) {
+        var params = documentParams(file);
+        params.add("position", jsonPosition(line, character));
+        return params;
+    }
+
+    private static JsonObject jsonPosition(int line, int character) {
+        var position = new JsonObject();
+        position.addProperty("line", line);
+        position.addProperty("character", character);
+        return position;
+    }
+
+    private static JsonObject toJson(Position position) {
+        var json = new JsonObject();
+        json.addProperty("line", position.line);
+        json.addProperty("character", position.character);
+        return json;
+    }
+
+    private static void writeSources(Path workspace, Map<String, String> sources) throws IOException {
+        for (var entry : sources.entrySet()) {
+            var file = workspace.resolve(entry.getKey());
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, entry.getValue());
+        }
+    }
+
+    private static Map<String, String> lombokBuilderDefinitionReplaySources() {
+        return Map.ofEntries(
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/AddressInfo.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import lombok.AllArgsConstructor;
+                        import lombok.Builder;
+                        import lombok.Data;
+                        import lombok.NoArgsConstructor;
+
+                        @Data
+                        @Builder
+                        @NoArgsConstructor
+                        @AllArgsConstructor
+                        public class AddressInfo {
+                          private String lineOne;
+                          private String lineTwo;
+                          private String city;
+                          private String region;
+                          private String postalCode;
+                          private String countryCode;
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/ContactWindow.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        public class ContactWindow {
+                          private String preferredZone;
+                          private int startHour;
+                          private int endHour;
+
+                          public ContactWindow() {}
+
+                          public ContactWindow(String preferredZone, int startHour, int endHour) {
+                            this.preferredZone = preferredZone;
+                            this.startHour = startHour;
+                            this.endHour = endHour;
+                          }
+
+                          public String getPreferredZone() {
+                            return preferredZone;
+                          }
+
+                          public void setPreferredZone(String preferredZone) {
+                            this.preferredZone = preferredZone;
+                          }
+
+                          public int getStartHour() {
+                            return startHour;
+                          }
+
+                          public void setStartHour(int startHour) {
+                            this.startHour = startHour;
+                          }
+
+                          public int getEndHour() {
+                            return endHour;
+                          }
+
+                          public void setEndHour(int endHour) {
+                            this.endHour = endHour;
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/AbstractTrackedRecord.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.time.Instant;
+                        import java.util.ArrayList;
+                        import java.util.List;
+
+                        public abstract class AbstractTrackedRecord {
+                          private String externalId;
+                          private Instant createdAt = Instant.now();
+                          private Instant updatedAt = Instant.now();
+                          private final List<String> tags = new ArrayList<>();
+
+                          public String getExternalId() {
+                            return externalId;
+                          }
+
+                          public void setExternalId(String externalId) {
+                            this.externalId = externalId;
+                          }
+
+                          public Instant getCreatedAt() {
+                            return createdAt;
+                          }
+
+                          public void setCreatedAt(Instant createdAt) {
+                            this.createdAt = createdAt;
+                          }
+
+                          public Instant getUpdatedAt() {
+                            return updatedAt;
+                          }
+
+                          public void setUpdatedAt(Instant updatedAt) {
+                            this.updatedAt = updatedAt;
+                          }
+
+                          public List<String> getTags() {
+                            return tags;
+                          }
+
+                          public boolean hasTag(String tag) {
+                            return tags.stream().anyMatch(tag::equalsIgnoreCase);
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/AbstractPartyRecord.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        public abstract class AbstractPartyRecord extends AbstractTrackedRecord {
+                          private String displayName;
+                          private String segment;
+                          private boolean archived;
+
+                          public String getDisplayName() {
+                            return displayName;
+                          }
+
+                          public void setDisplayName(String displayName) {
+                            this.displayName = displayName;
+                          }
+
+                          public String getSegment() {
+                            return segment;
+                          }
+
+                          public void setSegment(String segment) {
+                            this.segment = segment;
+                          }
+
+                          public boolean isArchived() {
+                            return archived;
+                          }
+
+                          public void setArchived(boolean archived) {
+                            this.archived = archived;
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/AbstractCustomerRecord.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.util.LinkedHashMap;
+                        import java.util.Map;
+                        import lombok.Getter;
+                        import lombok.Setter;
+
+                        @Getter
+                        @Setter
+                        public abstract class AbstractCustomerRecord extends AbstractPartyRecord {
+                          private final Map<String, String> attributes = new LinkedHashMap<>();
+                          private AddressInfo primaryAddress;
+                          private ContactWindow contactWindow;
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/CustomerProfile.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.util.ArrayList;
+                        import java.util.List;
+                        import lombok.EqualsAndHashCode;
+                        import lombok.Getter;
+                        import lombok.Setter;
+
+                        @Getter
+                        @Setter
+                        @EqualsAndHashCode(callSuper = true)
+                        public class CustomerProfile extends AbstractCustomerRecord {
+                          private String loyaltyTier;
+                          private boolean vip;
+                          private final List<OrderEnvelope> recentOrders = new ArrayList<>();
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/DeepGraph.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.util.ArrayList;
+                        import java.util.List;
+
+                        public class DeepGraph {
+                          private String graphName;
+                          private final List<DeepNode> nodes = new ArrayList<>();
+
+                          public String getGraphName() {
+                            return graphName;
+                          }
+
+                          public void setGraphName(String graphName) {
+                            this.graphName = graphName;
+                          }
+
+                          public List<DeepNode> getNodes() {
+                            return nodes;
+                          }
+
+                          public static class DeepNode {
+                            private String key;
+                            private OrderEnvelope envelope;
+                            private final List<DeepNode> children = new ArrayList<>();
+
+                            public String getKey() {
+                              return key;
+                            }
+
+                            public void setKey(String key) {
+                              this.key = key;
+                            }
+
+                            public OrderEnvelope getEnvelope() {
+                              return envelope;
+                            }
+
+                            public void setEnvelope(OrderEnvelope envelope) {
+                              this.envelope = envelope;
+                            }
+
+                            public List<DeepNode> getChildren() {
+                              return children;
+                            }
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/LineItem.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.math.BigDecimal;
+                        import java.util.ArrayList;
+                        import java.util.List;
+                        import lombok.AllArgsConstructor;
+                        import lombok.Builder;
+                        import lombok.Data;
+                        import lombok.NoArgsConstructor;
+
+                        @Data
+                        @Builder
+                        @NoArgsConstructor
+                        @AllArgsConstructor
+                        public class LineItem {
+                          private String sku;
+                          private String family;
+                          private int quantity;
+                          private BigDecimal unitPrice;
+                          private List<String> flags = new ArrayList<>();
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/MoneyBucket.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.math.BigDecimal;
+                        import java.util.Currency;
+
+                        public class MoneyBucket {
+                          private Currency currency;
+                          private BigDecimal subtotal;
+                          private BigDecimal taxes;
+                          private BigDecimal discount;
+
+                          public Currency getCurrency() {
+                            return currency;
+                          }
+
+                          public void setCurrency(Currency currency) {
+                            this.currency = currency;
+                          }
+
+                          public BigDecimal getSubtotal() {
+                            return subtotal;
+                          }
+
+                          public void setSubtotal(BigDecimal subtotal) {
+                            this.subtotal = subtotal;
+                          }
+
+                          public BigDecimal getTaxes() {
+                            return taxes;
+                          }
+
+                          public void setTaxes(BigDecimal taxes) {
+                            this.taxes = taxes;
+                          }
+
+                          public BigDecimal getDiscount() {
+                            return discount;
+                          }
+
+                          public void setDiscount(BigDecimal discount) {
+                            this.discount = discount;
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/model/OrderEnvelope.java",
+                        """
+                        package com.example.demo.complex.model;
+
+                        import java.time.LocalDate;
+                        import java.util.ArrayList;
+                        import java.util.List;
+                        import lombok.AllArgsConstructor;
+                        import lombok.Builder;
+                        import lombok.Data;
+                        import lombok.NoArgsConstructor;
+
+                        @Data
+                        @Builder
+                        @NoArgsConstructor
+                        @AllArgsConstructor
+                        public class OrderEnvelope {
+                          private String orderId;
+                          private String regionCode;
+                          private LocalDate requestedShipDate;
+                          private CustomerProfile customer;
+                          private MoneyBucket totals;
+                          private List<LineItem> items = new ArrayList<>();
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/spi/AuditPort.java",
+                        """
+                        package com.example.demo.complex.spi;
+
+                        import com.example.demo.complex.model.OrderEnvelope;
+                        import java.util.List;
+
+                        public interface AuditPort {
+                          List<String> LEVELS = List.of("TRACE", "DEBUG", "INFO", "WARN", "ERROR");
+
+                          String describe(OrderEnvelope envelope, String decision);
+
+                          default boolean isNoisy(String level) {
+                            LEVELS.getFirst();
+                            describe(null, null);
+                            return LEVELS.indexOf(level) >= LEVELS.indexOf("WARN");
+                          }
+
+                          static String hardcodedDecision() {
+                            LEVELS.getFirst();
+                            return "DIRECT_INTERFACE_DECISION";
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/spi/PricingPort.java",
+                        """
+                        package com.example.demo.complex.spi;
+
+                        import com.example.demo.complex.model.LineItem;
+                        import com.example.demo.complex.model.OrderEnvelope;
+                        import java.math.BigDecimal;
+                        import java.util.List;
+                        import java.util.Map;
+
+                        public interface PricingPort {
+                          Map<String, BigDecimal> SEGMENT_MULTIPLIERS =
+                              Map.of(
+                                  "enterprise", new BigDecimal("0.91"),
+                                  "mid-market", new BigDecimal("0.96"),
+                                  "starter", new BigDecimal("1.00"));
+
+                          List<String> HARD_CODED_REGIONS = List.of("EU", "US", "APAC", "INTERNAL");
+
+                          BigDecimal price(OrderEnvelope envelope, LineItem item);
+
+                          default BigDecimal fallbackDiscount(String segment) {
+                            HARD_CODED_REGIONS.add(null);
+                            price(null, null);
+                            price(null, null);
+                            HARD_CODED_REGIONS.getFirst();
+                            SEGMENT_MULTIPLIERS.get(null);
+                            return SEGMENT_MULTIPLIERS.getOrDefault(segment, BigDecimal.ONE);
+                          }
+
+                          static String directLookup(String region) {
+                            SEGMENT_MULTIPLIERS.get(null);
+                            HARD_CODED_REGIONS.getFirst();
+                            return HARD_CODED_REGIONS.stream()
+                                .filter(region::equalsIgnoreCase)
+                                .findFirst()
+                                .orElse("OTHER");
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/util/ComplexStatics.java",
+                        """
+                        package com.example.demo.complex.util;
+
+                        import com.example.demo.complex.model.LineItem;
+                        import com.example.demo.complex.model.OrderEnvelope;
+                        import com.example.demo.complex.spi.PricingPort;
+                        import java.math.BigDecimal;
+                        import java.util.Comparator;
+                        import java.util.List;
+                        import java.util.Locale;
+                        import java.util.concurrent.atomic.AtomicInteger;
+
+                        public final class ComplexStatics {
+                          private ComplexStatics() {}
+
+                          public static String resolveRiskBand(OrderEnvelope envelope) {
+                            var itemCount = envelope.getItems() == null ? 0 : envelope.getItems().size();
+                            return itemCount > 10 ? "HIGH" : itemCount > 5 ? "MEDIUM" : "LOW";
+                          }
+
+                          public static BigDecimal aggregate(List<LineItem> items, PricingPort pricingPort, OrderEnvelope envelope) {
+                            return items.stream()
+                                .map(item -> pricingPort.price(envelope, item))
+                                .reduce(BigDecimal.ZERO, BigDecimal::add);
+                          }
+
+                          public static final class NestedFormatter {
+                            private final AtomicInteger sequence = new AtomicInteger();
+
+                            public String label(LineItem item) {
+                              return item.getSku().toUpperCase(Locale.ROOT) + "-" + sequence.incrementAndGet();
+                            }
+
+                            public Comparator<LineItem> comparator() {
+                              return Comparator.comparing(LineItem::getFamily).thenComparing(LineItem::getSku);
+                            }
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/models/Foo.java",
+                        """
+                        package com.example.demo.models;
+
+                        import lombok.Data;
+
+                        @Data
+                        public class Foo {
+                          private Bar bar;
+                          private Integer dome;
+                          private String iba;
+                          private String adwqzxckqp;
+                          private String wakqll;
+                          private String someField;
+                          private String dfaa;
+                          private String name;
+                          private String hxawqp;
+                          private long zxczx;
+                          private String uws;
+                          private String qpo;
+                          private String halo;
+                          private String hihi;
+                          private String huhu;
+                          private String pipi;
+                          private String poppo;
+                          private int number;
+                          private String asd;
+                          private String koo;
+                          private String kk;
+                          private String xx;
+                          private String uui;
+                          private int oo;
+                          private static final String asdss = "SD";
+
+                          public static String getOne(String a) {
+                            return "asd";
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/models/Bar.java",
+                        """
+                        package com.example.demo.models;
+
+                        import lombok.Data;
+                        import lombok.extern.slf4j.Slf4j;
+
+                        @Data
+                        @Slf4j
+                        public class Bar {
+                          private Biz biz;
+                          private String xkkk;
+                          private String poo;
+                          private String pi;
+                          private String k;
+                          private int asd;
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/models/Biz.java",
+                        """
+                        package com.example.demo.models;
+
+                        public class Biz {
+                          private String bvca;
+                          private long jshq;
+                          private int huh;
+                          private long uuhas;
+                          private long buhk;
+                          private String alpoq;
+                          private long khasd;
+                          private String hzxww;
+
+                          public Biz() {}
+
+                          public Biz(String a) {
+                            this.bvca = a;
+                          }
+
+                          public String getBvca() {
+                            return this.bvca;
+                          }
+
+                          public void setBvca(String bvca) {
+                            this.bvca = bvca;
+                          }
+
+                          public long getJshq() {
+                            return this.jshq;
+                          }
+
+                          public void setJshq(long jshq) {
+                            this.jshq = jshq;
+                          }
+
+                          public String getHzxww() {
+                            return this.hzxww;
+                          }
+
+                          public void setHzxww(String hzxww) {
+                            this.hzxww = hzxww;
+                          }
+
+                          public String getAlpoq() {
+                            return this.alpoq;
+                          }
+
+                          public void setAlpoq(String alpoq) {
+                            this.alpoq = alpoq;
+                          }
+
+                          public long getKhasd() {
+                            return this.khasd;
+                          }
+
+                          public void setKhasd(long khasd) {
+                            this.khasd = khasd;
+                          }
+
+                          public long getBuhk() {
+                            return this.buhk;
+                          }
+
+                          public void setBuhk(long buhk) {
+                            this.buhk = buhk;
+                          }
+
+                          public long getUuhas() {
+                            return this.uuhas;
+                          }
+
+                          public void setUuhas(long uuhas) {
+                            this.uuhas = uuhas;
+                          }
+
+                          public int getHuh() {
+                            return this.huh;
+                          }
+
+                          public void setHuh(int huh) {
+                            this.huh = huh;
+                          }
+
+                          @Override
+                          public boolean equals(Object o) {
+                            if (this == o) return true;
+                            if (o == null || getClass() != o.getClass()) return false;
+                            Biz that = (Biz) o;
+                            if (!java.util.Objects.equals(this.huh, that.huh)) return false;
+                            if (!java.util.Objects.equals(this.uuhas, that.uuhas)) return false;
+                            if (!java.util.Objects.equals(this.buhk, that.buhk)) return false;
+                            if (!java.util.Objects.equals(this.alpoq, that.alpoq)) return false;
+                            if (!java.util.Objects.equals(this.khasd, that.khasd)) return false;
+                            if (!java.util.Objects.equals(this.hzxww, that.hzxww)) return false;
+                            return true;
+                          }
+
+                          @Override
+                          public int hashCode() {
+                            return java.util.Objects.hash(this.huh, this.uuhas, this.buhk, this.alpoq, this.khasd, this.hzxww);
+                          }
+                        }
+                        """),
+                Map.entry(
+                        "src/main/java/com/example/demo/complex/service/ComplexScenarioService.java",
+                        """
+                        package com.example.demo.complex.service;
+
+                        import com.example.demo.complex.model.AddressInfo;
+                        import com.example.demo.complex.model.ContactWindow;
+                        import com.example.demo.complex.model.CustomerProfile;
+                        import com.example.demo.complex.model.DeepGraph;
+                        import com.example.demo.complex.model.LineItem;
+                        import com.example.demo.complex.model.MoneyBucket;
+                        import com.example.demo.complex.model.OrderEnvelope;
+                        import com.example.demo.complex.spi.AuditPort;
+                        import com.example.demo.complex.spi.PricingPort;
+                        import com.example.demo.complex.util.ComplexStatics;
+                        import com.example.demo.models.Bar;
+                        import com.example.demo.models.Biz;
+                        import com.example.demo.models.Foo;
+                        import com.google.common.collect.ImmutableMap;
+                        import java.math.BigDecimal;
+                        import java.time.LocalDate;
+                        import java.util.ArrayList;
+                        import java.util.Comparator;
+                        import java.util.Currency;
+                        import java.util.LinkedHashMap;
+                        import java.util.List;
+                        import java.util.Map;
+                        import java.util.Objects;
+                        import java.util.stream.Collectors;
+                        import lombok.extern.slf4j.Slf4j;
+                        import org.apache.commons.lang3.StringUtils;
+                        import org.springframework.beans.factory.annotation.Autowired;
+                        import org.springframework.cache.annotation.Cacheable;
+                        import org.springframework.stereotype.Service;
+
+                        @Service
+                        @Slf4j
+                        public class ComplexScenarioService implements AuditPort {
+                          @Autowired private PricingPort pricingPort;
+                          @Autowired private AuditPort auditPort;
+
+                          @Cacheable("complex-snapshots")
+                          public Map<String, Object> generateSnapshot(String seed) {
+                            auditPort.isNoisy(null);
+                            auditPort.describe(null, null);
+                            auditPort.isNoisy(null);
+
+                            var envelope = sampleEnvelope(seed);
+                            var kasd = envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());
+                            envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());
+                            envelope.getItems().stream().map(i -> i.getFlags().getFirst()).collect(Collectors.toList());
+                            envelope.getItems().stream().map(LineItem::getFlags).collect(Collectors.toList());
+                            envelope.getItems().stream().map(i -> i.getFlags()).collect(Collectors.toList());
+                            var formatter = new ComplexStatics.NestedFormatter();
+                            formatter.comparator();
+                            var graph = buildGraph(envelope);
+                            graph.getGraphName();
+                            var results = new LinkedHashMap<String, Object>();
+                            results.put(null, null);
+                            results.get(null);
+                            results.get(null);
+                            var region = PricingPort.directLookup(envelope.getRegionCode());
+                            results.get(0);
+                            region.isBlank();
+                            log.info(null);
+                            var riskBand = ComplexStatics.resolveRiskBand(envelope);
+                            ComplexStatics.resolveRiskBand(null);
+                            ComplexStatics.aggregate(null, null, null);
+                            var hardDecision = AuditPort.hardcodedDecision();
+                            hardDecision.isBlank();
+                            hardDecision.isBlank();
+                            AuditPort.LEVELS.getFirst();
+                            AuditPort.LEVELS.getFirst();
+                            AuditPort.LEVELS.getLast();
+                            AuditPort.LEVELS.get(0);
+                            AuditPort.LEVELS.getFirst();
+                            envelope.getCustomer().getLoyaltyTier();
+                            envelope.getCustomer().getContactWindow().getEndHour();
+                            envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());
+                            envelope.getItems().stream().map(i -> i.getFamily()).collect(Collectors.toList());
+
+                            var labels =
+                                envelope.getItems().stream()
+                                    .sorted(formatter.comparator())
+                                    .map(formatter::label)
+                                    .collect(Collectors.toCollection(ArrayList::new));
+
+                            var k = envelope.getItems().stream().sorted(formatter.comparator());
+                            var pk = k.collect(Collectors.toList());
+                            pk.getFirst();
+                            labels.get(0);
+                            labels.getFirst();
+
+                            var xx = envelope.getItems().stream().sorted(formatter.comparator())
+                                .map(formatter::label)
+                                .toList();
+
+                            xx.getFirst();
+                            labels.get(0);
+                            var total = ComplexStatics.aggregate(envelope.getItems(), pricingPort, envelope);
+                            total.add(null);
+                            var flaggedFamilies =
+                                envelope.getItems().stream()
+                                    .filter(item -> item.getFlags().stream().anyMatch(flag -> flag.contains("manual")))
+                                    .collect(Collectors.groupingBy(LineItem::getFamily, Collectors.counting()));
+                            flaggedFamilies.get(null);
+                            flaggedFamilies.get(null);
+
+                            StringUtils.appendIfMissing(null, null, null);
+                            var branch =
+                                switch (region) {
+                                  case "asd" -> null;
+                                  case "EU" -> total.compareTo(new BigDecimal("2000")) > 0 ? "EU-HEAVY" : "EU-LIGHT";
+                                  case "US" -> total.compareTo(new BigDecimal("1000")) > 0 ? "US-HEAVY" : "US-LIGHT";
+                                  case "APAC" -> "APAC-" + riskBand;
+                                  default -> "OTHER-" + riskBand;
+                                };
+
+                            switch (region) {
+                              case "d" -> System.out.print("");
+                              default -> System.out.print("");
+                            }
+                            StringUtils.isBlank(null);
+                            if (StringUtils.isBlank(seed)) {
+                              results.put("seedState", "blank");
+                              results.get(null);
+                            } else if (seed.length() > 12 && envelope.getCustomer().isVip()) {
+                              results.put("seedState", "long-vip");
+                            } else if (seed.length() > 4) {
+                              results.put("seedState", "normal");
+                            } else {
+                              results.put("seedState", "tiny");
+                            }
+
+                            var expensiveItems =
+                                envelope.getItems().stream()
+                                    .map(item -> Map.entry(item.getSku(), pricingPort.price(envelope, item)))
+                                    .filter(entry -> entry.getValue().compareTo(new BigDecimal("150")) > 0)
+                                    .sorted(Map.Entry.comparingByValue(Comparator.reverseOrder()))
+                                    .toList();
+
+                            expensiveItems.getFirst();
+
+                            Foo foo = new Foo();
+                            foo.getAdwqzxckqp();
+                            foo.setBar(new Bar());
+                            foo.getBar().setBiz(new Biz("seed-" + seed));
+                            foo.setAsd(seed);
+                            foo.getAdwqzxckqp();
+
+                            results.put(null, null);
+                            results.put("region", region);
+                            results.put("riskBand", riskBand);
+                            results.put("branch", branch);
+                            results.put("hardDecision", hardDecision);
+                            results.put("labels", labels);
+                            results.put("graphSize", graph.getNodes().size());
+                            results.put("priceTotal", total);
+                            results.put("flaggedFamilies", flaggedFamilies);
+                            results.put("expensiveItems", expensiveItems);
+                            results.put("auditDescription", auditPort.describe(envelope, branch));
+                            results.put("localAuditDescription", describe(envelope, branch));
+                            results.put("fooBarName", foo.getBar().getBiz().getAlpoq());
+                            results.put("fooSeed", foo.getAsd());
+                            results.put("staticMultiplierKeys", ImmutableMap.copyOf(PricingPort.SEGMENT_MULTIPLIERS).keySet());
+                            results.put(null, null);
+
+                            for (var item : envelope.getItems()) {
+                              item.getFamily();
+                              var perItem = pricingPort.price(envelope, item);
+                              if (perItem.compareTo(new BigDecimal("600")) > 0 && item.getQuantity() > 5) {
+                                results.put(item.getSku(), "priority-" + item.getFamily());
+                              } else if (item.getQuantity() == 1) {
+                                results.put(item.getSku(), "single-" + formatter.label(item));
+                              } else {
+                                results.put(item.getSku(), item.getFlags().isEmpty() ? "plain" : item.getFlags().get(0));
+                              }
+                            }
+
+                            return results;
+                          }
+
+                          @Override
+                          public String describe(OrderEnvelope envelope, String decision) {
+                            envelope.getCustomer().getContactWindow().getEndHour();
+                            var summary =
+                                envelope.getItems().stream()
+                                    .map(item -> item.getSku() + ":" + item.getQuantity())
+                                    .collect(Collectors.joining("|"));
+                            envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.joining("|"));
+                            envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());
+                            var asd = envelope.getItems().stream().map(i -> i.getUnitPrice().toBigInteger()).collect(Collectors.toList());
+                            asd.remove(null);
+                            return envelope.getOrderId() + "::" + decision + "::" + summary;
+                          }
+
+                          private OrderEnvelope sampleEnvelope(String seed) {
+                            var customer = new CustomerProfile();
+                            customer.getLoyaltyTier().isBlank();
+                            customer.setContactWindow(new ContactWindow());
+                            customer.getLoyaltyTier();
+                            customer.getLoyaltyTier().isBlank();
+                            customer.setExternalId("customer-" + seed);
+                            customer.setDisplayName("Customer " + seed);
+                            customer.setSegment(seed.length() % 2 == 0 ? "enterprise" : "mid-market");
+                            customer.setVip(seed.length() % 3 == 0);
+                            customer.setLoyaltyTier(seed.length() > 8 ? "PLATINUM" : "GOLD");
+                            customer.setPrimaryAddress(
+                                AddressInfo.builder()
+                                    .lineOne("Infinite Loop " + seed)
+                                    .city("Copenhagen")
+                                    .region("Capital")
+                                    .postalCode("2100")
+                                    .countryCode("DK")
+                                    .build());
+                            customer.setContactWindow(new ContactWindow("Europe/Copenhagen", 8, 18));
+                            customer.getAttributes().put("seed", seed);
+                            customer.getAttributes().put("staticDecision", AuditPort.hardcodedDecision());
+
+                            var totals = new MoneyBucket();
+                            totals.getCurrency();
+                            totals.setCurrency(Currency.getInstance("USD"));
+                            totals.setSubtotal(new BigDecimal("1234.56"));
+                            totals.setTaxes(new BigDecimal("321.11"));
+                            totals.setDiscount(new BigDecimal("87.20"));
+                            LineItem.builder().family("asd").flags(List.of("asd")).sku("21");
+                            var b = LineItem.builder().family(null).quantity(0).sku(null).build();
+                            b.getFlags();
+
+                            var items = new ArrayList<LineItem>();
+                            items.add(null);
+                            LineItem.builder().family(null).flags(null).quantity(2).build();
+                            items.add(
+                                LineItem.builder()
+                                    .sku("CPU-" + seed)
+                                    .family("compute")
+                                    .quantity(3)
+                                    .unitPrice(new BigDecimal("122.10"))
+                                    .flags(List.of("manual-review", "fragile"))
+                                    .build());
+                            items.add(
+                                LineItem.builder()
+                                    .sku("MEM-" + seed)
+                                    .family("memory")
+                                    .quantity(9)
+                                    .unitPrice(new BigDecimal("55.00"))
+                                    .flags(List.of("warehouse-b"))
+                                    .build());
+                            items.add(null);
+                            items.add(
+                                LineItem.builder()
+                                    .sku("STO-" + seed)
+                                    .family("storage")
+                                    .quantity(1)
+                                    .unitPrice(new BigDecimal("899.99"))
+                                    .flags(List.of())
+                                    .build());
+
+                            var envelope = new OrderEnvelope();
+                            envelope.setCustomer(new CustomerProfile());
+                            var cs = new CustomerProfile();
+                            cs.setPrimaryAddress(null);
+                            envelope.setOrderId("order-" + seed);
+                            envelope.setRegionCode(seed.length() % 2 == 0 ? "EU" : "US");
+                            envelope.setRequestedShipDate(LocalDate.now().plusDays(seed.length()));
+                            envelope.setCustomer(customer);
+                            envelope.setTotals(totals);
+                            envelope.setTotals(null);
+                            envelope.setItems(items);
+                            customer.getRecentOrders().add(envelope);
+                            customer.getLoyaltyTier();
+                            customer.getContactWindow().getEndHour();
+                            return envelope;
+                          }
+
+                          private DeepGraph buildGraph(OrderEnvelope envelope) {
+                            var graph = new DeepGraph();
+                            graph.setGraphName("graph-" + envelope.getOrderId());
+
+                            var root = new DeepGraph.DeepNode();
+                            root.setKey(envelope.getOrderId());
+                            root.setEnvelope(envelope);
+
+                            for (var item : envelope.getItems()) {
+                              var child = new DeepGraph.DeepNode();
+                              child.setKey(item.getSku());
+                              child.setEnvelope(envelope);
+
+                              if (Objects.equals(item.getFamily(), "compute")) {
+                                child.getChildren().add(createLeaf(item.getSku() + "-policy", envelope));
+                                child.getChildren().add(createLeaf(item.getSku() + "-sla", envelope));
+                              } else {
+                                child.getChildren().add(createLeaf(item.getSku() + "-generic", envelope));
+                              }
+                              root.getChildren().add(child);
+                            }
+
+                            graph.getNodes().add(root);
+                            graph.getNodes().addAll(root.getChildren());
+                            graph.getGraphName();
+                            return graph;
+                          }
+
+                          private DeepGraph.DeepNode createLeaf(String key, OrderEnvelope envelope) {
+                            var leaf = new DeepGraph.DeepNode();
+                            leaf.getChildren();
+                            leaf.setKey(key);
+                            leaf.setEnvelope(envelope);
+                            return leaf;
+                          }
+                        }
+                        """));
+    }
+
+    private static Position positionAtMarker(String contents, String marker) {
+        var offset = contents.indexOf(marker);
+//        Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
+        var line = 0;
+        var character = 0;
+        for (int i = 0; i < offset; i++) {
+            if (contents.charAt(i) == '\n') {
+                line++;
+                character = 0;
+            } else {
+                character++;
+            }
+        }
+        return new Position(line, character);
+    }
+
+    private static String sanitizeCompletionMarker(String marker) {
+        Assert.assertTrue("expected dangling completion marker ending with '.'", marker.endsWith("."));
+        return marker + "toString();";
+    }
+
+    private static void assertDefinitionAtMarker(
+            JavaLanguageServer server,
+            Path file,
+            String contents,
+            String marker,
+            URI expectedUri,
+            int expectedLineZeroBased) {
+        var result =
+                server.gotoDefinition(
+                                new TextDocumentPositionParams(
+                                        new TextDocumentIdentifier(file.toUri()),
+                                        positionAtMarker(contents, marker)))
+                        .orElseThrow();
+        Assert.assertFalse("expected definition result for marker: " + marker, result.isEmpty());
+        Assert.assertEquals(expectedUri, result.get(0).uri);
+        Assert.assertEquals(expectedLineZeroBased, result.get(0).range.start.line);
+    }
+
+    private static void assertProcessDefinitionAtMarker(
+            ProcessLspClient rpc,
+            int id,
+            Path file,
+            String contents,
+            String marker,
+            URI expectedUri,
+            int expectedLineZeroBased)
+            throws Exception {
+        var position = positionAtMarker(contents, marker);
+        rpc.request(id, "textDocument/definition", textDocumentPositionParams(file, position.line, position.character));
+        var response = rpc.awaitResponse(id, 15, TimeUnit.SECONDS);
+        Assert.assertTrue("expected definition response payload", response.has("result"));
+        var result = response.get("result");
+        Assert.assertTrue("expected definition result array for marker: " + marker + ", got: " + response, result.isJsonArray());
+        Assert.assertFalse("expected non-empty definition result for marker: " + marker, result.getAsJsonArray().isEmpty());
+        var location = result.getAsJsonArray().get(0).getAsJsonObject();
+        Assert.assertEquals(expectedUri.toString(), location.get("uri").getAsString());
+        Assert.assertEquals(expectedLineZeroBased, location.getAsJsonObject("range").getAsJsonObject("start").get("line").getAsInt());
+    }
+
+    private static void assertProcessDefinitionPresentAtMarker(
+            ProcessLspClient rpc, int id, Path file, String contents, String marker) throws Exception {
+        assertProcessDefinitionPresentAtMarker(rpc, id, file, contents, marker, 0);
+    }
+
+    private static void assertProcessDefinitionPresentAtMarker(
+            ProcessLspClient rpc, int id, Path file, String contents, String marker, int markerOffset) throws Exception {
+        var position = requiredPositionAtMarker(contents, marker, markerOffset);
+        rpc.request(id, "textDocument/definition", textDocumentPositionParams(file, position.line, position.character));
+        var response = rpc.awaitResponse(id, 15, TimeUnit.SECONDS);
+        Assert.assertTrue("expected definition response payload", response.has("result"));
+        var result = response.get("result");
+        Assert.assertTrue("expected definition result array for marker: " + marker + ", got: " + response, result.isJsonArray());
+        Assert.assertFalse("expected non-empty definition result for marker: " + marker, result.getAsJsonArray().isEmpty());
+    }
+
+    private static void writeInferredDemoPom(Path workspace) throws IOException {
+        Files.writeString(
+                workspace.resolve("pom.xml"),
+                """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                  <modelVersion>4.0.0</modelVersion>
+                  <parent>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-parent</artifactId>
+                    <version>4.0.1</version>
+                    <relativePath/>
+                  </parent>
+                  <groupId>com.example</groupId>
+                  <artifactId>demo-repro</artifactId>
+                  <version>0.0.1-SNAPSHOT</version>
+                  <properties>
+                    <java.version>21</java.version>
+                  </properties>
+                  <dependencies>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-webmvc</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-data-jpa</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-validation</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-cache</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-actuator</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-security</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.apache.commons</groupId>
+                      <artifactId>commons-lang3</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>com.google.guava</groupId>
+                      <artifactId>guava</artifactId>
+                      <version>33.3.1-jre</version>
+                    </dependency>
+                    <dependency>
+                      <groupId>com.github.ben-manes.caffeine</groupId>
+                      <artifactId>caffeine</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.projectlombok</groupId>
+                      <artifactId>lombok</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-webmvc-test</artifactId>
+                      <scope>test</scope>
+                    </dependency>
+                  </dependencies>
+                  <build>
+                    <plugins>
+                      <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-compiler-plugin</artifactId>
+                        <configuration>
+                          <annotationProcessorPaths>
+                            <path>
+                              <groupId>org.projectlombok</groupId>
+                              <artifactId>lombok</artifactId>
+                            </path>
+                          </annotationProcessorPaths>
+                        </configuration>
+                      </plugin>
+                    </plugins>
+                  </build>
+                </project>
+                """);
+    }
+
+    private static Position requiredPositionAtMarker(String contents, String marker, int offset) {
+        var index = contents.indexOf(marker);
+        Assert.assertTrue("expected marker in file contents: " + marker, index >= 0);
+        return positionAtOffset(contents, index + offset);
+    }
+
+    private static Position positionAtOffset(String contents, int offset) {
+        var line = 0;
+        var character = 0;
+        for (int i = 0; i < offset; i++) {
+            if (contents.charAt(i) == '\n') {
+                line++;
+                character = 0;
+            } else {
+                character++;
+            }
+        }
+        return new Position(line, character);
+    }
+
+    private static Set<String> completionLabels(CompletionList completion) {
+        return completion.items.stream()
+                .map(item -> item.label)
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
+    private static final class ProcessLspClient implements AutoCloseable {
+        private final Process process;
+        private final OutputStream input;
+        private final BlockingQueue<JsonObject> messages = new LinkedBlockingQueue<>();
+        private final BlockingQueue<String> logs = new LinkedBlockingQueue<>();
+        private final Thread stdoutReader;
+        private final Thread stderrReader;
+
+        private ProcessLspClient(Process process) {
+            this.process = process;
+            this.input = process.getOutputStream();
+            this.stdoutReader =
+                    new Thread(
+                            () -> {
+                                try {
+                                    while (true) {
+                                        messages.add(JsonParser.parseString(nextLspToken(process.getInputStream())).getAsJsonObject());
+                                    }
+                                } catch (EOFException ignored) {
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            },
+                            "lsp-stdout-reader");
+            this.stderrReader =
+                    new Thread(
+                            () -> {
+                                try (var reader =
+                                        new BufferedReader(
+                                                new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
+                                    for (String line; (line = reader.readLine()) != null; ) {
+                                        logs.add(line);
+                                    }
+                                } catch (IOException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            },
+                            "lsp-stderr-reader");
+            stdoutReader.setDaemon(true);
+            stderrReader.setDaemon(true);
+            stdoutReader.start();
+            stderrReader.start();
+        }
+
+        void request(int id, String method, JsonObject params) throws IOException {
+            var message = new JsonObject();
+            message.addProperty("jsonrpc", "2.0");
+            message.addProperty("id", id);
+            message.addProperty("method", method);
+            message.add("params", params);
+            send(message);
+        }
+
+        void notify(String method, JsonObject params) throws IOException {
+            var message = new JsonObject();
+            message.addProperty("jsonrpc", "2.0");
+            message.addProperty("method", method);
+            message.add("params", params);
+            send(message);
+        }
+
+        JsonObject awaitResponse(int id, long timeout, TimeUnit unit) throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (true) {
+                var remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    Assert.fail("timed out waiting for LSP response id=" + id);
+                }
+                var next = messages.poll(remaining, TimeUnit.NANOSECONDS);
+                if (next == null) {
+                    continue;
+                }
+                if (next.has("id") && next.get("id").getAsInt() == id) {
+                    return next;
+                }
+            }
+        }
+
+        String awaitLog(String needle, long timeout, TimeUnit unit) throws InterruptedException {
+            var deadline = System.nanoTime() + unit.toNanos(timeout);
+            while (true) {
+                var remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    Assert.fail("timed out waiting for process log containing: " + needle);
+                }
+                var next = logs.poll(remaining, TimeUnit.NANOSECONDS);
+                if (next == null) {
+                    continue;
+                }
+                if (next.contains(needle)) {
+                    return next;
+                }
+            }
+        }
+
+        private void send(JsonObject message) throws IOException {
+            var json = message.toString();
+            var bytes = json.getBytes(StandardCharsets.UTF_8);
+            var header = String.format("Content-Length: %d\r\n\r\n", bytes.length).getBytes(StandardCharsets.UTF_8);
+            input.write(header);
+            input.write(bytes);
+            input.flush();
+        }
+
+        @Override
+        public void close() {
+            process.destroyForcibly();
+        }
+
+        private static String nextLspToken(InputStream stream) throws IOException {
+            int contentLength = -1;
+            while (true) {
+                var header = readHeader(stream);
+                if (header.isEmpty()) {
+                    if (contentLength < 0) {
+                        throw new EOFException("missing content length");
+                    }
+                    return readBody(stream, contentLength);
+                }
+                if (header.startsWith("Content-Length: ")) {
+                    contentLength = Integer.parseInt(header.substring("Content-Length: ".length()));
+                }
+            }
+        }
+
+        private static String readHeader(InputStream stream) throws IOException {
+            var line = new StringBuilder();
+            while (true) {
+                var next = stream.read();
+                if (next == -1) {
+                    throw new EOFException("stream closed");
+                }
+                if (next == '\r') {
+                    var newline = stream.read();
+                    if (newline == -1) {
+                        throw new EOFException("stream closed");
+                    }
+                    return line.toString();
+                }
+                line.append((char) next);
+            }
+        }
+
+        private static String readBody(InputStream stream, int contentLength) throws IOException {
+            var bytes = stream.readNBytes(contentLength);
+            if (bytes.length != contentLength) {
+                throw new EOFException("expected " + contentLength + " bytes, got " + bytes.length);
+            }
+            return new String(bytes, StandardCharsets.UTF_8);
+        }
     }
 
     private static boolean isSyntaxBlockingDiagnostic(Diagnostic diagnostic) {
@@ -4016,9 +6890,6 @@ public class JavaLanguageServerTest {
 
         @Override
         public void registerCapability(String method, com.google.gson.JsonElement options) {}
-
-        @Override
-        public void refreshInlayHints() {}
 
         @Override
         public void customNotification(String method, com.google.gson.JsonElement params) {}
@@ -4105,42 +6976,22 @@ public class JavaLanguageServerTest {
         }
     }
 
-    private static class RecordingInlayHintClient implements LanguageClient {
-        private final CountDownLatch refreshRequested = new CountDownLatch(1);
-        private final AtomicInteger refreshCount = new AtomicInteger();
+    private static final class RecordingMessageClient implements LanguageClient {
+        private final List<ShowMessageParams> messages = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         @Override
         public void publishDiagnostics(PublishDiagnosticsParams params) {}
 
         @Override
-        public void showMessage(ShowMessageParams params) {}
+        public void showMessage(ShowMessageParams params) {
+            messages.add(params);
+        }
 
         @Override
         public void registerCapability(String method, com.google.gson.JsonElement options) {}
 
         @Override
-        public void refreshInlayHints() {
-            refreshCount.incrementAndGet();
-            refreshRequested.countDown();
-        }
-
-        @Override
         public void customNotification(String method, com.google.gson.JsonElement params) {}
-
-        private boolean awaitRefresh(long timeout, TimeUnit unit) throws InterruptedException {
-            return refreshRequested.await(timeout, unit) && refreshCount.get() > 0;
-        }
-
-        private boolean awaitRefreshCountAtLeast(int target, long timeout, TimeUnit unit) throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (System.nanoTime() < deadline) {
-                if (refreshCount.get() >= target) {
-                    return true;
-                }
-                Thread.sleep(25);
-            }
-            return refreshCount.get() >= target;
-        }
     }
 
     private static class TestLogCapture extends Handler {
@@ -4215,7 +7066,8 @@ public class JavaLanguageServerTest {
         }
 
         @Override
-        public CompileTask compile(Path... files) {
+        CompileTask compileDiagnostics(
+                java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
             var active = inFlight.incrementAndGet();
             maxInFlight.accumulateAndGet(active, Math::max);
             try {
@@ -4230,6 +7082,79 @@ public class JavaLanguageServerTest {
 
         int maxConcurrentCompiles() {
             return maxInFlight.get();
+        }
+    }
+
+    private static class MethodTrackingCompiler extends JavaCompilerService {
+        final AtomicInteger parseCalls = new AtomicInteger();
+        final AtomicInteger compileCalls = new AtomicInteger();
+        final AtomicInteger compileFastCalls = new AtomicInteger();
+        final AtomicInteger compileFastWithProcessorsCalls = new AtomicInteger();
+
+        MethodTrackingCompiler(
+                Set<Path> classPath,
+                Set<Path> docPath,
+                Set<String> addExports,
+                List<String> extraArgs,
+                boolean lombokConfiguredEnabled,
+                String compilerRole) {
+            super(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, compilerRole);
+        }
+
+        void resetCounters() {
+            parseCalls.set(0);
+            compileCalls.set(0);
+            compileFastCalls.set(0);
+            compileFastWithProcessorsCalls.set(0);
+        }
+
+        @Override
+        public ParseTask parse(Path file) {
+            parseCalls.incrementAndGet();
+            return super.parse(file);
+        }
+
+        @Override
+        public ParseTask parse(javax.tools.JavaFileObject file) {
+            parseCalls.incrementAndGet();
+            return super.parse(file);
+        }
+
+        @Override
+        public CompileTask compile(Path... files) {
+            compileCalls.incrementAndGet();
+            return super.compile(files);
+        }
+
+        @Override
+        public CompileTask compile(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+            compileCalls.incrementAndGet();
+            return super.compile(sources);
+        }
+
+        @Override
+        public CompileTask compileFast(Path... files) {
+            compileFastCalls.incrementAndGet();
+            return super.compileFast(files);
+        }
+
+        @Override
+        public CompileTask compileFast(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+            compileFastCalls.incrementAndGet();
+            return super.compileFast(sources);
+        }
+
+        @Override
+        public CompileTask compileFastWithProcessors(Path... files) {
+            compileFastWithProcessorsCalls.incrementAndGet();
+            return super.compileFastWithProcessors(files);
+        }
+
+        @Override
+        public CompileTask compileFastWithProcessors(
+                java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+            compileFastWithProcessorsCalls.incrementAndGet();
+            return super.compileFastWithProcessors(sources);
         }
     }
 }

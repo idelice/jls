@@ -15,3 +15,5 @@ $JAVA_HOME/Contents/Home/bin/jlink \
   --no-header-files \
   --no-man-pages \
   --compress 2
+
+cp ./scripts/logging.properties dist/mac/conf/logging.properties

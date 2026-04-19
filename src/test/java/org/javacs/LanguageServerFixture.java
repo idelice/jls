@@ -17,7 +17,7 @@ public class LanguageServerFixture {
     }
 
     public static CompilerProvider getCompilerProvider() {
-        return getJavaLanguageServer().compiler();
+        return getJavaLanguageServer().getOrCreateCompiler();
     }
 
     static JavaLanguageServer getJavaLanguageServer() {
@@ -26,6 +26,10 @@ public class LanguageServerFixture {
 
     static JavaLanguageServer getJavaLanguageServer(Consumer<Diagnostic> onError) {
         return getJavaLanguageServer(DEFAULT_WORKSPACE_ROOT, onError);
+    }
+
+    static JavaLanguageServer getJavaLanguageServer(Path workspaceRoot) {
+        return getJavaLanguageServer(workspaceRoot, diagnostic -> LOG.info(diagnostic.message));
     }
 
     static JavaLanguageServer getJavaLanguageServer(Path workspaceRoot, Consumer<Diagnostic> onError) {
@@ -42,9 +46,6 @@ public class LanguageServerFixture {
 
                     @Override
                     public void registerCapability(String method, JsonElement options) {}
-
-                    @Override
-                    public void refreshInlayHints() {}
 
                     @Override
                     public void customNotification(String method, JsonElement params) {}

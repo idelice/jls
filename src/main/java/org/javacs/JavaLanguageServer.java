@@ -1,12 +1,11 @@
 package org.javacs;
 
-import static org.javacs.JsonHelper.GSON;
-
 import com.google.gson.*;
+import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
+import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,76 +17,107 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
 import org.javacs.action.CodeActionProvider;
-import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.completion.CompletionProvider;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.SignatureProvider;
-import org.javacs.completion.TypeMemberIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
+import org.javacs.provider.CompletionProvider;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.provider.SignatureProvider;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.fold.FoldProvider;
-import org.javacs.hover.HoverProvider;
-import org.javacs.index.SymbolProvider;
+import org.javacs.provider.HoverProvider;
+import org.javacs.index.IndexedType;
+import org.javacs.provider.SymbolProvider;
 import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ErrorProvider;
-import org.javacs.navigation.DefinitionProvider;
-import org.javacs.navigation.ReferenceProvider;
+import org.javacs.provider.DefinitionProvider;
+import org.javacs.provider.InlayHintProvider;
+import org.javacs.provider.ReferenceProvider;
 import org.javacs.rewrite.*;
 
+/**
+ * Main language-server orchestration for workspace state, diagnostics, and navigation/completion
+ * readiness.
+ *
+ * <p>Diagnostics and completion indexing intentionally remain separate flows. Diagnostics must be
+ * able to publish quickly for open files, while the completion index is allowed to lag slightly and
+ * rebuild independently as declarations drift or the compiler is recreated.
+ */
 class JavaLanguageServer extends LanguageServer {
     private static final Logger LOG = Logger.getLogger("main");
 
-    // TODO allow multiple workspace roots
-    private Path workspaceRoot;
-    private final LanguageClient client;
-    private JavaCompilerService cacheCompiler;
-    private JavaCompilerService diagnosticsCompiler;
-    private JsonObject cacheSettings;
-    private JsonObject settings = new JsonObject();
-    private boolean modifiedBuild = true;
-    private final ScheduledExecutorService diagnosticsExecutor =
-            Executors.newSingleThreadScheduledExecutor(
-                    r -> {
-                        var t = new Thread(r, "javacs-diagnostics");
-                        t.setDaemon(true);
-                        return t;
-                    });
-    private final ScheduledExecutorService completionIndexExecutor =
-            Executors.newSingleThreadScheduledExecutor(
-                    r -> {
-                        var t = new Thread(r, "javacs-completion-index");
-                        t.setDaemon(true);
-                        return t;
-                    });
-    private final AtomicLong diagnosticsRevision = new AtomicLong();
-    private final AtomicLong completionIndexRevision = new AtomicLong();
-    private final Object diagnosticsCompileMutex = new Object();
-    private final Object completionIndexCompileMutex = new Object();
-    private ScheduledFuture<?> pendingDiagnostics;
-    private ScheduledFuture<?> pendingCompletionIndex;
-    private static final long DIAGNOSTIC_DEBOUNCE_MS = 250;
     private static final long COMPLETION_INDEX_DEBOUNCE_MS = 100;
     private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 700;
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private static final long NAVIGATION_BOOTSTRAP_WAIT_MS = 1500;
-    private final AtomicReference<TypeMemberIndex> completionIndexRef =
-            new AtomicReference<>(TypeMemberIndex.EMPTY);
-    private final AtomicReference<ExternalBinaryTypeIndex> externalBinaryIndexRef =
-            new AtomicReference<>(ExternalBinaryTypeIndex.EMPTY);
+
+    private record TypeIndexAvailability(
+            long versionBefore, long versionAfter, CompletionIndexScope scopeBefore, CompletionIndexScope scopeAfter, long waitMs) {}
+    private record DeclaredTypeShape(
+            String qualifiedName,
+            List<String> directMemberSignatures,
+            String superclass,
+            List<String> interfaces,
+            boolean structuralLombok) {}
+    private record CompletionSnapshot(
+            WorkspaceTypeIndex workspaceIndex,
+            ExternalBinaryTypeIndex externalIndex,
+            TypeIndexRouter typeIndex,
+            long version,
+            CompletionIndexScope scope) {
+        private static final CompletionSnapshot EMPTY =
+                create(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, 0, CompletionIndexScope.EMPTY);
+
+        private static CompletionSnapshot create(
+                WorkspaceTypeIndex workspaceIndex,
+                ExternalBinaryTypeIndex externalIndex,
+                long version,
+                CompletionIndexScope scope) {
+            var safeWorkspace = workspaceIndex == null ? WorkspaceTypeIndex.EMPTY : workspaceIndex;
+            var safeExternal = externalIndex == null  ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
+            var safeScope = scope == null ? CompletionIndexScope.EMPTY : scope;
+            return new CompletionSnapshot(
+                    safeWorkspace,
+                    safeExternal,
+                    new TypeIndexRouter(safeWorkspace, safeExternal),
+                    Math.max(0L, version),
+                    safeScope);
+        }
+    }
+
+    // TODO allow multiple workspace roots
+    private Path workspaceRoot;
+    private final LanguageClient client;
+    private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
+
+    // Interactive requests use cacheCompiler; pull-diagnostics requests use diagnosticsCompiler so
+    // the completion-index background thread and the LSP main thread do not contend on one context.
+    private JavaCompilerService cacheCompiler;
+    private JavaCompilerService diagnosticsCompiler;
+
+    private JsonObject appliedCompilerSettings = new JsonObject();
+    private JsonObject settings = new JsonObject();
+    private boolean workDoneProgressSupported;
+
+    private final ScheduledExecutorService completionIndexExecutor =
+            Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofPlatform().daemon().name("javacs-completion-index").factory());
+
+    /** Monotonic revision for queued completion-index refreshes; newer schedules cancel older runs. */
+    private final AtomicLong completionIndexRevision = new AtomicLong();
     private final AtomicLong completionIndexVersion = new AtomicLong();
-    private final AtomicReference<CompletionIndexScope> completionIndexScope =
-            new AtomicReference<>(CompletionIndexScope.EMPTY);
     private final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
-    private final Set<Path> dirtyDiagnosticsFiles = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private final AtomicInteger diagnosticsCompilesInFlight = new AtomicInteger();
-    private final AtomicInteger didSaveDiagnosticsInFlight = new AtomicInteger();
+    /** Serialize completion-index refreshes so one compile/index install owns the refresh lane. */
+    private final Object completionIndexCompileMutex = new Object();
+
+    private ScheduledFuture<?> pendingCompletionIndex;
+
+    private final Set<String> shownWorkspaceWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private enum CompletionIndexRefreshMode {
         ACTIVE_DOCUMENT_BOOTSTRAP,
@@ -101,104 +131,20 @@ class JavaLanguageServer extends LanguageServer {
         WORKSPACE
     }
 
-    private record CompletionSnapshot(
-            TypeMemberIndex workspaceIndex,
-            ExternalBinaryTypeIndex externalIndex,
-            CompositeTypeIndex typeIndex,
-            long version,
-            CompletionIndexScope scope) {
-        private static final CompletionSnapshot EMPTY =
-                create(TypeMemberIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, 0, CompletionIndexScope.EMPTY);
-
-        private static CompletionSnapshot create(
-                TypeMemberIndex workspaceIndex,
-                ExternalBinaryTypeIndex externalIndex,
-                long version,
-                CompletionIndexScope scope) {
-            var safeWorkspace = workspaceIndex == null ? TypeMemberIndex.EMPTY : workspaceIndex;
-            var safeExternal = externalIndex == null  ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
-            var safeScope = scope == null ? CompletionIndexScope.EMPTY : scope;
-            return new CompletionSnapshot(
-                    safeWorkspace,
-                    safeExternal,
-                    new CompositeTypeIndex(WorkspaceTypeIndex.wrap(safeWorkspace), safeExternal),
-                    Math.max(0L, version),
-                    safeScope);
-        }
-    }
-
-    private record ActiveDocumentChangeImpact(boolean refreshCompletionIndex) {}
-
-    private record ScheduledDiagnosticsRequest(
-            long scheduleRevision, long contentRevision, int requestedCount, int dirtyOpenCount) {}
-
-    private record DiagnosticsBatch(List<Path> files, int requestedCount, int dirtyOpenCount) {}
-
-    private record TypeIndexAvailability(
-            long versionBefore, long versionAfter, CompletionIndexScope scopeBefore, CompletionIndexScope scopeAfter, long waitMs) {}
-
-    private record DeclaredTypeShape(
-            String qualifiedName,
-            List<String> directMemberSignatures,
-            String superclass,
-            List<String> interfaces,
-            boolean structuralLombok) {}
-
-    synchronized JavaCompilerService compiler() {
-        if (needsCompiler()) {
-            var compilers = createCompilers();
-            cacheCompiler = compilers.interactive;
-            diagnosticsCompiler = compilers.diagnosticsPrimary;
-            refreshExternalBinaryIndex(cacheCompiler);
-            cancelPendingCompletionIndex("compilerRecreated");
-            cacheSettings = compilerSettingsSnapshot(settings);
-            modifiedBuild = false;
-            refreshCompletionIndexForCompilerRecreated();
-        }
+    /** Return the current interactive compiler. Compiler recreation happens at explicit event boundaries. */
+    synchronized JavaCompilerService getOrCreateCompiler() {
+        Objects.requireNonNull(cacheCompiler, "Compiler has not been initialized");
         return cacheCompiler;
     }
 
-    private CompletionSnapshot completionSnapshot() {
-        return completionSnapshotRef.get();
-    }
-
     private void publishCompletionSnapshot(
-            TypeMemberIndex workspaceIndex,
+            WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
             long version,
             CompletionIndexScope scope) {
         var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, version, scope);
-        completionIndexRef.set(snapshot.workspaceIndex());
-        externalBinaryIndexRef.set(snapshot.externalIndex());
         completionIndexVersion.set(snapshot.version());
-        completionIndexScope.set(snapshot.scope());
         completionSnapshotRef.set(snapshot);
-    }
-
-    private void refreshExternalBinaryIndex(JavaCompilerService compiler) {
-        var currentSnapshot = completionSnapshot();
-        publishCompletionSnapshot(
-                currentSnapshot.workspaceIndex(),
-                new ExternalBinaryTypeIndex(compiler),
-                currentSnapshot.version(),
-                currentSnapshot.scope());
-    }
-
-    private DiagnosticsCompilerSelection selectDiagnosticsCompiler() {
-        compiler();
-        return new DiagnosticsCompilerSelection(diagnosticsCompiler);
-    }
-
-    private boolean needsCompiler() {
-        if (modifiedBuild) {
-            return true;
-        }
-        var currentCompilerSettings = compilerSettingsSnapshot(settings);
-        if (!currentCompilerSettings.equals(cacheSettings)) {
-            LOG.info("Settings\n\t" + settings + "\nis different than\n\t" + cacheSettings);
-            return true;
-        }
-        return false;
     }
 
     private JsonObject compilerSettingsSnapshot(JsonObject source) {
@@ -224,158 +170,200 @@ class JavaLanguageServer extends LanguageServer {
         target.add(key, source.get(key).deepCopy());
     }
 
-    private void refreshCompletionIndexForCompilerRecreated() {
-        var active = normalizeJavaFiles(FileStore.activeDocuments());
-        if (!active.isEmpty()) {
-            cancelPendingDiagnostics("compilerRecreated");
-            scheduleDiagnostics(active, "compilerRecreated", 0);
-            scheduleProjectCompletionIndexRefresh("compilerRecreated", 0);
+    private void publishExternalBinaryIndexSnapshot() {
+        var currentSnapshot = completionSnapshotRef.get();
+        publishCompletionSnapshot(
+                currentSnapshot.workspaceIndex(),
+                new ExternalBinaryTypeIndex(getOrCreateCompiler()),
+                currentSnapshot.version(),
+                currentSnapshot.scope());
+    }
+
+    private synchronized void initializeCompilers() {
+        createCompilers();
+        appliedCompilerSettings = compilerSettingsSnapshot(settings);
+        publishExternalBinaryIndexSnapshot();
+    }
+
+    private synchronized void recreateCompilersAndRefreshState(String trigger) {
+        LOG.info(String.format("[perf] compiler_recreate trigger=%s", trigger));
+        completionIndexScheduler.cancel(trigger);
+        createCompilers();
+        appliedCompilerSettings = compilerSettingsSnapshot(settings);
+        publishExternalBinaryIndexSnapshot();
+        refreshStateForCompilerRecreated();
+        client.customNotification("workspace/diagnostic/refresh", null);
+    }
+
+    private void refreshStateForCompilerRecreated() {
+        var currentSnapshot = completionSnapshotRef.get();
+        var active = filterJavaFiles(FileStore.activeDocuments());
+        if (active.isEmpty()) {
+            if (currentSnapshot.scope() != CompletionIndexScope.EMPTY) {
+                publishCompletionSnapshot(
+                        WorkspaceTypeIndex.EMPTY,
+                        currentSnapshot.externalIndex(),
+                        currentSnapshot.version(),
+                        CompletionIndexScope.EMPTY);
+            }
+            LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
             return;
         }
-        LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=no_active_docs");
+        if (currentSnapshot.scope() == CompletionIndexScope.EMPTY) {
+            LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=empty_scope");
+            return;
+        }
+        completionIndexScheduler.scheduleRefresh(
+                FileStore.all(), "compilerRecreated", 0, CompletionIndexRefreshMode.FULL_REBUILD);
     }
 
     void lint(Collection<Path> files) {
-        cancelPendingDiagnostics("foreground");
-        cancelPendingCompletionIndex("foreground");
-        var selection = selectDiagnosticsCompiler();
-        var javaFiles = normalizeJavaFiles(files);
-        compileAndPublish(files, selection.compiler, "foreground", -1, javaFiles.size(), 0);
-        if (completionSnapshot().version() == 0 && !FileStore.activeDocuments().isEmpty()) {
-            scheduleActiveCompletionBootstrapIfNeeded("lintBootstrap", 0);
+        var javaFiles = filterJavaFiles(files);
+        if (javaFiles.isEmpty()) {
+            return;
+        }
+        completionIndexScheduler.cancel("foreground");
+        getOrCreateCompiler();
+        CompileTask task = null;
+        try {
+            task = diagnosticsCompiler.compileDiagnostics(
+                    javaFiles.stream().map(SourceFileObject::new).toList());
+            var requestedUris = new HashSet<java.net.URI>();
+            for (var file : javaFiles) {
+                requestedUris.add(file.toUri());
+            }
+            var report = new ErrorProvider(task).errors(requestedUris);
+            for (var params : report.diagnostics()) {
+                client.publishDiagnostics(params);
+            }
+        } finally {
+            if (task != null) task.close();
+        }
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
+                && !FileStore.activeDocuments().isEmpty()) {
+            completionIndexScheduler.scheduleActiveBootstrapIfNeeded("lintBootstrap");
         }
     }
 
-    private void compileAndPublish(
-            Collection<Path> files,
-            JavaCompilerService diagnosticsCompiler,
-            String trigger,
-            long expectedContentRevision,
-            int requestedCount,
-            int dirtyOpenCount) {
-        if (shouldYieldToDidSaveDiagnostics(trigger, "pre_lock")) {
-            return;
-        }
-        var waitStarted = Instant.now();
-        synchronized (diagnosticsCompileMutex) {
-            if (shouldYieldToDidSaveDiagnostics(trigger, "post_lock")) {
-                return;
-            }
-            var waited = Duration.between(waitStarted, Instant.now()).toMillis();
-            if (waited > 0) {
+    private boolean analyzeActiveDocumentChange(
+            Path file, List<TextDocumentContentChangeEvent> contentChanges) {
+        try {
+            var parse = getOrCreateCompiler().parse(file);
+            var contents = FileStore.contents(file);
+            if (hasLikelyIncompleteSource(FileStore.contents(file))) {
                 LOG.fine(
-                        String.format(
-                                "[perf] diagnostics_compile_wait trigger=%s waited=%dms",
-                                trigger, waited));
+                        "[perf] completion_index_didChange_skip file="
+                                + file.getFileName()
+                                + " reason=incomplete_source");
+                return false;
             }
-            var javaFiles = normalizeJavaFiles(files);
-            if (javaFiles.isEmpty()) return;
-            LOG.info("Lint " + javaFiles.size() + " files...");
-            var started = Instant.now();
-            CompileTask task = null;
-            try {
-                diagnosticsCompilesInFlight.incrementAndGet();
-                task = diagnosticsCompiler.compile(javaFiles.toArray(Path[]::new));
-                var compiled = Instant.now();
-                var compileMs = Duration.between(started, compiled).toMillis();
-                var compileTelemetry = diagnosticsCompiler.lastCompileTelemetry();
-                LOG.info(
-                        String.format(
-                                "[perf] diagnostics_compile trigger=%s files=%d took=%dms",
-                                trigger, javaFiles.size(), compileMs));
+            if (contentChanges != null && !contentChanges.isEmpty()) {
+                var positions = Trees.instance(parse.task()).getSourcePositions();
+                var spans = new ArrayList<long[]>();
+                new TreePathScanner<Void, Void>() {
+                    @Override
+                    public Void visitMethod(MethodTree method, Void unused) {
+                        if (method.getBody() != null) {
+                            addSpan(method.getBody());
+                        }
+                        return super.visitMethod(method, unused);
+                    }
+
+                    @Override
+                    public Void visitBlock(BlockTree block, Void unused) {
+                        var parent = getCurrentPath().getParentPath();
+                        if (parent != null && parent.getLeaf() instanceof ClassTree) {
+                            addSpan(block);
+                        }
+                        return super.visitBlock(block, unused);
+                    }
+
+                    @Override
+                    public Void visitVariable(VariableTree variable, Void unused) {
+                        var parent = getCurrentPath().getParentPath();
+                        if (parent != null
+                                && parent.getLeaf() instanceof ClassTree
+                                && variable.getInitializer() != null) {
+                            addSpan(variable.getInitializer());
+                        }
+                        return super.visitVariable(variable, unused);
+                    }
+
+                    private void addSpan(com.sun.source.tree.Tree tree) {
+                        var start = positions.getStartPosition(parse.root(), tree);
+                        var end = positions.getEndPosition(parse.root(), tree);
+                        if (start >= 0 && end >= start) {
+                            spans.add(new long[] {start, end});
+                        }
+                    }
+                }.scan(parse.root(), null);
+                if (!spans.isEmpty()) {
+                    var executableOnlyChange = true;
+                    for (var change : contentChanges) {
+                        if (change.range == null) {
+                            executableOnlyChange = false;
+                            break;
+                        }
+                        var start =
+                                FileStore.offset(
+                                        contents,
+                                        change.range.start.line + 1,
+                                        change.range.start.character + 1);
+                        var end =
+                                FileStore.offset(
+                                        contents,
+                                        change.range.end.line + 1,
+                                        change.range.end.character + 1);
+                        if (end < start) {
+                            end = start;
+                        }
+                        var covered = false;
+                        for (var span : spans) {
+                            if (start >= span[0] && end <= span[1]) {
+                                covered = true;
+                                break;
+                            }
+                        }
+                        if (!covered) {
+                            executableOnlyChange = false;
+                            break;
+                        }
+                    }
+                    if (executableOnlyChange) {
+                        LOG.fine(
+                                "[perf] completion_index_didChange_skip file="
+                                        + file.getFileName()
+                                        + " reason=executable_only_change");
+                        return false;
+                    }
+                }
+            }
+            var shapes = declaredTypeShapes(parse);
+            var hasStructuralLombokType = shapes.stream().anyMatch(DeclaredTypeShape::structuralLombok);
+            if (hasStructuralLombokType) {
                 LOG.fine(
-                        String.format(
-                                "[perf] diagnostics_summary trigger=%s requested=%d dirty_open=%d batch=%d compiled_roots=%d ap=%s expanded=%d compiler_path=%s cache=%s",
-                                trigger,
-                                requestedCount,
-                                dirtyOpenCount,
-                                javaFiles.size(),
-                                task.roots.size(),
-                                compileTelemetry.annotationProcessingEnabled,
-                                compileTelemetry.expandedSources,
-                                compileTelemetry.path,
-                                compileTelemetry.cacheName));
-                if (shouldYieldToDidSaveDiagnostics(trigger, "post_compile")) {
-                    return;
-                }
-                if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_compile")) {
-                    return;
-                }
-                publishDiagnosticsFromTask(task, javaFiles, trigger, expectedContentRevision);
-                if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "post_publish")) {
-                    return;
-                }
-            } finally {
-                diagnosticsCompilesInFlight.updateAndGet(current -> Math.max(0, current - 1));
-                if (task != null) {
-                    task.close();
-                }
+                        "[perf] completion_index_didChange_refresh file="
+                                + file.getFileName()
+                                + " reason=structural_lombok");
+                return true;
             }
+            var declarationDrift = hasDeclarationDrift(file, shapes);
+            if (declarationDrift) {
+                LOG.fine(
+                        "[perf] completion_index_didChange_refresh file="
+                                + file.getFileName()
+                                + " reason=declaration_drift");
+            }
+            return declarationDrift;
+        } catch (RuntimeException e) {
+            LOG.fine(String.format(
+                    "[perf] completion_index_didChange_skip file=%s reason=parse_failed detail=%s",
+                    file.getFileName(), e.getMessage()));
         }
+        return false;
     }
 
-    private void publishDiagnosticsFromTask(
-            CompileTask task,
-            Collection<Path> requestedFiles,
-            String trigger,
-            long expectedContentRevision) {
-        var requestedJavaFiles = normalizeJavaFiles(requestedFiles);
-        if (requestedJavaFiles.isEmpty()) {
-            return;
-        }
-        var publishStarted = Instant.now();
-        if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "pre_publish")) {
-            return;
-        }
-        if (shouldYieldToDidSaveDiagnostics(trigger, "pre_publish")) {
-            return;
-        }
-        var diagnosticsCount = 0;
-        var publishedUris = new HashSet<java.net.URI>();
-        var requestedUris = new HashSet<java.net.URI>();
-        for (var file : requestedJavaFiles) {
-            requestedUris.add(file.toUri());
-        }
-        var materializeStarted = Instant.now();
-        var report = new ErrorProvider(task).errors(requestedUris);
-        var materializeMs = Duration.between(materializeStarted, Instant.now()).toMillis();
-        var clientStarted = Instant.now();
-        for (var errs : report.diagnostics()) {
-            if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_loop")) {
-                return;
-            }
-            client.publishDiagnostics(errs);
-            diagnosticsCount += errs.diagnostics.size();
-            publishedUris.add(errs.uri);
-        }
-        for (var file : requestedJavaFiles) {
-            if (shouldSkipStaleDiagnostics(expectedContentRevision, trigger, "publish_clear_loop")) {
-                return;
-            }
-            if (!FileStore.isJavaFile(file)) continue;
-            var uri = file.toUri();
-            if (publishedUris.contains(uri)) continue;
-            client.publishDiagnostics(new PublishDiagnosticsParams(uri, List.of()));
-            publishedUris.add(uri);
-        }
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_publish trigger=%s requested_roots=%d compiled_roots=%d processed_roots=%d published_roots=%d diagnostics=%d convert=%dms warnings=%dms materialize=%dms client=%dms took=%dms",
-                        trigger,
-                        requestedJavaFiles.size(),
-                        report.compiledRoots(),
-                        report.processedRoots(),
-                        publishedUris.size(),
-                        diagnosticsCount,
-                        report.convertMs(),
-                        report.warningMs(),
-                        materializeMs,
-                        Duration.between(clientStarted, Instant.now()).toMillis(),
-                        Duration.between(publishStarted, Instant.now()).toMillis()));
-        clearDirtyDiagnostics(requestedJavaFiles);
-    }
-
-    private List<Path> normalizeJavaFiles(Collection<Path> files) {
+    private static List<Path> filterJavaFiles(Collection<Path> files) {
         var javaFiles = new ArrayList<Path>();
         for (var file : files) {
             if (FileStore.isJavaFile(file)) {
@@ -385,240 +373,93 @@ class JavaLanguageServer extends LanguageServer {
         return javaFiles;
     }
 
-    private void installTypeMemberIndex(
-            TypeMemberIndex nextIndex,
-            long indexVersion,
-            String trigger,
-            Duration took,
-            CompletionIndexScope scope) {
-        var rebuilt = (nextIndex == null || nextIndex.size() == 0) ? TypeMemberIndex.EMPTY : nextIndex;
-        var currentSnapshot = completionSnapshot();
-        publishCompletionSnapshot(
-                rebuilt,
-                currentSnapshot.externalIndex(),
-                indexVersion,
-                rebuilt == TypeMemberIndex.EMPTY ? CompletionIndexScope.EMPTY : scope);
-        LOG.fine(
-                String.format(
-                        "[perf] completion_type_index trigger=%s version=%d types=%d took=%dms",
-                        trigger, indexVersion, rebuilt.size(), took.toMillis()));
-    }
-
-    private void installMergedTypeMemberIndex(
-            TypeMemberIndex deltaIndex,
-            Collection<Path> replacedFiles,
-            long indexVersion,
-            String trigger,
-            Duration took) {
-        var baseSnapshot = completionSnapshot();
-        var merged =
-                baseSnapshot
-                        .workspaceIndex()
-                        .replaceWorkspaceDeclarations(
-                                deltaIndex == null ? TypeMemberIndex.EMPTY : deltaIndex,
-                                new LinkedHashSet<>(replacedFiles));
-        var nextScope =
-                merged == TypeMemberIndex.EMPTY
-                        ? CompletionIndexScope.EMPTY
-                        : baseSnapshot.scope() == CompletionIndexScope.EMPTY
-                                ? CompletionIndexScope.ACTIVE
-                                : baseSnapshot.scope();
-        publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), indexVersion, nextScope);
-        LOG.fine(
-                String.format(
-                        "[perf] completion_type_index_merge trigger=%s base_version=%d version=%d types=%d files=%d took=%dms",
-                        trigger,
-                        baseSnapshot.version(),
-                        indexVersion,
-                        merged.size(),
-                        replacedFiles.size(),
-                        took.toMillis()));
-    }
-
-    private long nextIndexVersion() {
-        return completionIndexVersion.incrementAndGet();
-    }
-
-    private void scheduleProjectCompletionIndexRefresh(String trigger, long delayMs) {
-        scheduleCompletionIndexRefresh(FileStore.all(), trigger, delayMs, CompletionIndexRefreshMode.FULL_REBUILD);
-    }
-
-    private void scheduleActiveCompletionBootstrapIfNeeded(String trigger, long delayMs) {
-        if (completionSnapshot().scope() != CompletionIndexScope.EMPTY) {
-            return;
+    /**
+     * Heuristic used during active edits to avoid refreshing declaration indexes from obviously
+     * half-typed source.
+     */
+    static boolean hasLikelyIncompleteSource(String source) {
+        if (source == null || source.isEmpty()) {
+            return false;
         }
-        synchronized (this) {
-            if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
-                return;
+        var braces = 0;
+        var parens = 0;
+        var inString = false;
+        var inChar = false;
+        var inLineComment = false;
+        var inBlockComment = false;
+        var escaping = false;
+        for (int i = 0; i < source.length(); i++) {
+            var c = source.charAt(i);
+            var next = i + 1 < source.length() ? source.charAt(i + 1) : '\0';
+            if (inLineComment) {
+                if (c == '\n' || c == '\r') {
+                    inLineComment = false;
+                }
+                continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') {
+                    inBlockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (inString) {
+                if (escaping) {
+                    escaping = false;
+                } else if (c == '\\') {
+                    escaping = true;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (inChar) {
+                if (escaping) {
+                    escaping = false;
+                } else if (c == '\\') {
+                    escaping = true;
+                } else if (c == '\'') {
+                    inChar = false;
+                }
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                inLineComment = true;
+                i++;
+                continue;
+            }
+            if (c == '/' && next == '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = true;
+                continue;
+            }
+            if (c == '{') {
+                braces++;
+            } else if (c == '}') {
+                braces--;
+            } else if (c == '(') {
+                parens++;
+            } else if (c == ')') {
+                parens--;
+            }
+            if (braces < 0 || parens < 0) {
+                return true;
             }
         }
-        scheduleCompletionIndexRefresh(
-                FileStore.all(), trigger, delayMs, CompletionIndexRefreshMode.FULL_REBUILD);
-    }
-
-    private void scheduleProjectCompletionBootstrapIfNeeded(String trigger, long delayMs) {
-        if (completionSnapshot().scope() == CompletionIndexScope.WORKSPACE) {
-            return;
-        }
-        scheduleProjectCompletionIndexRefresh(trigger, delayMs);
-    }
-
-    private void scheduleCompletionIndexRefresh(
-            Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
-        var javaFiles = normalizeJavaFiles(files);
-        if (javaFiles.isEmpty()) {
-            return;
-        }
-        var revision = completionIndexRevision.incrementAndGet();
-        var filesBatch = List.copyOf(javaFiles);
-        synchronized (this) {
-            if (pendingCompletionIndex != null) {
-                pendingCompletionIndex.cancel(false);
-            }
-            pendingCompletionIndex =
-                    completionIndexExecutor.schedule(
-                            () -> runCompletionIndexRefresh(filesBatch, revision, trigger, mode),
-                            delayMs,
-                            TimeUnit.MILLISECONDS);
-        }
-        LOG.fine(
-                String.format(
-                        "[perf] completion_index_debounce trigger=%s files=%d mode=%s delay=%dms revision=%d",
-                        trigger, filesBatch.size(), mode.name().toLowerCase(), delayMs, revision));
-    }
-
-    private void runCompletionIndexRefresh(
-            List<Path> files, long revision, String trigger, CompletionIndexRefreshMode mode) {
-        if (revision != completionIndexRevision.get()) {
-            return;
-        }
-        var workspaceBootstrap =
-                mode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                        && completionSnapshot().scope() == CompletionIndexScope.EMPTY;
-        synchronized (completionIndexCompileMutex) {
-            var started = Instant.now();
-            CompileTask task = null;
-            try {
-                if (workspaceBootstrap) {
-                    LOG.info(
-                            String.format(
-                                    "[perf] workspace bootstrap started trigger=%s files=%d",
-                                    trigger, files.size()));
-                }
-                task = compiler().compileFast(files.toArray(Path[]::new));
-                if (revision != completionIndexRevision.get()) {
-                    LOG.fine(
-                            String.format(
-                                    "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
-                                    trigger, revision, completionIndexRevision.get()));
-                    return;
-                }
-                var indexStarted = Instant.now();
-                var nextIndex = buildCompletionIndex(task, mode);
-                if (revision != completionIndexRevision.get()) {
-                    LOG.fine(
-                            String.format(
-                                    "[perf] completion_index_refresh_skip trigger=%s phase=post_index expected=%d current=%d",
-                                    trigger, revision, completionIndexRevision.get()));
-                    return;
-                }
-                var indexVersion = nextIndexVersion();
-                installCompletionIndex(
-                        nextIndex,
-                        files,
-                        mode,
-                        indexVersion,
-                        "index:" + trigger,
-                        Duration.between(indexStarted, Instant.now()));
-                if (workspaceBootstrap) {
-                    LOG.info(
-                            String.format(
-                                    "[perf] workspace index installed trigger=%s version=%d types=%d",
-                                    trigger, indexVersion, nextIndex == null ? 0 : nextIndex.size()));
-                }
-                LOG.fine(
-                        String.format(
-                                "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
-                                trigger,
-                                files.size(),
-                                indexVersion,
-                                mode.name().toLowerCase(),
-                                Duration.between(started, indexStarted).toMillis(),
-                                Duration.between(started, Instant.now()).toMillis()));
-            } catch (Exception e) {
-                LOG.warning(
-                        String.format(
-                                "[completion] index refresh failed trigger=%s files=%d reason=%s",
-                                trigger, files.size(), e.getMessage()));
-                LOG.log(java.util.logging.Level.FINE, "", e);
-            } finally {
-                if (task != null) {
-                    task.close();
-                }
-            }
-        }
-    }
-
-    private void installCompletionIndex(
-            TypeMemberIndex nextIndex,
-            Collection<Path> files,
-            CompletionIndexRefreshMode mode,
-            long indexVersion,
-            String trigger,
-            Duration took) {
-        if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-            installMergedTypeMemberIndex(nextIndex, files, indexVersion, trigger, took);
-            return;
-        }
-        var scope =
-                mode == CompletionIndexRefreshMode.FULL_REBUILD
-                        ? CompletionIndexScope.WORKSPACE
-                        : CompletionIndexScope.ACTIVE;
-        installTypeMemberIndex(nextIndex, indexVersion, trigger, took, scope);
-    }
-
-    private TypeMemberIndex buildCompletionIndex(CompileTask task, CompletionIndexRefreshMode mode) {
-        if (mode == CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP) {
-            return TypeMemberIndex.from(task)
-                    .filterTypes(
-                            info ->
-                                    info.sourcePath != null
-                                            || compiler().findTypeDeclaration(info.qualifiedName) != CompilerProvider.NOT_FOUND);
-        }
-        return TypeMemberIndex.workspaceDeclarations(task);
-    }
-
-    private ActiveDocumentChangeImpact analyzeActiveDocumentChange(Path file) {
-        try {
-            var parse = compiler().parse(file);
-            var shapes = declaredTypeShapes(parse);
-            var hasStructuralLombokType = shapes.stream().anyMatch(DeclaredTypeShape::structuralLombok);
-            if (hasStructuralLombokType) {
-                LOG.fine(
-                        "[perf] completion_index_didChange_refresh file="
-                                + file.getFileName()
-                                + " reason=structural_lombok");
-                return new ActiveDocumentChangeImpact(true);
-            }
-            var declarationDrift = hasDeclarationDrift(file, shapes);
-            if (declarationDrift) {
-                LOG.fine(
-                        "[perf] completion_index_didChange_refresh file="
-                                + file.getFileName()
-                                + " reason=declaration_drift");
-            }
-            return new ActiveDocumentChangeImpact(declarationDrift);
-        } catch (RuntimeException e) {
-            LOG.fine(
-                    String.format(
-                            "[perf] completion_index_didChange_skip file=%s reason=parse_failed detail=%s",
-                            file.getFileName(), e.getMessage()));
-        }
-        return new ActiveDocumentChangeImpact(false);
+        return braces != 0 || parens != 0 || inString || inChar || inBlockComment;
     }
 
     private Collection<Path> otherActiveDocuments(Path file) {
-        var activeJavaFiles = normalizeJavaFiles(FileStore.activeDocuments());
+        var activeJavaFiles = filterJavaFiles(FileStore.activeDocuments());
         if (activeJavaFiles.isEmpty() || !activeJavaFiles.contains(file)) {
             return List.of();
         }
@@ -633,9 +474,9 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private List<DeclaredTypeShape> declaredTypeShapes(ParseTask parse) {
-        var packageName = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        var packageName = parse.root().getPackageName() == null ? "" : parse.root().getPackageName().toString();
         var result = new ArrayList<DeclaredTypeShape>();
-        for (var decl : parse.root.getTypeDecls()) {
+        for (var decl : parse.root().getTypeDecls()) {
             if (!(decl instanceof ClassTree cls)) {
                 continue;
             }
@@ -670,8 +511,8 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private boolean hasDeclarationDrift(Path file, List<DeclaredTypeShape> shapes) {
-        var indexedTypes = new LinkedHashMap<String, TypeMemberIndex.TypeInfo>();
-        for (var type : completionSnapshot().workspaceIndex().types().values()) {
+        var indexedTypes = new LinkedHashMap<String, IndexedType>();
+        for (var type : completionSnapshotRef.get().workspaceIndex().types().values()) {
             if (file.equals(type.sourcePath)) {
                 indexedTypes.put(type.qualifiedName, type);
             }
@@ -708,7 +549,7 @@ class JavaLanguageServer extends LanguageServer {
         return superclass == null || "java.lang.Object".equals(superclass) ? null : superclass;
     }
 
-    private List<String> indexedDirectMemberSignatures(TypeMemberIndex.TypeInfo type) {
+    private List<String> indexedDirectMemberSignatures(IndexedType type) {
         var signatures = new ArrayList<String>();
         for (var member : type.members) {
             if (member.synthetic || member.priority != 0) {
@@ -752,217 +593,14 @@ class JavaLanguageServer extends LanguageServer {
                 + isStatic;
     }
 
-    private void scheduleDiagnostics(Collection<Path> files, String trigger) {
-        scheduleDiagnostics(files, trigger, DIAGNOSTIC_DEBOUNCE_MS);
-    }
-
-    private void scheduleDiagnostics(Collection<Path> files, String trigger, long delayMs) {
-        var batch = resolveDiagnosticsBatch(files, trigger);
-        if (batch.files().isEmpty()) return;
-        var request =
-                new ScheduledDiagnosticsRequest(
-                        diagnosticsRevision.incrementAndGet(),
-                        FileStore.contentRevision(),
-                        batch.requestedCount(),
-                        batch.dirtyOpenCount());
-        var filesBatch = batch.files();
-        synchronized (this) {
-            if (pendingDiagnostics != null) {
-                pendingDiagnostics.cancel(false);
-            }
-            pendingDiagnostics =
-                    diagnosticsExecutor.schedule(
-                            () -> runDiagnostics(filesBatch, request, trigger),
-                            delayMs,
-                            TimeUnit.MILLISECONDS);
-        }
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_debounce trigger=%s files=%d delay=%dms revision=%d content_revision=%d",
-                        trigger,
-                        filesBatch.size(),
-                        delayMs,
-                        request.scheduleRevision(),
-                        request.contentRevision()));
-    }
-
-    private void markDirtyDiagnostics(Path file, String trigger) {
-        if (dirtyDiagnosticsFiles.add(file)) {
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_dirty_mark trigger=%s file=%s",
-                            trigger, file.getFileName()));
-        }
-    }
-
-    private void markDirtyDiagnostics(Collection<Path> files, String trigger) {
-        var javaFiles = normalizeJavaFiles(files);
-        if (javaFiles.isEmpty()) {
-            return;
-        }
-        var marked = 0;
-        for (var file : javaFiles) {
-            if (dirtyDiagnosticsFiles.add(file)) {
-                marked++;
-            }
-        }
-        if (marked > 0) {
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_dirty_batch trigger=%s files=%d",
-                            trigger, marked));
-        }
-    }
-
-    private void markOtherActiveDiagnosticsDirty(Path file, String trigger) {
-        markDirtyDiagnostics(file, trigger);
-        var others = otherActiveDocuments(file);
-        if (!others.isEmpty()) {
-            markDirtyDiagnostics(others, trigger + ":openFiles");
-            LOG.fine(
-                    String.format(
-                            "[perf] diagnostics_dirty_open_files trigger=%s file=%s files=%d",
-                            trigger, file.getFileName(), others.size()));
-        }
-    }
-
-    private void clearDirtyDiagnostics(Collection<Path> files) {
-        for (var file : files) {
-            dirtyDiagnosticsFiles.remove(file);
-        }
-    }
-
-    private void cancelPendingDiagnostics(String reason) {
-        synchronized (this) {
-            if (pendingDiagnostics == null) {
-                return;
-            }
-            diagnosticsRevision.incrementAndGet();
-            pendingDiagnostics.cancel(false);
-            pendingDiagnostics = null;
-        }
-        LOG.fine("[perf] diagnostics_cancel reason=" + reason);
-    }
-
-    private boolean shouldYieldToDidSaveDiagnostics(String trigger, String phase) {
-        if (!trigger.startsWith("async:")) {
-            return false;
-        }
-        if (didSaveDiagnosticsInFlight.get() <= 0) {
-            return false;
-        }
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_yield trigger=%s phase=%s reason=didSave_pending",
-                        trigger, phase));
-        return true;
-    }
-
-    private DiagnosticsBatch resolveDiagnosticsBatch(Collection<Path> files, String trigger) {
-        var requested = normalizeJavaFiles(files);
-        if (requested.isEmpty()) {
-            return new DiagnosticsBatch(List.of(), 0, 0);
-        }
-        var batch = new LinkedHashSet<Path>(requested);
-        var activeJavaFiles = new LinkedHashSet<>(normalizeJavaFiles(FileStore.activeDocuments()));
-        var dirtyOpenCount = 0;
-        if (!activeJavaFiles.isEmpty()) {
-            for (var dirty : dirtyDiagnosticsFiles) {
-                if (!activeJavaFiles.contains(dirty) || batch.contains(dirty)) {
-                    continue;
-                }
-                batch.add(dirty);
-                dirtyOpenCount++;
-            }
-        }
-        var filesBatch = List.copyOf(batch);
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_batch trigger=%s requested=%d dirty_open=%d files=%d",
-                        trigger, requested.size(), dirtyOpenCount, filesBatch.size()));
-        return new DiagnosticsBatch(filesBatch, requested.size(), dirtyOpenCount);
-    }
-
-    private void runDiagnostics(List<Path> files, ScheduledDiagnosticsRequest request, String trigger) {
-        if (request.scheduleRevision() != diagnosticsRevision.get()) {
-            return;
-        }
-        var selection = selectDiagnosticsCompiler();
-        try {
-            compileAndPublish(
-                    files,
-                    selection.compiler,
-                    "async:" + trigger,
-                    request.contentRevision(),
-                    request.requestedCount(),
-                    request.dirtyOpenCount());
-        } catch (Exception e) {
-            LOG.warning("Async lint failed for " + files + ": " + e.getMessage());
-            LOG.log(java.util.logging.Level.FINE, "", e);
-        }
-    }
-
-    private void bootstrapWorkspaceOnDidOpen(Path file) {
-        var selection = selectDiagnosticsCompiler();
-        var workspaceFiles = normalizeJavaFiles(FileStore.all());
-        if (workspaceFiles.isEmpty()) {
-            return;
-        }
-        cancelPendingDiagnostics("didOpenBootstrap");
-        cancelPendingCompletionIndex("didOpenBootstrap");
-        var started = Instant.now();
-        LOG.info(
-                String.format(
-                        "[perf] workspace bootstrap started trigger=didOpenBootstrap files=%d",
-                        workspaceFiles.size()));
-        CompileTask task = null;
-        synchronized (diagnosticsCompileMutex) {
-            try {
-                task = selection.compiler.compile(workspaceFiles.toArray(Path[]::new));
-                var compiled = Instant.now();
-                LOG.info(
-                        String.format(
-                                "[perf] diagnostics_compile trigger=didOpenBootstrap files=%d took=%dms",
-                                workspaceFiles.size(), Duration.between(started, compiled).toMillis()));
-                publishDiagnosticsFromTask(task, List.of(file), "didOpenBootstrap", -1);
-                var indexStarted = Instant.now();
-                var nextIndex = TypeMemberIndex.workspaceDeclarations(task);
-                var indexVersion = nextIndexVersion();
-                installCompletionIndex(
-                        nextIndex,
-                        workspaceFiles,
-                        CompletionIndexRefreshMode.FULL_REBUILD,
-                        indexVersion,
-                        "didOpenBootstrap",
-                        Duration.between(indexStarted, Instant.now()));
-                LOG.info(
-                        String.format(
-                                "[perf] workspace index installed trigger=didOpenBootstrap version=%d types=%d",
-                                indexVersion, nextIndex == null ? 0 : nextIndex.size()));
-            } finally {
-                if (task != null) {
-                    task.close();
-                }
-            }
-        }
-    }
-
-    private void cancelPendingCompletionIndex(String reason) {
-        synchronized (this) {
-            if (pendingCompletionIndex == null) {
-                return;
-            }
-            completionIndexRevision.incrementAndGet();
-            pendingCompletionIndex.cancel(false);
-            pendingCompletionIndex = null;
-        }
-        LOG.fine("[perf] completion_index_cancel reason=" + reason);
-    }
-
+    /**
+     * Wait briefly for an asynchronously scheduled completion-index bootstrap to publish a newer
+     * snapshot version.
+     */
     private long awaitCompletionBootstrap(long initialIndexVersion, long timeoutMs) {
         var started = System.nanoTime();
         var deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        while (completionSnapshot().version() == initialIndexVersion && System.nanoTime() < deadline) {
+        while (completionSnapshotRef.get().version() == initialIndexVersion && System.nanoTime() < deadline) {
             try {
                 Thread.sleep(COMPLETION_BOOTSTRAP_POLL_MS);
             } catch (InterruptedException e) {
@@ -973,26 +611,29 @@ class JavaLanguageServer extends LanguageServer {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
     }
 
+    /**
+     * Ensure the type index is available for a request, scheduling bootstrap and waiting briefly
+     * when the current snapshot is still empty or below the required scope.
+     */
     private TypeIndexAvailability ensureTypeIndexReady(String trigger, long waitMs, boolean requireWorkspaceScope) {
-        compiler();
-        var snapshot = completionSnapshot();
+        getOrCreateCompiler();
+        var snapshot = completionSnapshotRef.get();
         var initialIndexVersion = snapshot.version();
         var currentScope = snapshot.scope();
-        if (initialIndexVersion != 0
-                && (!requireWorkspaceScope || currentScope == CompletionIndexScope.WORKSPACE)) {
+        var hasIndex = initialIndexVersion != 0;
+        var hasRequiredScope = !requireWorkspaceScope || currentScope == CompletionIndexScope.WORKSPACE;
+        if (hasIndex && hasRequiredScope) {
             return new TypeIndexAvailability(initialIndexVersion, initialIndexVersion, currentScope, currentScope, 0);
         }
-        LOG.fine(
-                String.format(
-                        "[perf] completion_index_bootstrap trigger=%s",
-                        trigger));
-        if (requireWorkspaceScope || FileStore.activeDocuments().isEmpty()) {
-            scheduleProjectCompletionBootstrapIfNeeded(trigger, 0);
+        LOG.fine(String.format("[perf] completion_index_bootstrap trigger=%s", trigger));
+        var needsWorkspaceBootstrap = requireWorkspaceScope || FileStore.activeDocuments().isEmpty();
+        if (needsWorkspaceBootstrap) {
+            completionIndexScheduler.scheduleProjectBootstrapIfNeeded(trigger);
         } else {
-            scheduleActiveCompletionBootstrapIfNeeded(trigger, 0);
+            completionIndexScheduler.scheduleActiveBootstrapIfNeeded(trigger);
         }
         var waited = awaitCompletionBootstrap(initialIndexVersion, waitMs);
-        var updated = completionSnapshot();
+        var updated = completionSnapshotRef.get();
         return new TypeIndexAvailability(
                 initialIndexVersion,
                 updated.version(),
@@ -1001,105 +642,91 @@ class JavaLanguageServer extends LanguageServer {
                 waited);
     }
 
-    private boolean shouldSkipStaleDiagnostics(long expectedContentRevision, String trigger, String phase) {
-        var current = FileStore.contentRevision();
-        if (!isStaleDiagnosticsContent(expectedContentRevision, current)) {
-            return false;
-        }
-        LOG.fine(
-                String.format(
-                        "[perf] diagnostics_skip_stale trigger=%s phase=%s expected_content=%d current_content=%d",
-                        trigger, phase, expectedContentRevision, current));
-        return true;
-    }
-
-    static boolean isStaleDiagnosticsContent(long expectedContentRevision, long currentContentRevision) {
-        return expectedContentRevision >= 0 && expectedContentRevision != currentContentRevision;
-    }
-
-    private boolean shouldRefreshCompletionIndexForActiveDocumentChange(ActiveDocumentChangeImpact impact) {
-        return impact.refreshCompletionIndex();
-    }
-
-    private void javaStartProgress(JavaStartProgressParams params) {
-        client.customNotification("java/startProgress", GSON.toJsonTree(params));
-    }
-
-    private void javaReportProgress(JavaReportProgressParams params) {
-        client.customNotification("java/reportProgress", GSON.toJsonTree(params));
-    }
-
-    private void javaEndProgress() {
-        client.customNotification("java/endProgress", JsonNull.INSTANCE);
-    }
-
-    private CompilerSet createCompilers() {
+    /**
+     * Recreate the paired compiler services used for interactive requests and pull-diagnostics.
+     */
+    private void createCompilers() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
-
-        javaStartProgress(new JavaStartProgressParams("Configure javac"));
-        javaReportProgress(new JavaReportProgressParams("Finding source roots"));
+        var started = Instant.now();
+        var progressToken = beginWorkDoneProgress("Configure javac", "Finding source roots");
 
         var externalDependencies = externalDependencies();
         var classPath = classPath();
-        var extraArgs = extraCompilerArgs();
+        var userExtraArgs = extraCompilerArgs();
         var addExports = addExports();
         var lombokEnabled = lombokEnabled();
+        var compilerArgs = selectCompilerArgs(userExtraArgs, externalDependencies);
+        var extraArgs = compilerArgs.args();
+        var settingsLoaded = Instant.now();
         Set<Path> resolvedDocPath;
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
             resolvedDocPath = docPath();
+            LOG.info(String.format(
+                    "[perf] compiler_config_inference mode=explicit classpath=%d docpath=%d took=%dms",
+                    classPath.size(),
+                    resolvedDocPath.size(),
+                    Duration.between(settingsLoaded, Instant.now()).toMillis()));
         }
         // Otherwise, combine inference with user-specified external dependencies
         else {
             var infer = new InferConfig(workspaceRoot, externalDependencies);
 
-            javaReportProgress(new JavaReportProgressParams("Inferring class path"));
+            reportWorkDoneProgress(progressToken, "Inferring class path");
+            var inferClassPathStarted = Instant.now();
             classPath = infer.classPath();
+            var inferredClassPath = Instant.now();
 
-            javaReportProgress(new JavaReportProgressParams("Inferring doc path"));
+            reportWorkDoneProgress(progressToken, "Inferring doc path");
+            var inferDocPathStarted = Instant.now();
             resolvedDocPath = infer.buildDocPath();
+            LOG.info(String.format(
+                    "[perf] compiler_config_inference mode=inferred external=%d classpath=%d docpath=%d classpath_infer=%dms docpath_infer=%dms total=%dms",
+                    externalDependencies.size(),
+                    classPath.size(),
+                    resolvedDocPath.size(),
+                    Duration.between(inferClassPathStarted, inferredClassPath).toMillis(),
+                    Duration.between(inferDocPathStarted, Instant.now()).toMillis(),
+                    Duration.between(settingsLoaded, Instant.now()).toMillis()));
         }
-        javaEndProgress();
-        LOG.info("[perf] lombok_setting enabled=" + lombokEnabled);
-        return new CompilerSet(
+        var inferenceFinished = Instant.now();
+        endWorkDoneProgress(progressToken, "Configured javac");
+        LOG.info(String.format("[perf] lombok_setting enabled=%s", lombokEnabled));
+        LOG.info(
+                String.format(
+                        "[perf] compiler_args source=%s count=%d mixed_modules=%s",
+                        compilerArgs.source(),
+                        extraArgs.size(),
+                        compilerArgs.mixedModules()));
+        LOG.info(String.format("[perf] compiler_args_values args=%s", extraArgs));
+        cacheCompiler =
                 new JavaCompilerService(
                         classPath,
                         resolvedDocPath,
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "interactive"),
+                        "interactive");
+        var diagnosticsStarted = Instant.now();
+        diagnosticsCompiler =
                 new JavaCompilerService(
                         classPath,
                         resolvedDocPath,
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "diagnostics"),
-                lombokEnabled);
-    }
-
-    private static class CompilerSet {
-        final JavaCompilerService interactive;
-        final JavaCompilerService diagnosticsPrimary;
-        final boolean lombokEnabled;
-
-        CompilerSet(
-                JavaCompilerService interactive,
-                JavaCompilerService diagnosticsPrimary,
-                boolean lombokEnabled) {
-            this.interactive = interactive;
-            this.diagnosticsPrimary = diagnosticsPrimary;
-            this.lombokEnabled = lombokEnabled;
-        }
-    }
-
-    private static class DiagnosticsCompilerSelection {
-        final JavaCompilerService compiler;
-
-        DiagnosticsCompilerSelection(JavaCompilerService compiler) {
-            this.compiler = compiler;
-        }
+                        "diagnostics");
+        LOG.info(String.format(
+                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms total=%dms",
+                classPath.size(),
+                resolvedDocPath.size(),
+                extraArgs.size(),
+                addExports.size(),
+                Duration.between(started, settingsLoaded).toMillis(),
+                Duration.between(settingsLoaded, inferenceFinished).toMillis(),
+                Duration.between(inferenceFinished, diagnosticsStarted).toMillis(),
+                Duration.between(diagnosticsStarted, Instant.now()).toMillis(),
+                Duration.between(started, Instant.now()).toMillis()));
     }
 
     private Set<String> externalDependencies() {
@@ -1122,15 +749,59 @@ class JavaLanguageServer extends LanguageServer {
         return paths;
     }
 
-    private Set<String> extraCompilerArgs() {
-        if (!settings.has("extraCompilerArgs")) return Set.of();
+    private List<String> extraCompilerArgs() {
+        if (!settings.has("extraCompilerArgs")) return List.of();
         var array = settings.getAsJsonArray("extraCompilerArgs");
-        var args = new HashSet<String>();
+        var args = new ArrayList<String>();
         for (var each : array) {
             // split "a b  c" to ["a","b","c"]
-            args.addAll(Arrays.asList(each.getAsString().split("\\s+")));
+            args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
         }
-        return args;
+        return List.copyOf(args);
+    }
+
+    private InferConfig.MavenCompilerArgs selectCompilerArgs(List<String> userExtraArgs, Set<String> externalDependencies) {
+        if (hasExplicitJavaLevelOverride(userExtraArgs)) {
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "user", false);
+        }
+        var pomXml = workspaceRoot.resolve("pom.xml");
+        if (!Files.exists(pomXml)) {
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "none", false);
+        }
+        var inferred = new InferConfig(workspaceRoot, externalDependencies).compilerArgs();
+        if (inferred.mixedModules()) {
+            warnUserOnce(
+                    "maven_mixed_release_fallback",
+                    "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.");
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "fallback_mixed_modules", true);
+        }
+        if (inferred.args().isEmpty()) {
+            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "none", false);
+        }
+        var merged = new ArrayList<String>(userExtraArgs);
+        merged.addAll(inferred.args());
+        return new InferConfig.MavenCompilerArgs(List.copyOf(merged), inferred.source(), false);
+    }
+
+    private static boolean hasExplicitJavaLevelOverride(List<String> extraArgs) {
+        for (var i = 0; i < extraArgs.size(); i++) {
+            var arg = extraArgs.get(i);
+            if ("--release".equals(arg) || "-source".equals(arg) || "-target".equals(arg)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void warnUserOnce(String key, String message) {
+        if (!shownWorkspaceWarnings.add(key)) {
+            return;
+        }
+        var params = new ShowMessageParams();
+        params.type = MessageType.Warning;
+        params.message = message;
+        client.showMessage(params);
+        LOG.warning(message);
     }
 
     private Set<Path> docPath() {
@@ -1169,9 +840,72 @@ class JavaLanguageServer extends LanguageServer {
         return true;
     }
 
+    private static boolean supportsWorkDoneProgress(JsonElement capabilities) {
+        if (capabilities == null || !capabilities.isJsonObject()) {
+            return false;
+        }
+        var root = capabilities.getAsJsonObject();
+        if (!root.has("window") || !root.get("window").isJsonObject()) {
+            return false;
+        }
+        var window = root.getAsJsonObject("window");
+        return window.has("workDoneProgress") && window.get("workDoneProgress").getAsBoolean();
+    }
+
+    private String beginWorkDoneProgress(String title, String message) {
+        if (!workDoneProgressSupported) {
+            return null;
+        }
+        var token = UUID.randomUUID().toString();
+        var create = new JsonObject();
+        create.addProperty("token", token);
+        client.sendRequest("window/workDoneProgress/create", create);
+
+        var value = new JsonObject();
+        value.addProperty("kind", "begin");
+        value.addProperty("title", title);
+        value.addProperty("message", message);
+        value.addProperty("cancellable", false);
+        var progress = new JsonObject();
+        progress.addProperty("token", token);
+        progress.add("value", value);
+        client.customNotification("$/progress", progress);
+        return token;
+    }
+
+    private void reportWorkDoneProgress(String token, String message) {
+        if (token == null) {
+            return;
+        }
+        var value = new JsonObject();
+        value.addProperty("kind", "report");
+        value.addProperty("message", message);
+        value.addProperty("cancellable", false);
+        var progress = new JsonObject();
+        progress.addProperty("token", token);
+        progress.add("value", value);
+        client.customNotification("$/progress", progress);
+    }
+
+    private void endWorkDoneProgress(String token, String message) {
+        if (token == null) {
+            return;
+        }
+        var value = new JsonObject();
+        value.addProperty("kind", "end");
+        if (message != null && !message.isBlank()) {
+            value.addProperty("message", message);
+        }
+        var progress = new JsonObject();
+        progress.addProperty("token", token);
+        progress.add("value", value);
+        client.customNotification("$/progress", progress);
+    }
+
     @Override
     public InitializeResult initialize(InitializeParams params) {
         this.workspaceRoot = Paths.get(params.rootUri);
+        this.workDoneProgressSupported = supportsWorkDoneProgress(params.capabilities);
         FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
 
         var c = new JsonObject();
@@ -1197,50 +931,54 @@ class JavaLanguageServer extends LanguageServer {
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
-        // c.addProperty("inlayHintProvider", true);
+        c.addProperty("inlayHintProvider", true);
         c.addProperty("codeActionProvider", true);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
         c.add("renameProvider", renameOptions);
+        var diagnosticOptions = new JsonObject();
+        diagnosticOptions.addProperty("interFileDependencies", false);
+        diagnosticOptions.addProperty("workspaceDiagnostics", false);
+        c.add("diagnosticProvider", diagnosticOptions);
 
         return new InitializeResult(c);
     }
 
     private static final String[] watchFiles = {
-        "**/*.java", "**/pom.xml", "**/BUILD", "**/javaconfig.json", "**/WORKSPACE"
+        "**/*.java",
+        "**/pom.xml",
+        "**/BUILD",
+        "**/WORKSPACE",
+        "**/javaconfig.json",
+        "**/build.gradle",
+        "**/build.gradle.kts",
+        "**/settings.gradle",
+        "**/settings.gradle.kts"
     };
 
     @Override
     public void initialized() {
-        client.registerCapability("workspace/didChangeWatchedFiles", watchFiles(watchFiles));
-        compiler();
-    }
-
-    private JsonObject watchFiles(String... globPatterns) {
         var options = new JsonObject();
         var watchers = new JsonArray();
-        for (var p : globPatterns) {
+        for (var pattern : watchFiles) {
             var config = new JsonObject();
-            config.addProperty("globPattern", p);
+            config.addProperty("globPattern", pattern);
             watchers.add(config);
         }
         options.add("watchers", watchers);
-        return options;
+        client.registerCapability("workspace/didChangeWatchedFiles", options);
+        LOG.info(String.format("[perf] client_attached workspace=%s watchers=%d", workspaceRoot, watchFiles.length));
+        initializeCompilers();
     }
 
     @Override
     public void shutdown() {
         synchronized (this) {
-            if (pendingDiagnostics != null) {
-                pendingDiagnostics.cancel(false);
-                pendingDiagnostics = null;
-            }
             if (pendingCompletionIndex != null) {
                 pendingCompletionIndex.cancel(false);
                 pendingCompletionIndex = null;
             }
         }
-        diagnosticsExecutor.shutdownNow();
         completionIndexExecutor.shutdownNow();
         CacheAudit.logSummary(LOG);
     }
@@ -1251,24 +989,32 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<SymbolInformation> workspaceSymbols(WorkspaceSymbolParams params) {
-        return new SymbolProvider(compiler()).findSymbols(params.query, 50);
+        return new SymbolProvider(getOrCreateCompiler()).findSymbols(params.query, 50);
     }
 
     @Override
     public void didChangeConfiguration(DidChangeConfigurationParams change) {
         var java = change.settings.getAsJsonObject().get("java");
-        LOG.info("Received java settings " + java);
+        LOG.info(String.format("Received java settings %s", java));
+        var nextSettings = new JsonObject();
         if (java != null && !java.isJsonNull()) {
-            settings = java.getAsJsonObject();
+            nextSettings = java.getAsJsonObject();
+        }
+        var nextCompilerSettings = compilerSettingsSnapshot(nextSettings);
+        settings = nextSettings;
+        if (!nextCompilerSettings.equals(appliedCompilerSettings)) {
+            recreateCompilersAndRefreshState("didChangeConfiguration");
         }
     }
 
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
+        var activeDocuments = FileStore.activeDocuments();
+        var refreshActiveDiagnostics = false;
+        var compilerInputsChanged = false;
         for (var c : params.changes) {
             var file = Paths.get(c.uri);
             if (FileStore.isJavaFile(file)) {
-                var activeDocuments = FileStore.activeDocuments();
                 var activeJavaDocument = activeDocuments.contains(file);
                 var suppressActiveDocumentWork = activeJavaDocument && c.type != FileChangeType.Deleted;
                 switch (c.type) {
@@ -1282,7 +1028,7 @@ class JavaLanguageServer extends LanguageServer {
                                         "[perf] watched_java_change_skip reason=active_document event=created file="
                                                 + file);
                             } else {
-                                scheduleCompletionIndexRefresh(
+                                completionIndexScheduler.scheduleRefresh(
                                         List.of(file),
                                         "didChangeWatchedFiles:javaCreatedExisting",
                                         COMPLETION_INDEX_DEBOUNCE_MS,
@@ -1290,8 +1036,11 @@ class JavaLanguageServer extends LanguageServer {
                             }
                         } else {
                             FileStore.externalCreate(file);
-                            scheduleProjectCompletionIndexRefresh(
-                                    "didChangeWatchedFiles:javaCreated", 0);
+                            completionIndexScheduler.scheduleRefresh(
+                                    FileStore.all(),
+                                    "didChangeWatchedFiles:javaCreated",
+                                    0,
+                                    CompletionIndexRefreshMode.FULL_REBUILD);
                         }
                         break;
                     case FileChangeType.Changed:
@@ -1301,7 +1050,7 @@ class JavaLanguageServer extends LanguageServer {
                                     "[perf] watched_java_change_skip reason=active_document event=changed file="
                                             + file);
                         } else {
-                            scheduleCompletionIndexRefresh(
+                            completionIndexScheduler.scheduleRefresh(
                                     List.of(file),
                                     "didChangeWatchedFiles:javaChanged",
                                     COMPLETION_INDEX_DEBOUNCE_MS,
@@ -1310,7 +1059,11 @@ class JavaLanguageServer extends LanguageServer {
                         break;
                     case FileChangeType.Deleted:
                         FileStore.externalDelete(file);
-                        scheduleProjectCompletionIndexRefresh("didChangeWatchedFiles:javaDeleted", 0);
+                        completionIndexScheduler.scheduleRefresh(
+                                FileStore.all(),
+                                "didChangeWatchedFiles:javaDeleted",
+                                0,
+                                CompletionIndexRefreshMode.FULL_REBUILD);
                         break;
                 }
                 if (!activeDocuments.isEmpty()) {
@@ -1319,20 +1072,36 @@ class JavaLanguageServer extends LanguageServer {
                                 "[perf] diagnostics_watched_skip reason=active_document file="
                                         + file);
                     } else {
-                        markDirtyDiagnostics(activeDocuments, "didChangeWatchedFiles");
-                        scheduleDiagnostics(activeDocuments, "didChangeWatchedFiles", DIAGNOSTIC_DEBOUNCE_MS);
+                        refreshActiveDiagnostics = true;
                     }
                 }
-                return;
-            }
+                continue;            }
             var name = file.getFileName().toString();
-            switch (name) {
-                case "BUILD":
-                case "pom.xml":
-                    LOG.info("Compiler needs to be re-created because " + file + " has changed");
-                    modifiedBuild = true;
+            if (isCompilerConfigFile(name)) {
+                LOG.info(String.format("Compiler needs to be re-created because %s has changed", file));
+                compilerInputsChanged = true;
             }
         }
+        if (refreshActiveDiagnostics) {
+            client.customNotification("workspace/diagnostic/refresh", null);
+        }
+        if (compilerInputsChanged) {
+            recreateCompilersAndRefreshState("didChangeWatchedFiles");
+        }
+    }
+
+    private boolean isCompilerConfigFile(String name) {
+        return switch (name) {
+            case "BUILD",
+                    "WORKSPACE",
+                    "pom.xml",
+                    "javaconfig.json",
+                    "build.gradle",
+                    "build.gradle.kts",
+                    "settings.gradle",
+                    "settings.gradle.kts" -> true;
+            default -> false;
+        };
     }
 
     @Override
@@ -1341,28 +1110,27 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var started = Instant.now();
         var readiness = ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
-        var snapshot = completionSnapshot();
+        var snapshot = completionSnapshotRef.get();
         var provider = new CompletionProvider(cacheCompiler, snapshot.typeIndex(), snapshot.version());
-        var list = provider.complete(file, params.position.line + 1, params.position.character + 1, -1);
+        var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
-        LOG.fine(
-                String.format(
-                        "[perf] completion_request file=%s wait=%dms index_before=%d index_after=%d scope_before=%s scope_after=%s diagnostics_active=%s took=%dms",
-                        file.getFileName(),
-                        readiness.waitMs(),
-                        readiness.versionBefore(),
-                        readiness.versionAfter(),
-                        readiness.scopeBefore().name().toLowerCase(),
-                        readiness.scopeAfter().name().toLowerCase(),
-                        diagnosticsCompilesInFlight.get() > 0,
-                        Duration.between(started, Instant.now()).toMillis()));
+        LOG.fine(String.format(
+                "[perf] completion_request file=%s wait=%dms index_before=%d index_after=%d scope_before=%s scope_after=%s took=%dms",
+                file.getFileName(),
+                readiness.waitMs(),
+                readiness.versionBefore(),
+                readiness.versionAfter(),
+                readiness.scopeBefore().name().toLowerCase(),
+                readiness.scopeAfter().name().toLowerCase(),
+                Duration.between(started, Instant.now()).toMillis()));
         return Optional.of(list);
     }
 
     @Override
     public CompletionItem resolveCompletionItem(CompletionItem unresolved) {
-        var snapshot = completionSnapshot();
-        new HoverProvider(compiler(), snapshot.typeIndex()).resolveCompletionItem(unresolved);
+        var snapshot = completionSnapshotRef.get();
+        new CompletionProvider(getOrCreateCompiler(), snapshot.typeIndex(), snapshot.version())
+                .resolveCompletionItem(unresolved);
         return unresolved;
     }
 
@@ -1373,8 +1141,9 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
-        var snapshot = completionSnapshot();
-        var content = new HoverProvider(compiler(), snapshot.typeIndex()).hover(file, line, column);
+        ensureTypeIndexReady("hoverBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
+        var snapshot = completionSnapshotRef.get();
+        var content = new HoverProvider(getOrCreateCompiler(), snapshot.typeIndex()).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
         }
@@ -1388,7 +1157,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
-        var help = new SignatureProvider(compiler()).signatureHelp(file, line, column);
+        var help = new SignatureProvider(getOrCreateCompiler()).signatureHelp(file, line, column);
         if (help == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(help);
     }
@@ -1400,8 +1169,8 @@ class JavaLanguageServer extends LanguageServer {
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         ensureTypeIndexReady("definitionBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
-        var snapshot = completionSnapshot();
-        var found = new DefinitionProvider(compiler(), snapshot.typeIndex(), file, line, column).find();
+        var snapshot = completionSnapshotRef.get();
+        var found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -1415,8 +1184,12 @@ class JavaLanguageServer extends LanguageServer {
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
-        var snapshot = completionSnapshot();
-        var found = new ReferenceProvider(compiler(), snapshot.typeIndex(), file, line, column).find();
+        var snapshot = completionSnapshotRef.get();
+        var includeDeclaration = position.context != null && position.context.includeDeclaration;
+        var found =
+                new ReferenceProvider(
+                                getOrCreateCompiler(), snapshot.typeIndex(), file, line, column, includeDeclaration)
+                        .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -1427,14 +1200,14 @@ class JavaLanguageServer extends LanguageServer {
     public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
-        return new SymbolProvider(compiler()).documentSymbols(file);
+        return new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
     }
 
     @Override
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
-        var task = compiler().parse(file);
+        var task = getOrCreateCompiler().parse(file);
         return CodeLensProvider.find(task);
     }
 
@@ -1447,9 +1220,9 @@ class JavaLanguageServer extends LanguageServer {
     public List<TextEdit> formatting(DocumentFormattingParams params) {
         var edits = new ArrayList<TextEdit>();
         var file = Paths.get(params.textDocument.uri);
-        var fixImports = new AutoFixImports(file).rewrite(compiler()).get(file);
+        var fixImports = new AutoFixImports(file).rewrite(getOrCreateCompiler()).get(file);
         Collections.addAll(edits, fixImports);
-        var addOverrides = new AutoAddOverrides(file).rewrite(compiler()).get(file);
+        var addOverrides = new AutoAddOverrides(file).rewrite(getOrCreateCompiler()).get(file);
         Collections.addAll(edits, addOverrides);
         return edits;
     }
@@ -1458,17 +1231,14 @@ class JavaLanguageServer extends LanguageServer {
     public List<FoldingRange> foldingRange(FoldingRangeParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
-        return new FoldProvider(compiler()).foldingRanges(file);
+        return new FoldProvider(getOrCreateCompiler()).foldingRanges(file);
     }
 
     @Override
-    public List<InlayHint> inlayHint(InlayHintParams params) {
-            return List.of();
-        // if (params == null || params.textDocument == null || !FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
-        //     return List.of();
-        // }
-        // var file = Paths.get(params.textDocument.uri);
-        // return new InlayHintService(compiler(), completionSnapshot().workspaceIndex()).inlayHints(file, params.range);
+    public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
+        var file = Paths.get(params.textDocument.uri);
+        return Optional.of(new InlayHintProvider(getOrCreateCompiler()).inlayHints(file, params.range));
     }
 
     @Override
@@ -1476,9 +1246,17 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         LOG.info("Try to rename...");
         var file = Paths.get(params.textDocument.uri);
-        try (var task = compiler().compile(file)) {
-            var lines = task.root().getLineMap();
-            var cursor = lines.getPosition(params.position.line + 1, params.position.character + 1);
+        try (var task = getOrCreateCompiler().compile(file)) {
+            long cursor;
+            try {
+                cursor =
+                        FileStore.offset(
+                                task.root().getSourceFile().getCharContent(true).toString(),
+                                params.position.line + 1,
+                                params.position.character + 1);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
             var path = new FindNameAt(task).scan(task.root(), cursor);
             if (path == null) {
                 LOG.info("...no element under cursor");
@@ -1490,40 +1268,34 @@ class JavaLanguageServer extends LanguageServer {
                 return Optional.empty();
             }
             if (!canRename(el)) {
-                LOG.info("...can't rename " + el);
+                LOG.info(String.format("...can't rename %s", el));
                 return Optional.empty();
             }
             if (!canFindSource(el)) {
-                LOG.info("...can't find source for " + el);
+                LOG.info(String.format("...can't find source for %s", el));
                 return Optional.empty();
             }
             var response = new RenameResponse();
-            response.range = FindHelper.location(task, path).range;
+            response.range = FindHelper.location(task, path, "").range;
             response.placeholder = el.getSimpleName().toString();
             return Optional.of(response);
         }
     }
 
     private boolean canRename(Element rename) {
-        switch (rename.getKind()) {
-            case METHOD:
-            case FIELD:
-            case LOCAL_VARIABLE:
-            case PARAMETER:
-            case EXCEPTION_PARAMETER:
-                return true;
-            default:
+        return switch (rename.getKind()) {
+            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER -> true;
+            default ->
                 // TODO rename other types
-                return false;
-        }
+                    false;
+        };
     }
 
     private boolean canFindSource(Element rename) {
         if (rename == null) return false;
-        if (rename instanceof TypeElement) {
-            var type = (TypeElement) rename;
+        if (rename instanceof TypeElement type) {
             var name = type.getQualifiedName().toString();
-            return compiler().findTypeDeclaration(name) != CompilerProvider.NOT_FOUND;
+            return getOrCreateCompiler().findTypeDeclaration(name) != CompilerProvider.NOT_FOUND;
         }
         return canFindSource(rename.getEnclosingElement());
     }
@@ -1532,7 +1304,7 @@ class JavaLanguageServer extends LanguageServer {
     public WorkspaceEdit rename(RenameParams params) {
         var rw = createRewrite(params);
         var response = new WorkspaceEdit();
-        var map = rw.rewrite(compiler());
+        var map = rw.rewrite(getOrCreateCompiler());
         for (var editedFile : map.keySet()) {
             response.changes.put(editedFile.toUri(), List.of(map.get(editedFile)));
         }
@@ -1541,24 +1313,27 @@ class JavaLanguageServer extends LanguageServer {
 
     private Rewrite createRewrite(RenameParams params) {
         var file = Paths.get(params.textDocument.uri);
-        try (var task = compiler().compile(file)) {
-            var lines = task.root().getLineMap();
-            var position = lines.getPosition(params.position.line + 1, params.position.character + 1);
+        try (var task = getOrCreateCompiler().compile(file)) {
+            long position;
+            try {
+                position =
+                        FileStore.offset(
+                                task.root().getSourceFile().getCharContent(true).toString(),
+                                params.position.line + 1,
+                                params.position.character + 1);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
             var path = new FindNameAt(task).scan(task.root(), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = Trees.instance(task.task).getElement(path);
-            switch (el.getKind()) {
-                case METHOD:
-                    return renameMethod(task, (ExecutableElement) el, params.newName);
-                case FIELD:
-                    return renameField(task, (VariableElement) el, params.newName);
-                case LOCAL_VARIABLE:
-                case PARAMETER:
-                case EXCEPTION_PARAMETER:
-                    return renameVariable(task, (VariableElement) el, params.newName);
-                default:
-                    return Rewrite.NOT_SUPPORTED;
-            }
+            return switch (el.getKind()) {
+                case METHOD -> renameMethod(task, (ExecutableElement) el, params.newName);
+                case FIELD -> renameField(task, (VariableElement) el, params.newName);
+                case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER ->
+                        renameVariable(task, (VariableElement) el, params.newName);
+                default -> Rewrite.NOT_SUPPORTED;
+            };
         }
     }
 
@@ -1590,15 +1365,48 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     @Override
+    public DocumentDiagnosticReport textDocumentDiagnostic(DocumentDiagnosticParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) {
+            return new DocumentDiagnosticReport(List.of());
+        }
+        var file = Paths.get(params.textDocument.uri);
+        var fileUri = file.toUri();
+        var started = Instant.now();
+        CompileTask task = null;
+        try {
+            task = diagnosticsCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
+            var requestedUris = Set.of(fileUri);
+            var report = new ErrorProvider(task).errors(requestedUris);
+            var diagnostics = report.diagnostics().stream()
+                    .filter(p -> fileUri.equals(p.uri))
+                    .flatMap(p -> p.diagnostics.stream())
+                    .collect(java.util.stream.Collectors.toList());
+            LOG.fine(String.format(
+                    "[perf] pull_diagnostics file=%s count=%d took=%dms",
+                    file.getFileName(),
+                    diagnostics.size(),
+                    Duration.between(started, Instant.now()).toMillis()));
+            return new DocumentDiagnosticReport(diagnostics);
+        } catch (RuntimeException | AssertionError e) {
+            LOG.fine(String.format(
+                    "[perf] pull_diagnostics_skip file=%s reason=%s",
+                    file.getFileName(), e.getMessage()));
+            return new DocumentDiagnosticReport(List.of());
+        } finally {
+            if (task != null) task.close();
+        }
+    }
+
+    @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
-        var file = Paths.get(params.textDocument.uri);
-        if (completionSnapshot().version() == 0) {
-            bootstrapWorkspaceOnDidOpen(file);
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
+            completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
             return;
         }
-        scheduleDiagnostics(List.of(file), "didOpen", DIAGNOSTIC_DEBOUNCE_MS);
+        // Completion index is already populated; no extra work needed.
+        // Diagnostics are pull-based — the client requests them when ready.
     }
 
     @Override
@@ -1606,34 +1414,26 @@ class JavaLanguageServer extends LanguageServer {
         FileStore.change(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        var impact = analyzeActiveDocumentChange(file);
-        markOtherActiveDiagnosticsDirty(file, "didChange");
-        if (completionSnapshot().version() == 0) {
-            scheduleActiveCompletionBootstrapIfNeeded("didChangeActiveBootstrap", 0);
-        } else if (shouldRefreshCompletionIndexForActiveDocumentChange(impact)) {
-            scheduleCompletionIndexRefresh(
+        var refreshCompletionIndex = analyzeActiveDocumentChange(file, params.contentChanges);
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
+            completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didChangeActiveBootstrap");
+        } else if (refreshCompletionIndex) {
+            completionIndexScheduler.scheduleRefresh(
                     List.of(file),
                     "didChange",
                     COMPLETION_INDEX_DEBOUNCE_MS,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
         }
-        scheduleDiagnostics(List.of(file), "didChange", DIAGNOSTIC_DEBOUNCE_MS);
     }
 
     @Override
     public void didCloseTextDocument(DidCloseTextDocumentParams params) {
         FileStore.close(params);
-
-        if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
-            dirtyDiagnosticsFiles.remove(Paths.get(params.textDocument.uri));
-            // Clear diagnostics
-            client.publishDiagnostics(new PublishDiagnosticsParams(params.textDocument.uri, List.of()));
-        }
     }
 
     @Override
     public List<CodeAction> codeAction(CodeActionParams params) {
-        var provider = new CodeActionProvider(compiler());
+        var provider = new CodeActionProvider(getOrCreateCompiler());
         if (params.context.diagnostics.isEmpty()) {
             return provider.codeActionsForCursor(params);
         } else {
@@ -1643,38 +1443,263 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didSaveTextDocument(DidSaveTextDocumentParams params) {
-        if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) {
-            var file = Paths.get(params.textDocument.uri);
-            markOtherActiveDiagnosticsDirty(file, "didSave");
-            cancelPendingDiagnostics("didSave");
-            cancelPendingCompletionIndex("didSave");
-            var selection = selectDiagnosticsCompiler();
-            var batch = resolveDiagnosticsBatch(List.of(file), "didSave");
-            didSaveDiagnosticsInFlight.incrementAndGet();
-            try {
-                compileAndPublish(
-                        batch.files(),
-                        selection.compiler,
-                        "didSave",
-                        -1,
-                        batch.requestedCount(),
-                        batch.dirtyOpenCount());
-            } finally {
-                didSaveDiagnosticsInFlight.updateAndGet(current -> Math.max(0, current - 1));
-            }
-            if (completionSnapshot().version() == 0 && !FileStore.activeDocuments().isEmpty()) {
-                scheduleActiveCompletionBootstrapIfNeeded("didSaveBootstrap", 0);
-            } else {
-                scheduleCompletionIndexRefresh(
-                        List.of(file),
-                        "didSave",
-                        0,
-                        CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-            }
+        if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
+        var file = Paths.get(params.textDocument.uri);
+        FileStore.save(file);
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
+                && !FileStore.activeDocuments().isEmpty()) {
+            completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didSaveBootstrap");
+        } else {
+            completionIndexScheduler.scheduleRefresh(
+                    List.of(file),
+                    "didSave",
+                    0,
+                    CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
         }
     }
 
-    @Override
-    public void doAsyncWork() {}
+    /**
+     * Completion-index refresh/install logic is isolated so compiler recreation, active-document
+     * merges, and full workspace bootstraps share one publication path.
+     */
+    final class CompletionIndexScheduler {
+        CompletionIndexScheduler() {}
 
+        /** Publish a rebuilt workspace index snapshot, replacing the previous workspace view. */
+        void installTypeMemberIndex(
+                WorkspaceTypeIndex nextIndex,
+                long indexVersion,
+                String trigger,
+                Duration took,
+                CompletionIndexScope scope) {
+            var rebuilt = (nextIndex == null || nextIndex.size() == 0) ? WorkspaceTypeIndex.EMPTY : nextIndex;
+            var currentSnapshot = completionSnapshotRef.get();
+            publishCompletionSnapshot(
+                    rebuilt,
+                    currentSnapshot.externalIndex(),
+                    indexVersion,
+                    rebuilt == WorkspaceTypeIndex.EMPTY ? CompletionIndexScope.EMPTY : scope);
+            LOG.fine(String.format(
+                    "[perf] completion_type_index trigger=%s version=%d types=%d took=%dms",
+                    trigger,
+                    indexVersion,
+                    rebuilt.size(),
+                    took.toMillis()));
+        }
+
+        /**
+         * Publish a file-scoped workspace declaration merge, replacing only the declarations from
+         * the supplied files while preserving the rest of the existing workspace snapshot.
+         */
+        void installMergedTypeMemberIndex(
+                WorkspaceTypeIndex deltaIndex,
+                Collection<Path> replacedFiles,
+                long indexVersion,
+                String trigger,
+                Duration took) {
+            var baseSnapshot = completionSnapshotRef.get();
+            var merged =
+                    baseSnapshot
+                            .workspaceIndex()
+                            .replaceWorkspaceDeclarations(
+                                    deltaIndex == null ? WorkspaceTypeIndex.EMPTY : deltaIndex,
+                                    new LinkedHashSet<>(replacedFiles));
+            var nextScope =
+                    merged == WorkspaceTypeIndex.EMPTY
+                            ? CompletionIndexScope.EMPTY
+                            : baseSnapshot.scope() == CompletionIndexScope.EMPTY
+                                    ? CompletionIndexScope.ACTIVE
+                                    : baseSnapshot.scope();
+            publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), indexVersion, nextScope);
+            LOG.fine(String.format(
+                    "[perf] completion_type_index_merge trigger=%s base_version=%d version=%d types=%d files=%d took=%dms",
+                    trigger,
+                    baseSnapshot.version(),
+                    indexVersion,
+                    merged.size(),
+                    replacedFiles.size(),
+                    took.toMillis()));
+        }
+
+        /** Queue an active-document bootstrap only while the published scope is still empty. */
+        void scheduleActiveBootstrapIfNeeded(String trigger) {
+            if (completionSnapshotRef.get().scope() != CompletionIndexScope.EMPTY) {
+                return;
+            }
+            synchronized (JavaLanguageServer.this) {
+                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
+                    return;
+                }
+            }
+            scheduleRefresh(FileStore.all(), trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
+        }
+
+        /** Queue a full workspace bootstrap unless the published scope is already workspace-wide. */
+        void scheduleProjectBootstrapIfNeeded(String trigger) {
+            if (completionSnapshotRef.get().scope() == CompletionIndexScope.WORKSPACE) {
+                return;
+            }
+            synchronized (JavaLanguageServer.this) {
+                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
+                    return;
+                }
+            }
+            scheduleRefresh(FileStore.all(), trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
+        }
+
+        /** Debounce completion-index refreshes and collapse newer schedules onto one pending task. */
+        void scheduleRefresh(
+                Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
+            var javaFiles = filterJavaFiles(files);
+            if (javaFiles.isEmpty()) {
+                return;
+            }
+            var revision = completionIndexRevision.incrementAndGet();
+            var filesBatch = List.copyOf(javaFiles);
+            synchronized (JavaLanguageServer.this) {
+                if (pendingCompletionIndex != null) {
+                    pendingCompletionIndex.cancel(false);
+                }
+                pendingCompletionIndex =
+                        completionIndexExecutor.schedule(
+                                () -> runRefresh(filesBatch, revision, trigger, mode),
+                                delayMs,
+                                TimeUnit.MILLISECONDS);
+            }
+            if (delayMs == 0
+                    || "didSave".equals(trigger)
+                    || mode == CompletionIndexRefreshMode.FULL_REBUILD
+                    || filesBatch.size() > 1) {
+                LOG.fine(String.format(
+                        "[perf] completion_index_debounce trigger=%s files=%d mode=%s delay=%dms revision=%d",
+                        trigger,
+                        filesBatch.size(),
+                        mode.name().toLowerCase(),
+                        delayMs,
+                        revision));
+            }
+        }
+
+        /**
+         * Run one queued completion-index refresh if its revision is still current, then compile,
+         * index, and publish the resulting workspace snapshot.
+         */
+        void runRefresh(List<Path> files, long revision, String trigger, CompletionIndexRefreshMode mode) {
+            if (revision != completionIndexRevision.get()) {
+                return;
+            }
+            var workspaceBootstrap =
+                    mode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
+                            && completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY;
+            synchronized (completionIndexCompileMutex) {
+                var started = Instant.now();
+                CompileTask task = null;
+                String bootstrapProgressToken = null;
+                try {
+                    if (workspaceBootstrap) {
+                        LOG.info(String.format("[perf] workspace bootstrap started trigger=%s files=%d", trigger, files.size()));
+                        bootstrapProgressToken = beginWorkDoneProgress("Bootstrap index", "Indexing workspace");
+                    }
+                    var compiler = getOrCreateCompiler();
+                    task = compiler.compileFast(files.toArray(Path[]::new));
+                    if (revision != completionIndexRevision.get()) {
+                        LOG.fine(String.format(
+                                "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
+                                trigger,
+                                revision,
+                                completionIndexRevision.get()));
+                        endWorkDoneProgress(bootstrapProgressToken, null);
+                        return;
+                    }
+                    var indexStarted = Instant.now();
+                    var nextIndex = buildIndex(task, mode, compiler);
+                    if (revision != completionIndexRevision.get()) {
+                        LOG.fine(String.format(
+                                "[perf] completion_index_refresh_skip trigger=%s phase=post_index expected=%d current=%d",
+                                trigger,
+                                revision,
+                                completionIndexRevision.get()));
+                        endWorkDoneProgress(bootstrapProgressToken, null);
+                        return;
+                    }
+                    var indexVersion = completionIndexVersion.incrementAndGet();
+                    var installTook = Duration.between(indexStarted, Instant.now());
+                    if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
+                        installMergedTypeMemberIndex(
+                                nextIndex, files, indexVersion, "index:" + trigger, installTook);
+                    } else {
+                        var scope =
+                                mode == CompletionIndexRefreshMode.FULL_REBUILD
+                                        ? CompletionIndexScope.WORKSPACE
+                                        : CompletionIndexScope.ACTIVE;
+                        installTypeMemberIndex(
+                                nextIndex, indexVersion, "index:" + trigger, installTook, scope);
+                    }
+                    if (workspaceBootstrap) {
+                        LOG.info(String.format(
+                                "[perf] workspace index installed trigger=%s version=%d types=%d",
+                                trigger,
+                                indexVersion,
+                                nextIndex == null ? 0 : nextIndex.size()));
+                        endWorkDoneProgress(bootstrapProgressToken, "Index ready");
+                    }
+                    var totalMs = Duration.between(started, Instant.now()).toMillis();
+                    LOG.fine(String.format(
+                            "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
+                            trigger,
+                            files.size(),
+                            indexVersion,
+                            mode.name().toLowerCase(),
+                            Duration.between(started, indexStarted).toMillis(),
+                            totalMs));
+                } catch (Exception e) {
+                    endWorkDoneProgress(bootstrapProgressToken, "Index failed");
+                    LOG.warning(
+                            String.format(
+                                    "[completion] index refresh failed trigger=%s files=%d reason=%s",
+                                    trigger,
+                                    files.size(),
+                                    e.getMessage()));
+                    LOG.fine(e.toString());
+                } finally {
+                    if (task != null) {
+                        task.close();
+                    }
+                }
+            }
+        }
+
+        /**
+         * Build the next workspace type snapshot for the requested refresh mode.
+         *
+         * <p>Active bootstrap keeps only types that are declared in the compiled sources or can be
+         * mapped back to a source declaration. Full rebuild and declaration-merge modes index all
+         * workspace declarations from the compile task.
+         */
+        WorkspaceTypeIndex buildIndex(
+                CompileTask task, CompletionIndexRefreshMode mode, JavaCompilerService compiler) {
+            if (mode == CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP) {
+                return WorkspaceTypeIndex.from(task)
+                        .filterTypes(
+                                info ->
+                                        info.sourcePath != null
+                                                || compiler.findTypeDeclaration(info.qualifiedName)
+                                                        != CompilerProvider.NOT_FOUND);
+            }
+            return WorkspaceTypeIndex.workspaceDeclarations(task);
+        }
+
+        /** Cancel any queued completion-index refresh and bump the revision so stale work is dropped. */
+        void cancel(String reason) {
+            synchronized (JavaLanguageServer.this) {
+                if (pendingCompletionIndex == null) {
+                    return;
+                }
+                completionIndexRevision.incrementAndGet();
+                pendingCompletionIndex.cancel(false);
+                pendingCompletionIndex = null;
+            }
+            LOG.fine(String.format("[perf] completion_index_cancel reason=%s", reason));
+        }
+    }
 }

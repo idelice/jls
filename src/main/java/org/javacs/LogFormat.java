@@ -7,7 +7,6 @@ import java.util.logging.Formatter;
 import java.util.logging.LogRecord;
 
 public class LogFormat extends Formatter {
-    private final String format = "%1$tT.%1$tL\t%4$s\t%2$s\t%5$s%6$s%n";
     private final Date date = new Date();
 
     @Override
@@ -32,6 +31,7 @@ public class LogFormat extends Formatter {
             pw.close();
             throwable = sw.toString();
         }
+        String format = "%1$tT.%1$tL\t%4$s\t%2$s\t%5$s%6$s%n";
         return String.format(
                 format, date, source, record.getLoggerName(), record.getLevel().getLocalizedName(), message, throwable);
     }

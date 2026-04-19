@@ -19,15 +19,16 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import javax.tools.ToolProvider;
-import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.completion.CompletionProvider;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
-import org.javacs.navigation.DefinitionProvider;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.provider.CompletionProvider;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.provider.DefinitionProvider;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -242,21 +243,64 @@ public class ExternalBinaryTypeIndexTest {
     }
 
     @Test
-    public void completesLombokGeneratedMembersFromExternalBinary() throws Exception {
+    public void compositeDirectSupertypesUsesExternalTypeMetadata() throws Exception {
         var fixture =
                 createFixture(
-                        true,
+                        false,
                         "package ext;\n"
-                                + "import lombok.Data;\n"
-                                + "@Data\n"
-                                + "public class ExternalLombokPojo {\n"
-                                + "  private String name;\n"
+                                + "class ExternalBase {}\n"
+                                + "public class ExternalPojo extends ExternalBase {}\n",
+                        "package app;\n"
+                                + "import ext.ExternalPojo;\n"
+                                + "class UseExternal {\n"
+                                + "  ExternalPojo value;\n"
+                                + "}\n");
+        try {
+            assertThat(fixture.index().directSupertypes("ext.ExternalPojo"), is(Set.of("ext.ExternalBase")));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void externalIndexResolveTypeNameHonorsImportedSimpleNames() throws Exception {
+        var fixture =
+                createFixture(
+                        false,
+                        "package ext;\n"
+                                + "public class ExternalPojo {\n"
+                                + "  public String getName() { return \"x\"; }\n"
                                 + "}\n",
                         "package app;\n"
-                                + "import ext.ExternalLombokPojo;\n"
-                                + "class UseExternalLombok {\n"
+                                + "import ext.ExternalPojo;\n"
+                                + "class UseExternal {\n"
+                                + "  ExternalPojo value;\n"
+                                + "}\n");
+        try {
+            var parse = fixture.compiler(true).parse(fixture.consumerFile);
+            var index = new ExternalBinaryTypeIndex(fixture.compiler(true));
+            assertThat(index.resolveTypeName("ExternalPojo", parse.root()), is(Optional.of("ext.ExternalPojo")));
+        } finally {
+            fixture.close();
+        }
+    }
+
+    @Test
+    public void completesBinaryMembersWhenSourceJarIsAttached() throws Exception {
+        var fixture =
+                createFixture(
+                        false,
+                        "package ext;\n"
+                                + "public class ExternalPojo {\n"
+                                + "  private String name;\n"
+                                + "  public String getName() { return name; }\n"
+                                + "  public void setName(String name) { this.name = name; }\n"
+                                + "}\n",
+                        "package app;\n"
+                                + "import ext.ExternalPojo;\n"
+                                + "class UseExternal {\n"
                                 + "  void test() {\n"
-                                + "    ExternalLombokPojo user = new ExternalLombokPojo();\n"
+                                + "    ExternalPojo user = new ExternalPojo();\n"
                                 + "    user.getName();\n"
                                 + "    user.setName(\"x\");\n"
                                 + "  }\n"
@@ -618,9 +662,9 @@ public class ExternalBinaryTypeIndexTest {
             JavaCompilerService definitionCompiler,
             Path binaryJar,
             Path sourceJar) implements AutoCloseable {
-        CompositeTypeIndex index() {
+        TypeIndexRouter index() {
             try (var task = compileCompiler.compileFast(consumerFile)) {
-                return new CompositeTypeIndex(
+                return new TypeIndexRouter(
                         WorkspaceTypeIndex.workspaceDeclarations(task),
                         new ExternalBinaryTypeIndex(definitionCompiler));
             }

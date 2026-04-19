@@ -13,7 +13,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     }
 
     public FindNameAt(ParseTask task) {
-        this.task = task.task;
+        this.task = task.task();
     }
 
     @Override
@@ -72,6 +72,15 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     }
 
     @Override
+    public TreePath visitAnnotation(AnnotationTree t, Long find) {
+        var name = annotationName(t);
+        if (name != null && contains(t, name, find)) {
+            return getCurrentPath();
+        }
+        return super.visitAnnotation(t, find);
+    }
+
+    @Override
     public TreePath visitVariable(VariableTree t, Long find) {
         if (contains(t, t.getName(), find)) {
             return getCurrentPath();
@@ -104,5 +113,18 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         end = start + name.length();
         if (start == -1 || end == -1) return false;
         return start <= find && find <= end;
+    }
+
+    private CharSequence annotationName(AnnotationTree annotation) {
+        var type = annotation.getAnnotationType();
+        if (type instanceof IdentifierTree identifier) {
+            return identifier.getName();
+        }
+        if (type instanceof MemberSelectTree memberSelect) {
+            return memberSelect.getIdentifier();
+        }
+        var text = type == null ? "" : type.toString();
+        var lastDot = text.lastIndexOf('.');
+        return lastDot >= 0 ? text.substring(lastDot + 1) : text;
     }
 }

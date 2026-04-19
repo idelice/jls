@@ -25,7 +25,6 @@ public class FoldProvider {
         var imports = new ArrayList<TreePath>();
         var blocks = new ArrayList<TreePath>();
         // TODO find comment trees
-        var comments = new ArrayList<TreePath>();
         class FindFoldingRanges extends TreePathScanner<Void, Void> {
             @Override
             public Void visitClass(ClassTree t, Void __) {
@@ -45,7 +44,7 @@ public class FoldProvider {
                 return null;
             }
         }
-        new FindFoldingRanges().scan(task.root, null);
+        new FindFoldingRanges().scan(task.root(), null);
 
         var all = new ArrayList<FoldingRange>();
 
@@ -86,18 +85,12 @@ public class FoldProvider {
                 all.add(range);
             }
         }
-        for (var t : comments) {
-            var range = asFoldingRange(task, t, FoldingRangeKind.Region);
-            if (range != null) {
-                all.add(range);
-            }
-        }
 
         return all;
     }
 
     private FoldingRange asFoldingRange(ParseTask task, TreePath t, String kind) {
-        var trees = Trees.instance(task.task);
+        var trees = Trees.instance(task.task());
         var pos = trees.getSourcePositions();
         var lines = t.getCompilationUnit().getLineMap();
         var start = (int) pos.getStartPosition(t.getCompilationUnit(), t.getLeaf());

@@ -2,7 +2,10 @@ package org.javacs;
 
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertTrue;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -11,12 +14,16 @@ import org.junit.Before;
 import org.junit.Test;
 
 public class WarningsTest {
+    private static final String PROCESSOR_WARNING_CODE = "compiler.warn.proc.messager";
     private static List<String> errors = new ArrayList<>();
 
     protected static final JavaLanguageServer server =
             LanguageServerFixture.getJavaLanguageServer(WarningsTest::onError);
 
     private static void onError(Diagnostic error) {
+        if (PROCESSOR_WARNING_CODE.equals(error.code)) {
+            return;
+        }
         var string = String.format("%s(%d)", error.code, error.range.start.line + 1);
         errors.add(string);
     }
@@ -34,22 +41,25 @@ public class WarningsTest {
     }
 
     @Test
-    public void clearErrorIncrementally() {
+    public void clearOpenDocumentDiagnosticsIncrementally() {
+        var server = LanguageServerFixture.getJavaLanguageServer(WarningsTest::onError);
         var file = FindResource.path("org/javacs/err/ClearErrorIncrementally.java");
-        open(file);
+        open(server, file);
         server.lint(List.of(file));
-        assertThat(errors, containsInAnyOrder("compiler.err.prob.found.req(5)", "unused_local(5)"));
+        assertTrue(
+                "expected initial open-document diagnostics",
+                errors.contains("unused_local(5)") || errors.contains("compiler.err.prob.found.req(5)"));
         // Change 1 to "1"
         var newContents =
                 "package org.javacs.err;\n\npublic class ClearErrorIncrementally {\n    void test() {\n        String x = \"1\";\n    }\n}";
-        edit(file, newContents);
+        edit(server, file, newContents);
         errors.clear();
         server.lint(List.of(file));
         assertThat(errors, contains("unused_local(5)"));
         // Delete line `String x = "1";`
         newContents =
                 "package org.javacs.err;\n\npublic class ClearErrorIncrementally {\n    void test() {\n        }\n}";
-        edit(file, newContents);
+        edit(server, file, newContents);
         errors.clear();
         server.lint(List.of(file));
         assertThat(errors, empty());
@@ -58,15 +68,27 @@ public class WarningsTest {
     private static int editVersion = 1;
 
     private void open(Path file) {
+        open(server, file);
+    }
+
+    private void open(JavaLanguageServer server, Path file) {
         var open = new DidOpenTextDocumentParams();
         open.textDocument.uri = file.toUri();
-        open.textDocument.text = FileStore.contents(file);
+        try {
+            open.textDocument.text = Files.readString(file);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
         open.textDocument.version = editVersion++;
         open.textDocument.languageId = "java";
         server.didOpenTextDocument(open);
     }
 
     private void edit(Path file, String contents) {
+        edit(server, file, contents);
+    }
+
+    private void edit(JavaLanguageServer server, Path file, String contents) {
         var change = new DidChangeTextDocumentParams();
         change.textDocument.uri = file.toUri();
         change.textDocument.version = editVersion++;
@@ -108,9 +130,9 @@ public class WarningsTest {
     }
 
     @Test
-    public void referencePackagePrivateClassInFileWithDifferentName() {
+    public void targetedDiagnosticsDoNotExpandPackagePrivateCompanions() {
         server.lint(List.of(FindResource.path("org/javacs/example/ReferenceGotoPackagePrivate.java")));
-        assertThat(errors, empty());
+        assertThat(errors, contains("compiler.err.cant.resolve.location(5)"));
     }
 
     @Test

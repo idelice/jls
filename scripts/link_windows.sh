@@ -16,3 +16,5 @@ rm -rf dist/windows
   --no-header-files \
   --no-man-pages \
   --compress 2
+
+cp ./scripts/logging.properties dist/windows/conf/logging.properties

@@ -112,13 +112,12 @@ class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
 
     private Range range(Tree t) {
         var pos = Trees.instance(task).getSourcePositions();
-        var lines = root.getLineMap();
         var start = pos.getStartPosition(root, t);
         var end = pos.getEndPosition(root, t);
-        var startLine = (int) lines.getLineNumber(start);
-        var startColumn = (int) lines.getColumnNumber(start);
-        var endLine = (int) lines.getLineNumber(end);
-        var endColumn = (int) lines.getColumnNumber(end);
-        return new Range(new Position(startLine - 1, startColumn - 1), new Position(endLine - 1, endColumn - 1));
+        try {
+            return org.javacs.FileStore.range(root.getSourceFile().getCharContent(true).toString(), start, end);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 }

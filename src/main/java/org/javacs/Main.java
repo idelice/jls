@@ -17,7 +17,7 @@ public class Main {
     }
 
     public static void main(String[] args) {
-        boolean quiet = Arrays.stream(args).anyMatch("--quiet"::equals);
+        boolean quiet = Arrays.asList(args).contains("--quiet");
 
         if (quiet) {
             LOG.setLevel(Level.OFF);

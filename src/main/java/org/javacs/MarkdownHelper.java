@@ -209,6 +209,11 @@ public class MarkdownHelper {
                 case "literal":
                     parseInner(in, out);
                     break;
+                case "inheritDoc":
+                    // The inherited content is not available from this local inline-tag parser.
+                    // Treat it as a known tag and render nothing instead of warning noisily.
+                    parseInner(in, out);
+                    break;
                 default:
                     LOG.warning(String.format("Unknown tag `@%s`", tag));
                     parseInner(in, out);
@@ -396,20 +401,14 @@ public class MarkdownHelper {
     }
 
     private static String decodeEntity(String name) {
-        switch (name) {
-            case "lt":
-                return "<";
-            case "gt":
-                return ">";
-            case "amp":
-                return "&";
-            case "nbsp":
-                return " ";
-            case "quot":
-                return "\"";
-            default:
-                return "&" + name + ";";
-        }
+        return switch (name) {
+            case "lt" -> "<";
+            case "gt" -> ">";
+            case "amp" -> "&";
+            case "nbsp" -> " ";
+            case "quot" -> "\"";
+            default -> "&" + name + ";";
+        };
     }
 
     private static final Logger LOG = Logger.getLogger("main");

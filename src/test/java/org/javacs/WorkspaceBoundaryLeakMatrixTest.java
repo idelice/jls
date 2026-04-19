@@ -17,7 +17,6 @@ import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidCloseTextDocumentParams;
 import org.javacs.lsp.DidOpenTextDocumentParams;
 import org.javacs.lsp.DidSaveTextDocumentParams;
-import org.javacs.lsp.InlayHintParams;
 import org.javacs.lsp.LanguageClient;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.PublishDiagnosticsParams;
@@ -52,8 +51,7 @@ public class WorkspaceBoundaryLeakMatrixTest {
                     "matrix.use.DefinitionMatrixUse",
                     "matrix.use.ReferenceMatrixUse",
                     "matrix.use.CompletionMatrixUse",
-                    "matrix.use.LoggerCompletionUse",
-                    "matrix.use.HoverInlayUse");
+                    "matrix.use.LoggerCompletionUse");
 
     @Test
     public void workspaceDefinitionMatrixDoesNotLeakToExternalBinary() throws Exception {
@@ -132,59 +130,6 @@ public class WorkspaceBoundaryLeakMatrixTest {
             assertReferencesCase(server, capture, workspace.myInt2(), "/*DECL_ABSTRACT_METHOD*/");
             assertReferencesCase(server, capture, workspace.plainPojo(), "/*DECL_NESTED_INTERFACE_METHOD*/");
             assertReferencesCase(server, capture, workspace.lombokPojo(), "/*DECL_LOMBOK_NAME_FIELD*/");
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace.root());
-        }
-    }
-
-    @Test
-    public void workspaceCompletionHoverAndInlayMatrixDoesNotLeakToExternalBinary() throws Exception {
-        var workspace = createWorkspace();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace.root(), new NoopLanguageClient());
-            configureLombokClasspath(server);
-
-            open(server, workspace.completionUse());
-            open(server, workspace.loggerCompletionUse());
-            open(server, workspace.hoverInlayUse());
-            open(server, workspace.myEnum());
-            open(server, workspace.plainPojo());
-            open(server, workspace.lombokLogger());
-            open(server, workspace.myAnno());
-
-            Assert.assertTrue(awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            assertCompletionCase(server, capture, workspace.completionUse(), "MyEnum.FIRST/*COMP_ENUM*/.", "getType");
-            assertCompletionCase(server, capture, workspace.completionUse(), "this/*COMP_THIS*/.", "doit");
-            assertCompletionCase(server, capture, workspace.completionUse(), "new PlainPojo.Nested()/*COMP_NESTED*/.", "nestedValue");
-            assertCompletionCase(server, capture, workspace.completionUse(), "record/*COMP_RECORD*/.", "value");
-            assertCompletionCase(server, capture, workspace.loggerCompletionUse(), "log/*COMP_LOG*/.", null);
-
-            capture.clear();
-            var hover =
-                    server.hover(
-                                    new TextDocumentPositionParams(
-                                            new TextDocumentIdentifier(workspace.hoverInlayUse().toUri()),
-                                            positionAtMarker(workspace.hoverInlayUse(), "/*HOVER_ANNOTATION*/")))
-                            .orElseThrow();
-            Assert.assertTrue("expected hover contents for workspace annotation", hover.contents != null);
-            assertNoWorkspaceLeak(capture);
-
-            capture.clear();
-            var hints =
-                    server.inlayHint(
-                            new InlayHintParams(
-                                    new TextDocumentIdentifier(workspace.hoverInlayUse().toUri()),
-                                    new Range(new Position(0, 0), endOfFile(workspace.hoverInlayUse()))));
-            Assert.assertFalse("expected workspace inlay hints", hints.isEmpty());
-            assertNoWorkspaceLeak(capture);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -643,20 +588,6 @@ public class WorkspaceBoundaryLeakMatrixTest {
                         + "  void run() { log/*COMP_LOG*/.; }\n"
                         + "}\n");
 
-        var hoverInlayUse = use.resolve("HoverInlayUse.java");
-        Files.writeString(
-                hoverInlayUse,
-                "package matrix.use;\n"
-                        + "import matrix.model.MyAnno;\n"
-                        + "import matrix.model.PlainPojo;\n"
-                        + "@/*HOVER_ANNOTATION*/MyAnno\n"
-                        + "class HoverInlayUse {\n"
-                        + "  void run() {\n"
-                        + "    var plain = new PlainPojo();\n"
-                        + "    plain.countUp(1);\n"
-                        + "  }\n"
-                        + "}\n");
-
         var jdkCompletionUse = use.resolve("JdkCompletionUse.java");
         Files.writeString(
                 jdkCompletionUse,
@@ -682,7 +613,6 @@ public class WorkspaceBoundaryLeakMatrixTest {
                 referenceUse,
                 completionUse,
                 loggerCompletionUse,
-                hoverInlayUse,
                 jdkCompletionUse);
     }
 
@@ -703,7 +633,6 @@ public class WorkspaceBoundaryLeakMatrixTest {
             Path referenceUse,
             Path completionUse,
             Path loggerCompletionUse,
-            Path hoverInlayUse,
             Path jdkCompletionUse) {}
 
     private static void deleteRecursively(Path root) throws IOException {
@@ -800,9 +729,6 @@ public class WorkspaceBoundaryLeakMatrixTest {
 
         @Override
         public void registerCapability(String method, com.google.gson.JsonElement options) {}
-
-        @Override
-        public void refreshInlayHints() {}
 
         @Override
         public void customNotification(String method, com.google.gson.JsonElement params) {}

@@ -21,9 +21,9 @@ public class ConvertFieldToBlock implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var trees = Trees.instance(task.task);
+        var trees = Trees.instance(task.task());
         var pos = trees.getSourcePositions();
-        var lines = task.root.getLineMap();
+        var lines = task.root().getLineMap();
         var variable = ConvertVariableToStatement.findVariable(task, position);
         if (variable == null) {
             return CANCELLED;
@@ -32,8 +32,8 @@ public class ConvertFieldToBlock implements Rewrite {
         if (!ConvertVariableToStatement.isExpressionStatement(expression)) {
             return CANCELLED;
         }
-        var start = pos.getStartPosition(task.root, variable);
-        var end = pos.getStartPosition(task.root, expression);
+        var start = pos.getStartPosition(task.root(), variable);
+        var end = pos.getStartPosition(task.root(), expression);
         var startLine = (int) lines.getLineNumber(start);
         var startColumn = (int) lines.getColumnNumber(start);
         var startPos = new Position(startLine - 1, startColumn - 1);
@@ -45,7 +45,7 @@ public class ConvertFieldToBlock implements Rewrite {
         if (variable.getModifiers().getFlags().contains(Modifier.STATIC)) {
             fixLhs.newText = "static { ";
         }
-        var right = pos.getEndPosition(task.root, variable);
+        var right = pos.getEndPosition(task.root(), variable);
         var rightLine = (int) lines.getLineNumber(right);
         var rightColumn = (int) lines.getColumnNumber(right);
         var rightPos = new Position(rightLine - 1, rightColumn - 1);

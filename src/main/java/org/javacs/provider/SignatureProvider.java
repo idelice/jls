@@ -1,4 +1,4 @@
-package org.javacs.completion;
+package org.javacs.provider;
 
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.StringJoiner;
 import java.util.function.Predicate;
+import java.util.logging.Logger;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
@@ -23,14 +24,18 @@ import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.*;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.MarkdownHelper;
+import org.javacs.completion.FindInvocationAt;
+import org.javacs.completion.ScopeHelper;
 import org.javacs.hover.ShortTypePrinter;
 import org.javacs.lsp.ParameterInformation;
 import org.javacs.lsp.SignatureHelp;
 import org.javacs.lsp.SignatureInformation;
 
 public class SignatureProvider {
+    private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
 
@@ -44,7 +49,12 @@ public class SignatureProvider {
         // TODO prune
         try (var task = compiler.compileFastWithProcessors(file)) {
             var root = task.root(file);
-            var cursor = root.getLineMap().getPosition(line, column);
+            long cursor;
+            try {
+                cursor = FileStore.offset(root.getSourceFile().getCharContent(true).toString(), line, column);
+            } catch (java.io.IOException e) {
+                throw new RuntimeException(e);
+            }
             var path = new FindInvocationAt(task.task).scan(root, cursor);
             if (path == null) return NOT_SUPPORTED;
             if (path.getLeaf() instanceof MethodInvocationTree) {
@@ -75,6 +85,12 @@ public class SignatureProvider {
                 var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
                 return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
+            return NOT_SUPPORTED;
+        } catch (RuntimeException | AssertionError e) {
+            LOG.fine(
+                    String.format(
+                            "[perf] signature_help_skip file=%s reason=%s message=%s",
+                            file.getFileName(), e.getClass().getSimpleName(), e.getMessage()));
             return NOT_SUPPORTED;
         }
     }
@@ -187,7 +203,7 @@ public class SignatureProvider {
         try {
             var parse = compiler.parse(file.get());
             var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-            var path = Trees.instance(task.task).getPath(parse.root, source);
+            var path = Trees.instance(task.task).getPath(parse.root(), source);
             var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
             if (docTree != null) {
                 info.documentation = MarkdownHelper.asMarkupContent(docTree);

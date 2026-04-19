@@ -207,10 +207,6 @@ public class ErrorProvider {
     private org.javacs.lsp.Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d, LineMap lines) {
         var start = d.getStartPosition();
         var end = d.getEndPosition();
-        var startLine = (int) lines.getLineNumber(start);
-        var startColumn = (int) lines.getColumnNumber(start);
-        var endLine = (int) lines.getLineNumber(end);
-        var endColumn = (int) lines.getColumnNumber(end);
         var severity = severity(d.getKind());
         var code = d.getCode();
         var message = d.getMessage(null);
@@ -218,8 +214,11 @@ public class ErrorProvider {
         result.severity = severity;
         result.code = code;
         result.message = message;
-        result.range =
-                new Range(new Position(startLine - 1, startColumn - 1), new Position(endLine - 1, endColumn - 1));
+        try {
+            result.range = org.javacs.FileStore.range(d.getSource().getCharContent(true).toString(), start, end);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
         return result;
     }
 

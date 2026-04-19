@@ -1,62 +1,56 @@
-package org.javacs.hover;
+package org.javacs.provider;
 
-import com.google.gson.JsonNull;
 import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.DocTrees;
 import com.sun.source.util.TreePath;
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.StringJoiner;
-import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
-import org.javacs.CompletionData;
-import org.javacs.FindHelper;
+import org.javacs.FileStore;
 import org.javacs.FindNameAt;
-import org.javacs.JsonHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
-import org.javacs.TypeLookupBoundary;
-import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.lsp.CompletionItem;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.MarkupContent;
 import org.javacs.lsp.MarkupKind;
-import org.javacs.navigation.DefinitionProvider;
 
 public class HoverProvider {
-    private static final Logger LOG = Logger.getLogger("main");
+    private record ResolvedDeclaration(ParseTask parse, TreePath path) {}
 
     final CompilerProvider compiler;
-    final CompositeTypeIndex completionIndex;
-    final TypeLookupBoundary typeLookup;
+    final TypeIndexRouter typeIndexRouter;
 
     public HoverProvider(CompilerProvider compiler) {
-        this(compiler, CompositeTypeIndex.EMPTY);
+        this(compiler, TypeIndexRouter.EMPTY);
     }
 
-    public HoverProvider(CompilerProvider compiler, CompositeTypeIndex completionIndex) {
+    public HoverProvider(CompilerProvider compiler, TypeIndexRouter typeIndexRouter) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? CompositeTypeIndex.EMPTY : completionIndex;
-        this.typeLookup = new TypeLookupBoundary(compiler, this.completionIndex);
+        this.typeIndexRouter = typeIndexRouter == null ? TypeIndexRouter.EMPTY : typeIndexRouter;
     }
 
     public MarkupContent hover(Path file, int line, int column) {
         var parse = compiler.parse(file);
-        var cursor = parse.root.getLineMap().getPosition(line, column);
-        var path = new FindNameAt(parse).scan(parse.root, cursor);
+        long cursor;
+        try {
+            cursor = FileStore.offset(parse.root().getSourceFile().getCharContent(true).toString(), line, column);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
+        var path = new FindNameAt(parse).scan(parse.root(), cursor);
         if (path == null) {
             return null;
         }
 
-        var symbol = new DefinitionProvider(compiler, completionIndex, file, line, column).resolveSymbol();
+        var symbol = new DefinitionProvider(compiler, typeIndexRouter, file, line, column).resolveSymbol();
         var fallback = renderFromPath(parse, path);
         if (symbol.locations().isEmpty()) {
             var generated = renderGeneratedMember(symbol);
@@ -66,7 +60,7 @@ public class HoverProvider {
             return fallback;
         }
 
-        var resolved = resolveLocation(symbol.locations().get(0));
+        var resolved = resolveLocation(symbol.locations().getFirst());
         if (resolved.isEmpty()) {
             var generated = renderGeneratedMember(symbol);
             if (generated != null) {
@@ -93,13 +87,13 @@ public class HoverProvider {
             var parse = compiler.parse(target);
             var line = location.range.start.line + 1;
             var column = location.range.start.character + 1;
-            var cursor = parse.root.getLineMap().getPosition(line, column);
-            var path = new FindNameAt(parse).scan(parse.root, cursor);
+            long cursor = FileStore.offset(parse.root().getSourceFile().getCharContent(true).toString(), line, column);
+            var path = new FindNameAt(parse).scan(parse.root(), cursor);
             if (path == null) {
                 return Optional.empty();
             }
             return Optional.of(new ResolvedDeclaration(parse, path));
-        } catch (RuntimeException ignored) {
+        } catch (RuntimeException | java.io.IOException ignored) {
             return Optional.empty();
         }
     }
@@ -107,7 +101,7 @@ public class HoverProvider {
     private Optional<MarkupContent> renderResolvedDeclaration(
             ResolvedDeclaration resolved, DefinitionProvider.ResolvedSymbol symbol) {
         var tree = resolved.path().getLeaf();
-        if (tree instanceof ClassTree cls && symbol != null && symbol.method() && symbol.memberName() != null) {
+        if (tree instanceof ClassTree && symbol != null && symbol.method() && symbol.memberName() != null) {
             var methodPath = findMethodInClass(resolved.parse(), resolved.path(), symbol.memberName());
             if (methodPath.isPresent()) {
                 tree = methodPath.get().getLeaf();
@@ -183,7 +177,7 @@ public class HoverProvider {
     private String renderDeclaration(ParseTask parse, TreePath path, DefinitionProvider.ResolvedSymbol symbol) {
         var tree = path.getLeaf();
         if (tree instanceof ClassTree cls) {
-            return classSignature(parse, path, cls);
+            return classSignature(cls);
         }
         if (tree instanceof MethodTree method) {
             return methodSignature(parse, method);
@@ -201,7 +195,7 @@ public class HoverProvider {
         return tree.toString();
     }
 
-    private String classSignature(ParseTask parse, TreePath classPath, ClassTree cls) {
+    private String classSignature(ClassTree cls) {
         var modifiers = joinModifiers(cls.getModifiers().getFlags().stream().map(Enum::toString).toList());
         var kind = switch (cls.getKind()) {
             case ANNOTATION_TYPE -> "@interface";
@@ -261,7 +255,7 @@ public class HoverProvider {
         if (packageName.isBlank()) {
             packageName = "(default package)";
         }
-        return "**" + packageName + "**\n" + qualifiedName + "\n" + classSignature(parse, classPath, cls);
+        return "**" + packageName + "**\n" + qualifiedName + "\n" + classSignature(cls);
     }
 
     private String qualifiedClassName(ParseTask parse, TreePath classPath) {
@@ -272,7 +266,7 @@ public class HoverProvider {
             }
         }
         java.util.Collections.reverse(names);
-        var pkg = parse.root.getPackageName() == null ? "" : parse.root.getPackageName().toString();
+        var pkg = parse.root().getPackageName() == null ? "" : parse.root().getPackageName().toString();
         if (pkg.isBlank()) {
             return String.join(".", names);
         }
@@ -288,7 +282,7 @@ public class HoverProvider {
     }
 
     private String docs(ParseTask task, TreePath path) {
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+        var docTree = DocTrees.instance(task.task()).getDocCommentTree(path);
         if (docTree == null) return "";
         return MarkdownHelper.asMarkdown(docTree);
     }
@@ -304,7 +298,7 @@ public class HoverProvider {
     }
 
     private Optional<String> resolveTypeName(ParseTask parse, String typeName) {
-        return typeLookup.resolveTypeName(typeName, parse.root);
+        return typeIndexRouter.resolveTypeName(typeName, parse.root());
     }
 
     private String joinModifiers(List<String> modifiers) {
@@ -315,66 +309,4 @@ public class HoverProvider {
         return join.toString();
     }
 
-    public void resolveCompletionItem(CompletionItem item) {
-        if (item.data == null || item.data == JsonNull.INSTANCE) return;
-        var data = JsonHelper.GSON.fromJson(item.data, CompletionData.class);
-        var source = compiler.findAnywhere(data.className);
-        if (source.isEmpty()) return;
-        var task = compiler.parse(source.get());
-        Tree tree;
-        try {
-            tree = findItem(task, data);
-        } catch (RuntimeException missingGeneratedItem) {
-            LOG.fine(
-                    String.format(
-                            "Skip completion item resolve for unresolved member %s#%s",
-                            data.className, data.memberName));
-            return;
-        }
-        resolveDetail(item, data, tree);
-        var path = Trees.instance(task.task).getPath(task.root, tree);
-        if (path == null) return;
-        var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
-        if (docTree == null) return;
-        item.documentation = MarkdownHelper.asMarkupContent(docTree);
-    }
-
-    private void resolveDetail(CompletionItem item, CompletionData data, Tree tree) {
-        if (tree instanceof MethodTree method) {
-            var parameters = new StringJoiner(", ");
-            for (var p : method.getParameters()) {
-                parameters.add(p.getType() + " " + p.getName());
-            }
-            item.detail = method.getReturnType() + " " + method.getName() + "(" + parameters + ")";
-            if (!method.getThrows().isEmpty()) {
-                var exceptions = new StringJoiner(", ");
-                for (var e : method.getThrows()) {
-                    exceptions.add(e.toString());
-                }
-                item.detail += " throws " + exceptions;
-            }
-            if (data.plusOverloads != 0) {
-                item.detail += " (+" + data.plusOverloads + " overloads)";
-            }
-        }
-    }
-
-    private Tree findItem(ParseTask task, CompletionData data) {
-        if (data.erasedParameterTypes != null) {
-            return FindHelper.findMethod(task, data.className, data.memberName, data.erasedParameterTypes);
-        }
-        if (data.memberName != null) {
-            return FindHelper.findField(task, data.className, data.memberName);
-        }
-        if (data.className != null) {
-            var type = FindHelper.findType(task, data.className);
-            if (type != null) {
-                return type;
-            }
-            throw new RuntimeException("no type");
-        }
-        throw new RuntimeException("no className");
-    }
-
-    private record ResolvedDeclaration(ParseTask parse, TreePath path) {}
 }

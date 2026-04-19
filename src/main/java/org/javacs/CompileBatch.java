@@ -15,7 +15,6 @@ import javax.lang.model.util.*;
 import javax.tools.*;
 
 public class CompileBatch implements AutoCloseable {
-    static final int MAX_COMPLETION_ITEMS = 50;
     private static final Logger LOG = Logger.getLogger("main");
         private static final AtomicLong FULL_BATCHES = new AtomicLong();
     private static final AtomicLong ANALYZE_INVOCATIONS = new AtomicLong();
@@ -48,29 +47,10 @@ public class CompileBatch implements AutoCloseable {
     final List<CompilationUnitTree> roots;
     final Map<Path, CompileTask.SourceStamp> sourceStamps;
     final AnalysisMode analysisMode;
-
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
-        this(parent, files, true, AnalysisMode.FULL);
-    }
-
-    /**
-     * Create a compilation batch with optional annotation processing.
-     *
-     * @param parent the compiler service
-     * @param files the files to compile
-     * @param allowAP if false, uses non-AP options even if Lombok is present
-     */
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean allowAP) {
-        this(parent, files, allowAP, AnalysisMode.FULL);
-    }
-
-    CompileBatch(
-            JavaCompilerService parent,
-            Collection<? extends JavaFileObject> files,
-            boolean allowAP,
-            AnalysisMode analysisMode) {
-        this(parent, files, allowAP, analysisMode, parent.compiler);
-    }
+    final boolean annotationProcessingEnabled;
+    final long parseMs;
+    final long enterMs;
+    final long analyzeMs;
 
     CompileBatch(
             JavaCompilerService parent,
@@ -87,6 +67,7 @@ public class CompileBatch implements AutoCloseable {
         this.roots = new ArrayList<>();
         this.sourceStamps = collectSourceStamps(files);
         this.analysisMode = analysisMode;
+        this.annotationProcessingEnabled = allowAP;
 
         long parseNanos = 0;
         long enterNanos = 0;
@@ -149,6 +130,9 @@ public class CompileBatch implements AutoCloseable {
             }
             throw new RuntimeException("Compilation failed: " + e.getMessage(), e);
         } finally {
+            this.parseMs = parseNanos / 1_000_000;
+            this.enterMs = enterNanos / 1_000_000;
+            this.analyzeMs = analyzeNanos / 1_000_000;
             if (analysisMode == AnalysisMode.FULL) {
                 FULL_BATCHES.incrementAndGet();
             }
@@ -347,7 +331,7 @@ public class CompileBatch implements AutoCloseable {
     private Path findPackagePrivateClass(String packageName, String className) {
         for (var file : FileStore.list(packageName)) {
             var parse = parent.parse(file);
-            for (var declaration : parse.root.getTypeDecls()) {
+            for (var declaration : parse.root().getTypeDecls()) {
                 if (!(declaration instanceof ClassTree)) continue;
                 var cls = (ClassTree) declaration;
                 var isPublic = cls.getModifiers().getFlags().contains(Modifier.PUBLIC);
@@ -362,6 +346,7 @@ public class CompileBatch implements AutoCloseable {
 
     @Override
     public void close() {
+        borrow.close();
         closed = true;
     }
 
@@ -391,11 +376,13 @@ public class CompileBatch implements AutoCloseable {
     }
 
     private static List<String> options(
-            Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, boolean lombokPresent) {
+            Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
-        Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        if (!targetsJava8OrEarlier(extraArgs)) {
+            Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        }
         // Collections.addAll(list, "-verbose");
 
         if (lombokPresent) {
@@ -424,9 +411,7 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        var sortedExtraArgs = new ArrayList<>(extraArgs);
-        Collections.sort(sortedExtraArgs);
-        list.addAll(sortedExtraArgs);
+        list.addAll(extraArgs);
         var sortedExports = new ArrayList<>(addExports);
         Collections.sort(sortedExports);
         for (var export : sortedExports) {
@@ -438,7 +423,7 @@ public class CompileBatch implements AutoCloseable {
     }
 
     private static List<String> optionsForFastAp(
-            Set<Path> classPath, Set<String> addExports, Set<String> extraArgs, boolean lombokPresent) {
+            Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
         var list = options(classPath, addExports, extraArgs, lombokPresent);
         if (lombokPresent) {
             // Run AP + attribution, but stop before FLOW so completion stays lightweight.
@@ -463,10 +448,12 @@ public class CompileBatch implements AutoCloseable {
      * Create compilation options with annotation processing disabled.
      * Used for retrying compilation after AP failure.
      */
-    static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, Set<String> extraArgs) {
+    static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();
         Collections.addAll(list, "-classpath", joinPath(classPath));
-        Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        if (!targetsJava8OrEarlier(extraArgs)) {
+            Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
+        }
         Collections.addAll(list, "-proc:none");
         Collections.addAll(list, "-g");
         Collections.addAll(
@@ -480,9 +467,7 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        var sortedExtraArgs = new ArrayList<>(extraArgs);
-        Collections.sort(sortedExtraArgs);
-        list.addAll(sortedExtraArgs);
+        list.addAll(extraArgs);
         var sortedExports = new ArrayList<>(addExports);
         Collections.sort(sortedExports);
         for (var export : sortedExports) {
@@ -490,6 +475,34 @@ public class CompileBatch implements AutoCloseable {
             list.add(export + "=ALL-UNNAMED");
         }
         return list;
+    }
+
+    private static boolean targetsJava8OrEarlier(List<String> extraArgs) {
+        for (int i = 0; i < extraArgs.size() - 1; i++) {
+            var arg = extraArgs.get(i);
+            if (!"--release".equals(arg) && !"-source".equals(arg) && !"-target".equals(arg)) {
+                continue;
+            }
+            var level = parseJavaLevel(extraArgs.get(i + 1));
+            if (level > 0) {
+                return level <= 8;
+            }
+        }
+        return false;
+    }
+
+    private static int parseJavaLevel(String value) {
+        if (value == null || value.isBlank()) {
+            return -1;
+        }
+        if (value.startsWith("1.")) {
+            value = value.substring(2);
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     private boolean isValidFileRange(javax.tools.Diagnostic<? extends JavaFileObject> d) {

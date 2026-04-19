@@ -16,3 +16,5 @@ rm -rf dist/linux
   --no-header-files \
   --no-man-pages \
   --compress 2
+
+cp ./scripts/logging.properties dist/linux/conf/logging.properties

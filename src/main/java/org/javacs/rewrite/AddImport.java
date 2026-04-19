@@ -20,7 +20,7 @@ public class AddImport implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var edits = createTextEdits(className, task.root, com.sun.source.util.Trees.instance(task.task).getSourcePositions());
+        var edits = createTextEdits(className, task.root(), com.sun.source.util.Trees.instance(task.task()).getSourcePositions());
         return Map.of(file, edits);
     }
 

@@ -7,11 +7,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import org.javacs.completion.CompositeTypeIndex;
-import org.javacs.completion.ExternalBinaryTypeIndex;
-import org.javacs.completion.TypeMemberIndex;
-import org.javacs.completion.WorkspaceTypeIndex;
-import org.javacs.navigation.ReferenceProvider;
+import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.provider.ReferenceProvider;
 import org.junit.Test;
 
 public class FindReferencesTest {
@@ -147,6 +146,12 @@ public class FindReferencesTest {
                         "OverrideHierarchy.java(16)"));
     }
 
+    @Test
+    public void interfaceDefaultMethodReferencesIncludeInheritedCallSites() {
+        var file = "/org/javacs/example/InterfaceDefaultReference.java";
+        assertThat(items(file, 4, 28), contains("InterfaceDefaultReference.java(11)"));
+    }
+
     private static ReferenceContext referenceContext() {
         var workspaceRoot = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT;
         FileStore.reset();
@@ -155,11 +160,11 @@ public class FindReferencesTest {
         var compiler =
                 new JavaCompilerService(
                         infer.classPath(), infer.buildDocPath(), java.util.Collections.emptySet(), java.util.Collections.emptySet());
-        CompositeTypeIndex index;
+        TypeIndexRouter index;
         try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
             index =
-                    new CompositeTypeIndex(
-                            WorkspaceTypeIndex.wrap(TypeMemberIndex.from(task)),
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(task),
                             new ExternalBinaryTypeIndex(compiler));
         }
         return new ReferenceContext(compiler, index);
@@ -167,9 +172,9 @@ public class FindReferencesTest {
 
     private static final class ReferenceContext {
         final JavaCompilerService compiler;
-        final CompositeTypeIndex index;
+        final TypeIndexRouter index;
 
-        ReferenceContext(JavaCompilerService compiler, CompositeTypeIndex index) {
+        ReferenceContext(JavaCompilerService compiler, TypeIndexRouter index) {
             this.compiler = compiler;
             this.index = index;
         }

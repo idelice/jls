@@ -21,7 +21,7 @@ class FindTypeDeclarations extends TreeScanner<Void, List<String>> {
         qualifiedName.add(type.getSimpleName());
         found.add(String.join(".", qualifiedName));
         super.visitClass(type, found);
-        qualifiedName.remove(qualifiedName.size() - 1);
+        qualifiedName.removeLast();
         return null;
     }
 }

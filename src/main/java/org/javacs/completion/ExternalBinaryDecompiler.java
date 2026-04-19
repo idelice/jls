@@ -16,20 +16,20 @@ import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
 import org.jetbrains.java.decompiler.main.extern.IResultSaver;
 
-final class ExternalBinaryDecompiler {
+public final class ExternalBinaryDecompiler {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final Set<Path> classPathRoots;
     private final String classPathFingerprint;
     private final ClassLoader classLoader;
 
-    ExternalBinaryDecompiler(Set<Path> classPathRoots, String classPathFingerprint, ClassLoader classLoader) {
+    public ExternalBinaryDecompiler(Set<Path> classPathRoots, String classPathFingerprint, ClassLoader classLoader) {
         this.classPathRoots = classPathRoots == null ? Set.of() : Set.copyOf(classPathRoots);
         this.classPathFingerprint = classPathFingerprint == null ? "" : classPathFingerprint;
         this.classLoader = classLoader == null ? ExternalBinaryDecompiler.class.getClassLoader() : classLoader;
     }
 
-    Optional<Path> decompileSourcePath(String qualifiedName) {
+    public Optional<Path> decompileSourcePath(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || classPathRoots.isEmpty()) {
             return Optional.empty();
         }
@@ -106,7 +106,7 @@ final class ExternalBinaryDecompiler {
                 var topLevelName = topLevelFile.getFileName().toString();
                 var innerPrefix = topLevelName.substring(0, topLevelName.length() - ".class".length()) + "$";
                 try (var stream = Files.list(classDir)) {
-                    for (var child : stream.collect(Collectors.toList())) {
+                    for (var child : stream.toList()) {
                         var fileName = child.getFileName().toString();
                         if (!fileName.startsWith(innerPrefix) || !fileName.endsWith(".class")) {
                             continue;
@@ -212,8 +212,7 @@ final class ExternalBinaryDecompiler {
     private Optional<BinaryTarget> resolveReflectiveTopLevel(String qualifiedName) {
         for (var binaryName : binaryNameCandidates(qualifiedName)) {
             try {
-                var cls = Class.forName(binaryName, false, classLoader);
-                var topLevel = cls;
+                var topLevel = Class.forName(binaryName, false, classLoader);
                 while (topLevel.getEnclosingClass() != null) {
                     topLevel = topLevel.getEnclosingClass();
                 }

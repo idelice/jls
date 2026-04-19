@@ -168,13 +168,13 @@ public class LSP {
         }
 
         @Override
-        public void refreshInlayHints() {
-            var requestMethod = "workspace/inlayHint/refresh";
+        public void sendRequest(String method, JsonElement params) {
+            var jsonText = toJson(params);
             var id = new Random().nextInt();
             var messageText =
                     String.format(
-                            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":null}",
-                            id, requestMethod);
+                            "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":%s}",
+                            id, method, jsonText);
             writeClient(send, messageText);
         }
 
@@ -462,6 +462,13 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, FoldingRangeParams.class);
                             var response = server.foldingRange(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/diagnostic":
+                        {
+                            var params = gson.fromJson(r.params, DocumentDiagnosticParams.class);
+                            var response = server.textDocumentDiagnostic(params);
                             respond(send, r.id, response);
                             break;
                         }

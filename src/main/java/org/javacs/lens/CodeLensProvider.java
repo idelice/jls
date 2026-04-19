@@ -9,7 +9,7 @@ public class CodeLensProvider {
 
     public static List<CodeLens> find(ParseTask task) {
         var list = new ArrayList<CodeLens>();
-        new FindCodeLenses(task.task).scan(task.root, list);
+        new FindCodeLenses(task.task()).scan(task.root(), list);
         return list;
     }
 }

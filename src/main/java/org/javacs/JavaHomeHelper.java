@@ -79,7 +79,7 @@ class JavaHomeHelper {
         for (var root : roots) {
             List<Path> list;
             try {
-                list = Files.list(Paths.get(root)).collect(Collectors.toList());
+                list = Files.list(Paths.get(root)).toList();
             } catch (NoSuchFileException e) {
                 continue;
             } catch (IOException e) {

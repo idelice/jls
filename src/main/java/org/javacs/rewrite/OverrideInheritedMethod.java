@@ -61,20 +61,20 @@ public class OverrideInheritedMethod implements Rewrite {
 
     private Position insertNearCursor(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var parent = new FindTypeDeclarationAt(task.task).scan(task.root, (long) insertPosition);
+        var parent = new FindTypeDeclarationAt(task.task()).scan(task.root(), (long) insertPosition);
         var next = nextMember(task, parent);
         if (next != Position.NONE) {
             return next;
         }
-        return EditHelper.insertAtEndOfClass(task.task, task.root, parent);
+        return EditHelper.insertAtEndOfClass(task.task(), task.root(), parent);
     }
 
     private Position nextMember(ParseTask task, ClassTree parent) {
-        var pos = Trees.instance(task.task).getSourcePositions();
+        var pos = Trees.instance(task.task()).getSourcePositions();
         for (var member : parent.getMembers()) {
-            var start = pos.getStartPosition(task.root, member);
+            var start = pos.getStartPosition(task.root(), member);
             if (start > insertPosition) {
-                var line = (int) task.root.getLineMap().getLineNumber(start);
+                var line = (int) task.root().getLineMap().getLineNumber(start);
                 return new Position(line - 1, 0);
             }
         }

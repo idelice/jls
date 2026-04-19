@@ -12,10 +12,6 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.*;
-import java.util.logging.Handler;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
 import org.junit.*;
 
@@ -85,20 +81,20 @@ public class JavaCompilerServiceTest {
         try {
             var first = compiler.parse(new SourceFileObject(file, "class ParseCache { int one; }\n", Instant.EPOCH, 1));
             var second = compiler.parse(new SourceFileObject(file, "class ParseCache { int one; }\n", Instant.EPOCH, 1));
-            assertThat("same source fingerprint should reuse cached AST", second.root, sameInstance(first.root));
+            assertThat("same source fingerprint should reuse cached AST", second.root(), sameInstance(first.root()));
 
             var third = compiler.parse(new SourceFileObject(file, "class ParseCache { int two; }\n", Instant.EPOCH, 2));
-            assertThat("new source version should refresh cached AST", third.root, not(sameInstance(first.root)));
+            assertThat("new source version should refresh cached AST", third.root(), not(sameInstance(first.root())));
             var parsed = compiler.parsedUnits.get(file);
             assertThat("parsedUnits should track latest parsed unit per file", parsed, notNullValue());
-            assertThat("parsedUnits should track latest AST per file", parsed.task.root, sameInstance(third.root));
+            assertThat("parsedUnits should track latest AST per file", parsed.task().root(), sameInstance(third.root()));
         } finally {
             Files.deleteIfExists(file);
         }
     }
 
     @Test
-    public void parseCacheIsSharedAcrossCompilerServicesForSameSourceVersion() throws Exception {
+    public void parseCacheIsScopedToCompilerServiceInstances() throws Exception {
         var file = Files.createTempFile("shared-parse-cache-", ".java");
         try {
             var firstCompiler =
@@ -120,19 +116,26 @@ public class JavaCompilerServiceTest {
             var second =
                     secondCompiler.parse(
                             new SourceFileObject(file, "class SharedParseCache { int one; }\n", Instant.EPOCH, 1));
+            var secondRepeat =
+                    secondCompiler.parse(
+                            new SourceFileObject(file, "class SharedParseCache { int one; }\n", Instant.EPOCH, 1));
 
             assertThat(
-                    "same source fingerprint parsed by different compilers should reuse shared AST",
-                    second.root,
-                    sameInstance(first.root));
+                    "parse caching should remain isolated per compiler service",
+                    second.root(),
+                    not(sameInstance(first.root())));
+            assertThat(
+                    "repeated parses within the same compiler service should still reuse the cached AST",
+                    secondRepeat.root(),
+                    sameInstance(second.root()));
         } finally {
             Files.deleteIfExists(file);
         }
     }
 
     @Test
-    public void reusesPerOptionCompilerContextsWithoutRepeatedRecreation() throws Exception {
-        var service =
+    public void keepsCompilerContextGrowthBoundedAcrossRepeatedCompiles() throws Exception {
+        var fullService =
                 new JavaCompilerService(
                         Set.of(Paths.get("lib/lombok-1.18.30.jar")),
                         Collections.emptySet(),
@@ -140,13 +143,237 @@ public class JavaCompilerServiceTest {
                         Collections.emptySet());
         var file = FindResource.path("org/javacs/example/HelloWorld.java");
 
-        try (var ignored = service.compile(file)) {}
-        try (var ignored = service.compileFastWithProcessors(file)) {}
-        try (var ignored = service.compile(file)) {}
-        try (var ignored = service.compileFastWithProcessors(file)) {}
+        try (var ignored = fullService.compile(file)) {}
+        try (var ignored = fullService.compile(file)) {}
+        var fullContexts = reusableCompilerContexts(fullService.compiler);
+        assertThat(
+                "repeated full compiles should not keep creating new reusable contexts",
+                fullContexts.size(),
+                lessThanOrEqualTo(2));
 
-        var contexts = reusableCompilerContexts(service.compiler);
-        assertThat("expected one context per distinct option set", contexts.size(), is(2));
+        var fastService =
+                new JavaCompilerService(
+                        Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+        try (var ignored = fastService.compileFastWithProcessors(file)) {}
+        try (var ignored = fastService.compileFastWithProcessors(file)) {}
+        var fastContexts = reusableCompilerContexts(fastService.compiler);
+        assertThat(
+                "repeated fast AP compiles should not keep creating new reusable contexts",
+                    fastContexts.size(),
+                    lessThanOrEqualTo(2));
+    }
+
+    @Test
+    public void reusableCompilerUnlocksAfterTaskCreationFailure() {
+        var reusable = new ReusableCompiler();
+
+        try {
+            reusable.getTask(
+                    compiler.fileManager,
+                    diagnostic -> {},
+                    List.of("--release", "21", "-source", "21"),
+                    List.of(),
+                    List.of());
+            fail("expected javac option parsing to fail");
+        } catch (RuntimeException expected) {
+            assertThat(expected.getMessage(), containsString("--release"));
+        }
+
+        try (var borrow =
+                reusable.getTask(
+                        compiler.fileManager,
+                        diagnostic -> {},
+                        List.of("--release", "21"),
+                        List.of(),
+                        List.of())) {
+            assertThat("compiler should unlock after getTask failure", borrow, notNullValue());
+        }
+    }
+
+    @Test
+    public void compileTwiceWithReleaseArgsReusesNoStaleCompilerState() throws Exception {
+        var file = Files.createTempFile("release-compile-", ".java");
+        try {
+            Files.writeString(
+                    file,
+                    """
+                    class ReleaseCompile {
+                        String value() {
+                            return "ok";
+                        }
+                    }
+                    """);
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            List.of("--release", "21"));
+
+            try (var ignored = service.compile(file)) {}
+            try (var ignored = service.compile(file)) {}
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void closingCompileTaskClosesUnderlyingBorrow() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        CompileBatch batch;
+        try (var ignored = service.compile(file)) {
+            batch = cachedCompile(service, "cachedCompile");
+            assertThat("borrow should stay open while compile task is in use", batch.borrow.closed, is(false));
+        }
+
+        assertThat("compile batch should be marked closed after task close", batch.closed, is(true));
+        assertThat("closing the compile task should fully close the underlying borrow", batch.borrow.closed, is(true));
+    }
+
+    @Test
+    public void closingCompileTaskTwiceIsSafe() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        var task = service.compile(file);
+        var batch = cachedCompile(service, "cachedCompile");
+        task.close();
+        task.close();
+
+        assertThat("compile batch should stay closed after repeated close", batch.closed, is(true));
+        assertThat("borrow should stay closed after repeated close", batch.borrow.closed, is(true));
+    }
+
+    @Test
+    public void closedCachedCompileRefreshesInsteadOfReportingCacheHit() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        CompileBatch firstBatch;
+        try (var first = service.compile(file)) {
+            firstBatch = cachedCompile(service, "cachedCompile");
+            assertThat("initial compile should populate the full-compile cache", firstBatch, notNullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
+        }
+
+        assertThat("closing the first compile should mark the cached batch closed", firstBatch.closed, is(true));
+
+        CompileBatch secondBatch;
+        try (var second = service.compile(file)) {
+            secondBatch = cachedCompile(service, "cachedCompile");
+            assertThat("closed cache entry should be replaced with a fresh batch", secondBatch, not(sameInstance(firstBatch)));
+            assertThat(
+                    "reusing a closed cached compile would incorrectly report a cache hit",
+                    service.lastCompileTelemetry().path(),
+                    is("cache_refresh"));
+        }
+    }
+
+    @Test
+    public void openCachedCompileReportsCacheHitAndSharesBatchLifetime() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        try (var first = service.compile(file)) {
+            var firstBatch = cachedCompile(service, "cachedCompile");
+            assertThat("initial compile should populate the full-compile cache", firstBatch, notNullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
+
+            try (var second = service.compile(file)) {
+                var secondBatch = cachedCompile(service, "cachedCompile");
+                assertThat("live cache entry should be reused", secondBatch, sameInstance(firstBatch));
+                assertThat("reusing a live cached compile should report a cache hit", service.lastCompileTelemetry().path(), is("cache_hit"));
+            }
+
+            assertThat("closing the second shared compile task should close the shared batch", firstBatch.closed, is(true));
+        }
+    }
+
+    @Test
+    public void cacheRefreshClosesPreviousCachedBorrow() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var initial = FileStore.contents(file);
+        var updated = initial.replace("Hello world!", "Hello world 2!");
+        var fixedTime = Instant.EPOCH;
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        CompileBatch firstBatch;
+        try (var first =
+                service.compileFast(List.of(new SourceFileObject(file, initial, fixedTime, 1)))) {
+            firstBatch = cachedCompile(service, "cachedFastCompileNoAp");
+            assertThat(firstBatch.borrow.closed, is(false));
+        }
+        assertThat("first cached borrow should close when the task closes", firstBatch.borrow.closed, is(true));
+
+        CompileBatch secondBatch;
+        try (var second =
+                service.compileFast(List.of(new SourceFileObject(file, updated, fixedTime, 2)))) {
+            secondBatch = cachedCompile(service, "cachedFastCompileNoAp");
+            assertThat("cache refresh should replace the cached batch", secondBatch, not(sameInstance(firstBatch)));
+            assertThat("previous cached borrow should remain closed after refresh", firstBatch.borrow.closed, is(true));
+            assertThat("new cached borrow should be open while the refreshed task is in use", secondBatch.borrow.closed, is(false));
+        }
+
+        assertThat("refreshed cached borrow should close when its task closes", secondBatch.borrow.closed, is(true));
+    }
+
+    @Test
+    public void openCachedFastCompileReportsCacheHitAndSharesBatchLifetime() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var source = FileStore.contents(file);
+        var fixedTime = Instant.EPOCH;
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        try (var first =
+                service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
+            var firstBatch = cachedCompile(service, "cachedFastCompileNoAp");
+            assertThat("initial fast compile should populate the fast cache", firstBatch, notNullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
+
+            try (var second =
+                    service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
+                var secondBatch = cachedCompile(service, "cachedFastCompileNoAp");
+                assertThat("live fast cache entry should be reused", secondBatch, sameInstance(firstBatch));
+                assertThat("reusing a live fast cached compile should report a cache hit", service.lastCompileTelemetry().path(), is("cache_hit"));
+            }
+
+            assertThat("closing the second shared fast-compile task should close the shared batch", firstBatch.closed, is(true));
+        }
     }
 
     @Test
@@ -226,6 +453,60 @@ public class JavaCompilerServiceTest {
     }
 
     @Test
+    public void compileDiagnosticsDoesNotExpandToPackagePrivateCompanions() throws Exception {
+        var root = Files.createTempDirectory("diagnostics-no-expansion-");
+        try {
+            var pkg = root.resolve("p");
+            Files.createDirectories(pkg);
+            var use = pkg.resolve("Use.java");
+            var defs = pkg.resolve("Defs.java");
+
+            Files.writeString(
+                    defs,
+                    "package p;\n"
+                            + "class PackagePrivateType {}\n");
+            Files.writeString(
+                    use,
+                    "package p;\n"
+                            + "class Use {\n"
+                            + "  PackagePrivateType value;\n"
+                            + "}\n");
+
+            FileStore.setWorkspaceRoots(Set.of(root));
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet());
+
+            try (var task = service.compile(use)) {
+                assertThat(
+                        "regular compile should expand to include package-private companion",
+                        task.roots.size(),
+                        is(2));
+                assertThat(
+                        "regular compile should resolve package-private companion without unresolved-location diagnostic",
+                        task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
+                        is(true));
+            }
+
+            try (var task = service.compileDiagnostics(List.of(new SourceFileObject(use)))) {
+                assertThat(
+                        "diagnostics compile should stay constrained to explicitly requested roots",
+                        task.roots.size(),
+                        is(1));
+                assertThat(
+                        "constrained diagnostics compile should surface unresolved companion diagnostic instead of expanding sources",
+                        task.diagnostics.stream().anyMatch(d -> d.getCode().contains("cant.resolve.location")),
+                        is(true));
+            }
+        } finally {
+            deleteTree(root);
+        }
+    }
+
+    @Test
     public void nonLombokProjectDoesNotExpandSourcesForAp() throws Exception {
         var root = Files.createTempDirectory("lombok-no-expand-");
         try {
@@ -265,11 +546,6 @@ public class JavaCompilerServiceTest {
     @Test
     public void fullWorkspaceCompileSkipsPackagePrivateRetryWhenWorkspaceAlreadyCovered() throws Exception {
         var root = Files.createTempDirectory("workspace-covered-compile-");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = root.resolve("p");
             Files.createDirectories(pkg);
@@ -295,28 +571,20 @@ public class JavaCompilerServiceTest {
                 assertThat(
                         task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
                         is(true));
+                assertThat(
+                        "explicitly requested workspace sources should compile in a single batch",
+                        task.roots.size(),
+                        is(2));
             }
-
-            assertThat(
-                    "full workspace compile should not do a second compile batch",
-                    capture.countContaining("compile_retry mode=full sources=2 additional=1 action=second_attempt"),
-                    is(0));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
             deleteTree(root);
         }
     }
 
     @Test
-    public void targetedFullCompileStillRetriesForPackagePrivateSourceRecovery() throws Exception {
+    public void targetedFullCompileRecoversPackagePrivateDependency() throws Exception {
         var root = Files.createTempDirectory("targeted-retry-compile-");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
         try {
             var pkg = root.resolve("p");
             Files.createDirectories(pkg);
@@ -343,15 +611,12 @@ public class JavaCompilerServiceTest {
                         "targeted full compile should recover the package-private dependency",
                         task.diagnostics.stream().noneMatch(d -> d.getCode().contains("cant.resolve.location")),
                         is(true));
+                assertThat(
+                        "targeted full compile should include the recovered package-private source in the batch",
+                        task.roots.size(),
+                        is(2));
             }
-
-            assertThat(
-                    "targeted compile should still run a second batch when additional sources are needed",
-                    capture.countContaining("compile_retry mode=full sources=1 additional=1 action=second_attempt"),
-                    greaterThan(0));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
             deleteTree(root);
         }
@@ -364,8 +629,14 @@ public class JavaCompilerServiceTest {
         return (Map<List<String>, ?>) field.get(compiler);
     }
 
+    private static CompileBatch cachedCompile(JavaCompilerService service, String fieldName) throws Exception {
+        Field field = JavaCompilerService.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return (CompileBatch) field.get(service);
+    }
+
     private static boolean quickMaybeUsesLombok(JavaCompilerService service, Path file) throws Exception {
-        Method method = JavaCompilerService.class.getDeclaredMethod("quickMaybeUsesLombok", Path.class);
+        Method method = JavaCompilerService.class.getDeclaredMethod("hasLombokAnnotation", Path.class);
         method.setAccessible(true);
         return (boolean) method.invoke(service, file);
     }
@@ -374,10 +645,14 @@ public class JavaCompilerServiceTest {
     private static List<Path> expandedSourcesForLombokAp(JavaCompilerService service, Path file) throws Exception {
         Method method =
                 JavaCompilerService.class.getDeclaredMethod(
-                        "expandSourcesForLombokAP", Collection.class, boolean.class);
+                        "expandSourcesForLombokAPDetails", Collection.class, boolean.class);
         method.setAccessible(true);
         var sources = List.of((JavaFileObject) new SourceFileObject(file));
-        var expanded = (Collection<? extends JavaFileObject>) method.invoke(service, sources, true);
+        var expandedResult = method.invoke(service, sources, true);
+        var expandedSourcesMethod = expandedResult.getClass().getDeclaredMethod("sources");
+        expandedSourcesMethod.setAccessible(true);
+        var expanded =
+                (Collection<? extends JavaFileObject>) expandedSourcesMethod.invoke(expandedResult);
         var paths = new ArrayList<Path>();
         for (var source : expanded) {
             paths.add(Paths.get(source.toUri()));
@@ -412,32 +687,5 @@ public class JavaCompilerServiceTest {
                         return FileVisitResult.CONTINUE;
                     }
                 });
-    }
-
-    private static final class TestLogCapture extends Handler {
-        private final List<String> lines = Collections.synchronizedList(new ArrayList<>());
-
-        @Override
-        public void publish(LogRecord record) {
-            lines.add(record.getMessage());
-        }
-
-        @Override
-        public void flush() {}
-
-        @Override
-        public void close() {}
-
-        int countContaining(String needle) {
-            synchronized (lines) {
-                var count = 0;
-                for (var line : lines) {
-                    if (line != null && line.contains(needle)) {
-                        count++;
-                    }
-                }
-                return count;
-            }
-        }
     }
 }

@@ -5,9 +5,11 @@ import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
 
 import com.sun.tools.javac.main.JavaCompiler;
+import com.sun.tools.javac.util.JCDiagnostic;
 import com.sun.tools.javac.util.Log;
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.function.Predicate;
 import org.junit.Test;
 
 public class ReusableCompilerTest {
@@ -21,7 +23,8 @@ public class ReusableCompilerTest {
                 JavaCompiler.class,
                 compiler,
                 "deferredDiagnosticHandler",
-                new Log.DeferredDiagnosticHandler(Log.instance(context)));
+                Log.instance(context)
+                        .new DeferredDiagnosticHandler((Predicate<JCDiagnostic>) diagnostic -> true));
         setOptionalField(JavaCompiler.class, compiler, "annotationProcessingOccurred", true);
         setOptionalField(JavaCompiler.class, compiler, "explicitAnnotationProcessingRequested", true);
 

@@ -25,7 +25,7 @@ public class BenchmarkPruner {
             var file = Paths.get("src/main/java/org/javacs/InferConfig.java").normalize();
             if (prune) {
                 var task = compiler.parse(file);
-                var contents = new PruneMethodBodies(task.task).scan(task.root, 11222L).toString();
+                var contents = new PruneMethodBodies(task.task()).scan(task.root(), 11222L).toString();
                 return new SourceFileObject(file, contents, Instant.now());
             } else {
                 return new SourceFileObject(file);
