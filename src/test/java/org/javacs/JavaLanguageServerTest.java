@@ -4520,7 +4520,7 @@ public class JavaLanguageServerTest {
     @Test
     public void completionRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
-        var tracking = replaceCacheCompilerWithTracking(server);
+        var tracking = replaceInteractiveCompilerWithTracking(server);
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var before = completionIndexVersion(server);
         openJavaFile(server, file);
@@ -4547,7 +4547,7 @@ public class JavaLanguageServerTest {
     @Test
     public void hoverRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
-        var tracking = replaceCacheCompilerWithTracking(server);
+        var tracking = replaceInteractiveCompilerWithTracking(server);
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
         var before = completionIndexVersion(server);
         openJavaFile(server, file);
@@ -4574,7 +4574,7 @@ public class JavaLanguageServerTest {
     @Test
     public void signatureHelpUsesFastCompileWithProcessorsNotFastCompile() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
-        var tracking = replaceCacheCompilerWithTracking(server);
+        var tracking = replaceInteractiveCompilerWithTracking(server);
         var file = FindResource.path("org/javacs/example/SignatureHelp.java");
 
         tracking.resetCounters();
@@ -4643,7 +4643,7 @@ public class JavaLanguageServerTest {
             change.settings = settings;
             server.didChangeConfiguration(change);
 
-            var compiler = cacheCompiler(server);
+            var compiler = interactiveCompiler(server);
             Assert.assertEquals(List.of("--release", "17"), compiler.extraArgs);
         } finally {
             deleteRecursively(workspace);
@@ -4690,7 +4690,7 @@ public class JavaLanguageServerTest {
             logger.addHandler(capture);
             try {
                 var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
-                Assert.assertEquals(List.of("--release", "21"), cacheCompiler(server).extraArgs);
+                Assert.assertEquals(List.of("--release", "21"), interactiveCompiler(server).extraArgs);
 
                 var open = new DidOpenTextDocumentParams();
                 open.textDocument.uri = file.toUri();
@@ -4813,7 +4813,7 @@ public class JavaLanguageServerTest {
             Assert.assertThat(
                     client.messages.get(0).message,
                     org.hamcrest.Matchers.containsString("mixed Maven module Java levels"));
-            Assert.assertEquals(List.of(), cacheCompiler(server).extraArgs);
+            Assert.assertEquals(List.of(), interactiveCompiler(server).extraArgs);
 
             var settings = new JsonObject();
             var java = new JsonObject();
@@ -5367,20 +5367,20 @@ public class JavaLanguageServerTest {
         method.invoke(server, reason);
     }
 
-    private JavaCompilerService cacheCompiler(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
+    private JavaCompilerService interactiveCompiler(JavaLanguageServer server) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
         field.setAccessible(true);
         return (JavaCompilerService) field.get(server);
     }
 
-    private void setCacheCompiler(JavaLanguageServer server, JavaCompilerService compiler) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("cacheCompiler");
+    private void setInteractiveCompiler(JavaLanguageServer server, JavaCompilerService compiler) throws Exception {
+        var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
         field.setAccessible(true);
         field.set(server, compiler);
     }
 
-    private MethodTrackingCompiler replaceCacheCompilerWithTracking(JavaLanguageServer server) throws Exception {
-        var original = cacheCompiler(server);
+    private MethodTrackingCompiler replaceInteractiveCompilerWithTracking(JavaLanguageServer server) throws Exception {
+        var original = interactiveCompiler(server);
         var tracking =
                 new MethodTrackingCompiler(
                         original.classPath,
@@ -5389,7 +5389,7 @@ public class JavaLanguageServerTest {
                         original.extraArgs,
                         original.lombokConfiguredEnabled,
                         original.compilerRole);
-        setCacheCompiler(server, tracking);
+        setInteractiveCompiler(server, tracking);
         return tracking;
     }
 

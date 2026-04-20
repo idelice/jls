@@ -341,7 +341,10 @@ class JavaCompilerService implements CompilerProvider {
         var compileCache = cachedCompileFor(cacheSlot);
         var modifiedCache = modifiedCacheFor(cacheSlot);
         if (compileCache != null && !compileCache.closed) {
-            throw new RuntimeException("Compiler is still in-use!");
+            LOG.warning(String.format(
+                    "[compiler] stale cache slot detected role=%s mode=%s; closing and recovering",
+                    compilerRole, profile.analysisMode()));
+            compileCache.close();
         }
 
         var loaded =

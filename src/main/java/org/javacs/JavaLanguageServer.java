@@ -94,10 +94,14 @@ class JavaLanguageServer extends LanguageServer {
     private final LanguageClient client;
     private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
 
-    // Interactive requests use cacheCompiler; pull-diagnostics requests use diagnosticsCompiler so
-    // the completion-index background thread and the LSP main thread do not contend on one context.
-    private JavaCompilerService cacheCompiler;
-    private JavaCompilerService diagnosticsCompiler;
+    // Three compilers, each owned by exactly one thread/task:
+    //   interactiveCompiler — LSP main thread (definition, hover, completion, references, …)
+    //   backgroundCompiler  — pull-diagnostics only (lint/compileDiagnostics)
+    //   indexCompiler       — completion-index builds only (runRefresh / CompletionIndexScheduler)
+    // No two of these are ever used concurrently. JavaCompilerService is not thread-safe.
+    private JavaCompilerService interactiveCompiler;
+    private JavaCompilerService backgroundCompiler;
+    private JavaCompilerService indexCompiler;
 
     private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
@@ -133,8 +137,8 @@ class JavaLanguageServer extends LanguageServer {
 
     /** Return the current interactive compiler. Compiler recreation happens at explicit event boundaries. */
     synchronized JavaCompilerService getOrCreateCompiler() {
-        Objects.requireNonNull(cacheCompiler, "Compiler has not been initialized");
-        return cacheCompiler;
+        Objects.requireNonNull(interactiveCompiler, "Compiler has not been initialized");
+        return interactiveCompiler;
     }
 
     private void publishCompletionSnapshot(
@@ -213,8 +217,13 @@ class JavaLanguageServer extends LanguageServer {
             LOG.fine("[perf] completion_index_refresh_deferred trigger=compilerRecreated reason=empty_scope");
             return;
         }
-        completionIndexScheduler.scheduleRefresh(
-                FileStore.all(), "compilerRecreated", 0, CompletionIndexRefreshMode.FULL_REBUILD);
+        if (currentSnapshot.scope() == CompletionIndexScope.WORKSPACE) {
+            completionIndexScheduler.scheduleRefresh(
+                    FileStore.all(), "compilerRecreated", 0, CompletionIndexRefreshMode.FULL_REBUILD);
+        } else {
+            completionIndexScheduler.scheduleRefresh(
+                    active, "compilerRecreated", 0, CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP);
+        }
     }
 
     void lint(Collection<Path> files) {
@@ -226,7 +235,7 @@ class JavaLanguageServer extends LanguageServer {
         getOrCreateCompiler();
         CompileTask task = null;
         try {
-            task = diagnosticsCompiler.compileDiagnostics(
+            task = backgroundCompiler.compileDiagnostics(
                     javaFiles.stream().map(SourceFileObject::new).toList());
             var requestedUris = new HashSet<java.net.URI>();
             for (var file : javaFiles) {
@@ -699,7 +708,7 @@ class JavaLanguageServer extends LanguageServer {
                         extraArgs.size(),
                         compilerArgs.mixedModules()));
         LOG.info(String.format("[perf] compiler_args_values args=%s", extraArgs));
-        cacheCompiler =
+        interactiveCompiler =
                 new JavaCompilerService(
                         classPath,
                         resolvedDocPath,
@@ -708,16 +717,25 @@ class JavaLanguageServer extends LanguageServer {
                         lombokEnabled,
                         "interactive");
         var diagnosticsStarted = Instant.now();
-        diagnosticsCompiler =
+        backgroundCompiler =
                 new JavaCompilerService(
                         classPath,
                         resolvedDocPath,
                         addExports,
                         extraArgs,
                         lombokEnabled,
-                        "diagnostics");
+                        "background");
+        var indexStarted = Instant.now();
+        indexCompiler =
+                new JavaCompilerService(
+                        classPath,
+                        resolvedDocPath,
+                        addExports,
+                        extraArgs,
+                        lombokEnabled,
+                        "index");
         LOG.info(String.format(
-                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms total=%dms",
+                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms index=%dms total=%dms",
                 classPath.size(),
                 resolvedDocPath.size(),
                 extraArgs.size(),
@@ -725,7 +743,8 @@ class JavaLanguageServer extends LanguageServer {
                 Duration.between(started, settingsLoaded).toMillis(),
                 Duration.between(settingsLoaded, inferenceFinished).toMillis(),
                 Duration.between(inferenceFinished, diagnosticsStarted).toMillis(),
-                Duration.between(diagnosticsStarted, Instant.now()).toMillis(),
+                Duration.between(diagnosticsStarted, indexStarted).toMillis(),
+                Duration.between(indexStarted, Instant.now()).toMillis(),
                 Duration.between(started, Instant.now()).toMillis()));
     }
 
@@ -1111,7 +1130,7 @@ class JavaLanguageServer extends LanguageServer {
         var started = Instant.now();
         var readiness = ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
         var snapshot = completionSnapshotRef.get();
-        var provider = new CompletionProvider(cacheCompiler, snapshot.typeIndex(), snapshot.version());
+        var provider = new CompletionProvider(interactiveCompiler, snapshot.typeIndex(), snapshot.version());
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(String.format(
@@ -1374,7 +1393,7 @@ class JavaLanguageServer extends LanguageServer {
         var started = Instant.now();
         CompileTask task = null;
         try {
-            task = diagnosticsCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
+            task = backgroundCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
             var requestedUris = Set.of(fileUri);
             var report = new ErrorProvider(task).errors(requestedUris);
             var diagnostics = report.diagnostics().stream()
@@ -1401,12 +1420,7 @@ class JavaLanguageServer extends LanguageServer {
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
-        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY) {
-            completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
-            return;
-        }
-        // Completion index is already populated; no extra work needed.
-        // Diagnostics are pull-based — the client requests them when ready.
+        completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
     }
 
     @Override
@@ -1531,7 +1545,11 @@ class JavaLanguageServer extends LanguageServer {
                     return;
                 }
             }
-            scheduleRefresh(FileStore.all(), trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
+            var active = filterJavaFiles(FileStore.activeDocuments());
+            if (active.isEmpty()) {
+                return;
+            }
+            scheduleRefresh(active, trigger, 0, CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP);
         }
 
         /** Queue a full workspace bootstrap unless the published scope is already workspace-wide. */
@@ -1597,10 +1615,13 @@ class JavaLanguageServer extends LanguageServer {
                 String bootstrapProgressToken = null;
                 try {
                     if (workspaceBootstrap) {
-                        LOG.info(String.format("[perf] workspace bootstrap started trigger=%s files=%d", trigger, files.size()));
-                        bootstrapProgressToken = beginWorkDoneProgress("Bootstrap index", "Indexing workspace");
+                        var isActive = mode == CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP;
+                        LOG.info(String.format("[perf] %s bootstrap started trigger=%s files=%d",
+                                isActive ? "active" : "workspace", trigger, files.size()));
+                        bootstrapProgressToken = beginWorkDoneProgress("Bootstrap index",
+                                isActive ? "Indexing open files" : "Indexing workspace");
                     }
-                    var compiler = getOrCreateCompiler();
+                    var compiler = indexCompiler;
                     task = compiler.compileFast(files.toArray(Path[]::new));
                     if (revision != completionIndexRevision.get()) {
                         LOG.fine(String.format(
@@ -1634,6 +1655,12 @@ class JavaLanguageServer extends LanguageServer {
                                         : CompletionIndexScope.ACTIVE;
                         installTypeMemberIndex(
                                 nextIndex, indexVersion, "index:" + trigger, installTook, scope);
+                        if (scope == CompletionIndexScope.ACTIVE) {
+                            completionIndexExecutor.schedule(
+                                    () -> scheduleProjectBootstrapIfNeeded("active-bootstrap-upgrade"),
+                                    0,
+                                    TimeUnit.MILLISECONDS);
+                        }
                     }
                     if (workspaceBootstrap) {
                         LOG.info(String.format(
