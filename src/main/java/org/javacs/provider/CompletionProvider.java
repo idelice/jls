@@ -20,6 +20,7 @@ import com.sun.source.util.DocTrees;
 import com.sun.source.util.SourcePositions;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
+import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
 
 import java.nio.file.Path;
@@ -71,7 +72,7 @@ import org.javacs.rewrite.AddImport;
 public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
-    private record MemberAccessContext(String receiver, String partial, boolean dotTrigger, boolean methodReference) { }
+    private record MemberAccessContext(String receiver, String partial, boolean dotTrigger, boolean methodReference, int separatorEnd) { }
     private record IndexedCompletionResult(CompletionList list, long resolveMs, String cacheState) {}
     private record CompletionRequestContext(
             ParseTask task, String contents, long cursor, TreePath parsePath, MemberAccessContext memberAccess, long parseMs) {}
@@ -295,8 +296,13 @@ public class CompletionProvider {
         var started = Instant.now();
         var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
         var expression = memberReceiverExpression(parsePath);
+        if (expression == null && memberAccess.receiver().isEmpty()) {
+            // ParsePath didn't find a MemberSelectTree at the cursor (e.g. double-dot error recovery).
+            // Fall back to finding the expression that ends exactly at the separator position.
+            expression = findExpressionEndingAt(parseTask, memberAccess.separatorEnd());
+        }
         var resolveStarted = Instant.now();
-        var resolved = resolver.resolve(expression, memberAccess.receiver);
+        var resolved = resolver.resolve(expression, memberAccess.receiver());
         var resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
         if (resolved.isEmpty()) {
             return new IndexedCompletionResult(EMPTY, resolveMs, "unresolved_type");
@@ -1794,7 +1800,66 @@ public class CompletionProvider {
         }
         var receiver = receiverStart < receiverEnd ? contents.substring(receiverStart, receiverEnd) : "";
         var partial = contents.substring(partialStart, effectiveCursor);
-        return new MemberAccessContext(receiver, partial, partial.isEmpty(), methodReference);
+        return new MemberAccessContext(receiver, partial, partial.isEmpty(), methodReference, separatorEnd);
+    }
+
+    /**
+     * Find the expression tree in the parse task whose end position is closest to (but not past)
+     * {@code separatorEnd}. Used as a fallback when FindCompletionsAt cannot match the cursor to a
+     * MemberSelectTree, which happens during error recovery for double-dot edits (e.g. {@code
+     * expr()..member}).
+     */
+    private Tree findExpressionEndingAt(ParseTask task, int separatorEnd) {
+        var pos = Trees.instance(task.task()).getSourcePositions();
+        var root = task.root();
+        var bestEnd = new long[]{-1};
+        var result = new Tree[]{null};
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void scan(Tree tree, Void p) {
+                if (tree == null) return null;
+                var end = pos.getEndPosition(root, tree);
+                // Use >= so that when multiple expressions share the same end position
+                // (e.g. a lambda and its body under javac error recovery), the innermost
+                // (deepest/last-scanned) one wins rather than the outermost wrapper.
+                if (end >= bestEnd[0] && end <= separatorEnd && isExpressionTree(tree)) {
+                    bestEnd[0] = end;
+                    result[0] = tree;
+                }
+                return super.scan(tree, p);
+            }
+
+            @Override
+            public Void visitErroneous(com.sun.source.tree.ErroneousTree node, Void p) {
+                // TreeScanner.visitErroneous returns null without recursing;
+                // we need to descend into error trees to find valid sub-expressions
+                // that javac wrapped (e.g. CompleteExpression inside "CompleteExpression..").
+                if (node.getErrorTrees() != null) {
+                    for (var e : node.getErrorTrees()) {
+                        scan(e, p);
+                    }
+                }
+                return null;
+            }
+        }.scan(root, null);
+        return result[0];
+    }
+
+    private boolean isExpressionTree(Tree tree) {
+        return switch (tree.getKind()) {
+            case METHOD_INVOCATION, MEMBER_SELECT, IDENTIFIER, NEW_CLASS, NEW_ARRAY,
+                    INT_LITERAL, LONG_LITERAL, FLOAT_LITERAL, DOUBLE_LITERAL,
+                    BOOLEAN_LITERAL, CHAR_LITERAL, STRING_LITERAL, NULL_LITERAL,
+                    TYPE_CAST, ARRAY_ACCESS, PARENTHESIZED,
+                    POSTFIX_INCREMENT, POSTFIX_DECREMENT, PREFIX_INCREMENT, PREFIX_DECREMENT,
+                    UNARY_PLUS, UNARY_MINUS, BITWISE_COMPLEMENT, LOGICAL_COMPLEMENT,
+                    MULTIPLY, DIVIDE, REMAINDER, PLUS, MINUS, LEFT_SHIFT, RIGHT_SHIFT,
+                    UNSIGNED_RIGHT_SHIFT, AND, XOR, OR, CONDITIONAL_AND, CONDITIONAL_OR,
+                    EQUAL_TO, NOT_EQUAL_TO, LESS_THAN, LESS_THAN_EQUAL, GREATER_THAN,
+                    GREATER_THAN_EQUAL, CONDITIONAL_EXPRESSION, ASSIGNMENT,
+                    MEMBER_REFERENCE, LAMBDA_EXPRESSION -> true;
+            default -> false;
+        };
     }
 
 }
