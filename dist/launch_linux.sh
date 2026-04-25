@@ -25,4 +25,5 @@ JLINK_VM_OPTIONS="\
 --add-opens jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED"
 DIR=`dirname $0`
 JAVA_BIN="$DIR/linux/bin/java"
-exec "$JAVA_BIN" $JLINK_VM_OPTIONS -classpath "$DIR/classpath/*" "$@"
+LOGGING_CONFIG="$DIR/linux/conf/logging.properties"
+exec "$JAVA_BIN" $JLINK_VM_OPTIONS -Djava.util.logging.config.file="$LOGGING_CONFIG" -classpath "$DIR/classpath/*" "$@"
