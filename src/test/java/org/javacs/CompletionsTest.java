@@ -77,6 +77,43 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void expressionInMiddleOfChain() {
+        // Cursor is between the two dots in "CompleteExpression.create()..toString()"
+        // This simulates deleting a method call from a chain, leaving double-dot
+        var file = "/org/javacs/example/CompleteInMiddleOfChain.java";
+        var suggestions = filterText(file, 9, 62);
+        assertThat(suggestions, hasItems("instanceMethod", "equals"));
+    }
+
+    @Test
+    public void expressionInMiddleOfLongChain() {
+        // Cursor is between the two dots in "CompleteExpression.create()..instanceMethod()"
+        // This simulates deleting a method call from a longer chain (more calls after the double-dot)
+        var file = "/org/javacs/example/CompleteInMiddleOfLongChain.java";
+        // "        CompleteExpression.create()..instanceMethod();" — second dot at col 37
+        var suggestions = filterText(file, 10, 37);
+        assertThat(suggestions, hasItems("instanceMethod", "equals"));
+    }
+
+    @Test
+    public void expressionInMiddleOfLambdaChain() {
+        // Cursor between two dots in "item..isVip()" where item is a lambda parameter
+        var file = "/org/javacs/example/CompleteInMiddleOfLambdaChain.java";
+        // line 19: "                .filter(item -> item..isVip())", second dot at col 38 (1-indexed)
+        var suggestions = filterText(file, 19, 38);
+        assertThat(suggestions, hasItems("isVip", "instanceMethod", "equals"));
+    }
+
+    @Test
+    public void expressionInMiddleOfMethodParamChain() {
+        // Cursor between two dots in "envelope..isVip()" where envelope is a method parameter
+        var file = "/org/javacs/example/CompleteInMiddleOfMethodParamChain.java";
+        // second dot at col 30
+        var suggestions = filterText(file, 10, 30);
+        assertThat(suggestions, hasItems("isVip", "instanceMethod", "equals"));
+    }
+
+    @Test
     public void imports() {
         var file = "/org/javacs/example/CompleteImports.java";
         var suggestions = filterText(file, 3, 18);

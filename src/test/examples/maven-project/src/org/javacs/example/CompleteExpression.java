@@ -12,4 +12,8 @@ public class CompleteExpression {
     int instanceMethod() {
         return 1;
     }
+
+    boolean isVip() {
+        return false;
+    }
 }

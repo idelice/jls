@@ -378,6 +378,54 @@ public class DefinitionProviderTest {
         }
     }
 
+    @Test
+    public void innerClassResolvesOuterFieldAndMethodDefinitions() throws Exception {
+        var workspace = Files.createTempDirectory("definition-provider-enclosing-owner");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "class Use {\n"
+                            + "  int pendingCompletionIndex;\n"
+                            + "  void filterJavaFiles() {}\n"
+                            + "  class Inner {\n"
+                            + "    void test() {\n"
+                            + "      pendingCompletionIndex = 1;\n"
+                            + "      filterJavaFiles();\n"
+                            + "    }\n"
+                            + "  }\n"
+                            + "}\n");
+
+            FileStore.setWorkspaceRoots(Set.of(workspace));
+            var service =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet());
+            var index = workspaceIndex(service, use);
+
+            var fieldCursor = cursor(use, "pendingCompletionIndex = 1");
+            var fieldLocations =
+                    new DefinitionProvider(service, index, use, fieldCursor.line, fieldCursor.character)
+                            .find();
+            assertThat(fieldLocations, not(empty()));
+            assertThat(fieldLocations.get(0).range.start.line, is(2));
+
+            var methodCursor = cursor(use, "filterJavaFiles();");
+            var methodLocations =
+                    new DefinitionProvider(service, index, use, methodCursor.line, methodCursor.character)
+                            .find();
+            assertThat(methodLocations, not(empty()));
+            assertThat(methodLocations.get(0).range.start.line, is(3));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
     @After
     public void resetWorkspaceRoots() {
         FileStore.setWorkspaceRoots(Collections.emptySet());
@@ -470,6 +518,25 @@ public class DefinitionProviderTest {
                         "resolveIndexedMethodResult", String.class, String.class, IndexedMember.class);
         method.setAccessible(true);
         return method;
+    }
+
+    private static Position cursor(Path file, String needle) throws Exception {
+        var source = Files.readString(file);
+        var offset = source.indexOf(needle);
+        if (offset < 0) {
+            throw new AssertionError("missing needle: " + needle);
+        }
+        var line = 0;
+        var column = 0;
+        for (var i = 0; i < offset; i++) {
+            if (source.charAt(i) == '\n') {
+                line++;
+                column = 0;
+            } else {
+                column++;
+            }
+        }
+        return new Position(line + 1, column + 1);
     }
 
     private static void deleteTree(Path root) throws Exception {

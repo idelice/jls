@@ -377,6 +377,68 @@ public class JavaCompilerServiceTest {
     }
 
     @Test
+    public void backgroundCompilerDoesNotRetainDiagnosticsCompileBatch() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        true,
+                        "background");
+
+        try (var first = service.compileDiagnostics(List.of(new SourceFileObject(file)))) {
+            assertThat(
+                    "background compiler should not retain diagnostics compile batches",
+                    cachedCompile(service, "cachedCompileNoExpansion"),
+                    nullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
+        }
+
+        try (var second = service.compileDiagnostics(List.of(new SourceFileObject(file)))) {
+            assertThat(
+                    "background compiler should continue compiling without a retained cache slot",
+                    cachedCompile(service, "cachedCompileNoExpansion"),
+                    nullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
+        }
+    }
+
+    @Test
+    public void indexCompilerDoesNotRetainFastCompileBatch() throws Exception {
+        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var source = FileStore.contents(file);
+        var fixedTime = Instant.EPOCH;
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        true,
+                        "index");
+
+        try (var first =
+                service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
+            assertThat(
+                    "index compiler should not retain fast compile batches after index extraction work",
+                    cachedCompile(service, "cachedFastCompileNoAp"),
+                    nullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
+        }
+
+        try (var second =
+                service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
+            assertThat(
+                    "index compiler should keep using reusable compiler context without retaining compile graphs",
+                    cachedCompile(service, "cachedFastCompileNoAp"),
+                    nullValue());
+            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
+        }
+    }
+
+    @Test
     public void quickLombokGateUsesStrictAnnotationDetection() throws Exception {
         var lombokDataFile = Files.createTempFile("quick-lombok-data-", ".java");
         var springServiceFile = Files.createTempFile("quick-lombok-service-", ".java");
@@ -687,5 +749,65 @@ public class JavaCompilerServiceTest {
                         return FileVisitResult.CONTINUE;
                     }
                 });
+    }
+
+    // -------------------------------------------------------------------------
+    // CompilerSharedResources / Docs factory targeted tests
+    // -------------------------------------------------------------------------
+
+    @Test
+    public void sharedResourcesLanesProduceSamePublicTopLevelTypes() {
+        var shared = CompilerSharedResources.from(
+                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), List.of());
+        var lane1 = new JavaCompilerService(shared, true, "interactive");
+        var lane2 = new JavaCompilerService(shared, true, "background");
+
+        var types1 = lane1.publicTopLevelTypes();
+        var types2 = lane2.publicTopLevelTypes();
+        assertThat(
+                "both lanes from one shared resources object should return the same public top-level types",
+                types1, containsInAnyOrder(types2.toArray()));
+    }
+
+    @Test
+    public void docsCreateFileManagerProducesWorkingJdkSourceLookup() {
+        var srcZip = Docs.findSrcZip();
+        org.junit.Assume.assumeThat("src.zip must be present for JDK source lookup", srcZip, not(equalTo(Docs.NOT_FOUND)));
+
+        var docs = new Docs(Collections.emptySet());
+        var fm1 = docs.createFileManager();
+        var fm2 = docs.createFileManager();
+
+        assertThat("createFileManager must return a new instance on each call", fm1, not(sameInstance(fm2)));
+        // Both file managers should be independently usable; a simple non-null check confirms setup succeeded.
+        assertThat("first file manager should be non-null", fm1, notNullValue());
+        assertThat("second file manager should be non-null", fm2, notNullValue());
+    }
+
+    @Test
+    public void lanesFromSharedResourcesHaveIndependentDocsFileManagers() {
+        var shared = CompilerSharedResources.from(
+                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), List.of());
+        var lane1 = new JavaCompilerService(shared, true, "interactive");
+        var lane2 = new JavaCompilerService(shared, true, "index");
+
+        assertThat(
+                "each lane must get its own docsFileManager instance so they cannot share mutable file-manager state",
+                lane1.docsFileManager, not(sameInstance(lane2.docsFileManager)));
+    }
+
+    @Test
+    public void sharedResourcesExtraArgsNormalizationMatchesConvenienceConstructor() {
+        // Set<String> passed to convenience constructor triggers sort; the primary path should produce
+        // the same sorted list so that all lanes see identical compiler arguments.
+        var rawArgs = new LinkedHashSet<>(List.of("-target", "17", "-source", "17"));
+        var shared = CompilerSharedResources.from(
+                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), rawArgs);
+        var viaConvenience = new JavaCompilerService(
+                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), rawArgs);
+
+        assertThat(
+                "shared resources should produce the same normalized extra-args as the convenience constructor",
+                shared.extraArgs(), is(viaConvenience.extraArgs));
     }
 }
