@@ -140,27 +140,8 @@ public class DefinitionProvider {
             }
             if (parent instanceof MethodInvocationTree invocation
                     && invocation.getMethodSelect() == identifier) {
-                var enclosingOwner = types.currentEnclosingTypeName();
-                if (enclosingOwner.isPresent()) {
-                    var earlyMethod =
-                            methodEarlyReturn(
-                                            enclosingOwner.get(),
-                                            identifier.getName().toString(),
-                                            false,
-                                            invocation.getArguments().size())
-                                    .or(
-                                            () ->
-                                                    methodEarlyReturn(
-                                                            enclosingOwner.get(),
-                                                            identifier.getName().toString(),
-                                                            true,
-                                                            invocation.getArguments().size()));
-                    if (earlyMethod.isPresent()) {
-                        return earlyMethod.get();
-                    }
-                }
                 var resolved = resolveUnqualifiedMethodInvocation(
-                        parse, types, invocation, identifier.getName().toString());
+                        parse, path, types, invocation, identifier.getName().toString());
                 return resolved;
             }
 
@@ -202,7 +183,7 @@ public class DefinitionProvider {
             IdentifierTree identifier,
             ParseTypeResolver types) {
         var name = identifier.getName().toString();
-        var enclosingField = resolveEnclosingField(types, name);
+        var enclosingField = resolveEnclosingField(parse, path, name);
         if (enclosingField.isPresent()) {
             return enclosingField.get();
         }
@@ -437,24 +418,16 @@ public class DefinitionProvider {
      * materializing source locations.
      */
     private ResolvedSymbol resolveUnqualifiedMethodInvocation(
-            ParseTask parse, ParseTypeResolver types, MethodInvocationTree invocation, String methodName) {
+            ParseTask parse, TreePath path, ParseTypeResolver types, MethodInvocationTree invocation, String methodName) {
         var argCount = invocation.getArguments().size();
         var selected =
-                selectUnqualifiedMethodSymbol(
-                        parse.root(),
-                        types.currentEnclosingTypeName(),
-                        methodName,
-                        argCount,
-                        List.of());
+                selectEnclosingMethodSymbol(parse, path, methodName, argCount, List.of())
+                        .or(() -> selectStaticImportMethodSymbol(parse.root(), methodName, argCount, List.of()));
         if (selected.isEmpty()) {
             var argTypes = NavigationSymbolSupport.argumentTypes(invocation.getArguments(), types);
             selected =
-                    selectUnqualifiedMethodSymbol(
-                            parse.root(),
-                            types.currentEnclosingTypeName(),
-                            methodName,
-                            argCount,
-                            argTypes);
+                    selectEnclosingMethodSymbol(parse, path, methodName, argCount, argTypes)
+                            .or(() -> selectStaticImportMethodSymbol(parse.root(), methodName, argCount, argTypes));
         }
         if (selected.isPresent()) {
             var indexedResult =
@@ -469,6 +442,22 @@ public class DefinitionProvider {
             return materializeSelectedMethod(selected.get());
         }
         return unsupportedMethod(methodName);
+    }
+
+    private Optional<SelectedMethod> selectEnclosingMethodSymbol(
+            ParseTask parse, TreePath path, String methodName, int argCount, List<String> argTypes) {
+        for (var current = nearestClass(path); current != null; current = nearestClass(current.getParentPath())) {
+            var ownerType = declaredClassName(parse, current);
+            var currentOwner = selectMethodOnOwner(ownerType, methodName, false, argCount, argTypes, false);
+            if (currentOwner.isPresent()) {
+                return currentOwner;
+            }
+            var staticOwner = selectMethodOnOwner(ownerType, methodName, true, argCount, argTypes, false);
+            if (staticOwner.isPresent()) {
+                return staticOwner;
+            }
+        }
+        return Optional.empty();
     }
 
     /**
@@ -1036,34 +1025,44 @@ public class DefinitionProvider {
         return null;
     }
 
-    private Optional<ResolvedSymbol> resolveEnclosingField(ParseTypeResolver types, String fieldName) {
-        var ownerType = types.currentEnclosingTypeName();
-        if (ownerType.isEmpty()) {
-            return Optional.empty();
-        }
-        var member = typeIndexRouter.ownerMember(ownerType.get(), fieldName, false)
-                .filter(this::isFieldLikeMember)
-                .orElse(null);
-        if (member == null) {
-            member = typeIndexRouter.ownerMember(ownerType.get(), fieldName, true)
+    private Optional<ResolvedSymbol> resolveEnclosingField(ParseTask parse, TreePath path, String fieldName) {
+        for (var current = nearestClass(path); current != null; current = nearestClass(current.getParentPath())) {
+            var ownerType = declaredClassName(parse, current);
+            var classTree = (ClassTree) current.getLeaf();
+            for (var memberTree : classTree.getMembers()) {
+                if (!(memberTree instanceof VariableTree variable) || !variable.getName().contentEquals(fieldName)) {
+                    continue;
+                }
+                var location = FindHelper.location(parse, new TreePath(current, variable), variable.getName());
+                if (location != null) {
+                    return Optional.of(new ResolvedSymbol(List.of(location), ownerType, fieldName, false, null, fieldName));
+                }
+            }
+            var member = typeIndexRouter.ownerMember(ownerType, fieldName, false)
                     .filter(this::isFieldLikeMember)
                     .orElse(null);
+            if (member == null) {
+                member = typeIndexRouter.ownerMember(ownerType, fieldName, true)
+                        .filter(this::isFieldLikeMember)
+                        .orElse(null);
+            }
+            if (member == null) {
+                continue;
+            }
+            var indexedField = bestMemberDeclarationLocation(member);
+            if (indexedField.isPresent() && !hasBackingField(member)) {
+                return Optional.of(
+                        new ResolvedSymbol(
+                                List.of(indexedField.get()),
+                                member.declarationOwnerType,
+                                fieldName,
+                                false,
+                                member,
+                                fieldName));
+            }
+            return Optional.of(resolveField(ownerType, fieldName, member));
         }
-        if (member == null) {
-            return Optional.empty();
-        }
-        var indexedField = bestMemberDeclarationLocation(member);
-        if (indexedField.isPresent() && !hasBackingField(member)) {
-            return Optional.of(
-                    new ResolvedSymbol(
-                            List.of(indexedField.get()),
-                            member.declarationOwnerType,
-                            fieldName,
-                            false,
-                            member,
-                            fieldName));
-        }
-        return Optional.of(resolveField(ownerType.get(), fieldName, member));
+        return Optional.empty();
     }
 
     private Optional<String> enclosingOwnerType(ParseTask parse, TreePath path) {
