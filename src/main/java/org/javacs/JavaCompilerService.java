@@ -26,14 +26,6 @@ class JavaCompilerService implements CompilerProvider {
     private static final int MAX_CACHE_SIZE = 1000;
     private static final int MAX_PARSE_CACHE_SIZE = 200;
 
-    private record CompilerServiceConfig(
-            Set<Path> classPath,
-            Set<Path> docPath,
-            Set<String> addExports,
-            Collection<String> extraArgs,
-            boolean lombokConfiguredEnabled,
-            String compilerRole) {}
-
     private enum CacheSlot {
         FULL,
         FULL_NO_EXPANSION,
@@ -62,20 +54,52 @@ class JavaCompilerService implements CompilerProvider {
     final List<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
     final ReusableCompiler diagnosticsNoExpansionCompiler = new ReusableCompiler();
-    final Docs docs;
-    final Set<String> jdkClasses = ScanClassPath.jdkTopLevelClasses(), classPathClasses;
+    final Set<String> jdkClasses, classPathClasses;
     final boolean lombokConfiguredEnabled;
     final boolean lombokPresentOnClasspath;
     final String compilerRole;
+    final boolean retainCachedCompileBatches;
     // Diagnostics from the last compilation task
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
     // Use the same file manager for multiple tasks, so we don't repeatedly re-compile the same files
     // TODO intercept files that aren't in the batch and erase method bodies so compilation is faster
     final SourceFileManager fileManager;
+    // Lane-local file manager for doc-path and JDK source lookups, configured from shared Docs metadata
+    final SourceFileManager docsFileManager;
 
+    /**
+     * Primary constructor: all three compiler lanes are built from one shared resources object.
+     * Mutable lane state (compilers, caches, file managers) is still independent per lane.
+     */
+    JavaCompilerService(CompilerSharedResources shared, boolean lombokConfiguredEnabled, String compilerRole) {
+        var constructorStarted = Instant.now();
+
+        // classPath can't actually be modified, because JavaCompiler remembers it from task to task
+        this.classPath = shared.classPath();
+        this.docPath = shared.docPath();
+        this.addExports = shared.addExports();
+        this.extraArgs = shared.extraArgs();
+        this.jdkClasses = shared.jdkClasses();
+        this.classPathClasses = shared.classPathClasses();
+        this.lombokConfiguredEnabled = lombokConfiguredEnabled;
+        this.lombokPresentOnClasspath = shared.lombokPresentOnClasspath();
+        this.compilerRole = compilerRole;
+        this.retainCachedCompileBatches =
+                !"background".equals(this.compilerRole) && !"index".equals(this.compilerRole);
+        this.fileManager = new SourceFileManager();
+        this.docsFileManager = shared.docs().createFileManager();
+        LOG.info(String.format(
+                "[perf] compiler_lane_init role=%s lombok_configured=%s retain_compile_batches=%s took=%dms",
+                this.compilerRole,
+                this.lombokConfiguredEnabled,
+                this.retainCachedCompileBatches,
+                Duration.between(constructorStarted, Instant.now()).toMillis()));
+    }
+
+    /** Convenience constructor for tests and isolated callers that don't share resources across lanes. */
     JavaCompilerService(
             Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
-        this(new CompilerServiceConfig(classPath, docPath, addExports, extraArgs, true, "standalone"));
+        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), true, "standalone");
     }
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
@@ -88,14 +112,7 @@ class JavaCompilerService implements CompilerProvider {
             Set<String> addExports,
             Collection<String> extraArgs,
             boolean lombokConfiguredEnabled) {
-        this(
-                new CompilerServiceConfig(
-                        classPath,
-                        docPath,
-                        addExports,
-                        extraArgs,
-                        lombokConfiguredEnabled,
-                        "standalone"));
+        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), lombokConfiguredEnabled, "standalone");
     }
 
     JavaCompilerService(
@@ -105,52 +122,7 @@ class JavaCompilerService implements CompilerProvider {
             Collection<String> extraArgs,
             boolean lombokConfiguredEnabled,
             String compilerRole) {
-        this(
-                new CompilerServiceConfig(
-                        classPath,
-                        docPath,
-                        addExports,
-                        extraArgs,
-                        lombokConfiguredEnabled,
-                        compilerRole));
-    }
-
-    private JavaCompilerService(CompilerServiceConfig config) {
-        var constructorStarted = Instant.now();
-
-        // classPath can't actually be modified, because JavaCompiler remembers it from task to task
-        this.classPath = Collections.unmodifiableSet(config.classPath());
-        this.docPath = Collections.unmodifiableSet(config.docPath());
-        this.addExports = Collections.unmodifiableSet(config.addExports());
-        this.extraArgs = normalizedArgs(config.extraArgs());
-        this.docs = new Docs(config.docPath());
-        var docsReady = Instant.now();
-        this.classPathClasses = ScanClassPath.classPathTopLevelClasses(config.classPath());
-        var classPathScanReady = Instant.now();
-        this.lombokConfiguredEnabled = config.lombokConfiguredEnabled();
-        this.lombokPresentOnClasspath = hasLombokJar(config.classPath());
-        this.compilerRole = config.compilerRole();
-        this.fileManager = new SourceFileManager();
-        LOG.info(
-                String.format(
-                        "[perf] compiler_service_init role=%s classpath=%d docpath=%d docs=%dms classpath_scan=%dms total=%dms lombok_present=%s lombok_configured=%s",
-                        this.compilerRole,
-                        this.classPath.size(),
-                        this.docPath.size(),
-                        Duration.between(constructorStarted, docsReady).toMillis(),
-                        Duration.between(docsReady, classPathScanReady).toMillis(),
-                        Duration.between(constructorStarted, Instant.now()).toMillis(),
-                        lombokPresentOnClasspath,
-                        this.lombokConfiguredEnabled));
-    }
-
-    private static List<String> normalizedArgs(Collection<String> extraArgs) {
-        if (extraArgs instanceof Set<?>) {
-            var sorted = new ArrayList<>(extraArgs);
-            Collections.sort(sorted);
-            return List.copyOf(sorted);
-        }
-        return List.copyOf(extraArgs);
+        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), lombokConfiguredEnabled, compilerRole);
     }
 
     private Map<JavaFileObject, SourceFingerprint> newModifiedCache() {
@@ -288,7 +260,6 @@ class JavaCompilerService implements CompilerProvider {
         if (addFiles.isEmpty()) {
             return firstAttempt;
         }
-
         LOG.info("...need to recompile with " + addFiles);
         firstAttempt.close();
 
@@ -398,6 +369,23 @@ class JavaCompilerService implements CompilerProvider {
         var effectiveSources = expandedSources.sources();
         var cacheSlot = cacheSlot(profile, useAnnotationProcessing);
         var cacheName = cacheMetricNameFor(cacheSlot);
+        if (!retainCachedCompileBatches) {
+            CacheAudit.miss(cacheName);
+            var loaded =
+                    compileWithExpansionIfNeeded(
+                            effectiveSources,
+                            profile,
+                            useAnnotationProcessing,
+                            compilerFor(cacheSlot));
+            lastCompileTelemetry =
+                    compileTelemetry(
+                            cacheName,
+                            "uncached_role",
+                            loaded.annotationProcessingEnabled,
+                            expandedSources,
+                            loaded);
+            return loaded;
+        }
         var modifiedCache = modifiedCacheFor(cacheSlot);
         var currentContentRevision = FileStore.contentRevision();
         var cachedContentRevision = cachedContentRevisionFor(cacheSlot);
@@ -409,7 +397,7 @@ class JavaCompilerService implements CompilerProvider {
                     && profile.analysisMode() == CompileBatch.AnalysisMode.FULL) {
                 LOG.fine(
                         String.format(
-                                "[diag-trace] compile_batch decision=cache_refresh cache=%s cached_revision=%d current_revision=%d cache_size=%d",
+                            "[diag-trace] compile_batch decision=cache_refresh cache=%s cached_revision=%d current_revision=%d cache_size=%d",
                                 cacheName,
                                 cachedContentRevision,
                                 currentContentRevision,
@@ -993,7 +981,7 @@ class JavaCompilerService implements CompilerProvider {
     private Optional<JavaFileObject> findPublicTypeDeclarationInDocPath(String className) {
         try {
             var found =
-                    docs.fileManager.getJavaFileForInput(
+                    docsFileManager.getJavaFileForInput(
                             StandardLocation.SOURCE_PATH, className, JavaFileObject.Kind.SOURCE);
             return Optional.ofNullable(found);
         } catch (IOException e) {
@@ -1008,10 +996,10 @@ class JavaCompilerService implements CompilerProvider {
         }
         try {
             for (var module : ScanClassPath.JDK_MODULES) {
-                var moduleLocation = docs.fileManager.getLocationForModule(StandardLocation.MODULE_SOURCE_PATH, module);
+                var moduleLocation = docsFileManager.getLocationForModule(StandardLocation.MODULE_SOURCE_PATH, module);
                 if (moduleLocation == null) continue;
                 var fromModuleSourcePath =
-                        docs.fileManager.getJavaFileForInput(moduleLocation, className, JavaFileObject.Kind.SOURCE);
+                        docsFileManager.getJavaFileForInput(moduleLocation, className, JavaFileObject.Kind.SOURCE);
                 if (fromModuleSourcePath != null) {
                     LOG.fine(String.format("...found %s in module %s of jdk", fromModuleSourcePath.toUri(), module));
                     var found = Optional.of(fromModuleSourcePath);
@@ -1163,15 +1151,6 @@ class JavaCompilerService implements CompilerProvider {
             sources.add(new SourceFileObject(file));
         }
         return sources;
-    }
-
-    private static boolean hasLombokJar(Set<Path> classPath) {
-        return classPath.stream()
-                .anyMatch(
-                        p -> {
-                            var name = p.getFileName().toString().toLowerCase();
-                            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
-                        });
     }
 
 }

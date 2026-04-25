@@ -708,32 +708,12 @@ class JavaLanguageServer extends LanguageServer {
                         extraArgs.size(),
                         compilerArgs.mixedModules()));
         LOG.info(String.format("[perf] compiler_args_values args=%s", extraArgs));
-        interactiveCompiler =
-                new JavaCompilerService(
-                        classPath,
-                        resolvedDocPath,
-                        addExports,
-                        extraArgs,
-                        lombokEnabled,
-                        "interactive");
+        var shared = CompilerSharedResources.from(classPath, resolvedDocPath, addExports, extraArgs);
+        interactiveCompiler = new JavaCompilerService(shared, lombokEnabled, "interactive");
         var diagnosticsStarted = Instant.now();
-        backgroundCompiler =
-                new JavaCompilerService(
-                        classPath,
-                        resolvedDocPath,
-                        addExports,
-                        extraArgs,
-                        lombokEnabled,
-                        "background");
+        backgroundCompiler = new JavaCompilerService(shared, lombokEnabled, "background");
         var indexStarted = Instant.now();
-        indexCompiler =
-                new JavaCompilerService(
-                        classPath,
-                        resolvedDocPath,
-                        addExports,
-                        extraArgs,
-                        lombokEnabled,
-                        "index");
+        indexCompiler = new JavaCompilerService(shared, lombokEnabled, "index");
         LOG.info(String.format(
                 "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms index=%dms total=%dms",
                 classPath.size(),

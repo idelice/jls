@@ -11,28 +11,36 @@ import java.util.logging.Logger;
 import javax.tools.*;
 
 public class Docs {
-
-    /** File manager with source-path + platform sources, which we will use to look up individual source files */
-    final SourceFileManager fileManager = new SourceFileManager();
+    /** Resolved source path entries (docPath + src.zip if found). */
+    final List<Path> sourcePath;
+    /** Resolved virtual path for MODULE_SOURCE_PATH, or {@code NOT_FOUND} if unavailable. */
+    final Path moduleSourceVirtualPath;
 
     Docs(Set<Path> docPath) {
         var srcZipFile = findSrcZip();
-        // Path to source .jars + src.zip
-        var sourcePath = new ArrayList<Path>(docPath);
+        var sp = new ArrayList<Path>(docPath);
         if (srcZipFile != NOT_FOUND) {
-            sourcePath.add(srcZipFile);
+            sp.add(srcZipFile);
         }
+        this.sourcePath = List.copyOf(sp);
+        this.moduleSourceVirtualPath = srcZipFile != NOT_FOUND ? srcZipVirtualPath(srcZipFile) : NOT_FOUND;
+    }
+
+    /**
+     * Create a freshly configured {@link SourceFileManager} from this metadata.
+     * Each caller gets its own instance; file managers are not thread-safe and must not be shared.
+     */
+    SourceFileManager createFileManager() {
+        var fm = new SourceFileManager();
         try {
-            fileManager.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourcePath);
-            if (srcZipFile != NOT_FOUND) {
-                var srcZipVirtualPath = srcZipVirtualPath(srcZipFile);
-                if (srcZipVirtualPath != NOT_FOUND) {
-                    fileManager.setLocationFromPaths(StandardLocation.MODULE_SOURCE_PATH, Set.of(srcZipVirtualPath));
-                }
+            fm.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourcePath);
+            if (moduleSourceVirtualPath != NOT_FOUND) {
+                fm.setLocationFromPaths(StandardLocation.MODULE_SOURCE_PATH, Set.of(moduleSourceVirtualPath));
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+        return fm;
     }
 
     static final Path NOT_FOUND = Paths.get("");
