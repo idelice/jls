@@ -1,5 +1,6 @@
 package org.javacs;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
@@ -24,6 +25,7 @@ import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.IndexedMember;
 import org.javacs.index.IndexedType;
 import org.javacs.lsp.CompletionItemKind;
+import org.javacs.lsp.Location;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.provider.DefinitionProvider;
@@ -426,6 +428,166 @@ public class DefinitionProviderTest {
         }
     }
 
+    @Test
+    public void lombokGetterNavigatesToBackingField() throws Exception {
+        // Sets up FileStore with the maven-project workspace (which has Lombok on classpath).
+        var compiler = LanguageServerFixture.getCompilerProvider();
+        var use =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT
+                        .resolve("src/org/javacs/example/LombokCrossTypeDiagnostics.java");
+        // cursor on 'getName' in "model.getName();"
+        var pos = cursor(use, "getName");
+        var locations =
+                new DefinitionProvider(compiler, TypeIndexRouter.EMPTY, use, pos.line, pos.character)
+                        .find();
+        assertThat(
+                "Lombok getter should navigate to the backing field in LombokCrossTypeModel",
+                locations,
+                not(empty()));
+        assertThat(locations.get(0).uri.toString(), containsString("LombokCrossTypeModel"));
+    }
+
+    @Test
+    public void debugNonLombokMethodDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-method");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "class Helper { String greet() { return \"hi\"; } }\n"
+                            + "class Use { void test() { new Helper().greet(); } }\n");
+
+            var locations = debugDefinition(workspace, use, "greet();");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally{
+            deleteTree(workspace);
+        }
+    }
+
+    @Test
+    public void debugAbstractMethodDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-abstract-method");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "abstract class Base { abstract int endHour(); }\n"
+                            + "class Customer extends Base { int endHour() { return 17; } }\n"
+                            + "class Use { void test() { Base customer = new Customer(); customer.endHour(); } }\n");
+
+            var locations = debugDefinition(workspace, use, "endHour(); } }");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
+    @Test
+    public void debugExternalMethodDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-external-method");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "class Use { void test() { \" value \".trim(); } }\n");
+
+            var locations = debugDefinition(workspace, use, "trim");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
+    @Test
+    public void debugEnumDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-enum");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "enum Status { READY }\n"
+                            + "class Use { void test() { Status status = Status.READY; } }\n");
+
+            var locations = debugDefinition(workspace, use, "READY; } }");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
+    @Test
+    public void debugClassDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-class");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "class Customer {}\n"
+                            + "class Use { void test() { new Customer(); } }\n");
+
+            var locations = debugDefinition(workspace, use, "Customer();");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
+    @Test
+    public void debugRecordAccessorDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-record");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "record Person(String name) {}\n"
+                            + "class Use { void test() { new Person(\"Ada\").name(); } }\n");
+
+            var locations = debugDefinition(workspace, use, "name();");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
+    @Test
+    public void debugStaticImportMethodDefinition() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-static-import");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "import static app.Tools.answer;\n"
+                            + "class Tools { static int answer() { return 42; } }\n"
+                            + "class Use { void test() { answer(); } }\n");
+
+            var locations = debugDefinition(workspace, use, "answer();");
+            assertThat(locations.size(), greaterThanOrEqualTo(0));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
     @After
     public void resetWorkspaceRoots() {
         FileStore.setWorkspaceRoots(Collections.emptySet());
@@ -537,6 +699,19 @@ public class DefinitionProviderTest {
             }
         }
         return new Position(line + 1, column + 1);
+    }
+
+    private static List<Location> debugDefinition(Path workspace, Path file, String needle) throws Exception {
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var compiler =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+        var pos = cursor(file, needle);
+        return new DefinitionProvider(compiler, TypeIndexRouter.EMPTY, file, pos.line, pos.character)
+                .find();
     }
 
     private static void deleteTree(Path root) throws Exception {

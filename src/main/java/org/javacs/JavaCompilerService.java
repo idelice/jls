@@ -11,6 +11,8 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.net.URI;
 import java.nio.file.*;
 import java.time.Duration;
 import java.time.Instant;
@@ -23,12 +25,11 @@ import javax.tools.*;
 
 class JavaCompilerService implements CompilerProvider {
     private static final Logger LOG = Logger.getLogger("main");
-    private static final int MAX_CACHE_SIZE = 1000;
     private static final int MAX_PARSE_CACHE_SIZE = 200;
 
     private enum CacheSlot {
+        NONE,
         FULL,
-        FULL_NO_EXPANSION,
         ATTR,
         ATTR_NO_AP
     }
@@ -37,26 +38,35 @@ class JavaCompilerService implements CompilerProvider {
             CompileBatch.AnalysisMode analysisMode,
             boolean allowAnnotationProcessing,
             boolean expandAdditionalSources,
-            CacheSlot cacheSlot) {}
+            CacheSlot cacheSlot,
+            boolean widenToWorkspace) {}
 
     private static final CompileProfile FULL_PROFILE =
-            new CompileProfile(CompileBatch.AnalysisMode.FULL, true, true, CacheSlot.FULL);
-    private static final CompileProfile DIAGNOSTICS_PROFILE =
-            new CompileProfile(CompileBatch.AnalysisMode.FULL, true, false, CacheSlot.FULL_NO_EXPANSION);
+            new CompileProfile(CompileBatch.AnalysisMode.FULL, true, true, CacheSlot.FULL, true);
     private static final CompileProfile FAST_AP_PROFILE =
-            new CompileProfile(CompileBatch.AnalysisMode.ATTR, true, true, CacheSlot.ATTR);
+            new CompileProfile(CompileBatch.AnalysisMode.ATTR, true, true, CacheSlot.ATTR, false);
     private static final CompileProfile FAST_NO_AP_PROFILE =
-            new CompileProfile(CompileBatch.AnalysisMode.ATTR, false, true, CacheSlot.ATTR_NO_AP);
+            new CompileProfile(CompileBatch.AnalysisMode.ATTR, false, true, CacheSlot.ATTR_NO_AP, false);
+    // Diagnostics: full analysis on the requested file(s) only.
+    // Does NOT widen to FileStore.all() — pull diagnostics are strictly per-file.
+    // expandAdditionalSources=true enables targeted Lombok source expansion: only Lombok-annotated
+    // files directly referenced by the requested file are added to the compilation unit, so AP
+    // generates their members and Lombok method calls resolve correctly. ErrorProvider still filters
+    // emitted diagnostics to the requested URIs, so non-requested expanded roots are silent.
+    private static final CompileProfile DIAGNOSTICS_PROFILE =
+            new CompileProfile(CompileBatch.AnalysisMode.FULL, true, true, CacheSlot.NONE, false);
 
     // Not modifiable! If you want to edit these, you need to create a new instance
     final Set<Path> classPath, docPath;
     final Set<String> addExports;
     final List<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
-    final ReusableCompiler diagnosticsNoExpansionCompiler = new ReusableCompiler();
+    private final ReusableCompiler.SlotContext fullSlot = new ReusableCompiler.SlotContext();
+    private final ReusableCompiler.SlotContext attrSlot = new ReusableCompiler.SlotContext();
+    private final ReusableCompiler.SlotContext attrNoApSlot = new ReusableCompiler.SlotContext();
     final Set<String> jdkClasses, classPathClasses;
-    final boolean lombokConfiguredEnabled;
     final boolean lombokPresentOnClasspath;
+    final boolean apEnabled;
     final String compilerRole;
     final boolean retainCachedCompileBatches;
     // Diagnostics from the last compilation task
@@ -71,7 +81,7 @@ class JavaCompilerService implements CompilerProvider {
      * Primary constructor: all three compiler lanes are built from one shared resources object.
      * Mutable lane state (compilers, caches, file managers) is still independent per lane.
      */
-    JavaCompilerService(CompilerSharedResources shared, boolean lombokConfiguredEnabled, String compilerRole) {
+    JavaCompilerService(CompilerSharedResources shared, String compilerRole) {
         var constructorStarted = Instant.now();
 
         // classPath can't actually be modified, because JavaCompiler remembers it from task to task
@@ -81,17 +91,19 @@ class JavaCompilerService implements CompilerProvider {
         this.extraArgs = shared.extraArgs();
         this.jdkClasses = shared.jdkClasses();
         this.classPathClasses = shared.classPathClasses();
-        this.lombokConfiguredEnabled = lombokConfiguredEnabled;
         this.lombokPresentOnClasspath = shared.lombokPresentOnClasspath();
+        this.apEnabled = shared.apEnabled();
         this.compilerRole = compilerRole;
         this.retainCachedCompileBatches =
-                !"background".equals(this.compilerRole) && !"index".equals(this.compilerRole);
+                !"background".equals(this.compilerRole)
+                        && !"index".equals(this.compilerRole)
+                        && !"diagnostics".equals(this.compilerRole);
         this.fileManager = new SourceFileManager();
         this.docsFileManager = shared.docs().createFileManager();
         LOG.info(String.format(
-                "[perf] compiler_lane_init role=%s lombok_configured=%s retain_compile_batches=%s took=%dms",
+                "[perf] compiler_lane_init role=%s ap_enabled=%s retain_compile_batches=%s took=%dms",
                 this.compilerRole,
-                this.lombokConfiguredEnabled,
+                this.apEnabled,
                 this.retainCachedCompileBatches,
                 Duration.between(constructorStarted, Instant.now()).toMillis()));
     }
@@ -99,58 +111,22 @@ class JavaCompilerService implements CompilerProvider {
     /** Convenience constructor for tests and isolated callers that don't share resources across lanes. */
     JavaCompilerService(
             Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
-        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), true, "standalone");
+        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), "standalone");
     }
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
     }
 
-    JavaCompilerService(
-            Set<Path> classPath,
-            Set<Path> docPath,
-            Set<String> addExports,
-            Collection<String> extraArgs,
-            boolean lombokConfiguredEnabled) {
-        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), lombokConfiguredEnabled, "standalone");
-    }
-
-    JavaCompilerService(
-            Set<Path> classPath,
-            Set<Path> docPath,
-            Set<String> addExports,
-            Collection<String> extraArgs,
-            boolean lombokConfiguredEnabled,
-            String compilerRole) {
-        this(CompilerSharedResources.from(classPath, docPath, addExports, extraArgs), lombokConfiguredEnabled, compilerRole);
-    }
-
-    private Map<JavaFileObject, SourceFingerprint> newModifiedCache() {
-        return new LinkedHashMap<>(16, 0.75f, true) {
-            @Override
-            protected boolean removeEldestEntry(Map.Entry<JavaFileObject, SourceFingerprint> eldest) {
-                boolean remove = size() > MAX_CACHE_SIZE;
-                if (remove) {
-                    LOG.fine("Cache eviction: removing oldest entry");
-                }
-                return remove;
-            }
-        };
-    }
-
     private CompileBatch cachedCompile;
-    private final Map<JavaFileObject, SourceFingerprint> cachedModified = newModifiedCache();
     private long cachedCompileContentRevision = -1;
-    private CompileBatch cachedCompileNoExpansion;
-    private final Map<JavaFileObject, SourceFingerprint> cachedCompileNoExpansionModified =
-            newModifiedCache();
-    private long cachedCompileNoExpansionContentRevision = -1;
     private CompileBatch cachedFastCompile;
-    private final Map<JavaFileObject, SourceFingerprint> cachedFastModified = newModifiedCache();
     private long cachedFastCompileContentRevision = -1;
+    // URI of the single file compiled into this slot (completion always compiles one file).
+    private URI cachedFastCompileUri = null;
     private CompileBatch cachedFastCompileNoAp;
-    private final Map<JavaFileObject, SourceFingerprint> cachedFastNoApModified = newModifiedCache();
     private long cachedFastCompileNoApContentRevision = -1;
+    private URI cachedFastNoApCompileUri = null;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
     final Map<Path, ParsedUnit> parsedUnits =
             Collections.synchronizedMap(
@@ -167,15 +143,7 @@ class JavaCompilerService implements CompilerProvider {
 
     record ParsedUnit(ParseTask task, SourceFingerprint fingerprint) {}
 
-    private record SourceFingerprint(long modifiedMillis, int version) {
-        @Override
-        public boolean equals(Object other) {
-            if (!(other instanceof SourceFingerprint(long millis, int version1))) {
-                return false;
-            }
-            return modifiedMillis == millis && version == version1;
-        }
-    }
+    private record SourceFingerprint(long modifiedMillis, int version) {}
 
     private record LombokTypeIndex(
             Set<String> lombokTypes,
@@ -207,6 +175,50 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
+    record MemorySnapshot(
+            String label,
+            long heapUsedMb,
+            long heapCommittedMb,
+            long nonHeapUsedMb,
+            int fullRoots,
+            int fullSourceStamps,
+            boolean fullClosed,
+            int attrRoots,
+            int attrNoApRoots) {}
+
+    MemorySnapshot memorySnapshot(String label) {
+        var heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
+        var nonHeap = ManagementFactory.getMemoryMXBean().getNonHeapMemoryUsage();
+        return new MemorySnapshot(
+                label,
+                heap.getUsed() / (1024 * 1024),
+                heap.getCommitted() / (1024 * 1024),
+                nonHeap.getUsed() / (1024 * 1024),
+                cachedCompile == null ? 0 : cachedCompile.roots.size(),
+                cachedCompile == null ? 0 : cachedCompile.sourceStamps.size(),
+                cachedCompile == null || cachedCompile.closed,
+                cachedFastCompile == null ? 0 : cachedFastCompile.roots.size(),
+                cachedFastCompileNoAp == null ? 0 : cachedFastCompileNoAp.roots.size());
+    }
+
+    void logMemorySnapshot(String label) {
+        var snapshot = memorySnapshot(label);
+        LOG.warning(
+                String.format(
+                        "[memory] label=%s role=%s heap_used=%dmb heap_committed=%dmb non_heap=%dmb full_roots=%d full_stamps=%d full_closed=%s attr_roots=%d attr_no_ap_roots=%d file_store_all=%d",
+                        snapshot.label(),
+                        compilerRole,
+                        snapshot.heapUsedMb(),
+                        snapshot.heapCommittedMb(),
+                        snapshot.nonHeapUsedMb(),
+                        snapshot.fullRoots(),
+                        snapshot.fullSourceStamps(),
+                        snapshot.fullClosed(),
+                        snapshot.attrRoots(),
+                        snapshot.attrNoApRoots(),
+                        FileStore.all().size()));
+    }
+
     private SourceFingerprint fingerprint(JavaFileObject file) {
         var version = -1;
         if (file instanceof SourceFileObject sourceFileObject) {
@@ -215,34 +227,21 @@ class JavaCompilerService implements CompilerProvider {
         return new SourceFingerprint(file.getLastModified(), version);
     }
 
-    private boolean needsCompile(
-            Collection<? extends JavaFileObject> sources, Map<JavaFileObject, SourceFingerprint> modifiedCache) {
-        if (modifiedCache.size() != sources.size()) {
-            return true;
-        }
-        for (var f : sources) {
-            if (!modifiedCache.containsKey(f)) {
-                return true;
-            }
-            var previous = modifiedCache.get(f);
-            var current = fingerprint(f);
-            if (!current.equals(previous)) {
-                return true;
-            }
-        }
-        return false;
+    private boolean fileMatchesAttrCache(CacheSlot slot, Collection<? extends JavaFileObject> sources) {
+        var uri = sources.isEmpty() ? null : sources.iterator().next().toUri();
+        var cached = slot == CacheSlot.ATTR ? cachedFastCompileUri : cachedFastNoApCompileUri;
+        return Objects.equals(uri, cached);
     }
 
     private CompileBatch compileWithExpansionIfNeeded(
             Collection<? extends JavaFileObject> sources,
             CompileProfile profile,
             boolean useAnnotationProcessing,
-            ReusableCompiler compilerInstance) {
+            ReusableCompiler.SlotContext slot) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
 
         var firstAttempt =
-                createCompileBatch(
-                        sources, profile, useAnnotationProcessing, compilerInstance, "first-attempt");
+                createCompileBatch(sources, profile, useAnnotationProcessing, slot, "first-attempt");
 
         if (profile.analysisMode() == CompileBatch.AnalysisMode.ATTR
                 || !profile.expandAdditionalSources()) {
@@ -268,39 +267,48 @@ class JavaCompilerService implements CompilerProvider {
             moreSources.add(new SourceFileObject(add));
         }
 
-        return createCompileBatch(
-                moreSources, profile, useAnnotationProcessing, compilerInstance, "second-attempt");
+        return createCompileBatch(moreSources, profile, useAnnotationProcessing, slot, "second-attempt");
     }
 
     private CompileBatch createCompileBatch(
             Collection<? extends JavaFileObject> sources,
             CompileProfile profile,
             boolean useAnnotationProcessing,
-            ReusableCompiler compilerInstance,
+            ReusableCompiler.SlotContext slot,
             String phase) {
-        try {
-            return new CompileBatch(
-                    this,
-                    sources,
-                    useAnnotationProcessing,
-                    profile.analysisMode(),
-                    compilerInstance);
-        } catch (CompileBatch.APFailureException e) {
-            if (!useAnnotationProcessing) {
-                throw e;
-            }
-            var root = rootCause(e);
-            LOG.fine(
-                    String.format(
-                            "[lombok] ap_fallback phase=%s role=%s mode=%s sources=%d reason=%s root=%s",
-                            phase,
-                            compilerRole,
-                            profile.analysisMode(),
-                            sources.size(),
-                            e.getMessage(),
-                            root));
-            return new CompileBatch(this, sources, false, profile.analysisMode(), compilerInstance);
-        }
+        diags.clear();
+        var options = buildOptions(profile.analysisMode(), useAnnotationProcessing);
+        logMemorySnapshot(
+                String.format(
+                        "before_create_compile phase=%s mode=%s sources=%d ap=%s",
+                        phase, profile.analysisMode(), sources.size(), useAnnotationProcessing));
+        var batch = new CompileBatch(
+                this, sources, useAnnotationProcessing, profile.analysisMode(), slot, options);
+        logMemorySnapshot(
+                String.format(
+                        "after_create_compile phase=%s mode=%s sources=%d roots=%d ap=%s",
+                        phase,
+                        profile.analysisMode(),
+                        sources.size(),
+                        batch.roots.size(),
+                        batch.annotationProcessingEnabled));
+        return batch;
+    }
+
+    private List<String> buildOptions(CompileBatch.AnalysisMode mode, boolean allowAP) {
+        if (!allowAP) return CompileBatch.optionsWithoutAP(classPath, addExports, extraArgs);
+        if (mode == CompileBatch.AnalysisMode.ATTR)
+            return CompileBatch.optionsForFastAp(classPath, addExports, extraArgs, lombokPresentOnClasspath);
+        return CompileBatch.options(classPath, addExports, extraArgs, lombokPresentOnClasspath);
+    }
+
+    private ReusableCompiler.SlotContext slotFor(CacheSlot cacheSlot) {
+        return switch (cacheSlot) {
+            case NONE -> throw new IllegalArgumentException("CacheSlot.NONE has no reusable compiler slot");
+            case FULL -> fullSlot;
+            case ATTR -> attrSlot;
+            case ATTR_NO_AP -> attrNoApSlot;
+        };
     }
 
     private CompileBatch refreshCachedCompile(
@@ -310,7 +318,6 @@ class JavaCompilerService implements CompilerProvider {
             long contentRevision) {
         var cacheSlot = cacheSlot(profile, useAnnotationProcessing);
         var compileCache = cachedCompileFor(cacheSlot);
-        var modifiedCache = modifiedCacheFor(cacheSlot);
         if (compileCache != null && !compileCache.closed) {
             LOG.warning(String.format(
                     "[compiler] stale cache slot detected role=%s mode=%s; closing and recovering",
@@ -318,25 +325,20 @@ class JavaCompilerService implements CompilerProvider {
             compileCache.close();
         }
 
+        var slot = slotFor(cacheSlot);
         var loaded =
-                compileWithExpansionIfNeeded(
-                        sources, profile, useAnnotationProcessing, compilerFor(cacheSlot));
-        var fallbackWithoutAp = useAnnotationProcessing && !loaded.annotationProcessingEnabled;
-        if (fallbackWithoutAp) {
-            LOG.fine(
-                    String.format(
-                            "[lombok] ap_fallback_not_cached role=%s mode=%s expand=%s revision=%d",
-                            compilerRole,
-                            profile.analysisMode(),
-                            profile.expandAdditionalSources(),
-                            contentRevision));
-            return loaded;
-        }
+                compileWithExpansionIfNeeded(sources, profile, useAnnotationProcessing, slot);
 
         storeCachedCompile(cacheSlot, loaded, contentRevision);
-        modifiedCache.clear();
-        for (var f : sources) {
-            modifiedCache.put(f, fingerprint(f));
+        logMemorySnapshot(
+                String.format(
+                        "after_store_cache slot=%s sources=%d roots=%d revision=%d",
+                        cacheSlot, sources.size(), loaded.roots.size(), contentRevision));
+        // Track the compiled file URI for per-file hit validation on ATTR slots.
+        if (cacheSlot != CacheSlot.FULL && !sources.isEmpty()) {
+            var uri = sources.iterator().next().toUri();
+            if (cacheSlot == CacheSlot.ATTR) cachedFastCompileUri = uri;
+            else cachedFastNoApCompileUri = uri;
         }
         return loaded;
     }
@@ -361,11 +363,23 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch compileBatch(
             Collection<? extends JavaFileObject> sources, CompileProfile profile) {
-        var useAnnotationProcessing =
-                profile.allowAnnotationProcessing()
-                        && lombokPresentOnClasspath
-                        && lombokConfiguredEnabled;
-        var expandedSources = expandSourcesForLombokAPDetails(sources, useAnnotationProcessing);
+        var useAnnotationProcessing = profile.allowAnnotationProcessing() && apEnabled;
+        // FULL_PROFILE widens to FileStore.all() so definition/hover/reference requests warm a
+        // workspace-scoped cache for all subsequent interactive callers at the same revision.
+        // DIAGNOSTICS_PROFILE keeps the caller's source set to avoid retaining a full workspace
+        // compile batch on every BufEnter pull-diagnostic request.
+        var compileSources =
+                profile.cacheSlot() == CacheSlot.FULL && profile.widenToWorkspace()
+                        ? FileStore.all().stream().<JavaFileObject>map(SourceFileObject::new).toList()
+                        : sources;
+        var expandedSources =
+                profile.expandAdditionalSources()
+                        ? expandSourcesForLombokAPDetails(compileSources, useAnnotationProcessing)
+                        : new ExpandedSources(
+                                compileSources,
+                                false,
+                                compileSources.size(),
+                                compileSources.size());
         var effectiveSources = expandedSources.sources();
         var cacheSlot = cacheSlot(profile, useAnnotationProcessing);
         var cacheName = cacheMetricNameFor(cacheSlot);
@@ -376,7 +390,7 @@ class JavaCompilerService implements CompilerProvider {
                             effectiveSources,
                             profile,
                             useAnnotationProcessing,
-                            compilerFor(cacheSlot));
+                            null);
             lastCompileTelemetry =
                     compileTelemetry(
                             cacheName,
@@ -386,22 +400,25 @@ class JavaCompilerService implements CompilerProvider {
                             loaded);
             return loaded;
         }
-        var modifiedCache = modifiedCacheFor(cacheSlot);
         var currentContentRevision = FileStore.contentRevision();
         var cachedContentRevision = cachedContentRevisionFor(cacheSlot);
         var cachedCompile = cachedCompileFor(cacheSlot);
-        var cacheStale = cachedContentRevision != currentContentRevision || needsCompile(effectiveSources, modifiedCache);
+        // FULL: revision match is sufficient — always workspace-scoped, no per-file tracking needed.
+        // ATTR/ATTR_NO_AP: revision match + same file (completion is per-file).
+        var cacheStale =
+                cachedContentRevision != currentContentRevision
+                        || (cacheSlot != CacheSlot.FULL
+                                && !fileMatchesAttrCache(cacheSlot, effectiveSources));
         var cacheReusable = cachedCompile != null && !cachedCompile.closed;
         if (cacheStale || !cacheReusable) {
-            if ("diagnostics".equals(compilerRole)
-                    && profile.analysisMode() == CompileBatch.AnalysisMode.FULL) {
+            if (cacheSlot == CacheSlot.FULL) {
                 LOG.fine(
                         String.format(
-                            "[diag-trace] compile_batch decision=cache_refresh cache=%s cached_revision=%d current_revision=%d cache_size=%d",
+                            "[cache] compile_batch decision=miss role=%s cache=%s cached_rev=%d current_rev=%d",
+                                compilerRole,
                                 cacheName,
                                 cachedContentRevision,
-                                currentContentRevision,
-                                modifiedCache.size()));
+                                currentContentRevision));
             }
             if (!cacheStale && cachedCompile != null && cachedCompile.closed) {
                 LOG.fine(
@@ -431,14 +448,13 @@ class JavaCompilerService implements CompilerProvider {
                             loaded);
             return loaded;
         } else {
-            if ("diagnostics".equals(compilerRole)
-                    && profile.analysisMode() == CompileBatch.AnalysisMode.FULL) {
+            if (cacheSlot == CacheSlot.FULL) {
                 LOG.fine(
                         String.format(
-                                "[diag-trace] compile_batch decision=cache_hit cache=%s revision=%d cache_size=%d",
+                                "[cache] compile_batch decision=hit role=%s cache=%s revision=%d",
+                                compilerRole,
                                 cacheName,
-                                currentContentRevision,
-                                modifiedCache.size()));
+                                currentContentRevision));
             }
             CacheAudit.hit(cacheName);
             lastCompileTelemetry =
@@ -455,49 +471,34 @@ class JavaCompilerService implements CompilerProvider {
         return profile.cacheSlot();
     }
 
-    private ReusableCompiler compilerFor(CacheSlot cacheSlot) {
-        if (cacheSlot == CacheSlot.FULL_NO_EXPANSION) {
-            return diagnosticsNoExpansionCompiler;
-        }
-        return compiler;
-    }
-
     private CompileBatch cachedCompileFor(CacheSlot cacheSlot) {
         return switch (cacheSlot) {
+            case NONE -> null;
             case FULL -> cachedCompile;
-            case FULL_NO_EXPANSION -> cachedCompileNoExpansion;
             case ATTR -> cachedFastCompile;
             case ATTR_NO_AP -> cachedFastCompileNoAp;
         };
     }
 
-    private Map<JavaFileObject, SourceFingerprint> modifiedCacheFor(CacheSlot cacheSlot) {
-        return switch (cacheSlot) {
-            case FULL -> cachedModified;
-            case FULL_NO_EXPANSION -> cachedCompileNoExpansionModified;
-            case ATTR -> cachedFastModified;
-            case ATTR_NO_AP -> cachedFastNoApModified;
-        };
-    }
-
     private long cachedContentRevisionFor(CacheSlot cacheSlot) {
         return switch (cacheSlot) {
+            case NONE -> -1;
             case FULL -> cachedCompileContentRevision;
-            case FULL_NO_EXPANSION -> cachedCompileNoExpansionContentRevision;
             case ATTR -> cachedFastCompileContentRevision;
             case ATTR_NO_AP -> cachedFastCompileNoApContentRevision;
         };
     }
 
     private void storeCachedCompile(CacheSlot cacheSlot, CompileBatch loaded, long contentRevision) {
+        var old = cachedCompileFor(cacheSlot);
+        if (old != null && !old.closed) {
+            old.close();
+        }
         switch (cacheSlot) {
+            case NONE -> throw new IllegalArgumentException("CacheSlot.NONE cannot store compile batches");
             case FULL -> {
                 cachedCompile = loaded;
                 cachedCompileContentRevision = contentRevision;
-            }
-            case FULL_NO_EXPANSION -> {
-                cachedCompileNoExpansion = loaded;
-                cachedCompileNoExpansionContentRevision = contentRevision;
             }
             case ATTR -> {
                 cachedFastCompile = loaded;
@@ -512,8 +513,8 @@ class JavaCompilerService implements CompilerProvider {
 
     private String cacheMetricNameFor(CacheSlot cacheSlot) {
         return switch (cacheSlot) {
+            case NONE -> "javac.none";
             case FULL -> "javac.full";
-            case FULL_NO_EXPANSION -> "javac.full_no_expansion";
             case ATTR -> "javac.attr";
             case ATTR_NO_AP -> "javac.attr_no_ap";
         };
@@ -805,14 +806,6 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
-    private static Throwable rootCause(Throwable t) {
-        var current = t;
-        while (current.getCause() != null && current.getCause() != current) {
-            current = current.getCause();
-        }
-        return current;
-    }
-
     private static final Pattern PACKAGE_EXTRACTOR = Pattern.compile("^([a-z][_a-zA-Z0-9]*\\.)*[a-z][_a-zA-Z0-9]*");
     private static final Pattern SIMPLE_EXTRACTOR = Pattern.compile("[A-Z][_a-zA-Z0-9]*$");
     private static final Pattern IMPORT_CLASS = Pattern.compile("^import +(static +)?([\\w\\.]+\\.\\w+);");
@@ -898,6 +891,11 @@ class JavaCompilerService implements CompilerProvider {
             throw new RuntimeException(e);
         }
         cacheFileImports.load(file, null, list);
+    }
+
+    @Override
+    public boolean lombokPresentOnClasspath() {
+        return lombokPresentOnClasspath;
     }
 
     @Override
@@ -1103,6 +1101,13 @@ class JavaCompilerService implements CompilerProvider {
         return task;
     }
 
+    private boolean isCachedBatch(CompileBatch batch) {
+        return batch != null
+                && (batch == cachedCompile
+                        || batch == cachedFastCompile
+                        || batch == cachedFastCompileNoAp);
+    }
+
     @Override
     public CompileTask compile(Path... files) {
         return compile(toSourceFiles(files));
@@ -1111,12 +1116,18 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
         var compile = compileBatch(sources, FULL_PROFILE);
-        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
+        LOG.fine(String.format("[cache] compile role=%s cached=%s", compilerRole, isCachedBatch(compile)));
+        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
+                isCachedBatch(compile) ? () -> {} : compile::close);
     }
 
     CompileTask compileDiagnostics(Collection<? extends JavaFileObject> sources) {
+        // DIAGNOSTICS_PROFILE: full analysis on the requested file(s) only, no workspace widening.
+        // The diagnostics lane never retains a CompileBatch so close() is always real.
         var compile = compileBatch(sources, DIAGNOSTICS_PROFILE);
-        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
+        LOG.fine(String.format("[cache] compileDiagnostics role=%s cached=%s", compilerRole, isCachedBatch(compile)));
+        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
+                isCachedBatch(compile) ? () -> {} : compile::close);
     }
 
     @Override
@@ -1132,13 +1143,15 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public CompileTask compileFastWithProcessors(Collection<? extends JavaFileObject> sources) {
         var compile = compileBatch(sources, FAST_AP_PROFILE);
-        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
+        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
+                isCachedBatch(compile) ? () -> {} : compile::close);
     }
 
     @Override
     public CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
         var compile = compileBatch(sources, FAST_NO_AP_PROFILE);
-        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps, compile::close);
+        return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
+                isCachedBatch(compile) ? () -> {} : compile::close);
     }
 
     CompileTelemetry lastCompileTelemetry() {

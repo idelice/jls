@@ -43,15 +43,11 @@ import com.sun.tools.javac.util.Context;
 import com.sun.tools.javac.util.DefinedBy;
 import com.sun.tools.javac.util.DefinedBy.Api;
 import com.sun.tools.javac.util.Log;
+import com.sun.tools.javac.util.Options;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.logging.Logger;
-import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 import javax.tools.Diagnostic;
 import javax.tools.DiagnosticListener;
 import javax.tools.JavaFileManager;
@@ -82,142 +78,221 @@ class ReusableCompiler {
 
     private static final Logger LOG = Logger.getLogger("main");
     private static final JavacTool systemProvider = JavacTool.create();
+    private final SlotContext legacySlot = new SlotContext();
 
-    private final Map<List<String>, ReusableContextState> contexts = new HashMap<>();
-
-    private static class ReusableContextState {
-        final ReusableContext context;
-        boolean checkedOut;
-
-        ReusableContextState(ReusableContext context) {
-            this.context = context;
+    static class TaskCreationException extends RuntimeException {
+        TaskCreationException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
-    /**
-     * Creates a new task as if by {@link javax.tools.JavaCompiler#getTask} and runs the provided worker with it. The
-     * task is only valid while the worker is running. The internal structures may be reused from some previous
-     * compilation.
-     *
-     * @param fileManager a file manager; if {@code null} use the compiler's standard filemanager
-     * @param diagnosticListener a diagnostic listener; if {@code null} use the compiler's default method for reporting
-     *     diagnostics
-     * @param options compiler options, {@code null} means no options
-     * @param classes names of classes to be processed by annotation processing, {@code null} means no class names
-     * @param compilationUnits the compilation units to compile, {@code null} means no compilation units
-     * @return an object representing the compilation
-     * @throws RuntimeException if an unrecoverable error occurred in a user supplied component. The {@linkplain
-     *     Throwable#getCause() cause} will be the error in user code.
-     * @throws IllegalArgumentException if any of the options are invalid, or if any of the given compilation units are
-     *     of other kind than {@linkplain JavaFileObject.Kind#SOURCE source}
-     */
+    /** One dedicated javac context owned by a single cache slot. */
+    static class SlotContext {
+        ReusableContext context;
+        boolean inUse;
+
+        SlotContext() {
+            this.context = new ReusableContext();
+        }
+
+        void reset() {
+            this.context = new ReusableContext();
+            this.inUse = false;
+        }
+    }
+
     Borrow getTask(
             JavaFileManager fileManager,
             DiagnosticListener<? super JavaFileObject> diagnosticListener,
             Iterable<String> options,
             Iterable<String> classes,
             Iterable<? extends JavaFileObject> compilationUnits) {
-        List<String> opts =
-                StreamSupport.stream(options.spliterator(), false).collect(Collectors.toCollection(ArrayList::new));
-        var key = List.copyOf(opts);
-        var state = hasExplicitJavaLevelOption(opts) ? null : contexts.get(key);
-        if (state == null) {
-            state = new ReusableContextState(new ReusableContext(opts));
-            if (!hasExplicitJavaLevelOption(opts)) {
-                contexts.put(key, state);
+        var opts = new java.util.ArrayList<String>();
+        if (options != null) {
+            for (var option : options) {
+                opts.add(option);
             }
         }
-        if (state.checkedOut) {
-            throw new RuntimeException("Compiler is already in-use!");
+        var classNames = new java.util.ArrayList<String>();
+        if (classes != null) {
+            for (var className : classes) {
+                classNames.add(className);
+            }
         }
-        state.checkedOut = true;
-        JavacTaskImpl task;
+        if (legacySlot.inUse) throw new IllegalStateException("Slot already in use");
+        legacySlot.inUse = true;
         try {
-            task =
-                    (JavacTaskImpl)
-                            systemProvider.getTask(
-                                    null,
-                                    fileManager,
-                                    diagnosticListener,
-                                    opts,
-                                    classes,
-                                    compilationUnits,
-                                    state.context);
-        } catch (RuntimeException e) {
-            state.checkedOut = false;
-            LOG.warning(String.format("[perf] javac_get_task_failed options=%s reason=%s", opts, e.getMessage()));
-            throw e;
+            var task = (JavacTaskImpl) systemProvider.getTask(
+                    null, fileManager, diagnosticListener, opts, classNames, compilationUnits, legacySlot.context);
+            task.addTaskListener(legacySlot.context);
+            return new Borrow(this, legacySlot, task);
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError error) {
+                legacySlot.inUse = false;
+                throw error;
+            }
+            if (e instanceof ThreadDeath error) {
+                legacySlot.inUse = false;
+                throw error;
+            }
+            if (e instanceof LinkageError error) {
+                legacySlot.inUse = false;
+                throw error;
+            }
+            legacySlot.reset();
+            LOG.warning(String.format(
+                    "[perf] javac_get_task_failed options=%s reason=%s",
+                    compactOptions(opts), e.getMessage()));
+            throw new TaskCreationException("Failed to create javac task: " + e.getMessage(), e);
         }
-
-        task.addTaskListener(state.context);
-
-        return new Borrow(task, state);
     }
 
-    private static boolean hasExplicitJavaLevelOption(List<String> options) {
-        for (var option : options) {
-            if ("--release".equals(option) || "-source".equals(option) || "-target".equals(option)) {
-                return true;
+    JavacTask createTask(
+            SlotContext slot,
+            JavaFileManager fileManager,
+            DiagnosticListener<? super JavaFileObject> diagnosticListener,
+            List<String> options,
+            Iterable<? extends JavaFileObject> compilationUnits) {
+        if (slot.inUse) throw new IllegalStateException("Slot already in use");
+        slot.inUse = true;
+        try {
+            var task = (JavacTaskImpl) systemProvider.getTask(
+                    null, fileManager, diagnosticListener, options, List.of(), compilationUnits, slot.context);
+            task.addTaskListener(slot.context);
+            return task;
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError error) {
+                slot.inUse = false;
+                throw error;
+            }
+            if (e instanceof ThreadDeath error) {
+                slot.inUse = false;
+                throw error;
+            }
+            if (e instanceof LinkageError error) {
+                slot.inUse = false;
+                throw error;
+            }
+            slot.reset();
+            LOG.warning(String.format(
+                    "[perf] javac_get_task_failed options=%s reason=%s",
+                    compactOptions(options), e.getMessage()));
+            throw new TaskCreationException("Failed to create javac task: " + e.getMessage(), e);
+        }
+    }
+
+    JavacTask createSingleUseTask(
+            JavaFileManager fileManager,
+            DiagnosticListener<? super JavaFileObject> diagnosticListener,
+            List<String> options,
+            Iterable<? extends JavaFileObject> compilationUnits) {
+        try {
+            return systemProvider.getTask(
+                    null, fileManager, diagnosticListener, options, List.of(), compilationUnits);
+        } catch (Throwable e) {
+            if (e instanceof VirtualMachineError error) {
+                throw error;
+            }
+            if (e instanceof ThreadDeath error) {
+                throw error;
+            }
+            if (e instanceof LinkageError error) {
+                throw error;
+            }
+            LOG.warning(String.format(
+                    "[perf] javac_get_task_failed options=%s reason=%s",
+                    compactOptions(options), e.getMessage()));
+            throw new TaskCreationException("Failed to create javac task: " + e.getMessage(), e);
+        }
+    }
+
+    private static List<String> compactOptions(List<String> options) {
+        var compact = new java.util.ArrayList<String>();
+        for (var i = 0; i < options.size(); i++) {
+            var option = options.get(i);
+            switch (option) {
+                case "-classpath", "--class-path", "-cp", "-processorpath" -> {
+                    compact.add(option);
+                    if (i + 1 < options.size()) {
+                        compact.add("<paths>");
+                        i++;
+                    }
+                }
+                default -> compact.add(option);
             }
         }
-        return false;
+        return List.copyOf(compact);
     }
 
-    class Borrow implements AutoCloseable {
+    void releaseTask(SlotContext slot, JavacTask task) {
+        boolean cleared = false;
+        try {
+            slot.context.clear();
+            cleared = true;
+        } catch (Throwable e) {
+            // Context is corrupted (e.g. AP ExceptionInInitializerError left partial state).
+            // Reset the slot so the next task gets a fresh context instead of a broken one.
+            LOG.warning("[compiler] context_clear_failed resetting slot reason=" + e.getMessage());
+        }
+        cleanupTask(task);
+        if (cleared) {
+            slot.inUse = false;
+        } else {
+            slot.reset(); // creates new ReusableContext, sets inUse=false
+        }
+    }
+
+    void cleanupTask(JavacTask task) {
+        try {
+            var m = JavacTaskImpl.class.getDeclaredMethod("cleanup");
+            m.setAccessible(true);
+            m.invoke(task);
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+            LOG.fine("Task cleanup failed: " + e.getMessage());
+        }
+    }
+
+    static class Borrow implements AutoCloseable {
+        final ReusableCompiler compiler;
+        final SlotContext slot;
         final JavacTask task;
-        final ReusableContextState state;
         boolean closed;
 
-        Borrow(JavacTask task, ReusableContextState state) {
+        Borrow(ReusableCompiler compiler, SlotContext slot, JavacTask task) {
+            this.compiler = compiler;
+            this.slot = slot;
             this.task = task;
-            this.state = state;
         }
 
         @Override
         public void close() {
             if (closed) return;
-            try {
-                // Try to clean up the context and task.
-                // If either fails due to a corrupted state (e.g., after AP failure),
-                // we still need to unlock the compiler so subsequent attempts can proceed.
-                try {
-                    state.context.clear();
-                } catch (Throwable e) {
-                    // Context cleanup failed - likely due to AP infrastructure corruption.
-                    // Log and continue. We need to unlock the compiler.
-                    LOG.fine("Context cleanup failed (likely due to AP error): " + e.getMessage());
-                }
-
-                try {
-                    var method = JavacTaskImpl.class.getDeclaredMethod("cleanup");
-                    method.setAccessible(true);
-                    method.invoke(task);
-                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-                    LOG.fine("Task cleanup failed: " + e.getMessage());
-                    // Don't throw - we still need to unlock the compiler
-                }
-            } finally {
-                // CRITICAL: Always unlock the compiler, even if cleanup operations fail.
-                // If we don't do this, the compiler will be permanently locked.
-                state.checkedOut = false;
-                closed = true;
+            if (slot == null) {
+                compiler.cleanupTask(task);
+            } else {
+                compiler.releaseTask(slot, task);
             }
+            closed = true;
         }
     }
 
     static class ReusableContext extends Context implements TaskListener {
 
-        List<String> arguments;
-
-        ReusableContext(List<String> arguments) {
+        ReusableContext() {
             super();
-            this.arguments = arguments;
             put(Log.logKey, ReusableLog.factory);
             put(JavaCompiler.compilerKey, ReusableJavaCompiler.factory);
         }
 
+        ReusableContext(List<String> arguments) {
+            this();
+        }
+
         void clear() {
             drop(Arguments.argsKey);
+            drop(Options.optionsKey);
+            dropStaticContextKey("com.sun.tools.javac.code.Source", "sourceKey");
+            dropStaticContextKey("com.sun.tools.javac.jvm.Target", "targetKey");
             drop(DiagnosticListener.class);
             drop(Log.outKey);
             drop(Log.errKey);
@@ -229,6 +304,7 @@ class ReusableCompiler {
             // Lombok/AP state must not leak between tasks in a reusable context.
             dropByClassName("com.sun.tools.javac.processing.JavacProcessingEnvironment");
             dropByClassName("com.sun.tools.javac.processing.JavacProcessingEnvironment$DiscoveredProcessors");
+            dropByClassName("com.sun.tools.javac.platform.PlatformDescription");
 
             if (ht.get(Log.logKey) instanceof ReusableLog) {
                 // log already inited - not first round
@@ -241,6 +317,20 @@ class ReusableCompiler {
                 Annotate.instance(this).newRound();
                 CompileStates.instance(this).clear();
                 MultiTaskListener.instance(this).clear();
+            }
+        }
+
+        private void dropStaticContextKey(String ownerClassName, String fieldName) {
+            try {
+                var owner = Class.forName(ownerClassName);
+                var field = owner.getDeclaredField(fieldName);
+                field.setAccessible(true);
+                var key = field.get(null);
+                if (key instanceof Context.Key<?> contextKey) {
+                    ht.remove(contextKey);
+                }
+            } catch (ReflectiveOperationException ignored) {
+                // No-op: javac internals can move between JDK versions.
             }
         }
 

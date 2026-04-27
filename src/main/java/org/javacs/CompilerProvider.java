@@ -53,5 +53,10 @@ public interface CompilerProvider {
         return compileFast(sources);
     }
 
+   /** Returns true when Lombok is present on the project classpath. */
+    default boolean lombokPresentOnClasspath() {
+        return false;
+    }
+
     Path NOT_FOUND = Paths.get("");
 }

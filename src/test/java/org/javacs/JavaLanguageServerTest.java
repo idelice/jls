@@ -5387,7 +5387,7 @@ public class JavaLanguageServerTest {
                         original.docPath,
                         original.addExports,
                         original.extraArgs,
-                        original.lombokConfiguredEnabled,
+                        original.apEnabled,
                         original.compilerRole);
         setInteractiveCompiler(server, tracking);
         return tracking;
@@ -7062,7 +7062,7 @@ public class JavaLanguageServerTest {
         private final AtomicInteger maxInFlight = new AtomicInteger();
 
         ConcurrencyTrackingCompiler() {
-            super(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), true);
+            super(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         }
 
         @Override
@@ -7098,7 +7098,7 @@ public class JavaLanguageServerTest {
                 List<String> extraArgs,
                 boolean lombokConfiguredEnabled,
                 String compilerRole) {
-            super(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, compilerRole);
+            super(classPath, docPath, addExports, extraArgs);
         }
 
         void resetCounters() {

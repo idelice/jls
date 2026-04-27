@@ -70,6 +70,1290 @@ public class DefinitionProviderFlowTest {
     }
 
     @Test
+    public void compilerLookupResolvesDemoProjectLocalVariableAfterFullCompile() throws Exception {
+        var workspace = Path.of(System.getProperty("user.home"), "projects", "demo");
+        org.junit.Assume.assumeTrue("demo project must exist for local debug coverage", Files.exists(workspace));
+        var file = workspace.resolve("src/main/java/com/example/demo/service/ServiceOne.java");
+        org.junit.Assume.assumeTrue("ServiceOne.java must exist in demo project", Files.exists(file));
+
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var infer = new InferConfig(workspace);
+        var compiler =
+                new JavaCompilerService(
+                        new LinkedHashSet<Path>(infer.classPath()),
+                        infer.buildDocPath(),
+                        java.util.Collections.emptySet(),
+                        java.util.Collections.emptySet());
+
+        var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+        try {
+            var index =
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(initialCompile),
+                            new ExternalBinaryTypeIndex(compiler));
+            var cursor = cursor(file, "foo.getBar().getAsd();", 0);
+
+            var locations =
+                    new DefinitionProvider(compiler, index, file, cursor.line, cursor.character)
+                            .find();
+
+            assertEquals(1, locations.size());
+            assertEquals(file.toUri(), locations.get(0).uri);
+            assertEquals(14, locations.get(0).range.start.line);
+            assertEquals(8, locations.get(0).range.start.character);
+            assertEquals(14, locations.get(0).range.end.line);
+            assertEquals(11, locations.get(0).range.end.character);
+        } finally {
+            initialCompile.close();
+            FileStore.reset();
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesDemoProjectConstructorAfterFullCompile() throws Exception {
+        var workspace = Path.of(System.getProperty("user.home"), "projects", "demo");
+        org.junit.Assume.assumeTrue("demo project must exist for local debug coverage", Files.exists(workspace));
+        var file = workspace.resolve("src/main/java/com/example/demo/service/ServiceTwo.java");
+        var constructorFile = workspace.resolve("src/main/java/com/example/demo/models/Biz.java");
+        org.junit.Assume.assumeTrue("ServiceTwo.java must exist in demo project", Files.exists(file));
+        org.junit.Assume.assumeTrue("Biz.java must exist in demo project", Files.exists(constructorFile));
+
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var infer = new InferConfig(workspace);
+        var compiler =
+                new JavaCompilerService(
+                        new LinkedHashSet<Path>(infer.classPath()),
+                        infer.buildDocPath(),
+                        java.util.Collections.emptySet(),
+                        java.util.Collections.emptySet());
+
+        var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+        try {
+            var index =
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(initialCompile),
+                            new ExternalBinaryTypeIndex(compiler));
+            var cursor = cursor(file, "new Biz(\"asd\")", "new ".length());
+
+            var locations =
+                    new DefinitionProvider(compiler, index, file, cursor.line, cursor.character)
+                            .find();
+
+            assertEquals(1, locations.size());
+            assertEquals(constructorFile.toUri(), locations.get(0).uri);
+            assertEquals(13, locations.get(0).range.start.line);
+            assertEquals(9, locations.get(0).range.start.character);
+            assertEquals(13, locations.get(0).range.end.line);
+            assertEquals(12, locations.get(0).range.end.character);
+        } finally {
+            initialCompile.close();
+            FileStore.reset();
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesDemoProjectNestedClassAfterFullCompile() throws Exception {
+        var workspace = Path.of(System.getProperty("user.home"), "projects", "demo");
+        org.junit.Assume.assumeTrue("demo project must exist for local debug coverage", Files.exists(workspace));
+        var file = workspace.resolve("src/main/java/com/example/demo/complex/service/ComplexScenarioService.java");
+        var nestedFile = workspace.resolve("src/main/java/com/example/demo/complex/model/DeepGraph.java");
+        org.junit.Assume.assumeTrue(
+                "ComplexScenarioService.java must exist in demo project", Files.exists(file));
+        org.junit.Assume.assumeTrue("DeepGraph.java must exist in demo project", Files.exists(nestedFile));
+
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var infer = new InferConfig(workspace);
+        var compiler =
+                new JavaCompilerService(
+                        new LinkedHashSet<Path>(infer.classPath()),
+                        infer.buildDocPath(),
+                        java.util.Collections.emptySet(),
+                        java.util.Collections.emptySet());
+
+        var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+        try {
+            var index =
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(initialCompile),
+                            new ExternalBinaryTypeIndex(compiler));
+            var cursor = cursor(file, "DeepGraph.DeepNode createLeaf", "DeepGraph.".length());
+
+            var locations =
+                    new DefinitionProvider(compiler, index, file, cursor.line, cursor.character)
+                            .find();
+
+            assertEquals(1, locations.size());
+            assertEquals(nestedFile.toUri(), locations.get(0).uri);
+            assertEquals(21, locations.get(0).range.start.line);
+            assertEquals(22, locations.get(0).range.start.character);
+            assertEquals(21, locations.get(0).range.end.line);
+            assertEquals(30, locations.get(0).range.end.character);
+        } finally {
+            initialCompile.close();
+            FileStore.reset();
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesDemoProjectFieldAfterFullCompile() throws Exception {
+        var workspace = Path.of(System.getProperty("user.home"), "projects", "demo");
+        org.junit.Assume.assumeTrue("demo project must exist for local debug coverage", Files.exists(workspace));
+        var file = workspace.resolve("src/main/java/com/example/demo/service/ServiceOne.java");
+        var fieldFile = workspace.resolve("src/main/java/com/example/demo/models/B.java");
+        org.junit.Assume.assumeTrue("ServiceOne.java must exist in demo project", Files.exists(file));
+        org.junit.Assume.assumeTrue("B.java must exist in demo project", Files.exists(fieldFile));
+
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var infer = new InferConfig(workspace);
+        var compiler =
+                new JavaCompilerService(
+                        new LinkedHashSet<Path>(infer.classPath()),
+                        infer.buildDocPath(),
+                        java.util.Collections.emptySet(),
+                        java.util.Collections.emptySet());
+
+        var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+        try {
+            var index =
+                    new TypeIndexRouter(
+                            WorkspaceTypeIndex.from(initialCompile),
+                            new ExternalBinaryTypeIndex(compiler));
+            var cursor = cursor(file, "A.IM_B", "A.".length());
+
+            var locations =
+                    new DefinitionProvider(compiler, index, file, cursor.line, cursor.character)
+                            .find();
+
+            assertEquals(1, locations.size());
+            assertEquals(fieldFile.toUri(), locations.get(0).uri);
+            assertEquals(6, locations.get(0).range.start.line);
+            assertEquals(29, locations.get(0).range.start.character);
+            assertEquals(6, locations.get(0).range.end.line);
+            assertEquals(33, locations.get(0).range.end.character);
+        } finally {
+            initialCompile.close();
+            FileStore.reset();
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesDemoProjectLombokGeneratedFieldsAfterFullCompile()
+            throws Exception {
+        var workspace = Path.of(System.getProperty("user.home"), "projects", "demo");
+        org.junit.Assume.assumeTrue("demo project must exist for local debug coverage", Files.exists(workspace));
+        var service = workspace.resolve("src/main/java/com/example/demo/complex/service/ComplexScenarioService.java");
+        var customer = workspace.resolve("src/main/java/com/example/demo/complex/model/CustomerProfile.java");
+        var abstractCustomer =
+                workspace.resolve("src/main/java/com/example/demo/complex/model/AbstractCustomerRecord.java");
+        var envelope = workspace.resolve("src/main/java/com/example/demo/complex/model/OrderEnvelope.java");
+        var lineItem = workspace.resolve("src/main/java/com/example/demo/complex/model/LineItem.java");
+        org.junit.Assume.assumeTrue("ComplexScenarioService.java must exist", Files.exists(service));
+        org.junit.Assume.assumeTrue("CustomerProfile.java must exist", Files.exists(customer));
+        org.junit.Assume.assumeTrue("AbstractCustomerRecord.java must exist", Files.exists(abstractCustomer));
+        org.junit.Assume.assumeTrue("OrderEnvelope.java must exist", Files.exists(envelope));
+        org.junit.Assume.assumeTrue("LineItem.java must exist", Files.exists(lineItem));
+
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var infer = new InferConfig(workspace);
+        var compiler =
+                new JavaCompilerService(
+                        new LinkedHashSet<Path>(infer.classPath()),
+                        infer.buildDocPath(),
+                        java.util.Collections.emptySet(),
+                        java.util.Collections.emptySet());
+
+        var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+        try {
+            var context =
+                    new NavigationContext(
+                            compiler,
+                            new TypeIndexRouter(
+                                    WorkspaceTypeIndex.from(initialCompile),
+                                    new ExternalBinaryTypeIndex(compiler)));
+
+            assertLocation(context, service, "customer.getLoyaltyTier().isBlank()", "customer.".length(),
+                    customer, 12, 17, 12, 28);
+            assertLocation(context, service, "customer.setContactWindow(new ContactWindow())", "customer.".length(),
+                    abstractCustomer, 12, 24, 12, 37);
+            assertLocation(context, service, "customer.setVip(seed.length() % 3 == 0)", "customer.".length(),
+                    customer, 13, 18, 13, 21);
+            assertLocation(context, service, "envelope.setRequestedShipDate", "envelope.".length(),
+                    envelope, 17, 20, 17, 37);
+            assertLocation(context, service, "envelope.setCustomer(customer)", "envelope.".length(),
+                    envelope, 18, 26, 18, 34);
+
+            var builderChain = "LineItem.builder().family(null).quantity(0).sku(null).build()";
+            assertLocation(context, service, builderChain, "LineItem.builder().".length(),
+                    lineItem, 16, 17, 16, 23);
+            assertLocation(context, service, builderChain, "LineItem.builder().family(null).".length(),
+                    lineItem, 17, 14, 17, 22);
+            assertLocation(context, service, builderChain, "LineItem.builder().family(null).quantity(0).".length(),
+                    lineItem, 15, 17, 15, 20);
+        } finally {
+            initialCompile.close();
+            FileStore.reset();
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesEnumCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-enum-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var enumFile = pkg.resolve("WorkflowState.java");
+            Files.writeString(
+                    enumFile,
+                    "package com.example.demo;\n"
+                            + "enum WorkflowState {\n"
+                            + "  DRAFT,\n"
+                            + "  ACTIVE(\"active\"),\n"
+                            + "  CLOSED(\"closed\", true);\n"
+                            + "  private String label;\n"
+                            + "  private final boolean terminal;\n"
+                            + "  WorkflowState() {\n"
+                            + "    this(\"draft\", false);\n"
+                            + "  }\n"
+                            + "  WorkflowState(String label) {\n"
+                            + "    this(label, false);\n"
+                            + "  }\n"
+                            + "  WorkflowState(String label, boolean terminal) {\n"
+                            + "    this.label = label;\n"
+                            + "    this.terminal = terminal;\n"
+                            + "  }\n"
+                            + "  String getLabel() {\n"
+                            + "    return label;\n"
+                            + "  }\n"
+                            + "  void setLabel(String label) {\n"
+                            + "    this.label = label;\n"
+                            + "  }\n"
+                            + "  boolean isTerminal() {\n"
+                            + "    return terminal;\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("WorkflowUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "class WorkflowUse {\n"
+                            + "  void test() {\n"
+                            + "    WorkflowState state = WorkflowState.ACTIVE;\n"
+                            + "    WorkflowState closed = WorkflowState.CLOSED;\n"
+                            + "    state.getLabel();\n"
+                            + "    state.setLabel(\"ready\");\n"
+                            + "    closed.isTerminal();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            FileStore.reset();
+            FileStore.setWorkspaceRoots(Set.of(workspace));
+            var infer = new InferConfig(workspace);
+            var compiler =
+                    new JavaCompilerService(
+                            new LinkedHashSet<Path>(infer.classPath()),
+                            infer.buildDocPath(),
+                            java.util.Collections.emptySet(),
+                            java.util.Collections.emptySet());
+
+            var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+            try {
+                var context =
+                        new NavigationContext(
+                                compiler,
+                                new TypeIndexRouter(
+                                        WorkspaceTypeIndex.from(initialCompile),
+                                        new ExternalBinaryTypeIndex(compiler)));
+
+                assertLocation(context, use, "WorkflowState state", 0, enumFile, 1, 5, 1, 18);
+                assertLocation(
+                        context,
+                        use,
+                        "WorkflowState.ACTIVE",
+                        "WorkflowState.".length(),
+                        enumFile,
+                        3,
+                        2,
+                        3,
+                        8);
+                assertLocation(
+                        context,
+                        use,
+                        "WorkflowState.CLOSED",
+                        "WorkflowState.".length(),
+                        enumFile,
+                        4,
+                        2,
+                        4,
+                        8);
+                assertLocation(context, enumFile, "WorkflowState() {", 0, enumFile, 7, 2, 7, 15);
+                assertLocation(
+                        context,
+                        enumFile,
+                        "WorkflowState(String label) {",
+                        0,
+                        enumFile,
+                        10,
+                        2,
+                        10,
+                        15);
+                assertLocation(
+                        context,
+                        enumFile,
+                        "WorkflowState(String label, boolean terminal)",
+                        0,
+                        enumFile,
+                        13,
+                        2,
+                        13,
+                        15);
+                assertLocation(
+                        context,
+                        use,
+                        "state.getLabel()",
+                        "state.".length(),
+                        enumFile,
+                        17,
+                        9,
+                        17,
+                        17);
+                assertLocation(
+                        context,
+                        use,
+                        "state.setLabel",
+                        "state.".length(),
+                        enumFile,
+                        20,
+                        7,
+                        20,
+                        15);
+                assertLocation(
+                        context,
+                        use,
+                        "closed.isTerminal()",
+                        "closed.".length(),
+                        enumFile,
+                        23,
+                        10,
+                        23,
+                        20);
+                assertLocation(
+                        context,
+                        enumFile,
+                        "this.label = label;",
+                        "this.".length(),
+                        enumFile,
+                        5,
+                        17,
+                        5,
+                        22);
+                assertLocation(
+                        context,
+                        enumFile,
+                        "this.terminal = terminal;",
+                        "this.".length(),
+                        enumFile,
+                        6,
+                        24,
+                        6,
+                        32);
+                assertLocation(
+                        context,
+                        enumFile,
+                        "return label;",
+                        "return ".length(),
+                        enumFile,
+                        5,
+                        17,
+                        5,
+                        22);
+            } finally {
+                initialCompile.close();
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesMethodCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-method-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var model = pkg.resolve("MethodModel.java");
+            Files.writeString(
+                    model,
+                    "package com.example.demo;\n"
+                            + "class MethodBase {\n"
+                            + "  String inheritedName() {\n"
+                            + "    return \"base\";\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class MethodModel extends MethodBase {\n"
+                            + "  private String name;\n"
+                            + "  String getName() {\n"
+                            + "    return name;\n"
+                            + "  }\n"
+                            + "  void setName(String name) {\n"
+                            + "    this.name = name;\n"
+                            + "  }\n"
+                            + "  String label() {\n"
+                            + "    return getName();\n"
+                            + "  }\n"
+                            + "  String label(String prefix) {\n"
+                            + "    return prefix + name;\n"
+                            + "  }\n"
+                            + "  static MethodModel create() {\n"
+                            + "    return new MethodModel();\n"
+                            + "  }\n"
+                            + "  static MethodModel create(String name) {\n"
+                            + "    var model = new MethodModel();\n"
+                            + "    model.setName(name);\n"
+                            + "    return model;\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("MethodUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "class MethodUse {\n"
+                            + "  void test() {\n"
+                            + "    var model = MethodModel.create(\"Ada\");\n"
+                            + "    MethodModel.create();\n"
+                            + "    model.getName();\n"
+                            + "    model.setName(\"Grace\");\n"
+                            + "    model.label();\n"
+                            + "    model.label(\"Dr.\");\n"
+                            + "    model.inheritedName();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            FileStore.reset();
+            FileStore.setWorkspaceRoots(Set.of(workspace));
+            var infer = new InferConfig(workspace);
+            var compiler =
+                    new JavaCompilerService(
+                            new LinkedHashSet<Path>(infer.classPath()),
+                            infer.buildDocPath(),
+                            java.util.Collections.emptySet(),
+                            java.util.Collections.emptySet());
+
+            var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+            try {
+                var context =
+                        new NavigationContext(
+                                compiler,
+                                new TypeIndexRouter(
+                                        WorkspaceTypeIndex.from(initialCompile),
+                                        new ExternalBinaryTypeIndex(compiler)));
+
+                assertLocation(
+                        context,
+                        use,
+                        "model.getName()",
+                        "model.".length(),
+                        model,
+                        8,
+                        9,
+                        8,
+                        16);
+                assertLocation(
+                        context,
+                        use,
+                        "model.setName",
+                        "model.".length(),
+                        model,
+                        11,
+                        7,
+                        11,
+                        14);
+                assertLocation(
+                        context,
+                        use,
+                        "model.label();",
+                        "model.".length(),
+                        model,
+                        14,
+                        9,
+                        14,
+                        14);
+                assertLocation(
+                        context,
+                        use,
+                        "model.label(\"Dr.\")",
+                        "model.".length(),
+                        model,
+                        17,
+                        9,
+                        17,
+                        14);
+                assertLocation(
+                        context,
+                        use,
+                        "MethodModel.create(\"Ada\")",
+                        "MethodModel.".length(),
+                        model,
+                        23,
+                        21,
+                        23,
+                        27);
+                assertLocation(
+                        context,
+                        use,
+                        "MethodModel.create();",
+                        "MethodModel.".length(),
+                        model,
+                        20,
+                        21,
+                        20,
+                        27);
+                assertLocation(
+                        context,
+                        use,
+                        "model.inheritedName()",
+                        "model.".length(),
+                        model,
+                        2,
+                        9,
+                        2,
+                        22);
+                assertLocation(
+                        context,
+                        model,
+                        "return getName();",
+                        "return ".length(),
+                        model,
+                        8,
+                        9,
+                        8,
+                        16);
+                assertLocation(
+                        context,
+                        model,
+                        "model.setName(name);",
+                        "model.".length(),
+                        model,
+                        11,
+                        7,
+                        11,
+                        14);
+            } finally {
+                initialCompile.close();
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesLambdaAndStreamCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-stream-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var model = pkg.resolve("StreamModels.java");
+            Files.writeString(
+                    model,
+                    "package com.example.demo;\n"
+                            + "class Foo {\n"
+                            + "  private Bar bar;\n"
+                            + "  Bar getBar() {\n"
+                            + "    return bar;\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class Bar {\n"
+                            + "  String getName() {\n"
+                            + "    return \"bar\";\n"
+                            + "  }\n"
+                            + "  String getCode() {\n"
+                            + "    return \"code\";\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("StreamUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "import java.util.List;\n"
+                            + "import java.util.stream.Collectors;\n"
+                            + "class StreamUse {\n"
+                            + "  void test(List<Foo> foos) {\n"
+                            + "    foos.stream()\n"
+                            + "        .map(i -> i.getBar().getName())\n"
+                            + "        .collect(Collectors.toList());\n"
+                            + "    foos.stream()\n"
+                            + "        .map(Foo::getBar)\n"
+                            + "        .map(Bar::getName)\n"
+                            + "        .collect(Collectors.toList());\n"
+                            + "    foos.stream()\n"
+                            + "        .map(Foo::getBar)\n"
+                            + "        .map(bar -> bar.getCode())\n"
+                            + "        .collect(Collectors.toList());\n"
+                            + "  }\n"
+                            + "}\n");
+
+            FileStore.reset();
+            FileStore.setWorkspaceRoots(Set.of(workspace));
+            var infer = new InferConfig(workspace);
+            var compiler =
+                    new JavaCompilerService(
+                            new LinkedHashSet<Path>(infer.classPath()),
+                            infer.buildDocPath(),
+                            java.util.Collections.emptySet(),
+                            java.util.Collections.emptySet());
+
+            var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+            try {
+                var context =
+                        new NavigationContext(
+                                compiler,
+                                new TypeIndexRouter(
+                                        WorkspaceTypeIndex.from(initialCompile),
+                                        new ExternalBinaryTypeIndex(compiler)));
+
+                assertLocation(
+                        context,
+                        use,
+                        "i.getBar().getName()",
+                        "i.".length(),
+                        model,
+                        3,
+                        6,
+                        3,
+                        12);
+                assertLocation(
+                        context,
+                        use,
+                        "i.getBar().getName()",
+                        "i.getBar().".length(),
+                        model,
+                        8,
+                        9,
+                        8,
+                        16);
+                assertLocation(
+                        context,
+                        use,
+                        "Foo::getBar",
+                        0,
+                        model,
+                        1,
+                        6,
+                        1,
+                        9);
+                assertLocation(
+                        context,
+                        use,
+                        "Foo::getBar",
+                        "Foo::".length(),
+                        model,
+                        3,
+                        6,
+                        3,
+                        12);
+                assertLocation(
+                        context,
+                        use,
+                        "Bar::getName",
+                        0,
+                        model,
+                        7,
+                        6,
+                        7,
+                        9);
+                assertLocation(
+                        context,
+                        use,
+                        "Bar::getName",
+                        "Bar::".length(),
+                        model,
+                        8,
+                        9,
+                        8,
+                        16);
+                assertLocation(
+                        context,
+                        use,
+                        "bar.getCode()",
+                        "bar.".length(),
+                        model,
+                        11,
+                        9,
+                        11,
+                        16);
+            } finally {
+                initialCompile.close();
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesInterfaceCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-interface-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var api = pkg.resolve("InterfaceApi.java");
+            Files.writeString(
+                    api,
+                    "package com.example.demo;\n"
+                            + "interface ParentApi {\n"
+                            + "  default String inheritedDefault() {\n"
+                            + "    return \"parent\";\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "@FunctionalInterface\n"
+                            + "interface FormatterApi {\n"
+                            + "  String format(String input);\n"
+                            + "}\n"
+                            + "interface OrderApi extends ParentApi {\n"
+                            + "  String PREFIX = \"order\";\n"
+                            + "  String describe(String id);\n"
+                            + "  default String defaultLabel() {\n"
+                            + "    return PREFIX;\n"
+                            + "  }\n"
+                            + "  static String staticLabel() {\n"
+                            + "    return PREFIX;\n"
+                            + "  }\n"
+                            + "}\n");
+            var impl = pkg.resolve("DefaultOrderApi.java");
+            Files.writeString(
+                    impl,
+                    "package com.example.demo;\n"
+                            + "class DefaultOrderApi implements OrderApi {\n"
+                            + "  public String describe(String id) {\n"
+                            + "    return id;\n"
+                            + "  }\n"
+                            + "  String localOnly() {\n"
+                            + "    return \"local\";\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("InterfaceUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "class InterfaceUse {\n"
+                            + "  void test(OrderApi api, DefaultOrderApi concrete) {\n"
+                            + "    api.describe(\"42\");\n"
+                            + "    api.defaultLabel();\n"
+                            + "    api.inheritedDefault();\n"
+                            + "    OrderApi.staticLabel();\n"
+                            + "    String prefix = OrderApi.PREFIX;\n"
+                            + "    concrete.describe(\"42\");\n"
+                            + "    concrete.localOnly();\n"
+                            + "    FormatterApi formatter = value -> value.trim();\n"
+                            + "    formatter.format(\" x \");\n"
+                            + "  }\n"
+                            + "}\n");
+
+            FileStore.reset();
+            FileStore.setWorkspaceRoots(Set.of(workspace));
+            var infer = new InferConfig(workspace);
+            var compiler =
+                    new JavaCompilerService(
+                            new LinkedHashSet<Path>(infer.classPath()),
+                            infer.buildDocPath(),
+                            java.util.Collections.emptySet(),
+                            java.util.Collections.emptySet());
+
+            var initialCompile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+            try {
+                var context =
+                        new NavigationContext(
+                                compiler,
+                                new TypeIndexRouter(
+                                        WorkspaceTypeIndex.from(initialCompile),
+                                        new ExternalBinaryTypeIndex(compiler)));
+
+                assertLocation(context, use, "OrderApi api", 0, api, 10, 10, 10, 18);
+                assertLocation(context, use, "DefaultOrderApi concrete", 0, impl, 1, 6, 1, 21);
+                assertLocation(
+                        context,
+                        use,
+                        "api.describe",
+                        "api.".length(),
+                        api,
+                        12,
+                        9,
+                        12,
+                        17);
+                assertLocation(
+                        context,
+                        use,
+                        "api.defaultLabel",
+                        "api.".length(),
+                        api,
+                        13,
+                        17,
+                        13,
+                        29);
+                assertLocation(
+                        context,
+                        use,
+                        "api.inheritedDefault",
+                        "api.".length(),
+                        api,
+                        2,
+                        17,
+                        2,
+                        33);
+                assertLocation(
+                        context,
+                        use,
+                        "OrderApi.staticLabel",
+                        "OrderApi.".length(),
+                        api,
+                        16,
+                        16,
+                        16,
+                        27);
+                assertLocation(
+                        context,
+                        use,
+                        "OrderApi.PREFIX",
+                        "OrderApi.".length(),
+                        api,
+                        11,
+                        9,
+                        11,
+                        15);
+                assertLocation(
+                        context,
+                        use,
+                        "concrete.describe",
+                        "concrete.".length(),
+                        impl,
+                        2,
+                        16,
+                        2,
+                        24);
+                assertLocation(
+                        context,
+                        use,
+                        "concrete.localOnly",
+                        "concrete.".length(),
+                        impl,
+                        5,
+                        9,
+                        5,
+                        18);
+                assertLocation(context, use, "FormatterApi formatter", 0, api, 7, 10, 7, 22);
+                assertLocation(
+                        context,
+                        use,
+                        "formatter.format",
+                        "formatter.".length(),
+                        api,
+                        8,
+                        9,
+                        8,
+                        15);
+            } finally {
+                initialCompile.close();
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesRecordCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-record-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var recordFile = pkg.resolve("PersonRecord.java");
+            Files.writeString(
+                    recordFile,
+                    "package com.example.demo;\n"
+                            + "record PersonRecord(String componentName, int age) {\n"
+                            + "  PersonRecord {\n"
+                            + "    componentName = componentName.trim();\n"
+                            + "  }\n"
+                            + "  PersonRecord(String componentName) {\n"
+                            + "    this(componentName, 0);\n"
+                            + "  }\n"
+                            + "  String label() {\n"
+                            + "    return componentName;\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("RecordUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "class RecordUse {\n"
+                            + "  void test() {\n"
+                            + "    PersonRecord person = new PersonRecord(\"Ada\", 36);\n"
+                            + "    var other = new PersonRecord(\"Grace\");\n"
+                            + "    person.componentName();\n"
+                            + "    person.label();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            try (var flow = compilerFlowContext(workspace)) {
+                var context = flow.navigation();
+                assertLocationAtNeedle(context, use, "PersonRecord person", 0, recordFile, "PersonRecord");
+                assertLocationAtNeedle(
+                        context,
+                        use,
+                        "new PersonRecord(\"Ada\", 36)",
+                        "new ".length(),
+                        recordFile,
+                        "PersonRecord {",
+                        0,
+                        "PersonRecord");
+                assertLocationAtNeedle(
+                        context,
+                        use,
+                        "new PersonRecord(\"Grace\")",
+                        "new ".length(),
+                        recordFile,
+                        "PersonRecord(String componentName)",
+                        0,
+                        "PersonRecord");
+                assertLocationAtNeedle(
+                        context,
+                        use,
+                        "person.componentName()",
+                        "person.".length(),
+                        recordFile,
+                        "componentName, int age",
+                        0,
+                        "componentName");
+                assertLocationAtNeedle(context, use, "person.label()", "person.".length(), recordFile, "label");
+                assertLocationAtNeedle(
+                        context,
+                        recordFile,
+                        "return componentName;",
+                        "return ".length(),
+                        recordFile,
+                        "componentName, int age",
+                        0,
+                        "componentName");
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesAnnotationAndImportCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-annotation-import-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var route = pkg.resolve("Route.java");
+            Files.writeString(
+                    route,
+                    "package com.example.demo;\n"
+                            + "@interface Route {\n"
+                            + "  String value();\n"
+                            + "  String method() default \"GET\";\n"
+                            + "}\n");
+            var tools = pkg.resolve("ImportTargets.java");
+            Files.writeString(
+                    tools,
+                    "package com.example.demo;\n"
+                            + "class ImportedType {}\n"
+                            + "class StaticTools {\n"
+                            + "  static final String VALUE = \"value\";\n"
+                            + "  static String helper() {\n"
+                            + "    return VALUE;\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("AnnotationImportUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "import com.example.demo.ImportedType;\n"
+                            + "import static com.example.demo.StaticTools.VALUE;\n"
+                            + "import static com.example.demo.StaticTools.helper;\n"
+                            + "@Route(value = \"/orders\", method = \"POST\")\n"
+                            + "class AnnotationImportUse {\n"
+                            + "  ImportedType imported;\n"
+                            + "  void test() {\n"
+                            + "    helper();\n"
+                            + "    String value = VALUE;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            try (var flow = compilerFlowContext(workspace)) {
+                var context = flow.navigation();
+                assertLocationAtNeedle(context, use, "@Route", 1, route, "Route");
+                assertLocationAtNeedle(context, use, "value = \"/orders\"", 0, route, "value");
+                assertLocationAtNeedle(context, use, "method = \"POST\"", 0, route, "method");
+                assertLocationAtNeedle(context, use, "ImportedType imported", 0, tools, "ImportedType");
+                assertLocationAtNeedle(context, use, "helper();", 0, tools, "helper");
+                assertLocationAtNeedle(context, use, "String value = VALUE;", "String value = ".length(), tools, "VALUE");
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesThisSuperLocalAndAnonymousCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-this-super-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("ThisSuperUse.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "interface Task {\n"
+                            + "  void run();\n"
+                            + "  default String helper() {\n"
+                            + "    return \"help\";\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class ParentThing {\n"
+                            + "  String parentField;\n"
+                            + "  String parentMethod() {\n"
+                            + "    return parentField;\n"
+                            + "  }\n"
+                            + "}\n"
+                            + "class ChildThing extends ParentThing {\n"
+                            + "  String childField;\n"
+                            + "  String childMethod() {\n"
+                            + "    return childField;\n"
+                            + "  }\n"
+                            + "  void test() {\n"
+                            + "    this.childField = \"child\";\n"
+                            + "    this.childMethod();\n"
+                            + "    super.parentField = \"parent\";\n"
+                            + "    super.parentMethod();\n"
+                            + "    Task task = new Task() {\n"
+                            + "      public void run() {\n"
+                            + "        helper();\n"
+                            + "      }\n"
+                            + "    };\n"
+                            + "    class LocalThing {\n"
+                            + "      String localName() {\n"
+                            + "        return \"local\";\n"
+                            + "      }\n"
+                            + "    }\n"
+                            + "    var local = new LocalThing();\n"
+                            + "    local.localName();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            try (var flow = compilerFlowContext(workspace)) {
+                var context = flow.navigation();
+                assertLocationAtNeedle(context, file, "this.childField", "this.".length(), file, "childField");
+                assertLocationAtNeedle(context, file, "this.childMethod", "this.".length(), file, "childMethod");
+                assertLocationAtNeedle(context, file, "super.parentField", "super.".length(), file, "parentField");
+                assertLocationAtNeedle(context, file, "super.parentMethod", "super.".length(), file, "parentMethod");
+                assertLocationAtNeedle(context, file, "new Task()", "new ".length(), file, "Task");
+                assertLocationAtNeedle(context, file, "helper();", 0, file, "helper");
+                assertLocationAtNeedle(context, file, "new LocalThing()", "new ".length(), file, "LocalThing");
+                assertLocationAtNeedle(context, file, "local.localName", "local.".length(), file, "localName");
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesConstructorOverloadCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-constructor-overload-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("ConstructorOverloadUse.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "class OverloadedThing {\n"
+                            + "  OverloadedThing() {}\n"
+                            + "  OverloadedThing(String name) {}\n"
+                            + "  OverloadedThing(int size) {}\n"
+                            + "}\n"
+                            + "class ConstructorOverloadUse {\n"
+                            + "  void test() {\n"
+                            + "    new OverloadedThing();\n"
+                            + "    new OverloadedThing(\"name\");\n"
+                            + "    new OverloadedThing(3);\n"
+                            + "  }\n"
+                            + "}\n");
+
+            try (var flow = compilerFlowContext(workspace)) {
+                var context = flow.navigation();
+                assertLocationAtNeedle(
+                        context, file, "new OverloadedThing();", "new ".length(), file, "OverloadedThing()",
+                        0, "OverloadedThing");
+                assertLocationAtNeedle(
+                        context,
+                        file,
+                        "new OverloadedThing(\"name\")",
+                        "new ".length(),
+                        file,
+                        "OverloadedThing(String name)",
+                        0,
+                        "OverloadedThing");
+                assertLocationAtNeedle(
+                        context,
+                        file,
+                        "new OverloadedThing(3)",
+                        "new ".length(),
+                        file,
+                        "OverloadedThing(int size)",
+                        0,
+                        "OverloadedThing");
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupResolvesGenericsAndPackagePrivateCasesAfterFullCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-generics-package-private-compiler");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var hidden = pkg.resolve("HiddenType.java");
+            Files.writeString(
+                    hidden,
+                    "package com.example.demo;\n"
+                            + "class HiddenType {\n"
+                            + "  String reveal() {\n"
+                            + "    return \"hidden\";\n"
+                            + "  }\n"
+                            + "}\n");
+            var box = pkg.resolve("GenericBox.java");
+            Files.writeString(
+                    box,
+                    "package com.example.demo;\n"
+                            + "class GenericBox<T extends HiddenType> {\n"
+                            + "  private T value;\n"
+                            + "  T get() {\n"
+                            + "    return value;\n"
+                            + "  }\n"
+                            + "}\n");
+            var use = pkg.resolve("GenericUse.java");
+            Files.writeString(
+                    use,
+                    "package com.example.demo;\n"
+                            + "class GenericUse {\n"
+                            + "  void test(GenericBox<HiddenType> box, HiddenType direct) {\n"
+                            + "    box.get().reveal();\n"
+                            + "    direct.reveal();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            try (var flow = compilerFlowContext(workspace)) {
+                var context = flow.navigation();
+                assertLocationAtNeedle(context, use, "GenericBox<HiddenType>", 0, box, "GenericBox");
+                assertLocationAtNeedle(
+                        context,
+                        use,
+                        "GenericBox<HiddenType>",
+                        "GenericBox<".length(),
+                        hidden,
+                        "HiddenType");
+                assertLocationAtNeedle(
+                        context,
+                        box,
+                        "T extends HiddenType",
+                        "T extends ".length(),
+                        hidden,
+                        "HiddenType");
+                assertLocationAtNeedle(context, use, "box.get()", "box.".length(), box, "get");
+                assertLocationAtNeedle(
+                        context,
+                        use,
+                        "box.get().reveal()",
+                        "box.get().".length(),
+                        hidden,
+                        "reveal");
+                assertLocationAtNeedle(
+                        context,
+                        use,
+                        "direct.reveal()",
+                        "direct.".length(),
+                        hidden,
+                        "reveal");
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void compilerLookupAllowsRepeatedDefinitionsAfterFastCompile() throws Exception {
+        var workspace = Files.createTempDirectory("jls-definition-fast-cache");
+        try {
+            var pkg = workspace.resolve("src/com/example/demo");
+            Files.createDirectories(pkg);
+
+            var file = pkg.resolve("CacheUse.java");
+            Files.writeString(
+                    file,
+                    "package com.example.demo;\n"
+                            + "class CacheUse {\n"
+                            + "  void test() {\n"
+                            + "    String value = \"cached\";\n"
+                            + "    value.isBlank();\n"
+                            + "    value.length();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            try (var flow = compilerFlowContext(workspace)) {
+                var context = flow.navigation();
+
+                assertLocationAtNeedle(
+                        context,
+                        file,
+                        "value.isBlank()",
+                        0,
+                        file,
+                        "String value",
+                        "String ".length(),
+                        "value");
+                assertLocationAtNeedle(
+                        context,
+                        file,
+                        "value.length()",
+                        0,
+                        file,
+                        "String value",
+                        "String ".length(),
+                        "value");
+                assertEquals("cache_hit", context.compiler.lastCompileTelemetry().path());
+                assertEquals(-1, context.compiler.lastCompileTelemetry().parseMs());
+            }
+        } finally {
+            FileStore.reset();
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void resolvesMemberSelectFromAnnotatedLocalReceiver() throws Exception {
         var workspace = Files.createTempDirectory("jls-definition-annotated-local-receiver");
         try {
@@ -839,6 +2123,81 @@ public class DefinitionProviderFlowTest {
         return results;
     }
 
+    private void assertLocation(
+            NavigationContext context,
+            Path path,
+            String needle,
+            int extraOffset,
+            Path expectedFile,
+            int startLine,
+            int startCharacter,
+            int endLine,
+            int endCharacter)
+            throws Exception {
+        var cursor = cursor(path, needle, extraOffset);
+        var locations =
+                new DefinitionProvider(
+                                context.compiler, context.index, path, cursor.line, cursor.character)
+                        .find();
+        assertEquals(1, locations.size());
+        assertEquals(expectedFile.toUri(), locations.get(0).uri);
+        assertEquals(startLine, locations.get(0).range.start.line);
+        assertEquals(startCharacter, locations.get(0).range.start.character);
+        assertEquals(endLine, locations.get(0).range.end.line);
+        assertEquals(endCharacter, locations.get(0).range.end.character);
+    }
+
+    private void assertLocationAtNeedle(
+            NavigationContext context,
+            Path path,
+            String needle,
+            int extraOffset,
+            Path expectedFile,
+            String expectedNeedle)
+            throws Exception {
+        assertLocationAtNeedle(context, path, needle, extraOffset, expectedFile, expectedNeedle, 0, expectedNeedle);
+    }
+
+    private void assertLocationAtNeedle(
+            NavigationContext context,
+            Path path,
+            String needle,
+            int extraOffset,
+            Path expectedFile,
+            String expectedContainerNeedle,
+            int expectedSymbolOffset,
+            String expectedSymbol)
+            throws Exception {
+        var cursor = cursor(path, needle, extraOffset);
+        var locations =
+                new DefinitionProvider(
+                                context.compiler, context.index, path, cursor.line, cursor.character)
+                        .find();
+        assertEquals(1, locations.size());
+        assertEquals(expectedFile.toUri(), locations.get(0).uri);
+
+        var expectedSource = Files.readString(expectedFile);
+        var expectedOffset = expectedSource.indexOf(expectedContainerNeedle);
+        if (expectedOffset < 0) {
+            throw new AssertionError("Missing expected needle: " + expectedContainerNeedle);
+        }
+        expectedOffset += expectedSymbolOffset;
+        var startLine = 0;
+        var startCharacter = 0;
+        for (var i = 0; i < expectedOffset; i++) {
+            if (expectedSource.charAt(i) == '\n') {
+                startLine++;
+                startCharacter = 0;
+            } else {
+                startCharacter++;
+            }
+        }
+        assertEquals(startLine, locations.get(0).range.start.line);
+        assertEquals(startCharacter, locations.get(0).range.start.character);
+        assertEquals(startLine, locations.get(0).range.end.line);
+        assertEquals(startCharacter + expectedSymbol.length(), locations.get(0).range.end.character);
+    }
+
     private Cursor cursor(Path file, String needle, int extraOffset) throws IOException {
         var source = Files.readString(file);
         var index = source.indexOf(needle);
@@ -880,7 +2239,7 @@ public class DefinitionProviderFlowTest {
                         java.util.Collections.emptySet(),
                         java.util.Collections.emptySet());
         TypeIndexRouter index;
-        try (var task = compiler.compile(FileStore.all().toArray(Path[]::new))) {
+        try (var task = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new))) {
             index =
                     new TypeIndexRouter(
                             WorkspaceTypeIndex.from(task),
@@ -889,9 +2248,36 @@ public class DefinitionProviderFlowTest {
         return new NavigationContext(compiler, index);
     }
 
+    private static CompilerFlowContext compilerFlowContext(Path workspaceRoot) {
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspaceRoot));
+        var infer = new InferConfig(workspaceRoot);
+        var compiler =
+                new JavaCompilerService(
+                        new LinkedHashSet<Path>(infer.classPath()),
+                        infer.buildDocPath(),
+                        java.util.Collections.emptySet(),
+                        java.util.Collections.emptySet());
+        var compile = compiler.compileFastWithProcessors(FileStore.all().toArray(Path[]::new));
+        var index =
+                new TypeIndexRouter(
+                        WorkspaceTypeIndex.from(compile),
+                        new ExternalBinaryTypeIndex(compiler));
+        return new CompilerFlowContext(new NavigationContext(compiler, index), compile);
+    }
+
     private record Cursor(int line, int character) {}
 
     private record NavigationContext(JavaCompilerService compiler, TypeIndexRouter index) {}
+
+    private record CompilerFlowContext(NavigationContext navigation, CompileTask compile)
+            implements AutoCloseable {
+        @Override
+        public void close() {
+            compile.close();
+            FileStore.reset();
+        }
+    }
 
     private static class TestLogCapture extends Handler {
         private final List<String> lines = new ArrayList<>();

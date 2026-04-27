@@ -95,13 +95,13 @@ class JavaLanguageServer extends LanguageServer {
     private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
 
     // Three compilers, each owned by exactly one thread/task:
-    //   interactiveCompiler — LSP main thread (definition, hover, completion, references, …)
-    //   backgroundCompiler  — pull-diagnostics only (lint/compileDiagnostics)
+    //   interactiveCompiler — LSP main thread (definition, hover, completion, references …)
     //   indexCompiler       — completion-index builds only (runRefresh / CompletionIndexScheduler)
+    //   diagnosticsCompiler — pull-diagnostics only (textDocument/diagnostic), never retains a CompileBatch
     // No two of these are ever used concurrently. JavaCompilerService is not thread-safe.
     private JavaCompilerService interactiveCompiler;
-    private JavaCompilerService backgroundCompiler;
     private JavaCompilerService indexCompiler;
+    private JavaCompilerService diagnosticsCompiler;
 
     private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
@@ -161,9 +161,6 @@ class JavaLanguageServer extends LanguageServer {
         copySettingIfPresent(source, snapshot, "extraCompilerArgs");
         copySettingIfPresent(source, snapshot, "docPath");
         copySettingIfPresent(source, snapshot, "addExports");
-        copySettingIfPresent(source, snapshot, "lombokEnabled");
-        copySettingIfPresent(source, snapshot, "lombok.enabled");
-        copySettingIfPresent(source, snapshot, "lombok");
         return snapshot;
     }
 
@@ -223,34 +220,6 @@ class JavaLanguageServer extends LanguageServer {
         } else {
             completionIndexScheduler.scheduleRefresh(
                     active, "compilerRecreated", 0, CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP);
-        }
-    }
-
-    void lint(Collection<Path> files) {
-        var javaFiles = filterJavaFiles(files);
-        if (javaFiles.isEmpty()) {
-            return;
-        }
-        completionIndexScheduler.cancel("foreground");
-        getOrCreateCompiler();
-        CompileTask task = null;
-        try {
-            task = backgroundCompiler.compileDiagnostics(
-                    javaFiles.stream().map(SourceFileObject::new).toList());
-            var requestedUris = new HashSet<java.net.URI>();
-            for (var file : javaFiles) {
-                requestedUris.add(file.toUri());
-            }
-            var report = new ErrorProvider(task).errors(requestedUris);
-            for (var params : report.diagnostics()) {
-                client.publishDiagnostics(params);
-            }
-        } finally {
-            if (task != null) task.close();
-        }
-        if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
-                && !FileStore.activeDocuments().isEmpty()) {
-            completionIndexScheduler.scheduleActiveBootstrapIfNeeded("lintBootstrap");
         }
     }
 
@@ -663,7 +632,6 @@ class JavaLanguageServer extends LanguageServer {
         var classPath = classPath();
         var userExtraArgs = extraCompilerArgs();
         var addExports = addExports();
-        var lombokEnabled = lombokEnabled();
         var compilerArgs = selectCompilerArgs(userExtraArgs, externalDependencies);
         var extraArgs = compilerArgs.args();
         var settingsLoaded = Instant.now();
@@ -700,7 +668,6 @@ class JavaLanguageServer extends LanguageServer {
         }
         var inferenceFinished = Instant.now();
         endWorkDoneProgress(progressToken, "Configured javac");
-        LOG.info(String.format("[perf] lombok_setting enabled=%s", lombokEnabled));
         LOG.info(
                 String.format(
                         "[perf] compiler_args source=%s count=%d mixed_modules=%s",
@@ -709,22 +676,22 @@ class JavaLanguageServer extends LanguageServer {
                         compilerArgs.mixedModules()));
         LOG.info(String.format("[perf] compiler_args_values args=%s", extraArgs));
         var shared = CompilerSharedResources.from(classPath, resolvedDocPath, addExports, extraArgs);
-        interactiveCompiler = new JavaCompilerService(shared, lombokEnabled, "interactive");
-        var diagnosticsStarted = Instant.now();
-        backgroundCompiler = new JavaCompilerService(shared, lombokEnabled, "background");
+        interactiveCompiler = new JavaCompilerService(shared, "interactive");
         var indexStarted = Instant.now();
-        indexCompiler = new JavaCompilerService(shared, lombokEnabled, "index");
+        indexCompiler = new JavaCompilerService(shared, "index");
+        var diagnosticsStarted = Instant.now();
+        diagnosticsCompiler = new JavaCompilerService(shared, "diagnostics");
         LOG.info(String.format(
-                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms diagnostics=%dms index=%dms total=%dms",
+                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms index=%dms diagnostics=%dms total=%dms",
                 classPath.size(),
                 resolvedDocPath.size(),
                 extraArgs.size(),
                 addExports.size(),
                 Duration.between(started, settingsLoaded).toMillis(),
                 Duration.between(settingsLoaded, inferenceFinished).toMillis(),
-                Duration.between(inferenceFinished, diagnosticsStarted).toMillis(),
-                Duration.between(diagnosticsStarted, indexStarted).toMillis(),
-                Duration.between(indexStarted, Instant.now()).toMillis(),
+                Duration.between(inferenceFinished, indexStarted).toMillis(),
+                Duration.between(indexStarted, diagnosticsStarted).toMillis(),
+                Duration.between(diagnosticsStarted, Instant.now()).toMillis(),
                 Duration.between(started, Instant.now()).toMillis()));
     }
 
@@ -761,25 +728,25 @@ class JavaLanguageServer extends LanguageServer {
 
     private InferConfig.MavenCompilerArgs selectCompilerArgs(List<String> userExtraArgs, Set<String> externalDependencies) {
         if (hasExplicitJavaLevelOverride(userExtraArgs)) {
-            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "user", false);
+            return new InferConfig.MavenCompilerArgs(userExtraArgs, "user", false);
         }
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (!Files.exists(pomXml)) {
-            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "none", false);
+            return new InferConfig.MavenCompilerArgs(userExtraArgs, "none", false);
         }
         var inferred = new InferConfig(workspaceRoot, externalDependencies).compilerArgs();
         if (inferred.mixedModules()) {
             warnUserOnce(
                     "maven_mixed_release_fallback",
                     "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.");
-            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "fallback_mixed_modules", true);
+            return new InferConfig.MavenCompilerArgs(userExtraArgs, "fallback_mixed_modules", true);
         }
         if (inferred.args().isEmpty()) {
-            return new InferConfig.MavenCompilerArgs(List.copyOf(userExtraArgs), "none", false);
+            return new InferConfig.MavenCompilerArgs(userExtraArgs, "none", false);
         }
         var merged = new ArrayList<String>(userExtraArgs);
         merged.addAll(inferred.args());
-        return new InferConfig.MavenCompilerArgs(List.copyOf(merged), inferred.source(), false);
+        return new InferConfig.MavenCompilerArgs(merged, inferred.source(), false);
     }
 
     private static boolean hasExplicitJavaLevelOverride(List<String> extraArgs) {
@@ -821,22 +788,6 @@ class JavaLanguageServer extends LanguageServer {
             strings.add(each.getAsString());
         }
         return strings;
-    }
-
-    private boolean lombokEnabled() {
-        if (settings.has("lombokEnabled")) {
-            return settings.get("lombokEnabled").getAsBoolean();
-        }
-        if (settings.has("lombok.enabled")) {
-            return settings.get("lombok.enabled").getAsBoolean();
-        }
-        if (settings.has("lombok") && settings.get("lombok").isJsonObject()) {
-            var lombok = settings.getAsJsonObject("lombok");
-            if (lombok.has("enabled")) {
-                return lombok.get("enabled").getAsBoolean();
-            }
-        }
-        return true;
     }
 
     private static boolean supportsWorkDoneProgress(JsonElement capabilities) {
@@ -1169,7 +1120,24 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         ensureTypeIndexReady("definitionBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
-        var found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
+        List<Location> found;
+        try {
+            found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
+        } catch (ReusableCompiler.TaskCreationException e) {
+            LOG.warning(
+                    String.format(
+                            "[compiler] definition_retry_after_task_create_failure file=%s reason=%s",
+                            file.getFileName(), e.getMessage()));
+            try {
+                found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
+            } catch (ReusableCompiler.TaskCreationException retryFailure) {
+                LOG.warning(
+                        String.format(
+                                "[compiler] definition_failed_after_task_create_retry file=%s reason=%s",
+                                file.getFileName(), retryFailure.getMessage()));
+                return Optional.empty();
+            }
+        }
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -1373,7 +1341,7 @@ class JavaLanguageServer extends LanguageServer {
         var started = Instant.now();
         CompileTask task = null;
         try {
-            task = backgroundCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
+            task = diagnosticsCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
             var requestedUris = Set.of(fileUri);
             var report = new ErrorProvider(task).errors(requestedUris);
             var diagnostics = report.diagnostics().stream()
@@ -1386,13 +1354,22 @@ class JavaLanguageServer extends LanguageServer {
                     diagnostics.size(),
                     Duration.between(started, Instant.now()).toMillis()));
             return new DocumentDiagnosticReport(diagnostics);
-        } catch (RuntimeException | AssertionError e) {
+        } catch (ReusableCompiler.TaskCreationException e) {
             LOG.fine(String.format(
                     "[perf] pull_diagnostics_skip file=%s reason=%s",
                     file.getFileName(), e.getMessage()));
             return new DocumentDiagnosticReport(List.of());
         } finally {
             if (task != null) task.close();
+        }
+    }
+
+    /** Test helper: trigger diagnostics for a set of files synchronously. */
+    void lint(Collection<Path> files) {
+        for (var file : files) {
+            var params = new DocumentDiagnosticParams();
+            params.textDocument = new TextDocumentIdentifier(file.toUri());
+            textDocumentDiagnostic(params);
         }
     }
 
@@ -1659,7 +1636,7 @@ class JavaLanguageServer extends LanguageServer {
                             mode.name().toLowerCase(),
                             Duration.between(started, indexStarted).toMillis(),
                             totalMs));
-                } catch (Exception e) {
+                } catch (ReusableCompiler.TaskCreationException e) {
                     endWorkDoneProgress(bootstrapProgressToken, "Index failed");
                     LOG.warning(
                             String.format(
