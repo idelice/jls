@@ -668,19 +668,16 @@ class JavaLanguageServer extends LanguageServer {
         }
         var inferenceFinished = Instant.now();
         endWorkDoneProgress(progressToken, "Configured javac");
-        LOG.info(
-                String.format(
-                        "[perf] compiler_args source=%s count=%d mixed_modules=%s",
-                        compilerArgs.source(),
-                        extraArgs.size(),
-                        compilerArgs.mixedModules()));
-        LOG.info(String.format("[perf] compiler_args_values args=%s", extraArgs));
+
         var shared = CompilerSharedResources.from(classPath, resolvedDocPath, addExports, extraArgs);
         interactiveCompiler = new JavaCompilerService(shared, "interactive");
+
         var indexStarted = Instant.now();
         indexCompiler = new JavaCompilerService(shared, "index");
+
         var diagnosticsStarted = Instant.now();
         diagnosticsCompiler = new JavaCompilerService(shared, "diagnostics");
+
         LOG.info(String.format(
                 "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms index=%dms diagnostics=%dms total=%dms",
                 classPath.size(),

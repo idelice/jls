@@ -930,6 +930,32 @@ class JavaCompilerService implements CompilerProvider {
         return classPath;
     }
 
+    private volatile org.javacs.completion.ExternalBinaryDecompiler decompiler;
+
+    private org.javacs.completion.ExternalBinaryDecompiler decompiler() {
+        if (decompiler == null) {
+            synchronized (this) {
+                if (decompiler == null) {
+                    var fingerprint =
+                            Integer.toHexString(
+                                    classPath.stream()
+                                            .map(p -> p.toAbsolutePath().normalize().toString())
+                                            .sorted()
+                                            .collect(java.util.stream.Collectors.joining("|"))
+                                            .hashCode());
+                    decompiler = new org.javacs.completion.ExternalBinaryDecompiler(
+                            classPath, fingerprint, getClass().getClassLoader());
+                }
+            }
+        }
+        return decompiler;
+    }
+
+    @Override
+    public Optional<Path> decompileClass(String qualifiedName) {
+        return decompiler().decompileSourcePath(qualifiedName);
+    }
+
     @Override
     public List<String> packagePrivateTopLevelTypes(String packageName) {
         return List.of("TODO");

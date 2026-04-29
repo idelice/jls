@@ -58,5 +58,16 @@ public interface CompilerProvider {
         return false;
     }
 
+    /**
+     * Decompile the top-level source file that contains {@code qualifiedName} using the bundled
+     * Vineflower decompiler and return the path to the generated {@code .java} file.
+     *
+     * <p>The result is cached on disk by fingerprint so repeated calls are cheap. Returns empty
+     * when the type cannot be located on the classpath or decompilation fails.
+     */
+    default Optional<java.nio.file.Path> decompileClass(String qualifiedName) {
+        return Optional.empty();
+    }
+
     Path NOT_FOUND = Paths.get("");
 }

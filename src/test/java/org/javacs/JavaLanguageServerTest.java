@@ -4374,16 +4374,18 @@ public class JavaLanguageServerTest {
         t2.start();
         start.countDown();
 
-        Assert.assertTrue("both compile tasks should complete", done.await(5, TimeUnit.SECONDS));
-        if (failure.get() != null) {
-            throw new AssertionError("concurrent compile call failed", failure.get());
+        try {
+            Assert.assertTrue("both compile tasks should complete", done.await(5, TimeUnit.SECONDS));
+            if (failure.get() != null) {
+                throw new AssertionError("concurrent compile call failed", failure.get());
+            }
+            Assert.assertEquals(
+                    "compileAndPublish should not overlap diagnostics compiler usage",
+                    1,
+                    compiler.maxConcurrentCompiles());
+        } finally {
+            deleteRecursively(workspace);
         }
-        Assert.assertEquals(
-                "compileAndPublish should not overlap diagnostics compiler usage",
-                1,
-                compiler.maxConcurrentCompiles());
-
-        deleteRecursively(workspace);
     }
 
     @Test

@@ -429,6 +429,35 @@ public class DefinitionProviderTest {
     }
 
     @Test
+    public void externalBinaryMethodNavigatesToDecompiledSource() throws Exception {
+        // Uses the maven-project fixture (Gson 2.8.9 on classpath).
+        var compiler = LanguageServerFixture.getCompilerProvider();
+        var use =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT
+                        .resolve("src/org/javacs/example/GotoExternalBinaryMethod.java");
+        var pos = cursor(use, "toJson");
+        var locations =
+                new DefinitionProvider(compiler, TypeIndexRouter.EMPTY, use, pos.line, pos.character)
+                        .find();
+        assertThat("expected non-empty definition for external binary method", locations, not(empty()));
+    }
+
+    @Test
+    public void jdkMethodNavigatesToDecompiledSource() throws Exception {
+        // Uses the maven-project fixture. Navigates to a JDK platform class method (java.util.concurrent.Executors)
+        // whose bytecode lives in the JDK module system (jrt:/), not on the Maven classpath.
+        var compiler = LanguageServerFixture.getCompilerProvider();
+        var use =
+                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT
+                        .resolve("src/org/javacs/example/GotoJdkMethod.java");
+        var pos = cursor(use, "newSingleThreadExecutor");
+        var locations =
+                new DefinitionProvider(compiler, TypeIndexRouter.EMPTY, use, pos.line, pos.character)
+                        .find();
+        assertThat("expected non-empty definition for JDK platform method", locations, not(empty()));
+    }
+
+    @Test
     public void lombokGetterNavigatesToBackingField() throws Exception {
         // Sets up FileStore with the maven-project workspace (which has Lombok on classpath).
         var compiler = LanguageServerFixture.getCompilerProvider();
