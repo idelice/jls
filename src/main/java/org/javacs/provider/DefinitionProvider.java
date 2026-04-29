@@ -22,6 +22,8 @@ import org.javacs.index.IndexedType;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.NavigationSymbolSupport;
+import org.javacs.navigation.SymbolIdentity;
+import org.javacs.navigation.SymbolIdentityResolver;
 import org.javacs.resolve.ParseTypeResolver;
 import org.javacs.resolve.TypeNames;
 
@@ -39,7 +41,7 @@ import org.javacs.resolve.TypeNames;
  * declarations first, then identifier uses, member selects, member references, constructors, and
  * finally unsupported nodes.
  */
-public class DefinitionProvider {
+public class DefinitionProvider implements SymbolIdentityResolver {
     private record TypeSource(ParseTask task, TreePath classPath) {}
     private record FieldTarget(TreePath path, String name) {}
     private record SelectedMethod(
@@ -88,6 +90,34 @@ public class DefinitionProvider {
 
     public List<Location> find() {
         return resolveSymbol().locations();
+    }
+
+    @Override
+    public SymbolIdentity resolveTarget() {
+        return toSymbolIdentity(resolveSymbol());
+    }
+
+    @Override
+    public SymbolIdentity resolveOccurrence(ParseTask parse, TreePath path) {
+        var cursor = Trees.instance(parse.task()).getSourcePositions()
+                        .getStartPosition(parse.root(), path.getLeaf()) + 1;
+        return toSymbolIdentity(resolve(parse, path,
+                new ParseTypeResolver(parse, compiler, typeIndexRouter, cursor)));
+    }
+
+    private static SymbolIdentity toSymbolIdentity(ResolvedSymbol resolved) {
+        if (resolved == null) {
+            return SymbolIdentity.unsupported(null);
+        }
+        return new SymbolIdentity(
+                resolved.qualifiedType(),
+                resolved.memberName(),
+                resolved.method(),
+                resolved.indexMember(),
+                resolved.simpleName(),
+                resolved.locations().isEmpty()
+                        ? Optional.empty()
+                        : Optional.of(resolved.locations().get(0)));
     }
 
     public ResolvedSymbol resolveSymbol() {

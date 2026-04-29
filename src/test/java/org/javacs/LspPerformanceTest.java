@@ -23,6 +23,7 @@ import java.util.stream.Collectors;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.provider.DefinitionProvider;
 import org.javacs.provider.ReferenceProvider;
 import org.javacs.lsp.DidChangeTextDocumentParams;
 import org.javacs.lsp.DidOpenTextDocumentParams;
@@ -109,7 +110,8 @@ public class LspPerformanceTest {
         var file = FindResource.path("org/javacs/example/GotoOther.java");
         CompileBatch.resetPerfCounters();
 
-        var result = new ReferenceProvider(referenceContext.compiler, referenceContext.index, file, 6, 30).find();
+        var resolver = new DefinitionProvider(referenceContext.compiler, referenceContext.index, file, 6, 30);
+        var result = new ReferenceProvider(referenceContext.compiler, referenceContext.index, resolver, file, false).find();
         assertTrue(!result.isEmpty());
 
         var counters = CompileBatch.perfCounters();
@@ -123,8 +125,8 @@ public class LspPerformanceTest {
         var referenceContext = referenceContext(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
         CompileBatch.resetPerfCounters();
 
-        var result =
-                new ReferenceProvider(referenceContext.compiler, referenceContext.index, LOMBOK_MEMBER_FILE, 5, 25)
+        var resolver2 = new DefinitionProvider(referenceContext.compiler, referenceContext.index, LOMBOK_MEMBER_FILE, 5, 25);
+        var result = new ReferenceProvider(referenceContext.compiler, referenceContext.index, resolver2, LOMBOK_MEMBER_FILE, false)
                         .find();
         assertTrue(!result.isEmpty());
 

@@ -1150,9 +1150,10 @@ class JavaLanguageServer extends LanguageServer {
         ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
         var includeDeclaration = position.context != null && position.context.includeDeclaration;
+        var resolver = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column);
         var found =
                 new ReferenceProvider(
-                                getOrCreateCompiler(), snapshot.typeIndex(), file, line, column, includeDeclaration)
+                                getOrCreateCompiler(), snapshot.typeIndex(), resolver, file, includeDeclaration)
                         .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
