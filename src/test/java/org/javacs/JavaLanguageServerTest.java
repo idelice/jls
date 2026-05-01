@@ -1346,6 +1346,88 @@ public class JavaLanguageServerTest {
     }
 
     @Test
+    public void lombokNestedClassNameCollidesWithInterfaceNoFalseDiagnostics() throws Exception {
+        // Reproducer for: interface Foo in package A, outer @Data class in package B with a nested
+        // @Data class also named Foo (same simple name as the interface). Consumer imports both
+        // packages via wildcard and calls a getter chain through the nested Lombok type.
+        // Diagnostics should not falsely report that Lombok-generated methods do not exist.
+        var workspace = Files.createTempDirectory("jls-lombok-nested-name-collision");
+        try {
+            var contractDir = workspace.resolve("src/main/java/p/contract");
+            var modelDir = workspace.resolve("src/main/java/p/model");
+            var serviceDir = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(contractDir);
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            // Interface named "Response" in p.contract — no Lombok
+            Files.writeString(
+                    contractDir.resolve("Response.java"),
+                    "package p.contract;\n"
+                            + "public interface Response {\n"
+                            + "  String getStatus();\n"
+                            + "}\n");
+
+            // Outer @Data class with two nested @Data classes, one named "Response"
+            // (same simple name as the interface above)
+            Files.writeString(
+                    modelDir.resolve("Request.java"),
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Request {\n"
+                            + "  private Response response;\n"
+                            + "  private Detail detail;\n"
+                            + "  @lombok.Data\n"
+                            + "  public static class Response {\n"
+                            + "    private Detail detail;\n"
+                            + "    private String code;\n"
+                            + "  }\n"
+                            + "  @lombok.Data\n"
+                            + "  public static class Detail {\n"
+                            + "    private String message;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            // Consumer: wildcard imports bring in both the interface and the outer class.
+            // Getter chain goes through nested Lombok types.
+            var consumerFile = serviceDir.resolve("Consumer.java");
+            Files.writeString(
+                    consumerFile,
+                    "package p.service;\n"
+                            + "import p.contract.*;\n"
+                            + "import p.model.*;\n"
+                            + "public class Consumer {\n"
+                            + "  String use(Request req) {\n"
+                            + "    return req.getResponse().getDetail().getMessage();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+            configureLombokClasspath(server);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(open);
+
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
+                    "nested Lombok class with same name as interface should not produce false getter diagnostics; errors: "
+                            + report.items.stream()
+                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                                    .map(d -> d.message)
+                                    .toList(),
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getResponse()", "getDetail()", "getMessage()")));
+        } finally {
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
     public void completionInTestSourceResolvesMainSourceMemberChain() throws Exception {
         var workspace = Files.createTempDirectory("jls-test-source-main-member-chain");
         var logger = Logger.getLogger("main");
