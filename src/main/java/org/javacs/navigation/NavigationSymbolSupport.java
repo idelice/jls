@@ -22,7 +22,6 @@ import org.javacs.ParseTask;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.IndexedMember;
 import org.javacs.lsp.CompletionItemKind;
-import org.javacs.provider.DefinitionProvider;
 import org.javacs.resolve.ParseTypeResolver;
 import org.javacs.resolve.TypeNames;
 
@@ -40,11 +39,11 @@ public final class NavigationSymbolSupport {
     public static List<String> targetParameterTypes(
             CompilerProvider compiler,
             TypeIndexRouter completionIndex,
-            DefinitionProvider.ResolvedSymbol target) {
-        if (target.locations().isEmpty()) {
+            SymbolIdentity target) {
+        if (target.declarationLocation().isEmpty()) {
             return List.of();
         }
-        var location = target.locations().get(0);
+        var location = target.declarationLocation().get();
         if (location.uri == null || !"file".equals(location.uri.getScheme())) {
             return List.of();
         }
@@ -117,7 +116,7 @@ public final class NavigationSymbolSupport {
     }
 
     public static String methodCanonicalKey(
-            DefinitionProvider.ResolvedSymbol resolved,
+            SymbolIdentity resolved,
             ParseTask parse,
             TreePath path,
             TypeIndexRouter typeIndexRouter,
@@ -143,7 +142,7 @@ public final class NavigationSymbolSupport {
                 parameterTypes.toArray(String[]::new));
     }
 
-    public static Optional<String> fieldLogicalKey(DefinitionProvider.ResolvedSymbol symbol) {
+    public static Optional<String> fieldLogicalKey(SymbolIdentity symbol) {
         if (symbol == null || symbol.qualifiedType() == null || symbol.memberName() == null) {
             return Optional.empty();
         }
@@ -160,7 +159,7 @@ public final class NavigationSymbolSupport {
         return Optional.empty();
     }
 
-    public static String logicalKey(DefinitionProvider.ResolvedSymbol symbol) {
+    public static String logicalKey(SymbolIdentity symbol) {
         if (symbol.indexMember() != null && symbol.indexMember().logicalKey != null) {
             return symbol.indexMember().logicalKey;
         }

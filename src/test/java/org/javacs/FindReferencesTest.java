@@ -10,6 +10,7 @@ import java.util.Set;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.index.WorkspaceTypeIndex;
+import org.javacs.provider.DefinitionProvider;
 import org.javacs.provider.ReferenceProvider;
 import org.junit.Test;
 
@@ -18,7 +19,8 @@ public class FindReferencesTest {
 
     protected List<String> items(String file, int row, int column) {
         var path = FindResource.path(file);
-        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, path, row, column).find();
+        var resolver = new DefinitionProvider(REFERENCES.compiler, REFERENCES.index, path, row, column);
+        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, resolver, path, false).find();
         var strings = new ArrayList<String>();
         for (var l : locations) {
             var fileName = StringSearch.fileName(l.uri);

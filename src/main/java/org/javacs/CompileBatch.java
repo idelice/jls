@@ -16,7 +16,7 @@ import javax.tools.*;
 
 public class CompileBatch implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
-        private static final AtomicLong FULL_BATCHES = new AtomicLong();
+    private static final AtomicLong FULL_BATCHES = new AtomicLong();
     private static final AtomicLong ANALYZE_INVOCATIONS = new AtomicLong();
     private static final AtomicLong AP_ENABLED_BATCHES = new AtomicLong();
 
@@ -25,17 +25,8 @@ public class CompileBatch implements AutoCloseable {
         FULL
     }
 
-    /**
-     * Exception thrown when annotation processing fails.
-     * Indicates that compilation should be retried without AP.
-     */
-    static class APFailureException extends RuntimeException {
-        APFailureException(String message, Throwable cause) {
-            super(message, cause);
-        }
-    }
-
     final JavaCompilerService parent;
+    final ReusableCompiler.SlotContext slot;
     final ReusableCompiler.Borrow borrow;
     /** Indicates the task that requested the compilation is finished with it. */
     boolean closed;
@@ -57,13 +48,18 @@ public class CompileBatch implements AutoCloseable {
             Collection<? extends JavaFileObject> files,
             boolean allowAP,
             AnalysisMode analysisMode,
-            ReusableCompiler compiler) {
+            ReusableCompiler.SlotContext slot,
+            List<String> options) {
         this.parent = parent;
-        this.borrow = batchTask(parent, files, allowAP, analysisMode, compiler);
-        this.task = borrow.task;
-        this.trees = Trees.instance(borrow.task);
-        this.elements = borrow.task.getElements();
-        this.types = borrow.task.getTypes();
+        this.slot = slot;
+        this.task =
+                slot == null
+                        ? parent.compiler.createSingleUseTask(parent.fileManager, parent.diags::add, options, files)
+                        : parent.compiler.createTask(slot, parent.fileManager, parent.diags::add, options, files);
+        this.borrow = new ReusableCompiler.Borrow(parent.compiler, slot, task);
+        this.trees = Trees.instance(task);
+        this.elements = task.getElements();
+        this.types = task.getTypes();
         this.roots = new ArrayList<>();
         this.sourceStamps = collectSourceStamps(files);
         this.analysisMode = analysisMode;
@@ -75,7 +71,7 @@ public class CompileBatch implements AutoCloseable {
 
         try {
             var parseStarted = System.nanoTime();
-            for (var t : borrow.task.parse()) {
+            for (var t : task.parse()) {
                 roots.add(t);
             }
             parseNanos = System.nanoTime() - parseStarted;
@@ -84,20 +80,15 @@ public class CompileBatch implements AutoCloseable {
                 // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
                 // Running enter() first can lock in pre-processor symbols (missing Lombok members).
                 var analyzeStarted = System.nanoTime();
-                borrow.task.analyze();
+                task.analyze();
                 analyzeNanos = System.nanoTime() - analyzeStarted;
                 if (analysisMode == AnalysisMode.FULL) {
                     ANALYZE_INVOCATIONS.incrementAndGet();
                 }
             } else {
-                var enterStarted = System.nanoTime();
-                invokeEnter(borrow.task);
-                enterNanos = System.nanoTime() - enterStarted;
-
-                // The results of borrow.task.analyze() are unreliable when errors are present
-                // You can get at `Element` values using `Trees`
+                // Without AP, task.analyze() drives enter + attribute internally.
                 var analyzeStarted = System.nanoTime();
-                borrow.task.analyze();
+                task.analyze();
                 analyzeNanos = System.nanoTime() - analyzeStarted;
                 if (analysisMode == AnalysisMode.FULL) {
                     ANALYZE_INVOCATIONS.incrementAndGet();
@@ -107,21 +98,15 @@ public class CompileBatch implements AutoCloseable {
             try {
                 borrow.close();
             } catch (Exception closeError) {
-                LOG.fine("Failed to close borrow after IOException: " + closeError.getMessage());
+                LOG.fine("Failed to release task after IOException: " + closeError.getMessage());
             }
             throw new RuntimeException(e);
         } catch (Throwable e) {
-            // Always try to close the borrow, but don't let cleanup errors mask the original error
+            // Always try to release the task, but don't let cleanup errors mask the original error
             try {
                 borrow.close();
             } catch (Exception closeError) {
-                LOG.fine("Failed to close borrow after compilation error: " + closeError.getMessage());
-            }
-
-            // If AP was enabled and we got an error, it's likely an AP infrastructure bug
-            // Catch both Exception and Error (like AssertionError from javac)
-            if (allowAP && (isDeferredDiagnosticError(e) || isLikelyAPError(e))) {
-                throw new APFailureException("Annotation processing failed: " + e.getMessage(), e);
+                LOG.fine("Failed to release task after compilation error: " + closeError.getMessage());
             }
 
             // For other errors, wrap in RuntimeException
@@ -183,15 +168,6 @@ public class CompileBatch implements AutoCloseable {
                         analyzeNanos / 1_000_000));
     }
 
-    private void invokeEnter(JavacTask task) {
-        try {
-            var enter = task.getClass().getMethod("enter");
-            enter.invoke(task);
-        } catch (ReflectiveOperationException e) {
-            throw new RuntimeException("Failed to run javac enter phase", e);
-        }
-    }
-
     private Map<Path, CompileTask.SourceStamp> collectSourceStamps(Collection<? extends JavaFileObject> files) {
         var result = new HashMap<Path, CompileTask.SourceStamp>();
         for (var file : files) {
@@ -211,85 +187,6 @@ public class CompileBatch implements AutoCloseable {
         }
         return result;
     }
-
-    /**
-     * Check if the error is related to javac's deferred diagnostic handler or other AP internal bugs.
-     * These are failures in javac's internal annotation processing infrastructure.
-     */
-    private static boolean isDeferredDiagnosticError(Throwable e) {
-        if (e == null) return false;
-
-        // Check error message and all nested causes for AP infrastructure errors
-        var current = e;
-        while (current != null) {
-            var message = current.getMessage();
-            if (message != null) {
-                // Match various AP/javac internal errors
-                if (message.contains("DeferredDiagnosticHandler")
-                    || message.contains("Log$")
-                    || message.contains("deferredDiagnosticHandler")) {
-                    return true;
-                }
-            }
-            current = current.getCause();
-        }
-        return false;
-    }
-
-    /**
-     * Check if an error is likely caused by javac AP infrastructure bugs.
-     * Errors in the AP infrastructure often come from:
-     * - NullPointerExceptions in javac compiler classes
-     * - AssertionErrors in javac AP code (processAnnotations, etc.)
-     * - Errors wrapped by javac (e.g., IllegalStateException wrapping AssertionError)
-     * - Errors in com.sun.tools.javac.* AP-related classes
-     */
-    private static boolean isLikelyAPError(Throwable e) {
-        if (e == null) return false;
-
-        // Check the exception and all its causes in the chain
-        var current = e;
-        while (current != null) {
-            // AssertionError is often used in javac internal assertions and indicates a bug
-            if (current instanceof AssertionError) {
-                for (var frame : current.getStackTrace()) {
-                    var className = frame.getClassName();
-                    // AssertionError in javac AP code is definitely an AP bug
-                    if (className.contains("com.sun.tools.javac")) {
-                        return true;
-                    }
-                }
-            }
-
-            // Check the stack trace for javac AP infrastructure classes
-            for (var frame : current.getStackTrace()) {
-                var className = frame.getClassName();
-                // Check if error originated in javac AP infrastructure
-                if (className.contains("com.sun.tools.javac.comp.Annotate")
-                    || className.contains("com.sun.tools.javac.util.Log")
-                    || className.contains("com.sun.tools.javac.comp.Enter")
-                    || className.contains("com.sun.tools.javac.processing")
-                    || className.contains("com.sun.tools.javac.main.JavaCompiler.processAnnotations")) {
-                    return true;
-                }
-            }
-
-            // Also check for NullPointerException in any javac class
-            if (current instanceof NullPointerException) {
-                for (var frame : current.getStackTrace()) {
-                    if (frame.getClassName().startsWith("com.sun.tools.javac")) {
-                        return true;
-                    }
-                }
-            }
-
-            // Check next cause in chain
-            current = current.getCause();
-        }
-
-        return false;
-    }
-
 
     /**
      * If the compilation failed because javac didn't find some package-private files in source files with different
@@ -346,25 +243,9 @@ public class CompileBatch implements AutoCloseable {
 
     @Override
     public void close() {
+        if (closed) return;
         borrow.close();
         closed = true;
-    }
-
-    private static ReusableCompiler.Borrow batchTask(
-            JavaCompilerService parent,
-            Collection<? extends JavaFileObject> sources,
-            boolean allowAP,
-            AnalysisMode mode,
-            ReusableCompiler compiler) {
-        parent.diags.clear();
-        var options =
-                allowAP
-                        ? (mode == AnalysisMode.ATTR
-                                ? optionsForFastAp(
-                                        parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath)
-                                : options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath))
-                        : optionsWithoutAP(parent.classPath, parent.addExports, parent.extraArgs);
-        return compiler.getTask(parent.fileManager, parent.diags::add, options, List.of(), sources);
     }
 
     /** Combine source path or class path entries using the system separator, for example ':' in unix */
@@ -375,7 +256,7 @@ public class CompileBatch implements AutoCloseable {
                 .collect(Collectors.joining(File.pathSeparator));
     }
 
-    private static List<String> options(
+    static List<String> options(
             Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
         var list = new ArrayList<String>();
 
@@ -422,7 +303,7 @@ public class CompileBatch implements AutoCloseable {
         return list;
     }
 
-    private static List<String> optionsForFastAp(
+    static List<String> optionsForFastAp(
             Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
         var list = options(classPath, addExports, extraArgs, lombokPresent);
         if (lombokPresent) {

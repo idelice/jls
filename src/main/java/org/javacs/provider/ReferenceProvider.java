@@ -7,7 +7,6 @@ import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.*;
 import org.javacs.CompilerProvider;
@@ -16,83 +15,73 @@ import org.javacs.ParseTask;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.NavigationSymbolSupport;
-import org.javacs.resolve.ParseTypeResolver;
+import org.javacs.navigation.SymbolIdentity;
+import org.javacs.navigation.SymbolIdentityResolver;
 import org.javacs.resolve.TypeNames;
 
 /**
- * Find references by resolving the target symbol once through {@link DefinitionProvider} and then
- * matching occurrences through shared navigation-side symbol keys.
+ * Find references by resolving the target symbol once through {@link SymbolIdentityResolver} and
+ * then matching occurrences through shared navigation-side symbol keys.
  */
 public class ReferenceProvider {
     private final CompilerProvider compiler;
     private final TypeIndexRouter typeIndexRouter;
+    private final SymbolIdentityResolver resolver;
     private final Path file;
-    private final int line, column;
     private final boolean includeDeclaration;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
-    public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, TypeIndexRouter.EMPTY, file, line, column, false);
-    }
-
-    public ReferenceProvider(CompilerProvider compiler, TypeIndexRouter typeIndexRouter, Path file, int line, int column) {
-        this(compiler, typeIndexRouter, file, line, column, false);
-    }
-
     public ReferenceProvider(
             CompilerProvider compiler,
             TypeIndexRouter typeIndexRouter,
+            SymbolIdentityResolver resolver,
             Path file,
-            int line,
-            int column,
             boolean includeDeclaration) {
         this.compiler = compiler;
         this.typeIndexRouter = typeIndexRouter == null ? TypeIndexRouter.EMPTY : typeIndexRouter;
+        this.resolver = resolver;
         this.file = file;
-        this.line = line;
-        this.column = column;
         this.includeDeclaration = includeDeclaration;
     }
 
     public List<Location> find() {
-        var definitions = new DefinitionProvider(compiler, typeIndexRouter, file, line, column);
-        var target = definitions.resolveSymbol();
+        var target = resolver.resolveTarget();
         if (!isSupported(target)) {
             return NOT_SUPPORTED;
         }
         if (target.qualifiedType() == null) {
-            return findLocalReferences(definitions, target);
+            return findLocalReferences(target);
         }
         if (target.memberName() == null) {
-            return findTypeReferences(definitions, target);
+            return findTypeReferences(target);
         }
         var fieldLogicalKey = NavigationSymbolSupport.fieldLogicalKey(target);
         if (fieldLogicalKey.isPresent()) {
-            return findFieldReferencesScoped(definitions, target, fieldLogicalKey.get());
+            return findFieldReferencesScoped(target, fieldLogicalKey.get());
         }
         return findMemberReferences(
-                definitions,
                 target,
                 NavigationSymbolSupport.targetParameterTypes(compiler, typeIndexRouter, target));
     }
 
-    private boolean isSupported(DefinitionProvider.ResolvedSymbol target) {
-        return target != null && (!target.locations().isEmpty() || target.qualifiedType() != null || target.memberName() != null);
+    private boolean isSupported(SymbolIdentity target) {
+        return target != null
+                && (target.declarationLocation().isPresent()
+                        || target.qualifiedType() != null
+                        || target.memberName() != null);
     }
 
-    private List<Location> findTypeReferences(
-            DefinitionProvider definitions, DefinitionProvider.ResolvedSymbol target) {
+    private List<Location> findTypeReferences(SymbolIdentity target) {
         var files = includeDeclarationFile(target.qualifiedType(), compiler.findTypeReferences(target.qualifiedType()));
         return scan(
                 files,
                 Set.of(target.simpleName()),
                 target,
-                (parse, path) -> matchesTypeReference(definitions, parse, path, target));
+                (parse, path) -> matchesTypeReference(parse, path, target));
     }
 
-    private List<Location> findMemberReferences(
-            DefinitionProvider definitions, DefinitionProvider.ResolvedSymbol target, List<String> targetParameterTypes) {
+    private List<Location> findMemberReferences(SymbolIdentity target, List<String> targetParameterTypes) {
         var files = compiler.findMemberReferences(target.qualifiedType(), target.memberName());
         var names = new java.util.LinkedHashSet<String>();
         names.add(target.memberName());
@@ -103,27 +92,25 @@ public class ReferenceProvider {
                 names,
                 target,
                 (parse, path) ->
-                        matchesMemberReference(definitions, parse, path, target, targetParameterTypes, relatedMethodKeys));
+                        matchesMemberReference(parse, path, target, targetParameterTypes, relatedMethodKeys));
     }
 
-    private List<Location> findFieldReferencesScoped(
-            DefinitionProvider definitions, DefinitionProvider.ResolvedSymbol target, String logicalKey) {
+    private List<Location> findFieldReferencesScoped(SymbolIdentity target, String logicalKey) {
         var files = includeDeclarationFile(target.qualifiedType(), compiler.findTypeReferences(target.qualifiedType()));
         var names = relatedLogicalNames(target, logicalKey);
-        return scan(files, names, target, (parse, path) -> matchesFieldReference(definitions, parse, path, logicalKey));
+        return scan(files, names, target, (parse, path) -> matchesFieldReference(parse, path, logicalKey));
     }
 
-    private List<Location> findLocalReferences(
-            DefinitionProvider definitions, DefinitionProvider.ResolvedSymbol target) {
+    private List<Location> findLocalReferences(SymbolIdentity target) {
         return scan(
                 new Path[] {file},
                 Set.of(target.simpleName()),
                 target,
-                (parse, path) -> matchesLocalReference(definitions, parse, path, target));
+                (parse, path) -> matchesLocalReference(parse, path, target));
     }
 
     private List<Location> scan(
-            Path[] files, Set<String> names, DefinitionProvider.ResolvedSymbol target, ReferenceMatcher matcher) {
+            Path[] files, Set<String> names, SymbolIdentity target, ReferenceMatcher matcher) {
         var dedup = new LinkedHashMap<String, Location>();
         for (var candidate : files) {
             var parse = compiler.parse(candidate);
@@ -178,9 +165,8 @@ public class ReferenceProvider {
         return new ArrayList<>(dedup.values());
     }
 
-    private boolean matchesTypeReference(
-            DefinitionProvider definitions, ParseTask parse, TreePath path, DefinitionProvider.ResolvedSymbol target) {
-        var resolved = resolveOccurrence(definitions, parse, path);
+    private boolean matchesTypeReference(ParseTask parse, TreePath path, SymbolIdentity target) {
+        var resolved = resolver.resolveOccurrence(parse, path);
         return resolved.qualifiedType() != null
                 && Objects.equals(target.qualifiedType(), resolved.qualifiedType())
                 && (resolved.memberName() == null
@@ -188,13 +174,12 @@ public class ReferenceProvider {
     }
 
     private boolean matchesMemberReference(
-            DefinitionProvider definitions,
             ParseTask parse,
             TreePath path,
-            DefinitionProvider.ResolvedSymbol target,
+            SymbolIdentity target,
             List<String> targetParameterTypes,
             Set<String> relatedMethodKeys) {
-        var resolved = resolveOccurrence(definitions, parse, path);
+        var resolved = resolver.resolveOccurrence(parse, path);
         if (isConstructorTarget(target)
                 && Objects.equals(target.qualifiedType(), resolved.qualifiedType())
                 && !resolved.method()
@@ -235,33 +220,22 @@ public class ReferenceProvider {
                 || typeIndexRouter.workspaceSubTypes(resolvedOwner).contains(targetOwner);
     }
 
-    private boolean matchesFieldReference(
-            DefinitionProvider definitions, ParseTask parse, TreePath path, String logicalKey) {
-        var resolved = resolveOccurrence(definitions, parse, path);
+    private boolean matchesFieldReference(ParseTask parse, TreePath path, String logicalKey) {
+        var resolved = resolver.resolveOccurrence(parse, path);
         return Objects.equals(logicalKey, NavigationSymbolSupport.logicalKey(resolved));
     }
 
-    private boolean matchesLocalReference(
-            DefinitionProvider definitions, ParseTask parse, TreePath path, DefinitionProvider.ResolvedSymbol target) {
-        var resolved = resolveOccurrence(definitions, parse, path);
-        if (resolved.locations().isEmpty() || target.locations().isEmpty()) {
+    private boolean matchesLocalReference(ParseTask parse, TreePath path, SymbolIdentity target) {
+        var resolved = resolver.resolveOccurrence(parse, path);
+        if (resolved.declarationLocation().isEmpty() || target.declarationLocation().isEmpty()) {
             return false;
         }
-        return sameLocation(target.locations().getFirst(), resolved.locations().getFirst());
+        return sameLocation(target.declarationLocation().get(), resolved.declarationLocation().get());
     }
 
-    private DefinitionProvider.ResolvedSymbol resolveOccurrence(
-            DefinitionProvider definitions, ParseTask parse, TreePath path) {
-        var cursor = Trees.instance(parse.task()).getSourcePositions().getStartPosition(parse.root(), path.getLeaf());
-        if (cursor < 0) {
-            cursor = parse.root().getLineMap().getPosition(1, 1);
-        }
-        return definitions.resolve(
-                parse, path, new ParseTypeResolver(parse, compiler, typeIndexRouter, cursor + 1));
-    }
-
-    private boolean isDeclarationLocation(Location location, DefinitionProvider.ResolvedSymbol target) {
-        return !target.locations().isEmpty() && sameLocation(location, target.locations().get(0));
+    private boolean isDeclarationLocation(Location location, SymbolIdentity target) {
+        return target.declarationLocation().isPresent()
+                && sameLocation(location, target.declarationLocation().get());
     }
 
     private boolean signatureMatches(List<String> targetParameterTypes, List<String> occurrenceParameterTypes) {
@@ -275,7 +249,7 @@ public class ReferenceProvider {
         return targetParameterTypes.equals(occurrenceParameterTypes);
     }
 
-    private boolean isConstructorTarget(DefinitionProvider.ResolvedSymbol target) {
+    private boolean isConstructorTarget(SymbolIdentity target) {
         return target.method() && Objects.equals(target.memberName(), target.simpleName());
     }
 
@@ -306,8 +280,7 @@ public class ReferenceProvider {
                 + location.range.end.line + ":" + location.range.end.character;
     }
 
-    private Set<String> relatedMethodKeys(
-            DefinitionProvider.ResolvedSymbol target, List<String> targetParameterTypes) {
+    private Set<String> relatedMethodKeys(SymbolIdentity target, List<String> targetParameterTypes) {
         if (target.indexMember() != null) {
             String[] erasedParameterTypes = target.indexMember().erasedParameterTypes == null
                     ? new String[0]
@@ -331,7 +304,7 @@ public class ReferenceProvider {
                 target.qualifiedType(), target.memberName(), targetParameterTypes.toArray(String[]::new));
     }
 
-    private Set<String> relatedLogicalNames(DefinitionProvider.ResolvedSymbol target, String logicalKey) {
+    private Set<String> relatedLogicalNames(SymbolIdentity target, String logicalKey) {
         var names = new LinkedHashSet<String>();
         if (target.memberName() != null) {
             names.add(target.memberName());

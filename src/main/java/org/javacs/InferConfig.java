@@ -668,6 +668,10 @@ class InferConfig {
         if (isConcreteJavaLevel(release)) {
             return new MavenCompilerArgs(List.of("--release", release), "maven_release", false);
         }
+        var pluginRelease = compilerPluginRelease(document);
+        if (isConcreteJavaLevel(pluginRelease)) {
+            return new MavenCompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
+        }
         if (includeJavaVersionProperty) {
             var javaVersion = property(document, "java.version");
             if (isConcreteJavaLevel(javaVersion)) {
@@ -678,10 +682,6 @@ class InferConfig {
         var target = property(document, "maven.compiler.target");
         if (isConcreteJavaLevel(source) && isConcreteJavaLevel(target)) {
             return sourceTargetArgs(source, target);
-        }
-        var pluginRelease = compilerPluginRelease(document);
-        if (isConcreteJavaLevel(pluginRelease)) {
-            return new MavenCompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
         }
         return compilerPluginSourceTarget(document);
     }

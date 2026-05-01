@@ -10,7 +10,7 @@ JAVA_HOME="./jdks/mac/jdk-25"
 rm -rf dist/mac
 $JAVA_HOME/Contents/Home/bin/jlink \
   --module-path $JAVA_HOME/Contents/Home/jmods \
-  --add-modules java.base,java.compiler,java.logging,java.sql,java.xml,jdk.compiler,jdk.jdeps,jdk.jdi,jdk.unsupported,jdk.zipfs \
+  --add-modules java.base,java.compiler,java.logging,java.management,java.sql,java.xml,jdk.compiler,jdk.jdeps,jdk.jdi,jdk.unsupported,jdk.zipfs \
   --output dist/mac \
   --no-header-files \
   --no-man-pages \

@@ -4374,16 +4374,18 @@ public class JavaLanguageServerTest {
         t2.start();
         start.countDown();
 
-        Assert.assertTrue("both compile tasks should complete", done.await(5, TimeUnit.SECONDS));
-        if (failure.get() != null) {
-            throw new AssertionError("concurrent compile call failed", failure.get());
+        try {
+            Assert.assertTrue("both compile tasks should complete", done.await(5, TimeUnit.SECONDS));
+            if (failure.get() != null) {
+                throw new AssertionError("concurrent compile call failed", failure.get());
+            }
+            Assert.assertEquals(
+                    "compileAndPublish should not overlap diagnostics compiler usage",
+                    1,
+                    compiler.maxConcurrentCompiles());
+        } finally {
+            deleteRecursively(workspace);
         }
-        Assert.assertEquals(
-                "compileAndPublish should not overlap diagnostics compiler usage",
-                1,
-                compiler.maxConcurrentCompiles());
-
-        deleteRecursively(workspace);
     }
 
     @Test
@@ -5387,7 +5389,7 @@ public class JavaLanguageServerTest {
                         original.docPath,
                         original.addExports,
                         original.extraArgs,
-                        original.lombokConfiguredEnabled,
+                        original.apEnabled,
                         original.compilerRole);
         setInteractiveCompiler(server, tracking);
         return tracking;
@@ -7062,7 +7064,7 @@ public class JavaLanguageServerTest {
         private final AtomicInteger maxInFlight = new AtomicInteger();
 
         ConcurrencyTrackingCompiler() {
-            super(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), true);
+            super(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         }
 
         @Override
@@ -7098,7 +7100,7 @@ public class JavaLanguageServerTest {
                 List<String> extraArgs,
                 boolean lombokConfiguredEnabled,
                 String compilerRole) {
-            super(classPath, docPath, addExports, extraArgs, lombokConfiguredEnabled, compilerRole);
+            super(classPath, docPath, addExports, extraArgs);
         }
 
         void resetCounters() {

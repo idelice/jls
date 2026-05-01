@@ -90,9 +90,19 @@ public class FileStore {
             }
             return FileVisitResult.CONTINUE;
         }
+
+        @Override
+        public FileVisitResult visitFileFailed(Path file, IOException e) {
+            // Temp files created by git and other tools may disappear mid-walk. Skip silently.
+            if (e instanceof java.nio.file.NoSuchFileException) {
+                return FileVisitResult.CONTINUE;
+            }
+            LOG.warning("Failed to visit " + file + ": " + e.getMessage());
+            return FileVisitResult.CONTINUE;
+        }
     }
 
-    static Collection<Path> all() {
+    public static Collection<Path> all() {
         return javaSources.keySet();
     }
 
@@ -350,13 +360,13 @@ public class FileStore {
         line--;
         column--;
         int cursor = 0;
-        while (line > 0) {
+        while (line > 0 && cursor < contents.length()) {
             if (contents.charAt(cursor) == '\n') {
                 line--;
             }
             cursor++;
         }
-        return cursor + column;
+        return Math.min(cursor + column, contents.length());
     }
 
     private static String patch(String sourceText, TextDocumentContentChangeEvent change) {

@@ -18,6 +18,7 @@ import org.jetbrains.java.decompiler.main.extern.IResultSaver;
 
 public final class ExternalBinaryDecompiler {
     private static final Logger LOG = Logger.getLogger("main");
+    private static final long STALE_CACHE_DAYS = 7;
 
     private final Set<Path> classPathRoots;
     private final String classPathFingerprint;
@@ -27,6 +28,44 @@ public final class ExternalBinaryDecompiler {
         this.classPathRoots = classPathRoots == null ? Set.of() : Set.copyOf(classPathRoots);
         this.classPathFingerprint = classPathFingerprint == null ? "" : classPathFingerprint;
         this.classLoader = classLoader == null ? ExternalBinaryDecompiler.class.getClassLoader() : classLoader;
+        pruneStaleCache();
+    }
+
+    /**
+     * Deletes fingerprint-level subdirectories under jls-binary-decompiled and jls-binary-inputs
+     * that are older than STALE_CACHE_DAYS days. Skips the current session's fingerprint dir.
+     * Runs synchronously but is bounded: it only lists one level of subdirs per cache root.
+     */
+    private void pruneStaleCache() {
+        var tmp = Path.of(System.getProperty("java.io.tmpdir"));
+        var cutoff = java.time.Instant.now().minus(STALE_CACHE_DAYS, java.time.temporal.ChronoUnit.DAYS);
+        for (var cacheRoot : List.of(tmp.resolve("jls-binary-decompiled"), tmp.resolve("jls-binary-inputs"))) {
+            if (!Files.isDirectory(cacheRoot)) continue;
+            try (var stream = Files.list(cacheRoot)) {
+                for (var fingerprintDir : stream.toList()) {
+                    if (!Files.isDirectory(fingerprintDir)) continue;
+                    var name = fingerprintDir.getFileName().toString();
+                    if (name.equals(classPathFingerprint)) continue; // keep current session
+                    try {
+                        var modified = Files.getLastModifiedTime(fingerprintDir).toInstant();
+                        if (modified.isBefore(cutoff)) {
+                            deleteTree(fingerprintDir);
+                            LOG.fine(String.format("[external-binary] pruned stale cache dir %s", fingerprintDir));
+                        }
+                    } catch (IOException ignored) {
+                    }
+                }
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        try (var walk = Files.walk(root)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try { Files.delete(p); } catch (IOException ignored) {}
+            });
+        }
     }
 
     public Optional<Path> decompileSourcePath(String qualifiedName) {
@@ -94,6 +133,30 @@ public final class ExternalBinaryDecompiler {
         var files = new ArrayList<Path>();
         var topLevelRelative = target.topLevelRelativePath();
         var topLevelPrefix = topLevelRelative.substring(0, topLevelRelative.length() - ".class".length());
+
+        // Null root: JDK module class (jrt:/) not present in any classpath jar.
+        // Extract bytes via the classloader which can reach the module system.
+        if (target.root() == null) {
+            try (var is = classLoader.getResourceAsStream(topLevelRelative)) {
+                if (is == null) return List.of();
+                files.add(copyToInputRoot(inputRoot, topLevelRelative, is.readAllBytes()));
+            }
+            // Also pull declared inner classes so Vineflower can decompile them.
+            try {
+                var topClass = Class.forName(target.topLevelQualifiedName(), false, classLoader);
+                for (var inner : topClass.getDeclaredClasses()) {
+                    var innerRelative = inner.getName().replace('.', '/') + ".class";
+                    try (var is = classLoader.getResourceAsStream(innerRelative)) {
+                        if (is != null) {
+                            files.add(copyToInputRoot(inputRoot, innerRelative, is.readAllBytes()));
+                        }
+                    }
+                }
+            } catch (ClassNotFoundException | LinkageError ignored) {
+            }
+            return files;
+        }
+
         if (Files.isDirectory(target.root())) {
             var topLevelFile = target.root().resolve(topLevelRelative);
             if (!Files.isRegularFile(topLevelFile)) {
@@ -205,6 +268,9 @@ public final class ExternalBinaryDecompiler {
                     }
                 }
             }
+            // Not found in any classpath jar/dir (e.g. JDK module classes accessed via jrt:/).
+            // Return a null-root target; materializeInputs will load bytes via the classloader.
+            return reflective;
         }
         return Optional.empty();
     }

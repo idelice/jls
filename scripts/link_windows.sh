@@ -11,7 +11,7 @@ JLINK_BIN="${JLINK_BIN:-jlink}"
 rm -rf dist/windows
 "$JLINK_BIN" \
   --module-path $JAVA_HOME/jmods \
-  --add-modules java.base,java.compiler,java.logging,java.sql,java.xml,jdk.compiler,jdk.jdeps,jdk.jdi,jdk.unsupported,jdk.zipfs \
+  --add-modules java.base,java.compiler,java.logging,java.management,java.sql,java.xml,jdk.compiler,jdk.jdeps,jdk.jdi,jdk.unsupported,jdk.zipfs \
   --output dist/windows \
   --no-header-files \
   --no-man-pages \
