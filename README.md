@@ -24,6 +24,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - Java 25
 - Maven
 - protobuf
+- **Neovim 0.10+** (required for pull diagnostics — see [Client Requirements](#client-requirements))
 
 ### Build
 
@@ -32,6 +33,14 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 ```
 
 The language server will be built to `dist/lang_server_{linux|mac|windows}.sh`
+
+## Client Requirements
+
+This server uses the **pull diagnostics** model ([LSP 3.17](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_diagnostic)): it does not push errors to the client after save. Instead, the client requests diagnostics on demand via `textDocument/diagnostic`.
+
+- **Neovim 0.10+**: Pull diagnostics are supported natively. No extra configuration is needed — `nvim-lspconfig` will enable them automatically.
+- **Neovim 0.9 and older**: Not supported. Diagnostics will not appear.
+- **Vim (not Neovim)**: Not supported. Vim has no built-in LSP client, and common Vim LSP plugins (`coc.nvim`, `vim-lsp`, `ale`) do not implement pull diagnostics.
 
 ## Setup with Neovim
 
