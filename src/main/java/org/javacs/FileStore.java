@@ -360,13 +360,13 @@ public class FileStore {
         line--;
         column--;
         int cursor = 0;
-        while (line > 0) {
+        while (line > 0 && cursor < contents.length()) {
             if (contents.charAt(cursor) == '\n') {
                 line--;
             }
             cursor++;
         }
-        return cursor + column;
+        return Math.min(cursor + column, contents.length());
     }
 
     private static String patch(String sourceText, TextDocumentContentChangeEvent change) {
