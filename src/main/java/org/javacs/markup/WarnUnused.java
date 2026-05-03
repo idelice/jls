@@ -138,7 +138,11 @@ class WarnUnused extends TreeScanner<Void, Void> {
             return false;
         }
         var parent = path.getParentPath().getLeaf().getKind();
-        if (parent == Tree.Kind.CLASS || parent == Tree.Kind.INTERFACE) {
+        if (parent == Tree.Kind.CLASS
+                || parent == Tree.Kind.INTERFACE
+                || parent == Tree.Kind.ENUM
+                || parent == Tree.Kind.RECORD
+                || parent == Tree.Kind.ANNOTATION_TYPE) {
             return false;
         }
         if (parent == Tree.Kind.METHOD) {

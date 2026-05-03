@@ -1,6 +1,7 @@
 package org.javacs.rewrite;
 
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
@@ -32,10 +33,11 @@ public class GenerateRecordConstructor implements Rewrite {
         // TODO this needs to fall back on looking for inner classes and package-private classes
         var file = compiler.findTypeDeclaration(className);
         try (var task = compiler.compile(file)) {
+            var root = task.root(file);
             var typeElement = task.task.getElements().getTypeElement(className);
             var typeTree = Trees.instance(task.task).getTree(typeElement);
             var fields = fieldsNeedingInitialization(typeTree);
-            var parameters = generateParameters(task, fields);
+            var parameters = generateParameters(task, root, fields);
             var initializers = generateInitializers(task, fields);
             var buf = new StringBuffer();
             buf.append("\n");
@@ -49,10 +51,10 @@ public class GenerateRecordConstructor implements Rewrite {
                     .append(initializers)
                     .append("\n}");
             var string = buf.toString();
-            var indent = EditHelper.indent(task.task, task.root(), typeTree) + 4;
+            var indent = EditHelper.indent(task.task, root, typeTree) + 4;
             string = string.replaceAll("\n", "\n" + " ".repeat(indent));
             string = string + "\n\n";
-            var insert = insertPoint(task, typeTree);
+            var insert = insertPoint(task, root, typeTree);
             TextEdit[] edits = {new TextEdit(new Range(insert, insert), string)};
             return Map.of(file, edits);
         }
@@ -72,10 +74,10 @@ public class GenerateRecordConstructor implements Rewrite {
         return fields;
     }
 
-    private String generateParameters(CompileTask task, List<VariableTree> fields) {
+    private String generateParameters(CompileTask task, CompilationUnitTree root, List<VariableTree> fields) {
         var join = new StringJoiner(", ");
         for (var f : fields) {
-            join.add(extract(task, f.getType()) + " " + f.getName());
+            join.add(extract(task, root, f.getType()) + " " + f.getName());
         }
         return join.toString();
     }
@@ -88,12 +90,12 @@ public class GenerateRecordConstructor implements Rewrite {
         return join.toString();
     }
 
-    private CharSequence extract(CompileTask task, Tree typeTree) {
+    private CharSequence extract(CompileTask task, CompilationUnitTree root, Tree typeTree) {
         try {
-            var contents = task.root().getSourceFile().getCharContent(true);
+            var contents = root.getSourceFile().getCharContent(true);
             var pos = Trees.instance(task.task).getSourcePositions();
-            var start = (int) pos.getStartPosition(task.root(), typeTree);
-            var end = (int) pos.getEndPosition(task.root(), typeTree);
+            var start = (int) pos.getStartPosition(root, typeTree);
+            var end = (int) pos.getEndPosition(root, typeTree);
             return contents.subSequence(start, end);
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -108,17 +110,17 @@ public class GenerateRecordConstructor implements Rewrite {
         return className;
     }
 
-    private Position insertPoint(CompileTask task, ClassTree typeTree) {
+    private Position insertPoint(CompileTask task, CompilationUnitTree root, ClassTree typeTree) {
         for (var member : typeTree.getMembers()) {
             if (member.getKind() == Tree.Kind.METHOD) {
                 var method = (MethodTree) member;
                 if (method.getReturnType() == null) continue;
                 LOG.info("...insert constructor before " + method.getName());
-                return EditHelper.insertBefore(task.task, task.root(), method);
+                return EditHelper.insertBefore(task.task, root, method);
             }
         }
         LOG.info("...insert constructor at end of class");
-        return EditHelper.insertAtEndOfClass(task.task, task.root(), typeTree);
+        return EditHelper.insertAtEndOfClass(task.task, root, typeTree);
     }
 
     private static final Logger LOG = Logger.getLogger("main");

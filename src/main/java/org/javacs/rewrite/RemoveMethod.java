@@ -26,7 +26,7 @@ public class RemoveMethod implements Rewrite {
         try (var task = compiler.compile(file)) {
             var methodElement = FindHelper.findMethod(task, className, methodName, erasedParameterTypes);
             var methodTree = Trees.instance(task.task).getTree(methodElement);
-            TextEdit[] edits = {new EditHelper(task.task).removeTree(task.root(), methodTree)};
+            TextEdit[] edits = {new EditHelper(task.task).removeTree(task.root(file), methodTree)};
             return Map.of(file, edits);
         }
     }

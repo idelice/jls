@@ -1,6 +1,7 @@
 package org.javacs.rewrite;
 
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberReferenceTree;
@@ -33,15 +34,16 @@ public class CreateMissingMethod implements Rewrite {
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         try (var task = compiler.compile(file)) {
             var trees = Trees.instance(task.task);
-            var call = new FindMethodCallAt(task.task).scan(task.root(), position);
+            var root = task.root(file);
+            var call = new FindMethodCallAt(task.task).scan(root, position);
             if (call == null) return CANCELLED;
-            var path = trees.getPath(task.root(), call);
-            var insertText = "\n" + printMethodHeader(task, call) + " {\n    // TODO\n}";
+            var path = trees.getPath(root, call);
+            var insertText = "\n" + printMethodHeader(task, root, call) + " {\n    // TODO\n}";
             var surroundingClass = surroundingClass(path);
-            var indent = EditHelper.indent(task.task, task.root(), surroundingClass) + 4;
+            var indent = EditHelper.indent(task.task, root, surroundingClass) + 4;
             insertText = insertText.replaceAll("\n", "\n" + " ".repeat(indent));
             insertText = insertText + "\n";
-            var insertPoint = EditHelper.insertAfter(task.task, task.root(), surroundingMethod(path));
+            var insertPoint = EditHelper.insertAfter(task.task, root, surroundingMethod(path));
             TextEdit[] edits = {new TextEdit(new Range(insertPoint, insertPoint), insertText)};
             return Map.of(file, edits);
         }
@@ -67,21 +69,21 @@ public class CreateMissingMethod implements Rewrite {
         throw new RuntimeException("No surrounding class");
     }
 
-    private String printMethodHeader(CompileTask task, MethodInvocationTree call) {
+    private String printMethodHeader(CompileTask task, CompilationUnitTree root, MethodInvocationTree call) {
         var methodName = extractMethodName(call.getMethodSelect());
         var returnType = "void"; // TODO infer type
         if (returnType.equals(methodName)) {
             returnType = "_";
         }
-        var parameters = printParameters(task, call);
+        var parameters = printParameters(task, root, call);
         return "private " + returnType + " " + methodName + "(" + parameters + ")";
     }
 
-    private String printParameters(CompileTask task, MethodInvocationTree call) {
+    private String printParameters(CompileTask task, CompilationUnitTree root, MethodInvocationTree call) {
         var trees = Trees.instance(task.task);
         var join = new StringJoiner(", ");
         for (var i = 0; i < call.getArguments().size(); i++) {
-            var type = trees.getTypeMirror(trees.getPath(task.root(), call.getArguments().get(i)));
+            var type = trees.getTypeMirror(trees.getPath(root, call.getArguments().get(i)));
             var name = guessParameterName(call.getArguments().get(i), type);
             var printType = EditHelper.printType(type);
             join.add(printType + " " + name);
