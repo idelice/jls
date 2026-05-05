@@ -154,6 +154,10 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
+    private record LombokSourceExpansion(Set<Path> referenced, boolean anyRequestedHasLombok) {
+        static final LombokSourceExpansion EMPTY = new LombokSourceExpansion(Set.of(), false);
+    }
+
     private record ExpandedSources(
             Collection<? extends JavaFileObject> sources,
             boolean lombokExpansionUsed,
@@ -203,7 +207,7 @@ class JavaCompilerService implements CompilerProvider {
 
     void logMemorySnapshot(String label) {
         var snapshot = memorySnapshot(label);
-        LOG.warning(
+        LOG.fine(
                 String.format(
                         "[memory] label=%s role=%s heap_used=%dmb heap_committed=%dmb non_heap=%dmb full_roots=%d full_stamps=%d full_closed=%s attr_roots=%d attr_no_ap_roots=%d file_store_all=%d",
                         snapshot.label(),
@@ -364,8 +368,6 @@ class JavaCompilerService implements CompilerProvider {
     private CompileBatch compileBatch(
             Collection<? extends JavaFileObject> sources, CompileProfile profile) {
         var useAnnotationProcessing = profile.allowAnnotationProcessing() && apEnabled;
-        LOG.info(String.format("[debug-lombok] compileBatch role=%s profile_allowAP=%s apEnabled=%s useAP=%s sources=%d",
-                compilerRole, profile.allowAnnotationProcessing(), apEnabled, useAnnotationProcessing, sources.size()));
         // FULL_PROFILE widens to FileStore.all() so definition/hover/reference requests warm a
         // workspace-scoped cache for all subsequent interactive callers at the same revision.
         // DIAGNOSTICS_PROFILE keeps the caller's source set to avoid retaining a full workspace
@@ -375,7 +377,7 @@ class JavaCompilerService implements CompilerProvider {
                         ? FileStore.all().stream().<JavaFileObject>map(SourceFileObject::new).toList()
                         : sources;
         var expandedSources =
-                profile.expandAdditionalSources()
+                profile.expandAdditionalSources() && useAnnotationProcessing
                         ? expandSourcesForLombokAPDetails(compileSources, useAnnotationProcessing)
                         : new ExpandedSources(
                                 compileSources,
@@ -383,14 +385,6 @@ class JavaCompilerService implements CompilerProvider {
                                 compileSources.size(),
                                 compileSources.size());
         var effectiveSources = expandedSources.sources();
-        if (compilerRole.toString().equals("diagnostics")) {
-            var fileNames = new java.util.ArrayList<String>();
-            for (var s : effectiveSources) {
-                var p = sourcePath(s);
-                fileNames.add(p != null ? p.getFileName().toString() : s.getName());
-            }
-            LOG.info(String.format("[debug-lombok] diagnostics final batch sources=%s useAP=%s", fileNames, useAnnotationProcessing));
-        }
         var cacheSlot = cacheSlot(profile, useAnnotationProcessing);
         var cacheName = cacheMetricNameFor(cacheSlot);
         if (!retainCachedCompileBatches) {
@@ -532,16 +526,12 @@ class JavaCompilerService implements CompilerProvider {
 
     private ExpandedSources expandSourcesForLombokAPDetails(
             Collection<? extends JavaFileObject> sources, boolean allowAP) {
-        LOG.info(String.format("[debug-lombok] expandSources allowAP=%s lombokPresent=%s", allowAP, lombokPresentOnClasspath));
         if (!allowAP || !lombokPresentOnClasspath) {
             return new ExpandedSources(sources, false, sources.size(), sources.size());
         }
 
-        var requestedHasLombokAnnotations = requestedSourcesUseLombokAnnotations(sources);
-        var referencedLombokSources = referencedLombokSources(sources);
-        LOG.info(String.format("[debug-lombok] requestedHasLombok=%s referencedLombokSources=%s",
-                requestedHasLombokAnnotations, referencedLombokSources));
-        if (!requestedHasLombokAnnotations && referencedLombokSources.isEmpty()) {
+        var expansion = referencedLombokSources(sources);
+        if (!expansion.anyRequestedHasLombok() && expansion.referenced().isEmpty()) {
             return new ExpandedSources(sources, false, sources.size(), sources.size());
         }
 
@@ -556,7 +546,7 @@ class JavaCompilerService implements CompilerProvider {
             expanded.put(path, source);
         }
 
-        for (var lombokSource : referencedLombokSources) {
+        for (var lombokSource : expansion.referenced()) {
             expanded.putIfAbsent(lombokSource, new SourceFileObject(lombokSource));
         }
 
@@ -569,21 +559,25 @@ class JavaCompilerService implements CompilerProvider {
         return new ExpandedSources(result, true, sources.size(), result.size());
     }
 
-    private Set<Path> referencedLombokSources(Collection<? extends JavaFileObject> sources) {
+    private LombokSourceExpansion referencedLombokSources(Collection<? extends JavaFileObject> sources) {
         var requestedPaths = new ArrayList<Path>();
+        boolean anyHasLombok = false;
         for (var source : sources) {
             var path = sourcePath(source);
             if (path != null) {
                 requestedPaths.add(path);
+                if (!anyHasLombok && hasLombokAnnotation(path)) {
+                    anyHasLombok = true;
+                }
             }
         }
         if (requestedPaths.isEmpty()) {
-            return Set.of();
+            return LombokSourceExpansion.EMPTY;
         }
 
         var index = currentLombokTypeIndex();
         if (index.lombokTypes.isEmpty()) {
-            return Set.of();
+            return new LombokSourceExpansion(Set.of(), anyHasLombok);
         }
 
         var requestedSet = new LinkedHashSet<>(requestedPaths);
@@ -601,7 +595,7 @@ class JavaCompilerService implements CompilerProvider {
             }
         }
         referenced.removeAll(requestedSet);
-        return referenced;
+        return new LombokSourceExpansion(referenced, anyHasLombok);
     }
 
     private Set<Path> referencedLombokSourcesIn(Path source, LombokTypeIndex index) {
@@ -622,12 +616,9 @@ class JavaCompilerService implements CompilerProvider {
         }
 
         var typeRefs = collectReferencedTypeNames(source);
-        LOG.info(String.format("[debug-lombok] referencedLombokSourcesIn source=%s packages=%s typeRefs=%s",
-                source.getFileName(), importedPackages, typeRefs));
         for (var typeReference : typeRefs) {
             addResolvedLombokSource(typeReference, explicitImports, importedPackages, index, referenced);
         }
-        LOG.info(String.format("[debug-lombok] referencedLombokSourcesIn source=%s resolved=%s", source.getFileName(), referenced));
         return referenced;
     }
 
@@ -760,10 +751,8 @@ class JavaCompilerService implements CompilerProvider {
             }
             var byQualifiedName = new Object2ObjectLinkedOpenHashMap<String, Path>();
             var bySimpleName = new Object2ObjectOpenHashMap<String, Set<String>>();
-            LOG.info(String.format("[debug-lombok] rebuilding LombokTypeIndex from %d FileStore sources", FileStore.all().size()));
             for (var source : FileStore.all()) {
                 if (!hasLombokAnnotation(source)) continue;
-                LOG.info(String.format("[debug-lombok] lombokTypeIndex adding source=%s", source));
                 var simple = simpleTypeName(source);
                 var pkg = FileStore.packageName(source);
                 var qualified = pkg == null || pkg.isBlank() ? simple : pkg + "." + simple;
@@ -788,20 +777,6 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
-    private boolean requestedSourcesUseLombokAnnotations(Collection<? extends JavaFileObject> sources) {
-        for (var source : sources) {
-            var path = sourcePath(source);
-            if (path == null) {
-                continue;
-            }
-            if (hasLombokAnnotation(path)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    
     private String simpleTypeName(Path file) {
         var name = file.getFileName().toString();
         if (name.endsWith(".java")) {
@@ -1171,14 +1146,6 @@ class JavaCompilerService implements CompilerProvider {
         // The diagnostics lane never retains a CompileBatch so close() is always real.
         var compile = compileBatch(sources, DIAGNOSTICS_PROFILE);
         LOG.fine(String.format("[cache] compileDiagnostics role=%s cached=%s", compilerRole, isCachedBatch(compile)));
-        // Log errors so we can cross-reference against expansion decisions
-        for (var d : diags) {
-            if (d.getKind() == javax.tools.Diagnostic.Kind.ERROR) {
-                var src = d.getSource() != null ? java.nio.file.Paths.get(d.getSource().toUri()).getFileName() : "?";
-                LOG.info(String.format("[debug-lombok] diagnostics error src=%s code=%s msg=%s",
-                        src, d.getCode(), d.getMessage(java.util.Locale.ROOT)));
-            }
-        }
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
                 isCachedBatch(compile) ? () -> {} : compile::close);
     }
