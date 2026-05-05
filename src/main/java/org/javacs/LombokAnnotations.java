@@ -51,8 +51,8 @@ public final class LombokAnnotations {
 
     private static final Pattern SOURCE_EXPANSION_PATTERN =
             Pattern.compile(
-                    "@(?:lombok\\.(?:experimental\\.)?)?"
-                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With)\\b");
+                    "@(?:lombok\\.(?:experimental\\.)?|lombok\\.extern\\.slf4j\\.)?"
+                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With|Slf4j)\\b");
 
     private LombokAnnotations() {}
 
