@@ -343,25 +343,42 @@ public final class ExternalBinaryTypeIndex {
                                     + "("
                                     + parameters
                                     + ")";
-                    var member =
-                            new IndexedMember(
-                                    declaring,
-                                    method.getName(),
-                                    CompletionItemKind.Method,
-                                    java.lang.reflect.Modifier.isStatic(method.getModifiers()),
-                                    java.lang.reflect.Modifier.isPrivate(method.getModifiers()),
-                                    priority,
-                                    detail,
-                                    canonicalTypeName(method.getReturnType()),
-                                    parameterNames,
-                                    erasedParameterTypes,
-                                    IndexedMember.canonicalKey(
-                                            declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
-                                    IndexedMember.canonicalKey(
-                                            declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
-                                    null,
-                                    false,
-                                    IndexedMember.Provenance.EXTERNAL_BINARY);
+                    IndexedMember member;
+                    {
+                        var base =
+                                new IndexedMember(
+                                        declaring,
+                                        method.getName(),
+                                        CompletionItemKind.Method,
+                                        java.lang.reflect.Modifier.isStatic(method.getModifiers()),
+                                        java.lang.reflect.Modifier.isPrivate(method.getModifiers()),
+                                        priority,
+                                        detail,
+                                        canonicalTypeName(method.getReturnType()),
+                                        parameterNames,
+                                        erasedParameterTypes,
+                                        IndexedMember.canonicalKey(
+                                                declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
+                                        IndexedMember.canonicalKey(
+                                                declaring, CompletionItemKind.Method, method.getName(), erasedParameterTypes),
+                                        null,
+                                        false,
+                                        IndexedMember.Provenance.EXTERNAL_BINARY);
+                        // Enrich with generic (non-erased) declared types so that
+                        // ParseTypeResolver can bind method-level type variables from
+                        // call-site Class<T> arguments (e.g. mapper.readValue(json, Foo.class)).
+                        try {
+                            var genericReturn = method.getGenericReturnType().getTypeName();
+                            var genericParams = method.getGenericParameterTypes();
+                            var declaredParamTypes = new String[genericParams.length];
+                            for (int gi = 0; gi < genericParams.length; gi++) {
+                                declaredParamTypes[gi] = genericParams[gi].getTypeName();
+                            }
+                            member = base.withDeclaredTypes(genericReturn, declaredParamTypes);
+                        } catch (Exception ignored) {
+                            member = base;
+                        }
+                    }
                     var key = memberKey(member);
                     var existing = seen.get(key);
                     if (existing == null || member.priority < existing.priority) {

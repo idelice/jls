@@ -22,6 +22,7 @@ import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.util.ArrayDeque;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.logging.Logger;
@@ -398,11 +399,8 @@ final class FunctionalTargetResolver {
     private Optional<TypeResolution> resolveCollectedSequenceType(
             TypeResolution streamType, String collectionType) {
         return Optional.of(
-                new TypeResolution(
-                        collectionType,
-                        false,
-                        false,
-                        streamElementType(streamType).map(this::typeName).orElse(null)));
+                new TypeResolution(collectionType, false, false)
+                        .withFirstTypeArgument(streamElementType(streamType).map(this::typeName).orElse(null)));
     }
 
     private Optional<TypeResolution> resolveCollectedToCollection(
@@ -418,11 +416,8 @@ final class FunctionalTargetResolver {
         return support.resolveTypeTree(reference.getQualifierExpression(), root, true)
                 .map(
                         type ->
-                                new TypeResolution(
-                                        type.qualifiedType(),
-                                        false,
-                                        false,
-                                        streamElementType(streamType).map(this::typeName).orElse(null)));
+                                new TypeResolution(type.qualifiedType(), false, false)
+                                        .withFirstTypeArgument(streamElementType(streamType).map(this::typeName).orElse(null)));
     }
 
     private Optional<TypeResolution> resolveGroupingBy(
@@ -457,11 +452,8 @@ final class FunctionalTargetResolver {
             }
         }
         return Optional.of(
-                new TypeResolution(
-                        MAP,
-                        false,
-                        false,
-                        keyType.map(this::typeName).orElse(null)));
+                new TypeResolution(MAP, false, false)
+                        .withFirstTypeArgument(keyType.map(this::typeName).orElse(null)));
     }
 
     private Optional<TypeResolution> resolveMapperResult(Tree mapper, TypeResolution elementType, int depth) {
@@ -660,7 +652,8 @@ final class FunctionalTargetResolver {
     }
 
     private TypeResolution streamType(String firstTypeArgument) {
-        return new TypeResolution(STREAM, false, false, firstTypeArgument);
+        return new TypeResolution(STREAM, false, false,
+                firstTypeArgument == null ? List.of() : List.of(firstTypeArgument));
     }
 
     private TypeResolution streamTypeForArrayComponent(String componentType) {
