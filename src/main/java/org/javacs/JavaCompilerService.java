@@ -870,12 +870,18 @@ class JavaCompilerService implements CompilerProvider {
         return cacheFileImports.get(file, null);
     }
 
+    private static final Pattern CLASS_DECLARATION_PATTERN =
+                Pattern.compile("\\b(class|interface|enum|record)\\b");
+
     private void loadImports(Path file) {
         var list = new ArrayList<String>();
         try (var lines = FileStore.lines(file)) {
             for (var line = lines.readLine(); line != null; line = lines.readLine()) {
-                // If we reach a class declaration, stop looking for imports
-                if (line.contains("class") || line.contains("interface") || line.contains("enum")) break;
+                // If we reach a class declaration, stop looking for imports.
+                // Skip lines that are imports/package declarations — they may contain
+                // 'class'/'enum'/'interface' as part of package names (e.g. com.foo.enums.Bar).
+                if (!line.startsWith("import ") && !line.startsWith("package ")
+                        && CLASS_DECLARATION_PATTERN.matcher(line).find()) break;
                 // import foo.bar.Doh;
                 var matchesClass = IMPORT_CLASS.matcher(line);
                 if (matchesClass.matches()) {
@@ -886,7 +892,7 @@ class JavaCompilerService implements CompilerProvider {
                 if (matchesStar.matches()) {
                     list.add(matchesStar.group(2));
                 }
-            }
+          }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
