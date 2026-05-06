@@ -259,6 +259,16 @@ public final class IndexedMember {
                 declarationOwnerType, targetDeclarationKey);
     }
 
+    public IndexedMember withDeclaredTypes(String newDeclaredReturnType, String[] newDeclaredParameterTypes) {
+        return new IndexedMember(
+                ownerType, name, kind, isStatic, isPrivate, isProtected, isPublic, isAbstract,
+                priority, detail, returnType, newDeclaredReturnType,
+                parameterNames, erasedParameterTypes, newDeclaredParameterTypes,
+                canonicalKey, logicalKey, backingFieldName, synthetic,
+                origin, provenance, modifiers, sourceUri, declarationRange,
+                declarationOwnerType, targetDeclarationKey);
+    }
+
     public static String canonicalKey(
             String ownerType, int kind, String name, String[] erasedParameterTypes) {
         if (kind == CompletionItemKind.Method || kind == CompletionItemKind.Constructor) {

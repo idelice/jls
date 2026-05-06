@@ -67,6 +67,15 @@ public final class TypeNames {
         if (simpleName == null || simpleName.isBlank() || root == null || containsType == null) {
             return Optional.empty();
         }
+        for (var importTree : root.getImports()) {
+            if (importTree.isStatic()) {
+                continue;
+            }
+            var imported = importTree.getQualifiedIdentifier().toString();
+            if (!imported.endsWith(".*") && imported.endsWith("." + simpleName) && containsType.test(imported)) {
+                return Optional.of(imported);
+            }
+        }
         var candidates = new ObjectLinkedOpenHashSet<String>();
         var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
         if (!packageName.isBlank()) {
@@ -81,9 +90,6 @@ public final class TypeNames {
                 continue;
             }
             var imported = importTree.getQualifiedIdentifier().toString();
-            if (imported.endsWith("." + simpleName) && containsType.test(imported)) {
-                candidates.add(imported);
-            }
             if (imported.endsWith(".*")) {
                 var candidate = imported.substring(0, imported.length() - 1) + simpleName;
                 if (containsType.test(candidate)) {
