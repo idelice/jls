@@ -107,6 +107,13 @@ class WarnUnused extends TreeScanner<Void, Void> {
         var t = path.getLeaf();
         if (t instanceof VariableTree) {
             var v = (VariableTree) t;
+
+            // Record components are always reachable — they have implicit public accessors
+            var parent = path.getParentPath().getLeaf();
+            if (parent.getKind() == Tree.Kind.RECORD) {
+                return true;
+            }
+
             var isPrivate = v.getModifiers().getFlags().contains(Modifier.PRIVATE);
             if (!isPrivate || isLocalVariable(path)) {
                 return true;
