@@ -3,6 +3,8 @@ package org.javacs;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import java.util.ArrayList;
 import java.util.List;
 import org.javacs.lsp.*;
@@ -62,6 +64,16 @@ public class CodeActionTest {
     }
 
     @Test
+    public void testAddImportViaJsonRoundTrip() {
+        // Reproduces the real LSP flow: JLS emits diagnostics -> JSON wire -> nvim -> JSON wire -> JLS codeAction.
+        // Verifies that Diagnostic.code survives serialization and triggers the correct import suggestions.
+        String[] expect = {
+            "Import 'java.util.List'", "Import 'com.google.gson.Gson'", "Import 'com.sun.source.util.TreePathScanner'"
+        };
+        assertThat(quickFixViaJsonRoundTrip("org/javacs/action/TestAddImport.java"), hasItems(expect));
+    }
+
+    @Test
     public void testAddImportInAnonymousClass() {
         String[] expect = {"Import 'java.util.List'"};
         assertThat(quickFix("org/javacs/action/TestAddImportAnonymousClass.java"), hasItems(expect));
@@ -103,12 +115,39 @@ public class CodeActionTest {
 
     private List<String> quickFix(String testFile) {
         var file = FindResource.path(testFile);
-        server.lint(List.of(file));
-        var params = new CodeActionParams();
-        params.textDocument = new TextDocumentIdentifier(file.toUri());
-        params.context.diagnostics = errors;
-        var actions = server.codeAction(params);
-        return extractTitles(actions);
+        var diagParams = new DocumentDiagnosticParams();
+        diagParams.textDocument = new TextDocumentIdentifier(file.toUri());
+        var report = server.textDocumentDiagnostic(diagParams);
+
+        var actionParams = new CodeActionParams();
+        actionParams.textDocument = new TextDocumentIdentifier(file.toUri());
+        actionParams.range = new Range(new Position(0, 0), new Position(0, 0));
+        actionParams.context.diagnostics = report.items;
+        return extractTitles(server.codeAction(actionParams));
+    }
+
+    /**
+     * Simulates the JSON serialization round-trip that happens in the real LSP flow:
+     * JLS -> JSON -> nvim -> JSON -> JLS (codeAction).
+     * This catches any deserialization issues with Diagnostic fields (range, code, etc.).
+     */
+    private List<String> quickFixViaJsonRoundTrip(String testFile) {
+        var gson = new Gson();
+        var file = FindResource.path(testFile);
+        var diagParams = new DocumentDiagnosticParams();
+        diagParams.textDocument = new TextDocumentIdentifier(file.toUri());
+        var report = server.textDocumentDiagnostic(diagParams);
+
+        // Serialize diagnostics to JSON and back (mimics the LSP wire protocol)
+        var json = gson.toJson(report.items);
+        @SuppressWarnings("unchecked")
+        List<Diagnostic> roundTripped = (List<Diagnostic>) gson.fromJson(json, new TypeToken<List<Diagnostic>>() {}.getType());
+
+        var actionParams = new CodeActionParams();
+        actionParams.textDocument = new TextDocumentIdentifier(file.toUri());
+        actionParams.range = new Range(new Position(0, 0), new Position(0, 0));
+        actionParams.context.diagnostics = roundTripped;
+        return extractTitles(server.codeAction(actionParams));
     }
 
     private List<String> forCursor(String testFile, int line, int column) {

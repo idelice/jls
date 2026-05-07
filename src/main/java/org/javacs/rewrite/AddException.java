@@ -32,8 +32,8 @@ public class AddException implements Rewrite {
             var methodElement = FindHelper.findMethod(task, className, methodName, erasedParameterTypes);
             var methodTree = trees.getTree(methodElement);
             var pos = trees.getSourcePositions();
-            var lines = task.root().getLineMap();
-            var startBody = pos.getStartPosition(task.root(), methodTree.getBody());
+            var lines = task.root(file).getLineMap();
+            var startBody = pos.getStartPosition(task.root(file), methodTree.getBody());
             var line = (int) lines.getLineNumber(startBody);
             var column = (int) lines.getColumnNumber(startBody);
             var insertPos = new Position(line - 1, column - 1);

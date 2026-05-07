@@ -12,7 +12,9 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.StringJoiner;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
@@ -27,6 +29,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.MarkdownHelper;
+import org.javacs.ParseTask;
 import org.javacs.completion.FindInvocationAt;
 import org.javacs.completion.ScopeHelper;
 import org.javacs.hover.ShortTypePrinter;
@@ -46,46 +49,49 @@ public class SignatureProvider {
     }
 
     public SignatureHelp signatureHelp(Path file, int line, int column) {
-        // TODO prune
-        try (var task = compiler.compileFastWithProcessors(file)) {
+        // Skip annotation processors when Lombok is absent — cheaper compile.
+        try (var task = compiler.lombokPresentOnClasspath()
+                ? compiler.compileFastWithProcessors(file)
+                : compiler.compileFast(file)) {
             var root = task.root(file);
-            long cursor;
+            String content;
             try {
-                cursor = FileStore.offset(root.getSourceFile().getCharContent(true).toString(), line, column);
+                content = root.getSourceFile().getCharContent(true).toString();
             } catch (java.io.IOException e) {
                 throw new RuntimeException(e);
             }
-            var path = new FindInvocationAt(task.task).scan(root, cursor);
-            if (path == null) return NOT_SUPPORTED;
-            if (path.getLeaf() instanceof MethodInvocationTree) {
-                var invoke = (MethodInvocationTree) path.getLeaf();
+            long cursor = FileStore.offset(content, line, column);
+            var attrPath = new FindInvocationAt(task.task).scan(root, (Long) cursor);
+            if (attrPath == null) return NOT_SUPPORTED;
+
+            var sourcePos = Trees.instance(task.task).getSourcePositions();
+            long invocationStart;
+            if (attrPath.getLeaf() instanceof MethodInvocationTree inv) {
+                invocationStart = sourcePos.getEndPosition(root, inv.getMethodSelect()) + 1;
+            } else if (attrPath.getLeaf() instanceof NewClassTree nc) {
+                invocationStart = sourcePos.getEndPosition(root, nc.getIdentifier()) + 1;
+            } else {
+                return NOT_SUPPORTED;
+            }
+
+            // activeParameter computed from text — no extra ATTR needed for comma counting.
+            var activeParameter = activeParameterFromText(content, invocationStart, cursor);
+
+            List<SignatureInformation> signatures;
+            int activeSignature;
+            if (attrPath.getLeaf() instanceof MethodInvocationTree invoke) {
                 var overloads = methodOverloads(task, root, invoke);
-                var activeParameter = activeParameter(task, root, invoke.getArguments(), cursor);
-                var signatures = new ArrayList<SignatureInformation>();
-                for (var method : overloads) {
-                    var info = info(method);
-                    addSourceInfo(task, method, info);
-                    addFancyLabel(info);
-                    signatures.add(info);
-                }
-                var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
-                return new SignatureHelp(signatures, activeSignature, activeParameter);
-            }
-            if (path.getLeaf() instanceof NewClassTree) {
-                var invoke = (NewClassTree) path.getLeaf();
+                signatures = buildSignatures(task, overloads);
+                activeSignature = activeSignature(task, attrPath, invoke.getArguments(), overloads);
+            } else if (attrPath.getLeaf() instanceof NewClassTree invoke) {
                 var overloads = constructorOverloads(task, root, invoke);
-                var activeParameter = activeParameter(task, root, invoke.getArguments(), cursor);
-                var signatures = new ArrayList<SignatureInformation>();
-                for (var method : overloads) {
-                    var info = info(method);
-                    addSourceInfo(task, method, info);
-                    addFancyLabel(info);
-                    signatures.add(info);
-                }
-                var activeSignature = activeSignature(task, path, invoke.getArguments(), overloads);
-                return new SignatureHelp(signatures, activeSignature, activeParameter);
+                signatures = buildSignatures(task, overloads);
+                activeSignature = activeSignature(task, attrPath, invoke.getArguments(), overloads);
+            } else {
+                return NOT_SUPPORTED;
             }
-            return NOT_SUPPORTED;
+
+            return new SignatureHelp(signatures, activeSignature, activeParameter);
         } catch (RuntimeException | AssertionError e) {
             LOG.fine(
                     String.format(
@@ -93,6 +99,40 @@ public class SignatureProvider {
                             file.getFileName(), e.getClass().getSimpleName(), e.getMessage()));
             return NOT_SUPPORTED;
         }
+    }
+
+    /**
+     * Count argument index at cursor using raw text. Counts commas at depth 0 (not nested in inner
+     * parens/brackets) starting from openParen, which points to the first character inside the call
+     * (i.e., already past the opening '('). Avoids any compiler involvement.
+     */
+    private static int activeParameterFromText(String content, long openParen, long cursor) {
+        // openParen is the position of the first char after '(' — already inside the call.
+        int depth = 0;
+        int commas = 0;
+        for (long i = openParen; i < cursor && i < content.length(); i++) {
+            char c = content.charAt((int) i);
+            if (c == '(' || c == '[' || c == '{') depth++;
+            else if ((c == ')' || c == ']' || c == '}') && depth > 0) depth--;
+            else if (c == ',' && depth == 0) commas++;
+        }
+        return commas;
+    }
+
+    /**
+     * Build SignatureInformation list from overloads, deduplicating source file parses per
+     * declaring class so each source file is parsed at most once per request.
+     */
+    private List<SignatureInformation> buildSignatures(CompileTask task, List<ExecutableElement> overloads) {
+        var parsedSources = new HashMap<String, Optional<ParseTask>>();
+        var signatures = new ArrayList<SignatureInformation>();
+        for (var method : overloads) {
+            var info = info(method);
+            addSourceInfoDeduped(task, method, info, parsedSources);
+            addFancyLabel(info);
+            signatures.add(info);
+        }
+        return signatures;
     }
 
     private List<ExecutableElement> methodOverloads(
@@ -193,17 +233,28 @@ public class SignatureProvider {
         return info;
     }
 
-    private void addSourceInfo(CompileTask task, ExecutableElement method, SignatureInformation info) {
+    /**
+     * Populate source-derived documentation and parameter names, reusing an already-parsed source
+     * file for the declaring class when available. parsedSources is keyed by qualified class name
+     * and accumulates across overloads so each source file is parsed at most once per request.
+     */
+    private void addSourceInfoDeduped(
+            CompileTask task,
+            ExecutableElement method,
+            SignatureInformation info,
+            HashMap<String, Optional<ParseTask>> parsedSources) {
         var type = (TypeElement) method.getEnclosingElement();
         var className = type.getQualifiedName().toString();
         var methodName = method.getSimpleName().toString();
         var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
-        var file = compiler.findAnywhere(className);
-        if (file.isEmpty()) return;
+        var parse = parsedSources.computeIfAbsent(className, key -> {
+            var sourceFile = compiler.findAnywhere(key);
+            return sourceFile.map(compiler::parse);
+        });
+        if (parse.isEmpty()) return;
         try {
-            var parse = compiler.parse(file.get());
-            var source = FindHelper.findMethod(parse, className, methodName, erasedParameterTypes);
-            var path = Trees.instance(task.task).getPath(parse.root(), source);
+            var source = FindHelper.findMethod(parse.get(), className, methodName, erasedParameterTypes);
+            var path = Trees.instance(task.task).getPath(parse.get().root(), source);
             var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
             if (docTree != null) {
                 info.documentation = MarkdownHelper.asMarkupContent(docTree);
@@ -230,18 +281,6 @@ public class SignatureProvider {
             list.add(info);
         }
         return list;
-    }
-
-    private int activeParameter(
-            CompileTask task, CompilationUnitTree root, List<? extends ExpressionTree> arguments, long cursor) {
-        var pos = Trees.instance(task.task).getSourcePositions();
-        for (var i = 0; i < arguments.size(); i++) {
-            var end = pos.getEndPosition(root, arguments.get(i));
-            if (cursor <= end) {
-                return i;
-            }
-        }
-        return arguments.size();
     }
 
     private int activeSignature(

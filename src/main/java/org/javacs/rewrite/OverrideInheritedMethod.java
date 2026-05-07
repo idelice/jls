@@ -40,14 +40,15 @@ public class OverrideInheritedMethod implements Rewrite {
 
     private String insertText(CompilerProvider compiler) {
         try (var task = compiler.compile(file)) {
+            var root = task.root(file);
             var types = task.task.getTypes();
             var trees = Trees.instance(task.task);
             var superMethod = FindHelper.findMethod(task, superClassName, methodName, erasedParameterTypes);
-            var thisTree = new FindTypeDeclarationAt(task.task).scan(task.root(), (long) insertPosition);
-            var thisPath = trees.getPath(task.root(), thisTree);
+            var thisTree = new FindTypeDeclarationAt(task.task).scan(root, (long) insertPosition);
+            var thisPath = trees.getPath(root, thisTree);
             var thisClass = (TypeElement) trees.getElement(thisPath);
             var parameterizedType = (ExecutableType) types.asMemberOf((DeclaredType) thisClass.asType(), superMethod);
-            var indent = EditHelper.indent(task.task, task.root(), thisTree) + 4;
+            var indent = EditHelper.indent(task.task, root, thisTree) + 4;
             var sourceFile = compiler.findAnywhere(superClassName);
             if (sourceFile.isEmpty()) return "";
             var parse = compiler.parse(sourceFile.get());

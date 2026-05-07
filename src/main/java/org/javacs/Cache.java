@@ -25,7 +25,7 @@ class Cache<K, V> {
         @Override
         public boolean equals(Object other) {
             if (other.getClass() != Cache.Key.class) return false;
-            var that = (Cache.Key) other;
+            var that = (Cache.Key<?>) other;
             return Objects.equals(this.key, that.key) && Objects.equals(this.file, that.file);
         }
 

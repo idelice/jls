@@ -1118,54 +1118,63 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void enterpriseStyleLombokDiagnosticsResolveGeneratedGetterChain() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enterprise-lombok-getter-chain");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
+    public void lombokSlf4jBridgeBreaksDataClassExpansion() throws Exception {
+        // Reproducer for the @Slf4j LombokTypeIndex exclusion bug.
+        //
+        // BFS expansion from the opened file resolves type references and adds each resolved path
+        // to the explicit diagnostic batch only if that path is in LombokTypeIndex. Because
+        // SOURCE_EXPANSION_PATTERN in LombokAnnotations omits @Slf4j, a class annotated with only
+        // @Slf4j is excluded from LombokTypeIndex. BFS stops at that class and never explores its
+        // own type references. Any @Data class reachable only through the @Slf4j bridge is also
+        // excluded, so it is compiled via source path without AP and its generated getters are never
+        // created. Calls to those getters on the opened file then produce false diagnostics.
+        //
+        // Setup:
+        //   Processor (opened) → calls Dispatcher.process() → returns Route
+        //   Dispatcher has @Slf4j only  → excluded from LombokTypeIndex → BFS stops
+        //   Route has @Data             → never reached by BFS → compiled via source path without AP
+        //   Route.getTarget() is missing → false "cannot find symbol" error on Processor
+        var workspace = Files.createTempDirectory("jls-lombok-slf4j-bridge");
         try {
-            var model = workspace.resolve("src/main/java/p/model");
-            var service = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(model);
-            Files.createDirectories(service);
+            var modelDir = workspace.resolve("src/main/java/p/model");
+            var dispatchDir = workspace.resolve("src/main/java/p/dispatch");
+            var serviceDir = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(dispatchDir);
+            Files.createDirectories(serviceDir);
 
-            var fooFile = model.resolve("Foo.java");
-            var barFile = model.resolve("Bar.java");
-            var bizFile = model.resolve("Biz.java");
-            var consumerFile = service.resolve("FooService.java");
+            // @Data class reachable only through the @Slf4j bridge — must get AP to have getters.
             Files.writeString(
-                    fooFile,
+                    modelDir.resolve("Route.java"),
                     "package p.model;\n"
                             + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  private Bar bar;\n"
+                            + "public class Route {\n"
+                            + "  private String target;\n"
                             + "}\n");
+
+            // @Slf4j-only bridge — excluded from LombokTypeIndex; BFS stops here.
             Files.writeString(
-                    barFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Bar {\n"
-                            + "  private Biz biz = new Biz();\n"
-                            + "}\n");
-            Files.writeString(
-                    bizFile,
-                    "package p.model;\n"
-                            + "public class Biz {\n"
-                            + "  public String value() {\n"
-                            + "    return \"ok\";\n"
+                    dispatchDir.resolve("Dispatcher.java"),
+                    "package p.dispatch;\n"
+                            + "import lombok.extern.slf4j.Slf4j;\n"
+                            + "@Slf4j\n"
+                            + "public class Dispatcher {\n"
+                            + "  public p.model.Route process() {\n"
+                            + "    log.info(\"dispatching\");\n"
+                            + "    return new p.model.Route();\n"
                             + "  }\n"
                             + "}\n");
+
+            // Opened file: calls Dispatcher.process().getTarget() — getTarget() is Lombok-generated.
+            var processorFile = serviceDir.resolve("Processor.java");
             Files.writeString(
-                    consumerFile,
+                    processorFile,
                     "package p.service;\n"
-                            + "import p.model.Foo;\n"
-                            + "public class FooService {\n"
-                            + "  String use(Foo foo) {\n"
-                            + "    var bar = foo.getBar();\n"
-                            + "    var biz = bar.getBiz();\n"
-                            + "    return biz.value();\n"
+                            + "import p.dispatch.Dispatcher;\n"
+                            + "public class Processor {\n"
+                            + "  Dispatcher dispatcher = new Dispatcher();\n"
+                            + "  public String run() {\n"
+                            + "    return dispatcher.process().getTarget();\n"
                             + "  }\n"
                             + "}\n");
 
@@ -1173,21 +1182,23 @@ public class JavaLanguageServerTest {
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.uri = processorFile.toUri();
             open.textDocument.version = 1;
             open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(consumerFile);
+            open.textDocument.text = Files.readString(processorFile);
             server.didOpenTextDocument(open);
 
-            var report = pullDiagnostics(server, consumerFile.toUri());
+            var report = pullDiagnostics(server, processorFile.toUri());
             Assert.assertFalse(
-                    "generated getter chain should not produce diagnostics in consumer",
+                    "@Slf4j bridge should not block @Data getter expansion; errors: "
+                            + report.items.stream()
+                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                                    .map(d -> d.message)
+                                    .toList(),
                     report.items.stream()
                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
+                            .anyMatch(d -> d.message.contains("getTarget")));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -1341,6 +1352,88 @@ public class JavaLanguageServerTest {
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void lombokNestedClassNameCollidesWithInterfaceNoFalseDiagnostics() throws Exception {
+        // Reproducer for: interface Foo in package A, outer @Data class in package B with a nested
+        // @Data class also named Foo (same simple name as the interface). Consumer imports both
+        // packages via wildcard and calls a getter chain through the nested Lombok type.
+        // Diagnostics should not falsely report that Lombok-generated methods do not exist.
+        var workspace = Files.createTempDirectory("jls-lombok-nested-name-collision");
+        try {
+            var contractDir = workspace.resolve("src/main/java/p/contract");
+            var modelDir = workspace.resolve("src/main/java/p/model");
+            var serviceDir = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(contractDir);
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            // Interface named "Response" in p.contract — no Lombok
+            Files.writeString(
+                    contractDir.resolve("Response.java"),
+                    "package p.contract;\n"
+                            + "public interface Response {\n"
+                            + "  String getStatus();\n"
+                            + "}\n");
+
+            // Outer @Data class with two nested @Data classes, one named "Response"
+            // (same simple name as the interface above)
+            Files.writeString(
+                    modelDir.resolve("Request.java"),
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Request {\n"
+                            + "  private Response response;\n"
+                            + "  private Detail detail;\n"
+                            + "  @lombok.Data\n"
+                            + "  public static class Response {\n"
+                            + "    private Detail detail;\n"
+                            + "    private String code;\n"
+                            + "  }\n"
+                            + "  @lombok.Data\n"
+                            + "  public static class Detail {\n"
+                            + "    private String message;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            // Consumer: wildcard imports bring in both the interface and the outer class.
+            // Getter chain goes through nested Lombok types.
+            var consumerFile = serviceDir.resolve("Consumer.java");
+            Files.writeString(
+                    consumerFile,
+                    "package p.service;\n"
+                            + "import p.contract.*;\n"
+                            + "import p.model.*;\n"
+                            + "public class Consumer {\n"
+                            + "  String use(Request req) {\n"
+                            + "    return req.getResponse().getDetail().getMessage();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+            configureLombokClasspath(server);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(open);
+
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
+                    "nested Lombok class with same name as interface should not produce false getter diagnostics; errors: "
+                            + report.items.stream()
+                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                                    .map(d -> d.message)
+                                    .toList(),
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getResponse()", "getDetail()", "getMessage()")));
+        } finally {
             deleteRecursively(workspace);
         }
     }
