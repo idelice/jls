@@ -110,7 +110,8 @@ class WarnUnused extends TreeScanner<Void, Void> {
 
             // Record components are always reachable — they have implicit public accessors
             var parent = path.getParentPath().getLeaf();
-            if (parent.getKind() == Tree.Kind.RECORD) {
+            var isStatic = v.getModifiers().getFlags().contains(Modifier.STATIC);
+             if (parent.getKind() == Tree.Kind.RECORD && !isStatic) {
                 return true;
             }
 

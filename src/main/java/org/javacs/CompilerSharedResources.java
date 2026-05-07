@@ -124,7 +124,6 @@ record CompilerSharedResources(
             LOG.warning(String.format(
                     "[lombok] ap_probe_failed ap_enabled=false reason=%s cause=%s",
                     e.getMessage(), e.getClass().getName()));
-            e.printStackTrace();
             return false;
         }
     }

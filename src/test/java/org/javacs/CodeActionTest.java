@@ -140,9 +140,7 @@ public class CodeActionTest {
 
         // Serialize diagnostics to JSON and back (mimics the LSP wire protocol)
         var json = gson.toJson(report.items);
-        @SuppressWarnings("unchecked")
-        List<Diagnostic> roundTripped = (List<Diagnostic>) gson.fromJson(json, new TypeToken<List<Diagnostic>>() {}.getType());
-
+        List<Diagnostic> roundTripped = gson.fromJson(json, new TypeToken<List<Diagnostic>>() {}.getType());
         var actionParams = new CodeActionParams();
         actionParams.textDocument = new TextDocumentIdentifier(file.toUri());
         actionParams.range = new Range(new Position(0, 0), new Position(0, 0));

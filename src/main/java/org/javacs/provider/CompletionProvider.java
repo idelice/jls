@@ -802,7 +802,8 @@ public class CompletionProvider {
             }
         }.scan(task.root(), null);
     }
-private String syntacticType(VariableTree t) {
+
+    private String syntacticType(VariableTree t) {
         var type = t.getType();
         if (type != null) return type.toString();
         var init = t.getInitializer();
@@ -814,6 +815,7 @@ private String syntacticType(VariableTree t) {
         }
         return null;
     }
+
     private void addSyntacticEnclosingTypeMembers(
             ParseTask parseTask, TreePath path, long cursor, String partial, CompletionList list) {
         var classPath = enclosingClassPath(path);
