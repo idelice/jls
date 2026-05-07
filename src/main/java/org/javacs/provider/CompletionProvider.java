@@ -12,9 +12,11 @@ import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.SwitchExpressionTree;
 import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.DocTrees;
 import com.sun.source.util.SourcePositions;
@@ -322,7 +324,7 @@ public class CompletionProvider {
                         ? mergeMemberContexts(index, target.qualifiedType())
                         : index.members(target.qualifiedType(), target.staticContext());
         var membersMs = Duration.between(membersStarted, Instant.now()).toMillis();
-        if (members.isEmpty()) {
+        if (members.isEmpty() && !target.staticContext()) {
             return new IndexedCompletionResult(EMPTY, resolveMs + membersMs, "no_members");
         }
         var enclosingInstanceAccess =
@@ -772,6 +774,14 @@ public class CompletionProvider {
         }
         new TreePathScanner<Void, Void>() {
             @Override
+            public Void visitMethod(MethodTree t, Void __) {
+                var start = positions.getStartPosition(task.root(), t);
+                var end = positions.getEndPosition(task.root(), t);
+                if (cursor < start || cursor > end) return null;
+                return super.visitMethod(t, null);
+            }
+
+            @Override
             public Void visitVariable(VariableTree t, Void __) {
                 var parent = getCurrentPath().getParentPath();
                 if (parent != null && parent.getLeaf() instanceof ClassTree) {
@@ -786,13 +796,24 @@ public class CompletionProvider {
                     return super.visitVariable(t, null);
                 }
                 if (seen.add(name)) {
-                    list.items.add(variable(name));
+                     list.items.add(variable(name, syntacticType(t)));
                 }
                 return super.visitVariable(t, null);
             }
         }.scan(task.root(), null);
     }
-
+private String syntacticType(VariableTree t) {
+        var type = t.getType();
+        if (type != null) return type.toString();
+        var init = t.getInitializer();
+        if (init instanceof NewClassTree nct && nct.getIdentifier() != null) {
+            return nct.getIdentifier().toString();
+        }
+        if (init instanceof TypeCastTree cast) {
+            return cast.getType().toString();
+        }
+        return null;
+    }
     private void addSyntacticEnclosingTypeMembers(
             ParseTask parseTask, TreePath path, long cursor, String partial, CompletionList list) {
         var classPath = enclosingClassPath(path);
@@ -973,7 +994,7 @@ public class CompletionProvider {
         if (containsCompletionLabel(list, name)) {
             return;
         }
-        list.items.add(field(name));
+        list.items.add(field(name, syntacticType(field)));
     }
 
     private void addSyntacticMethod(MethodTree method, String partial, CompletionList list) {
@@ -1668,20 +1689,20 @@ public class CompletionProvider {
         return i;
     }
 
-    private CompletionItem variable(String name) {
+    private CompletionItem variable(String name, String type) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Variable;
-        i.detail = "local";
+        i.detail = type != null ? type : "local";
         i.sortText = sortKey(Priority.LOCAL, i.label);
         return i;
     }
 
-    private CompletionItem field(String name) {
+    private CompletionItem field(String name, String type) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Field;
-        i.detail = "field";
+        i.detail = type != null ? type : "field";
         i.sortText = sortKey(Priority.FIELD, i.label);
         return i;
     }
