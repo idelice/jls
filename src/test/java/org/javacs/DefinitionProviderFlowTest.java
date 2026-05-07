@@ -1515,7 +1515,7 @@ public class DefinitionProviderFlowTest {
 
             assertThat(
                     gotoDefinition(
-                            navigationContext(workspace, Set.of(Path.of("lib/lombok-1.18.30.jar").toAbsolutePath())),
+                            navigationContext(workspace, Set.of(TestRuntimeJars.lombokJar())),
                             use,
                             "getContactWindow",
                             0),

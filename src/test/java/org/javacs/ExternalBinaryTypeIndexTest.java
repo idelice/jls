@@ -563,7 +563,7 @@ public class ExternalBinaryTypeIndexTest {
             options.add(classesDir.toString());
             var classpath = new ArrayList<Path>(classPathEntries);
             if (lombok) {
-                var lombokJar = runtimeJarPath("lombok.Data");
+                var lombokJar = TestRuntimeJars.lombokJar();
                 classpath.add(lombokJar);
             }
             if (!classpath.isEmpty()) {
@@ -575,17 +575,6 @@ public class ExternalBinaryTypeIndexTest {
             if (!Boolean.TRUE.equals(ok)) {
                 Assert.fail("failed to compile external source: " + output);
             }
-        }
-    }
-
-    private static Path runtimeJarPath(String className) {
-        try {
-            var type = Class.forName(className);
-            var codeSource = type.getProtectionDomain().getCodeSource();
-            Assert.assertNotNull("Missing code source for " + className, codeSource);
-            return Paths.get(codeSource.getLocation().toURI()).toAbsolutePath().normalize();
-        } catch (Exception e) {
-            throw new RuntimeException("Unable to locate runtime jar for " + className, e);
         }
     }
 

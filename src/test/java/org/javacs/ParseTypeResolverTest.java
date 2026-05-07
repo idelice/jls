@@ -103,6 +103,56 @@ public class ParseTypeResolverTest {
         }
     }
 
+    /**
+     * Reproduces: var response = mapper.readValue(json, Foo.class); response.↓
+     * should complete Foo members, not just Object members.
+     */
+    @Test
+    public void classLiteralArgBindsExternalMethodTypeVar() throws Exception {
+        var root = Files.createTempDirectory("class-literal-typevar-test");
+        try {
+            FileStore.setWorkspaceRoots(Set.of(root));
+
+            // Single file: Target + TypedMapper + UseCase — Target is visible in same
+            // compilation unit so resolveTypeTree can find it by simple name.
+            var useFile = root.resolve("UseCase.java");
+            var useSource =
+                    "class Target { public String getId() { return null; } }\n"
+                            + "class UseCase {\n"
+                            + "    interface TypedMapper {\n"
+                            + "        <T> T readValue(String content, Class<T> valueType);\n"
+                            + "    }\n"
+                            + "    TypedMapper mapper = null;\n"
+                            + "    void test() {\n"
+                            + "        var response = mapper.readValue(\"json\", Target.class);\n"
+                            + "        response.getId();\n"
+                            + "    }\n"
+                            + "}\n";
+            Files.writeString(useFile, useSource);
+
+            var compiler =
+                    new JavaCompilerService(
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet(),
+                            Collections.emptySet());
+            var parse = compiler.parse(useFile);
+            var index = navigationIndex(compiler, useFile);
+
+            var cursor = offset(useSource, "response.getId()", "response.".length());
+            var resolver = new ParseTypeResolver(parse, compiler, index, cursor);
+
+            var result = resolver.resolve(null, "response");
+            assertEquals(
+                    "response should resolve to Target, not Object",
+                    Optional.of("Target"),
+                    result.map(ParseTypeResolver.TypeResolution::qualifiedType));
+        } finally {
+            FileStore.setWorkspaceRoots(Collections.emptySet());
+            deleteTree(root);
+        }
+    }
+
     private static void assertVisibleDeclaration(
             String targetName, String source, String marker, int extraOffset, boolean expectedPresent)
             throws Exception {

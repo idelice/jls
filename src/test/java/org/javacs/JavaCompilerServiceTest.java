@@ -29,7 +29,7 @@ public class JavaCompilerServiceTest {
 
 //    @Test
 //    public void lombokCanBeDisabledBySetting() {
-//        var classPath = Set.of(Paths.get("lib/lombok-1.18.30.jar"));
+//        var classPath = Set.of(TestRuntimeJars.lombokJar());
 //        var service =
 //                new JavaCompilerService(
 //                        classPath,
@@ -43,7 +43,7 @@ public class JavaCompilerServiceTest {
 
     @Test
     public void lombokDefaultsToEnabledWhenPresentOnClasspath() {
-        var classPath = Set.of(Paths.get("lib/lombok-1.18.30.jar"));
+        var classPath = Set.of(TestRuntimeJars.lombokJar());
         var service =
                 new JavaCompilerService(
                         classPath, Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
@@ -137,7 +137,7 @@ public class JavaCompilerServiceTest {
     public void keepsCompilerContextGrowthBoundedAcrossRepeatedCompiles() throws Exception {
         var fullService =
                 new JavaCompilerService(
-                        Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                        Set.of(TestRuntimeJars.lombokJar()),
                         Collections.emptySet(),
                         Collections.emptySet(),
                         Collections.emptySet());
@@ -153,7 +153,7 @@ public class JavaCompilerServiceTest {
 
         var fastService =
                 new JavaCompilerService(
-                        Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                        Set.of(TestRuntimeJars.lombokJar()),
                         Collections.emptySet(),
                         Collections.emptySet(),
                         Collections.emptySet());
@@ -559,7 +559,7 @@ public class JavaCompilerServiceTest {
             FileStore.setWorkspaceRoots(Set.of(root));
             var service =
                     new JavaCompilerService(
-                            Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                            Set.of(TestRuntimeJars.lombokJar()),
                             Collections.emptySet(),
                             Collections.emptySet(),
                             Collections.emptySet());
@@ -651,7 +651,7 @@ public class JavaCompilerServiceTest {
             FileStore.setWorkspaceRoots(Set.of(root));
             var service =
                     new JavaCompilerService(
-                            Set.of(Paths.get("lib/lombok-1.18.30.jar")),
+                            Set.of(TestRuntimeJars.lombokJar()),
                             Collections.emptySet(),
                             Collections.emptySet(),
                             Collections.emptySet());

@@ -1028,7 +1028,7 @@ public class JavaLanguageServerTest {
             var settings = new JsonObject();
             var java = new JsonObject();
             var classPath = new com.google.gson.JsonArray();
-            classPath.add(Paths.get("lib/lombok-1.18.30.jar").toAbsolutePath().toString());
+            classPath.add(TestRuntimeJars.lombokJar().toString());
             java.add("classPath", classPath);
             settings.add("java", java);
             var change = new DidChangeConfigurationParams();
@@ -6962,7 +6962,7 @@ public class JavaLanguageServerTest {
         var settings = new JsonObject();
         var java = new JsonObject();
         var classPath = new com.google.gson.JsonArray();
-        classPath.add(Paths.get("lib/lombok-1.18.30.jar").toAbsolutePath().toString());
+        classPath.add(TestRuntimeJars.lombokJar().toString());
         java.add("classPath", classPath);
         settings.add("java", java);
         var change = new DidChangeConfigurationParams();
