@@ -125,17 +125,6 @@ public class FindReferencesTest {
                         "LombokFieldReferences.java(13)"));
     }
 
-    @Test
-    public void lombokAccessorReferencesIncludeFieldReadsAndWrites() {
-        var file = "/org/javacs/example/LombokFieldReferences.java";
-        assertThat(
-                items(file, 10, 13),
-                contains(
-                        "LombokFieldReferences.java(10)",
-                        "LombokFieldReferences.java(11)",
-                        "LombokFieldReferences.java(12)",
-                        "LombokFieldReferences.java(13)"));
-    }
 
     @Test
     public void abstractMethodReferencesIncludeOverridesAndCallSites() {

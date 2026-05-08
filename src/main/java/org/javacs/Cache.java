@@ -8,9 +8,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 /** Cache maps a file + an arbitrary key to a value. When the file is modified, the mapping expires. */
 class Cache<K, V> {
+    private static final Logger LOG = Logger.getLogger("main");
     private static final long DEFAULT_MAX_SIZE = 20_000;
 
     private static class Key<K> {
@@ -66,15 +68,21 @@ class Cache<K, V> {
     }
 
     private void onRemoval(Key<K> key, Value<V> value, RemovalCause cause) {
-        if (key == null) {
-            return;
+        if (key != null) {
+            keysByFile.computeIfPresent(
+                    key.file,
+                    (file, keys) -> {
+                        keys.remove(key);
+                        return keys.isEmpty() ? null : keys;
+                    });
         }
-        keysByFile.computeIfPresent(
-                key.file,
-                (file, keys) -> {
-                    keys.remove(key);
-                    return keys.isEmpty() ? null : keys;
-                });
+        if (value != null && value.value instanceof AutoCloseable closeable) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                LOG.fine(String.format("[cache] close_failed name=%s cause=%s error=%s", name, cause, e));
+            }
+        }
     }
 
     private void indexKey(Key<K> key) {
@@ -131,6 +139,11 @@ class Cache<K, V> {
             throw new IllegalArgumentException(k + " is not in cache " + name);
         }
         return value.value;
+    }
+
+    void evictAll() {
+        cache.invalidateAll();
+        keysByFile.clear();
     }
 
     int size() {

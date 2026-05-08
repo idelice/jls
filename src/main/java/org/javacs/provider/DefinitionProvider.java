@@ -71,10 +71,6 @@ public class DefinitionProvider implements SymbolIdentityResolver {
     private final int line;
     private final int column;
 
-    public DefinitionProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, TypeIndexRouter.EMPTY, file, line, column);
-    }
-
     public DefinitionProvider(
             CompilerProvider compiler,
             TypeIndexRouter typeIndexRouter,
@@ -117,7 +113,7 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                 resolved.simpleName(),
                 resolved.locations().isEmpty()
                         ? Optional.empty()
-                        : Optional.of(resolved.locations().get(0)));
+                        : Optional.of(resolved.locations().getFirst()));
     }
 
     public ResolvedSymbol resolveSymbol() {
@@ -152,8 +148,38 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             }
             var selectedName = selectedName(path);
             var trees = Trees.instance(compile.task);
-            var element = trees.getElement(path);
-            if (element == null) {
+             var element = trees.getElement(path);
+             if ((element == null
+                             || (element.getKind() != javax.lang.model.element.ElementKind.METHOD
+                                     && element.getKind()
+                                             != javax.lang.model.element.ElementKind.CONSTRUCTOR))
+                     && path.getLeaf() instanceof IdentifierTree mismatchId
+                     && path.getParentPath() != null
+                     && path.getParentPath().getLeaf() instanceof MethodInvocationTree mismatchInv
+                     && mismatchInv.getMethodSelect() == path.getLeaf()) {
+                 var mismatchName = mismatchId.getName().toString();
+                 var encClassPath = nearestClass(path);
+                 if (encClassPath != null && encClassPath.getLeaf() instanceof ClassTree encClass) {
+                     var allLocs = new ArrayList<Location>();
+                     for (var m : encClass.getMembers()) {
+                         if (!(m instanceof MethodTree mt)) continue;
+                         if (!mt.getName().contentEquals(mismatchName)) continue;
+                         var mPath = new TreePath(encClassPath, m);
+                         var l = FindHelper.location(compile, mPath, mismatchName);
+                         if (l != null) allLocs.add(l);
+                     }
+                     if (!allLocs.isEmpty()) {
+                         var encClassEl = trees.getElement(encClassPath);
+                         var qualName =
+                                 encClassEl instanceof javax.lang.model.element.TypeElement te
+                                         ? te.getQualifiedName().toString()
+                                         : null;
+                         return new ResolvedSymbol(
+                                 allLocs, qualName, mismatchName, true, null, mismatchName);
+                     }
+                 }
+             }
+             if (element == null) {
                 if (lombokUsed) {
                     var builderField = lombokBuilderFieldFromReceiver(compile, trees, path, selectedName);
                     if (builderField.isPresent()) {
@@ -166,8 +192,31 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                     }
                 }
                 return unsupported(null);
+             }
+             var declarationPath = trees.getPath(element);
+             
+             if (element.getKind() == javax.lang.model.element.ElementKind.METHOD
+                    && element instanceof javax.lang.model.element.ExecutableElement method) {
+                var enclosingClass = (javax.lang.model.element.TypeElement) method.getEnclosingElement();
+                var enclosingType = enclosingClass.asType();
+                var types = compile.task.getTypes();
+                var elements = compile.task.getElements();
+                for (var superClass : types.directSupertypes(enclosingType)) {
+                    var e = (javax.lang.model.element.TypeElement) types.asElement(superClass);
+                    for (var other : e.getEnclosedElements()) {
+                        if (!(other instanceof javax.lang.model.element.ExecutableElement otherMethod)) continue;
+                        if (elements.overrides(method, otherMethod, enclosingClass)) {
+                            element = otherMethod;
+                            declarationPath = trees.getPath(otherMethod);
+                            if (declarationPath != null) {
+                                break;
+                            }
+                        }
+                    }
+                    if (element != method) break;
+                }
             }
-            var declarationPath = trees.getPath(element);
+            
             // Edge case: constructors may not have a direct path; navigate to the enclosing class.
             if (declarationPath == null
                     && element.getKind() == javax.lang.model.element.ElementKind.CONSTRUCTOR) {
@@ -234,7 +283,7 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                     }
                 }
             }
-            return resolveElementCrossFile(element, selectedName, lombokUsed);
+            return resolveElementCrossFile(element, lombokUsed);
         } finally {
             compile.close();
         }
@@ -242,7 +291,6 @@ public class DefinitionProvider implements SymbolIdentityResolver {
 
     private ResolvedSymbol resolveElementCrossFile(
             javax.lang.model.element.Element element,
-            String selectedName,
             boolean lombokUsed) {
         var kind = element.getKind();
         if (kind == javax.lang.model.element.ElementKind.CLASS
@@ -693,9 +741,8 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             }
             if (parent instanceof MethodInvocationTree invocation
                     && invocation.getMethodSelect() == identifier) {
-                var resolved = resolveUnqualifiedMethodInvocation(
+                return resolveUnqualifiedMethodInvocation(
                         parse, path, types, invocation, identifier.getName().toString());
-                return resolved;
             }
 
             return resolveIdentifier(parse, path, identifier, types);
@@ -785,14 +832,15 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             }
             member = candidate;
         }
+        var indexedLocation = bestMemberDeclarationLocation(member);
         if (member == null
-            || bestMemberDeclarationLocation(member).isEmpty()
+            || indexedLocation.isEmpty()
                 || hasBackingField(member)) {
             return Optional.empty();
         }
         return Optional.of(
                 new ResolvedSymbol(
-                List.of(bestMemberDeclarationLocation(member).get()),
+                List.of(indexedLocation.get()),
                         member.declarationOwnerType,
                         methodName,
                         true,
@@ -1043,8 +1091,8 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                                 methodName,
                                 receiver.staticContext(),
                                 argumentCount,
-                                java.util.Collections.emptyList(),
-                                strictArity)
+                                java.util.Collections.emptyList()
+                )
                         .or(
                                 () ->
                                         receiver.staticContext()
@@ -1053,8 +1101,8 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                                                         receiver.qualifiedType(),
                                                         methodName,
                                                         argumentCount,
-                                                        java.util.Collections.emptyList(),
-                                                        strictArity))
+                                                        java.util.Collections.emptyList()
+                                        ))
                         .orElse(null);
         var indexed = resolveIndexedMethodResult(receiver.qualifiedType(), methodName, member);
         if (indexed.isPresent()) {
@@ -1069,8 +1117,8 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                                     methodName,
                                     receiver.staticContext(),
                                     argumentCount,
-                                    argTypes,
-                                    strictArity)
+                                    argTypes
+                    )
                             .orElse(null);
             if (member == null && !receiver.staticContext()) {
                 member =
@@ -1078,8 +1126,8 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                                         receiver.qualifiedType(),
                                         methodName,
                                         argumentCount,
-                                        argTypes,
-                                        strictArity)
+                                        argTypes
+                        )
                                 .orElse(null);
             }
             indexed = resolveIndexedMethodResult(receiver.qualifiedType(), methodName, member);
@@ -1334,48 +1382,6 @@ public class DefinitionProvider implements SymbolIdentityResolver {
                         materializeSelectedMethod(
                                 new SelectedMethod(ownerType, methodName, argumentCount, List.of(), indexed)))
                 .filter(resolved -> !resolved.locations().isEmpty());
-    }
-
-    /**
-     * Pick the owner/member pair for an unqualified call before location lookup starts.
-     *
-     * <p>Example: for {@code helper("x")}, search the current enclosing type first because instance
-     * methods beat static imports. If no unique match exists there, try the static-import owners
-     * declared in the current compilation unit.
-     */
-    private Optional<SelectedMethod> selectUnqualifiedMethodSymbol(
-            com.sun.source.tree.CompilationUnitTree root,
-            Optional<String> currentOwnerType,
-            String methodName,
-            int argCount,
-            List<String> argTypes) {
-        if (currentOwnerType.isPresent()) {
-            var currentOwner =
-                    selectMethodOnOwner(
-                            currentOwnerType.get(),
-                            methodName,
-                            false,
-                            argCount,
-                            argTypes,
-                            false);
-            if (currentOwner.isPresent()) {
-                return currentOwner;
-            }
-            // Also probe static methods on the enclosing type — unqualified calls to static
-            // methods in the same class are valid in static field initializers and static methods.
-            var staticOwner =
-                    selectMethodOnOwner(
-                            currentOwnerType.get(),
-                            methodName,
-                            true,
-                            argCount,
-                            argTypes,
-                            false);
-            if (staticOwner.isPresent()) {
-                return staticOwner;
-            }
-        }
-        return selectStaticImportMethodSymbol(root, methodName, argCount, argTypes);
     }
 
     private Optional<SelectedMethod> selectMethodOnOwner(
@@ -1656,11 +1662,11 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             int argumentCount,
             List<String> argTypes,
             boolean strictArity) {
-        var direct = lookupMethodOnOwner(ownerType, methodName, staticContext, argumentCount, argTypes, strictArity);
+        var direct = lookupMethodOnOwner(ownerType, methodName, staticContext, argumentCount, argTypes);
         if (direct.isPresent() || staticContext) {
             return direct;
         }
-        return lookupInheritedMethod(ownerType, methodName, argumentCount, argTypes, strictArity);
+        return lookupInheritedMethod(ownerType, methodName, argumentCount, argTypes);
     }
 
     private Optional<IndexedMember> lookupMethodOnOwner(
@@ -1668,8 +1674,7 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             String methodName,
             boolean staticContext,
             int argumentCount,
-            List<String> argTypes,
-            boolean strictArity) {
+            List<String> argTypes) {
         if (argTypes.size() == argumentCount && argTypes.stream().noneMatch(String::isBlank)) {
             var withArgs = typeIndexRouter.ownerMember(ownerType, methodName, staticContext, argTypes.toArray(String[]::new));
             var method = withArgs.filter(this::isMethodMember);
@@ -1684,17 +1689,16 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             String ownerType,
             String methodName,
             int argumentCount,
-            List<String> argTypes,
-            boolean strictArity) {
+            List<String> argTypes) {
         var visited = new LinkedHashSet<String>();
         var queue = new ArrayList<>(typeIndexRouter.directSupertypes(ownerType));
         IndexedMember match = null;
         while (!queue.isEmpty()) {
-            var current = queue.remove(0);
+            var current = queue.removeFirst();
             if (!visited.add(current)) {
                 continue;
             }
-            var candidate = lookupMethodOnOwner(current, methodName, false, argumentCount, argTypes, strictArity);
+            var candidate = lookupMethodOnOwner(current, methodName, false, argumentCount, argTypes);
             if (candidate.isPresent()) {
                 if (match != null && !java.util.Objects.equals(match.canonicalKey, candidate.get().canonicalKey)) {
                     return Optional.empty();
@@ -1816,7 +1820,7 @@ public class DefinitionProvider implements SymbolIdentityResolver {
         if (typeIndexRouter.ownerStore(type.qualifiedName) == TypeIndexRouter.OwnerStore.WORKSPACE) {
             var locations = findTypeLocations(type.qualifiedName, simpleName);
             if (!locations.isEmpty()) {
-                return Optional.of(locations.get(0));
+                return Optional.of(locations.getFirst());
             }
         }
         return type.declarationLocation();
@@ -1843,13 +1847,13 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             var argTypes = member.declaredParameterTypes == null ? List.<String>of() : List.of(member.declaredParameterTypes);
             var locations = findMethodLocations(member.declarationOwnerType, member.name, argCount, argTypes);
             if (!locations.isEmpty()) {
-                return Optional.of(locations.get(0));
+                return Optional.of(locations.getFirst());
             }
         }
         if (member.kind == CompletionItemKind.Field && !hasBackingField(member)) {
             var locations = findFieldLocations(member.declarationOwnerType, member.name);
             if (!locations.isEmpty()) {
-                return Optional.of(locations.get(0));
+                return Optional.of(locations.getFirst());
             }
         }
         return Optional.empty();
@@ -2189,7 +2193,7 @@ public class DefinitionProvider implements SymbolIdentityResolver {
         if (indexed == null || indexed.enclosingTypes.isEmpty()) {
             return List.of();
         }
-        var ordered = new ArrayList<String>(indexed.enclosingTypes);
+        var ordered = new ArrayList<>(indexed.enclosingTypes);
         java.util.Collections.reverse(ordered);
         return ordered;
     }
@@ -2320,5 +2324,4 @@ public class DefinitionProvider implements SymbolIdentityResolver {
             throw new RuntimeException(e);
         }
     }
-
 }

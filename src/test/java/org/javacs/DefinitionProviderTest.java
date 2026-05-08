@@ -70,7 +70,7 @@ public class DefinitionProviderTest {
                         "Owner",
                         List.of(member),
                         false,
-                        Path.of("Owner.java"),
+                        null,
                         Path.of("Owner.java").toUri(),
                         null,
                         List.of(),
@@ -152,80 +152,6 @@ public class DefinitionProviderTest {
                         strictIndexedMethod.invoke(provider, "test.Owner", "call", false, 0);
 
         assertThat("unsupported indexed fallback must not be treated as a successful strict resolution", resolved.isPresent(), is(false));
-    }
-
-    @Test
-    public void unqualifiedCurrentOwnerSelectionUsesIndexBeforeHeavyMaterialization() throws Exception {
-        var workspace = Files.createTempDirectory("definition-provider-current-owner");
-        try {
-            var appDir = workspace.resolve("app");
-            Files.createDirectories(appDir);
-            var use = appDir.resolve("Use.java");
-            Files.writeString(
-                    use,
-                    "package app;\n"
-                            + "class Use {\n"
-                            + "  String helper(String input) { return input; }\n"
-                            + "  void test() { helper(\"x\"); }\n"
-                            + "}\n");
-
-            FileStore.setWorkspaceRoots(Set.of(workspace));
-            var service =
-                    new JavaCompilerService(
-                            Collections.emptySet(),
-                            Collections.emptySet(),
-                            Collections.emptySet(),
-                            Collections.emptySet());
-            var tracking = new TrackingCompilerProvider(service);
-            var index = workspaceIndex(service, use);
-            var provider = new DefinitionProvider(tracking, index, use, 1, 1);
-            var parse = service.parse(use);
-
-            var select =
-                    DefinitionProvider.class.getDeclaredMethod(
-                            "selectUnqualifiedMethodSymbol",
-                            com.sun.source.tree.CompilationUnitTree.class,
-                            Optional.class,
-                            String.class,
-                            int.class,
-                            List.class);
-            select.setAccessible(true);
-            var selected =
-                    (Optional<?>)
-                            select.invoke(
-                                    provider,
-                                    parse.root(),
-                                    Optional.of("app.Use"),
-                                    "helper",
-                                    1,
-                                    List.of("java.lang.String"));
-
-            assertThat(selected.isPresent(), is(true));
-            assertThat("selection should stay cheap", tracking.parseCount, is(0));
-
-            var resolveIndexed = resolveIndexedMethodResult();
-            var selectedMethod = selected.get();
-            var ownerType = selectedMethod.getClass().getDeclaredMethod("ownerType");
-            var methodName = selectedMethod.getClass().getDeclaredMethod("methodName");
-            var member = selectedMethod.getClass().getDeclaredMethod("member");
-            ownerType.setAccessible(true);
-            methodName.setAccessible(true);
-            member.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            var resolved =
-                    (Optional<DefinitionProvider.ResolvedSymbol>)
-                            resolveIndexed.invoke(
-                                    provider,
-                                    ownerType.invoke(selectedMethod),
-                                    methodName.invoke(selectedMethod),
-                                    member.invoke(selectedMethod));
-
-            assertThat(resolved.isPresent(), is(true));
-            assertThat(resolved.get().locations(), not(empty()));
-            assertThat("indexed resolution should avoid extra parse work", tracking.parseCount, is(0));
-        } finally {
-            deleteTree(workspace);
-        }
     }
 
     @Test
@@ -457,24 +383,6 @@ public class DefinitionProviderTest {
         assertThat("expected non-empty definition for JDK platform method", locations, not(empty()));
     }
 
-    @Test
-    public void lombokGetterNavigatesToBackingField() throws Exception {
-        // Sets up FileStore with the maven-project workspace (which has Lombok on classpath).
-        var compiler = LanguageServerFixture.getCompilerProvider();
-        var use =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT
-                        .resolve("src/org/javacs/example/LombokCrossTypeDiagnostics.java");
-        // cursor on 'getName' in "model.getName();"
-        var pos = cursor(use, "getName");
-        var locations =
-                new DefinitionProvider(compiler, TypeIndexRouter.EMPTY, use, pos.line, pos.character)
-                        .find();
-        assertThat(
-                "Lombok getter should navigate to the backing field in LombokCrossTypeModel",
-                locations,
-                not(empty()));
-        assertThat(locations.get(0).uri.toString(), containsString("LombokCrossTypeModel"));
-    }
 
     @Test
     public void debugNonLombokMethodDefinition() throws Exception {

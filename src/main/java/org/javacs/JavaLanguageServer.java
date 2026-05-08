@@ -94,14 +94,12 @@ class JavaLanguageServer extends LanguageServer {
     private final LanguageClient client;
     private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
 
-    // Three compilers, each owned by exactly one thread/task:
-    //   interactiveCompiler — LSP main thread (definition, hover, completion, references …)
-    //   indexCompiler       — completion-index builds only (runRefresh / CompletionIndexScheduler)
-    //   diagnosticsCompiler — pull-diagnostics only (textDocument/diagnostic), never retains a CompileBatch
+    // Two compilers, each owned by exactly one thread/task:
+    //   mainCompiler / interactiveCompiler — LSP main thread (definition, hover, completion, references …)
+    //   indexCompiler                    — background completion-index builds (runRefresh / CompletionIndexScheduler)
     // No two of these are ever used concurrently. JavaCompilerService is not thread-safe.
     private JavaCompilerService interactiveCompiler;
     private JavaCompilerService indexCompiler;
-    private JavaCompilerService diagnosticsCompiler;
 
     private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
@@ -675,11 +673,8 @@ class JavaLanguageServer extends LanguageServer {
         var indexStarted = Instant.now();
         indexCompiler = new JavaCompilerService(shared, "index");
 
-        var diagnosticsStarted = Instant.now();
-        diagnosticsCompiler = new JavaCompilerService(shared, "diagnostics");
-
         LOG.info(String.format(
-                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms index=%dms diagnostics=%dms total=%dms",
+                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms index=%dms total=%dms",
                 classPath.size(),
                 resolvedDocPath.size(),
                 extraArgs.size(),
@@ -687,8 +682,7 @@ class JavaLanguageServer extends LanguageServer {
                 Duration.between(started, settingsLoaded).toMillis(),
                 Duration.between(settingsLoaded, inferenceFinished).toMillis(),
                 Duration.between(inferenceFinished, indexStarted).toMillis(),
-                Duration.between(indexStarted, diagnosticsStarted).toMillis(),
-                Duration.between(diagnosticsStarted, Instant.now()).toMillis(),
+                Duration.between(indexStarted, Instant.now()).toMillis(),
                 Duration.between(started, Instant.now()).toMillis()));
     }
 
@@ -1058,7 +1052,7 @@ class JavaLanguageServer extends LanguageServer {
         var started = Instant.now();
         var readiness = ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
         var snapshot = completionSnapshotRef.get();
-        var provider = new CompletionProvider(interactiveCompiler, snapshot.typeIndex(), snapshot.version());
+        var provider = new CompletionProvider(getOrCreateCompiler(), snapshot.typeIndex(), snapshot.version());
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(String.format(
@@ -1090,7 +1084,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(uri);
         ensureTypeIndexReady("hoverBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
-        var content = new HoverProvider(getOrCreateCompiler(), snapshot.typeIndex()).hover(file, line, column);
+        var content = new HoverProvider(getOrCreateCompiler()).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
         }
@@ -1216,13 +1210,13 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 cursor =
                         FileStore.offset(
-                                task.root().getSourceFile().getCharContent(true).toString(),
+                                task.root(file).getSourceFile().getCharContent(true).toString(),
                                 params.position.line + 1,
                                 params.position.character + 1);
             } catch (java.io.IOException e) {
                 throw new RuntimeException(e);
             }
-            var path = new FindNameAt(task).scan(task.root(), cursor);
+            var path = new FindNameAt(task).scan(task.root(file), cursor);
             if (path == null) {
                 LOG.info("...no element under cursor");
                 return Optional.empty();
@@ -1283,13 +1277,13 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 position =
                         FileStore.offset(
-                                task.root().getSourceFile().getCharContent(true).toString(),
+                                task.root(file).getSourceFile().getCharContent(true).toString(),
                                 params.position.line + 1,
                                 params.position.character + 1);
             } catch (java.io.IOException e) {
                 throw new RuntimeException(e);
             }
-            var path = new FindNameAt(task).scan(task.root(), position);
+            var path = new FindNameAt(task).scan(task.root(file), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = Trees.instance(task.task).getElement(path);
             return switch (el.getKind()) {
@@ -1339,7 +1333,7 @@ class JavaLanguageServer extends LanguageServer {
         var started = Instant.now();
         CompileTask task = null;
         try {
-            task = diagnosticsCompiler.compileDiagnostics(List.of(new SourceFileObject(file)));
+            task = getOrCreateCompiler().compileDiagnostics(List.of(new SourceFileObject(file)));
             var requestedUris = Set.of(fileUri);
             var report = new ErrorProvider(task).errors(requestedUris);
             var diagnostics = report.diagnostics().stream()
@@ -1367,7 +1361,8 @@ class JavaLanguageServer extends LanguageServer {
         for (var file : files) {
             var params = new DocumentDiagnosticParams();
             params.textDocument = new TextDocumentIdentifier(file.toUri());
-            textDocumentDiagnostic(params);
+            var report = textDocumentDiagnostic(params);
+            client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), report.items));
         }
     }
 
