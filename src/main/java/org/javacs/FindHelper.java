@@ -236,17 +236,37 @@ public class FindHelper {
     }
 
     public static int findNameIn(CompilationUnitTree root, CharSequence name, int start, int end) {
+        return findNameIn(root, name, start, end, -1);
+    }
+
+    /**
+     * Like {@link #findNameIn(CompilationUnitTree, CharSequence, int, int)} but finds
+     * the occurrence of {@code name} within {@code [start, end)} that contains
+     * {@code cursor}. Falls back to the first occurrence if none contains the cursor.
+     * Callers without cursor context can pass {@code -1} to always return the first
+     * occurrence.
+     */
+    public static int findNameIn(
+            CompilationUnitTree root, CharSequence name, int start, int end, long cursor) {
         CharSequence contents;
         try {
             contents = root.getSourceFile().getCharContent(true);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        var matcher = Pattern.compile("\\b" + name + "\\b").matcher(contents);
+        var escaped = Pattern.quote(name.toString());
+        var pattern = Pattern.compile("\\b" + escaped + "\\b");
+        var matcher = pattern.matcher(contents);
         matcher.region(start, end);
-        if (matcher.find()) {
-            return matcher.start();
+        int firstMatch = -1;
+        while (matcher.find()) {
+            var nameStart = matcher.start();
+            if (firstMatch < 0) firstMatch = nameStart;
+            var nameEnd = matcher.end();
+            if (nameStart <= cursor && cursor <= nameEnd) {
+                return nameStart;
+            }
         }
-        return -1;
+        return firstMatch;
     }
 }

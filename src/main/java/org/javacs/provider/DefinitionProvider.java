@@ -577,10 +577,13 @@ public class DefinitionProvider implements SymbolIdentityResolver {
         @Override
         public TreePath visitMemberSelect(MemberSelectTree tree, Long cursor) {
             var positions = Trees.instance(compile.task).getSourcePositions();
-            var start = (int) positions.getStartPosition(root, tree);
             var end = (int) positions.getEndPosition(root, tree);
-            if (start >= 0 && end >= start) {
-                var nameStart = FindHelper.findNameIn(root, tree.getIdentifier(), start, end);
+            // Only match cursor on the right-hand identifier (method name),
+            // never on the expression (variable name) which may share the same name.
+            var exprEnd = (int) positions.getEndPosition(root, tree.getExpression());
+            if (exprEnd >= 0 && exprEnd < end) {
+                var nameStart =
+                        FindHelper.findNameIn(root, tree.getIdentifier(), exprEnd, end, cursor);
                 var nameEnd = nameStart + tree.getIdentifier().length();
                 if (nameStart >= 0 && nameStart <= cursor && cursor <= nameEnd) {
                     return getCurrentPath();
