@@ -44,7 +44,7 @@ public class FileStore {
         newRoots = normalize(newRoots);
         for (var root : workspaceRoots) {
             if (!newRoots.contains(root)) {
-                workspaceRoots.removeIf(f -> f.startsWith(root));
+                javaSources.keySet().removeIf(f -> f.startsWith(root));
             }
         }
         for (var root : newRoots) {

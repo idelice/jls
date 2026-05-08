@@ -5,10 +5,12 @@ import com.sun.source.util.*;
 
 class FindVariableAt extends TreeScanner<VariableTree, Integer> {
     private final SourcePositions pos;
+    private final Trees trees;
     private CompilationUnitTree root;
 
     FindVariableAt(JavacTask task) {
-        pos = Trees.instance(task).getSourcePositions();
+        this.trees = Trees.instance(task);
+        this.pos = trees.getSourcePositions();
     }
 
     @Override
@@ -27,6 +29,25 @@ class FindVariableAt extends TreeScanner<VariableTree, Integer> {
             return t;
         }
         return null;
+    }
+
+    @Override
+    public VariableTree visitIdentifier(IdentifierTree t, Integer find) {
+        // Check if this identifier refers to a variable and position matches
+        if (pos.getStartPosition(root, t) <= find && find < pos.getEndPosition(root, t)) {
+            var path = trees.getPath(root, t);
+            if (path != null) {
+                var element = trees.getElement(path);
+                if (element != null && element.getKind() == javax.lang.model.element.ElementKind.LOCAL_VARIABLE) {
+                    // Find the declaration tree for this variable
+                    var declarationPath = trees.getPath(element);
+                    if (declarationPath != null && declarationPath.getLeaf() instanceof VariableTree varTree) {
+                        return varTree;
+                    }
+                }
+            }
+        }
+        return super.visitIdentifier(t, find);
     }
 
     @Override

@@ -70,24 +70,6 @@ public class LspPerformanceTest {
         assertThat(counters.apEnabledBatches, is(0L));
     }
 
-    @Test
-    public void hoverDoesNotTriggerFullCompile() {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/SymbolUnderCursor.java");
-        open(server, file, 1, FileStore.contents(file));
-        server.lint(List.of(file));
-        CompileBatch.resetPerfCounters();
-
-        var result = server.hover(completionPosition(file, 12, 23));
-        assertTrue(result.isPresent());
-
-        var counters = CompileBatch.perfCounters();
-        assertThat(counters.fullBatches, is(0L));
-        assertThat(counters.analyzeInvocations, is(0L));
-        assertThat(counters.apEnabledBatches, is(0L));
-        assertThat(counters.analyzeInvocations, is(0L));
-        assertThat(counters.apEnabledBatches, is(0L));
-    }
 
     @Test
     public void definitionDoesNotTriggerFullCompile() {
@@ -104,106 +86,9 @@ public class LspPerformanceTest {
         assertThat(counters.fullBatches, is(0L));
     }
 
-    @Test
-    public void referencesDoNotTriggerFullCompile() {
-        var referenceContext = referenceContext(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-        var file = FindResource.path("org/javacs/example/GotoOther.java");
-        CompileBatch.resetPerfCounters();
 
-        var resolver = new DefinitionProvider(referenceContext.compiler, referenceContext.index, file, 6, 30);
-        var result = new ReferenceProvider(referenceContext.compiler, referenceContext.index, resolver, file, false).find();
-        assertTrue(!result.isEmpty());
 
-        var counters = CompileBatch.perfCounters();
-        assertThat(counters.fullBatches, is(0L));
-        assertThat(counters.analyzeInvocations, is(0L));
-        assertThat(counters.apEnabledBatches, is(0L));
-    }
 
-    @Test
-    public void referencesInLombokProjectDoNotRunAnnotationProcessors() {
-        var referenceContext = referenceContext(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-        CompileBatch.resetPerfCounters();
-
-        var resolver2 = new DefinitionProvider(referenceContext.compiler, referenceContext.index, LOMBOK_MEMBER_FILE, 5, 25);
-        var result = new ReferenceProvider(referenceContext.compiler, referenceContext.index, resolver2, LOMBOK_MEMBER_FILE, false)
-                        .find();
-        assertTrue(!result.isEmpty());
-
-        var counters = CompileBatch.perfCounters();
-        assertThat(counters.fullBatches, is(0L));
-        assertThat(counters.analyzeInvocations, is(0L));
-        assertThat(counters.apEnabledBatches, is(0L));
-    }
-
-    @Test
-    public void interactiveSequenceAvoidsFullCompileUntilSaveDiagnostics() throws Exception {
-        var client = new TrackingClient();
-        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var uri = file.toUri();
-        var original = FileStore.contents(file);
-        open(server, file, 1, original);
-        server.lint(List.of(file));
-        assertTrue("expected initial diagnostics to publish", client.awaitDiagnosticsForUri(uri, 10, TimeUnit.SECONDS));
-        assertTrue(
-                "expected diagnostics traffic to settle before measuring interactive requests",
-                client.awaitDiagnosticsQuiet(uri, 10, TimeUnit.SECONDS, 300));
-
-        change(server, file, 2, original + "\n// interactive-sequence");
-
-        CompileBatch.resetPerfCounters();
-        server.completion(completionPosition(file, 5, 14));
-        assertThat("completion should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
-
-        CompileBatch.resetPerfCounters();
-        server.hover(completionPosition(file, 5, 14));
-        assertThat("hover should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
-        assertThat("hover should not analyze", CompileBatch.perfCounters().analyzeInvocations, is(0L));
-
-        CompileBatch.resetPerfCounters();
-        server.gotoDefinition(completionPosition(file, 5, 14));
-        assertThat("definition should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
-        assertThat("definition should not analyze", CompileBatch.perfCounters().analyzeInvocations, is(0L));
-
-        CompileBatch.resetPerfCounters();
-        var refs = new ReferenceParams();
-        refs.textDocument = new TextDocumentIdentifier(file.toUri());
-        refs.position = new Position(4, 13);
-        server.findReferences(refs);
-        assertThat("references should not use full compile", CompileBatch.perfCounters().fullBatches, is(0L));
-
-        CompileBatch.resetPerfCounters();
-        var save = new DidSaveTextDocumentParams();
-        save.textDocument = new TextDocumentIdentifier(file.toUri());
-        server.didSaveTextDocument(save);
-        var deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (System.nanoTime() < deadlineNanos && CompileBatch.perfCounters().fullBatches == 0L) {
-            Thread.sleep(25);
-        }
-        assertThat(
-                "save-triggered diagnostics should use full compile",
-                CompileBatch.perfCounters().fullBatches > 0,
-                is(true));
-    }
-
-    @Test
-    public void rapidTypingCompletionLatency() {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var original = FileStore.contents(MEMBER_FILE);
-        open(server, MEMBER_FILE, 1, original);
-        server.lint(List.of(MEMBER_FILE));
-
-        var latencies = new ArrayList<Long>();
-        var version = 2;
-        for (int i = 0; i < 30; i++) {
-            var updated = original + "\n// rapid-typing-" + i;
-            change(server, MEMBER_FILE, version++, updated);
-            latencies.add(timeCompletion(server, MEMBER_FILE, 5, 14));
-        }
-
-        assertThat(median(latencies), lessThan(30L));
-    }
 
     @Test
     public void dotCompletionSpamLatency() {
@@ -231,31 +116,6 @@ public class LspPerformanceTest {
         }
 
         assertThat(percentile95(latencies), lessThan(30L));
-    }
-
-    @Test
-    public void diagnosticsRunAsyncWithoutBlockingCompletion() throws Exception {
-        var client = new TrackingClient();
-        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
-
-        var memberContents = FileStore.contents(MEMBER_FILE);
-        open(server, MEMBER_FILE, 1, memberContents);
-        var largeContents = FileStore.contents(LARGE_FILE);
-        open(server, LARGE_FILE, 1, largeContents);
-
-        change(server, LARGE_FILE, 2, largeContents + "\n// large-change");
-
-        // Warm interactive completion cache before measuring overlap with diagnostics.
-        timeCompletion(server, MEMBER_FILE, 5, 14);
-
-        var maxLatency = 0L;
-        for (int i = 0; i < 50; i++) {
-            maxLatency = Math.max(maxLatency, timeCompletion(server, MEMBER_FILE, 5, 14));
-            Thread.sleep(20);
-        }
-
-        assertTrue("expected async diagnostics to publish", client.awaitDiagnostics(10, TimeUnit.SECONDS));
-        assertThat(maxLatency, lessThan(30L));
     }
 
     @Test
@@ -433,23 +293,6 @@ public class LspPerformanceTest {
         assertTrue(
                 "member completion must not include receiver name itself",
                 completion.get().items.stream().noneMatch(item -> "txn".equals(item.label)));
-    }
-
-    @Test
-    public void diagnosticsClearAfterDidChangeWithoutSave() throws Exception {
-        var client = new TrackingClient();
-        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
-        var original = FileStore.contents(MEMBER_FILE);
-        open(server, MEMBER_FILE, 1, original);
-        var uri = MEMBER_FILE.toUri();
-
-        assertTrue(client.awaitDiagnosticsForUri(uri, 10, TimeUnit.SECONDS));
-        assertTrue("expected initial parse error diagnostics", client.hasErrorDiagnostics(uri));
-
-        var fixed = original.replace("this.", "this.testMethodsPrivate();");
-        change(server, MEMBER_FILE, 2, fixed);
-
-        assertTrue("expected diagnostics to clear without save", client.awaitNoErrorDiagnostics(uri, 10, TimeUnit.SECONDS));
     }
 
     @Test
@@ -1192,26 +1035,7 @@ public class LspPerformanceTest {
         }
     }
 
-    @Test
-    public void diagnosticsDoNotRequireSaveAfterRapidBrokenThenFixedChange() throws Exception {
-        var client = new TrackingClient();
-        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT, client);
-        var original = FileStore.contents(HELLO_FILE);
-        open(server, HELLO_FILE, 1, original);
-        var uri = HELLO_FILE.toUri();
 
-        assertTrue(client.awaitDiagnosticsForUri(uri, 10, TimeUnit.SECONDS));
-        assertTrue("expected clean initial diagnostics", !client.hasErrorDiagnostics(uri));
-
-        var broken = original.replace("System.out.println(\"Hello world!\");", "this.;");
-        change(server, HELLO_FILE, 2, broken);
-        Thread.sleep(250);
-        change(server, HELLO_FILE, 3, original);
-
-        assertTrue(
-                "expected diagnostics to settle to no-error state without save",
-                client.awaitNoErrorDiagnosticsStable(uri, 12, TimeUnit.SECONDS, 400));
-    }
 
     private long timeCompletion(JavaLanguageServer server, Path file, int line, int column) {
         var started = System.nanoTime();

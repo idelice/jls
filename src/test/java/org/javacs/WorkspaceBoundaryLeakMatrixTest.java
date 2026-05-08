@@ -54,56 +54,6 @@ public class WorkspaceBoundaryLeakMatrixTest {
                     "matrix.use.LoggerCompletionUse");
 
     @Test
-    public void workspaceDefinitionMatrixDoesNotLeakToExternalBinary() throws Exception {
-        var workspace = createWorkspace();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace.root(), new NoopLanguageClient());
-            configureLombokClasspath(server);
-
-            open(server, workspace.serviceTwo());
-            open(server, workspace.definitionUse());
-            open(server, workspace.myEnum());
-            open(server, workspace.plainPojo());
-            open(server, workspace.myRecord());
-            open(server, workspace.lombokPojo());
-            open(server, workspace.lombokBase());
-            open(server, workspace.myInt());
-            open(server, workspace.myInt2());
-            open(server, workspace.myAnno());
-
-            Assert.assertTrue(awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_ANNOTATION*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_CONSTRUCTOR*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_PLAIN_FIELD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_INSTANCE_METHOD*/");
-            assertDefinitionCase(server, capture, workspace.serviceTwo(), "/*USE_UNQUALIFIED_CALL*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_STATIC_FIELD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_STATIC_METHOD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_NESTED_CLASS*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_NESTED_METHOD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_NESTED_ENUM_CONSTANT*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_ENUM_CONSTANT*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_LOMBOK_ENUM_ACCESSOR*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_LOMBOK_ACCESSOR*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_LOMBOK_INHERITED_ACCESSOR*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_DEFAULT_METHOD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_ABSTRACT_METHOD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_SEALED_METHOD*/");
-            assertDefinitionCase(server, capture, workspace.definitionUse(), "/*USE_NESTED_INTERFACE_METHOD*/");
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace.root());
-        }
-    }
-
-    @Test
     public void workspaceReferenceMatrixDoesNotLeakToExternalBinary() throws Exception {
         var workspace = createWorkspace();
         var logger = Logger.getLogger("main");

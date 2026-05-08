@@ -1090,7 +1090,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(uri);
         ensureTypeIndexReady("hoverBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
-        var content = new HoverProvider(getOrCreateCompiler(), snapshot.typeIndex()).hover(file, line, column);
+        var content = new HoverProvider(getOrCreateCompiler()).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
         }
@@ -1216,13 +1216,13 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 cursor =
                         FileStore.offset(
-                                task.root().getSourceFile().getCharContent(true).toString(),
+                                task.root(file).getSourceFile().getCharContent(true).toString(),
                                 params.position.line + 1,
                                 params.position.character + 1);
             } catch (java.io.IOException e) {
                 throw new RuntimeException(e);
             }
-            var path = new FindNameAt(task).scan(task.root(), cursor);
+            var path = new FindNameAt(task).scan(task.root(file), cursor);
             if (path == null) {
                 LOG.info("...no element under cursor");
                 return Optional.empty();
@@ -1283,13 +1283,13 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 position =
                         FileStore.offset(
-                                task.root().getSourceFile().getCharContent(true).toString(),
+                                task.root(file).getSourceFile().getCharContent(true).toString(),
                                 params.position.line + 1,
                                 params.position.character + 1);
             } catch (java.io.IOException e) {
                 throw new RuntimeException(e);
             }
-            var path = new FindNameAt(task).scan(task.root(), position);
+            var path = new FindNameAt(task).scan(task.root(file), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = Trees.instance(task.task).getElement(path);
             return switch (el.getKind()) {
@@ -1367,7 +1367,8 @@ class JavaLanguageServer extends LanguageServer {
         for (var file : files) {
             var params = new DocumentDiagnosticParams();
             params.textDocument = new TextDocumentIdentifier(file.toUri());
-            textDocumentDiagnostic(params);
+            var report = textDocumentDiagnostic(params);
+            client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), report.items));
         }
     }
 

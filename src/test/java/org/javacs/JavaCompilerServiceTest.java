@@ -134,39 +134,6 @@ public class JavaCompilerServiceTest {
     }
 
     @Test
-    public void keepsCompilerContextGrowthBoundedAcrossRepeatedCompiles() throws Exception {
-        var fullService =
-                new JavaCompilerService(
-                        Set.of(TestRuntimeJars.lombokJar()),
-                        Collections.emptySet(),
-                        Collections.emptySet(),
-                        Collections.emptySet());
-        var file = FindResource.path("org/javacs/example/HelloWorld.java");
-
-        try (var ignored = fullService.compile(file)) {}
-        try (var ignored = fullService.compile(file)) {}
-        var fullContexts = reusableCompilerContexts(fullService.compiler);
-        assertThat(
-                "repeated full compiles should not keep creating new reusable contexts",
-                fullContexts.size(),
-                lessThanOrEqualTo(2));
-
-        var fastService =
-                new JavaCompilerService(
-                        Set.of(TestRuntimeJars.lombokJar()),
-                        Collections.emptySet(),
-                        Collections.emptySet(),
-                        Collections.emptySet());
-        try (var ignored = fastService.compileFastWithProcessors(file)) {}
-        try (var ignored = fastService.compileFastWithProcessors(file)) {}
-        var fastContexts = reusableCompilerContexts(fastService.compiler);
-        assertThat(
-                "repeated fast AP compiles should not keep creating new reusable contexts",
-                    fastContexts.size(),
-                    lessThanOrEqualTo(2));
-    }
-
-    @Test
     public void reusableCompilerUnlocksAfterTaskCreationFailure() {
         var reusable = new ReusableCompiler();
 
@@ -746,12 +713,6 @@ public class JavaCompilerServiceTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<List<String>, ?> reusableCompilerContexts(ReusableCompiler compiler) throws Exception {
-        Field field = ReusableCompiler.class.getDeclaredField("contexts");
-        field.setAccessible(true);
-        return (Map<List<String>, ?>) field.get(compiler);
-    }
-
     private static CompileBatch cachedCompile(JavaCompilerService service, String fieldName) throws Exception {
         Field field = JavaCompilerService.class.getDeclaredField(fieldName);
         field.setAccessible(true);

@@ -248,7 +248,8 @@ class JavaCompilerService implements CompilerProvider {
                 createCompileBatch(sources, profile, useAnnotationProcessing, slot, "first-attempt");
 
         if (profile.analysisMode() == CompileBatch.AnalysisMode.ATTR
-                || !profile.expandAdditionalSources()) {
+                || !profile.expandAdditionalSources()
+                || profile.cacheSlot() == CacheSlot.NONE) {
             return firstAttempt;
         }
 
@@ -373,7 +374,7 @@ class JavaCompilerService implements CompilerProvider {
         // DIAGNOSTICS_PROFILE keeps the caller's source set to avoid retaining a full workspace
         // compile batch on every BufEnter pull-diagnostic request.
         var compileSources =
-                profile.cacheSlot() == CacheSlot.FULL && profile.widenToWorkspace()
+                profile.cacheSlot() == CacheSlot.FULL && profile.widenToWorkspace() && sources.size() <= 1
                         ? FileStore.all().stream().<JavaFileObject>map(SourceFileObject::new).toList()
                         : sources;
         var expandedSources =
@@ -387,7 +388,7 @@ class JavaCompilerService implements CompilerProvider {
         var effectiveSources = expandedSources.sources();
         var cacheSlot = cacheSlot(profile, useAnnotationProcessing);
         var cacheName = cacheMetricNameFor(cacheSlot);
-        if (!retainCachedCompileBatches) {
+        if (!retainCachedCompileBatches || cacheSlot == CacheSlot.NONE) {
             CacheAudit.miss(cacheName);
             var loaded =
                     compileWithExpansionIfNeeded(
@@ -1144,7 +1145,7 @@ class JavaCompilerService implements CompilerProvider {
         var compile = compileBatch(sources, FULL_PROFILE);
         LOG.fine(String.format("[cache] compile role=%s cached=%s", compilerRole, isCachedBatch(compile)));
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
-                isCachedBatch(compile) ? () -> {} : compile::close);
+                compile::close);
     }
 
     CompileTask compileDiagnostics(Collection<? extends JavaFileObject> sources) {
@@ -1153,7 +1154,7 @@ class JavaCompilerService implements CompilerProvider {
         var compile = compileBatch(sources, DIAGNOSTICS_PROFILE);
         LOG.fine(String.format("[cache] compileDiagnostics role=%s cached=%s", compilerRole, isCachedBatch(compile)));
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
-                isCachedBatch(compile) ? () -> {} : compile::close);
+                compile::close);
     }
 
     @Override
@@ -1170,14 +1171,14 @@ class JavaCompilerService implements CompilerProvider {
     public CompileTask compileFastWithProcessors(Collection<? extends JavaFileObject> sources) {
         var compile = compileBatch(sources, FAST_AP_PROFILE);
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
-                isCachedBatch(compile) ? () -> {} : compile::close);
+                compile::close);
     }
 
     @Override
     public CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
         var compile = compileBatch(sources, FAST_NO_AP_PROFILE);
         return new CompileTask(compile.task, compile.roots, diags, compile.sourceStamps,
-                isCachedBatch(compile) ? () -> {} : compile::close);
+                compile::close);
     }
 
     CompileTelemetry lastCompileTelemetry() {
