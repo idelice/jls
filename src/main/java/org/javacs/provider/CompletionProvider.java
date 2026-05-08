@@ -196,6 +196,9 @@ public class CompletionProvider {
     public CompletionList complete(Path file, int line, int column) {
         var started = Instant.now();
         var request = prepareRequestContext(file, line, column);
+        if (request == null) {
+            return NOT_SUPPORTED;
+        }
         CompletionList list;
         String mode;
         long resolveMs = 0;
@@ -235,7 +238,11 @@ public class CompletionProvider {
         var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
         long cursor;
         try {
-            cursor = FileStore.offset(task.root().getSourceFile().getCharContent(true).toString(), line, column);
+            var source = task.root().getSourceFile().getCharContent(true).toString();
+            cursor = FileStore.offset(source, line, column);
+            if (isInComment(source, cursor)) {
+                return null;
+            }
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }
@@ -246,6 +253,75 @@ public class CompletionProvider {
         var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
         var memberAccess = memberAccessContext(pruned, (int) cursor);
         return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, parseMs);
+    }
+
+    /**
+     * Scans source text up to cursor offset to determine if the cursor is inside a comment.
+     * Tracks string and char literals to avoid false positives where // or /* appear inside strings.
+     */
+    private static boolean isInComment(String source, long cursorOffset) {
+        var inLineComment = false;
+        var inBlockComment = false;
+        var inString = false;
+        var inChar = false;
+        var escaping = false;
+        var limit = (int) Math.min(cursorOffset, source.length());
+        for (int i = 0; i < limit; i++) {
+            var c = source.charAt(i);
+            var next = i + 1 < source.length() ? source.charAt(i + 1) : '\0';
+            if (inLineComment) {
+                if (c == '\n' || c == '\r') {
+                    inLineComment = false;
+                }
+                continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') {
+                    inBlockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (inString) {
+                if (escaping) {
+                    escaping = false;
+                } else if (c == '\\') {
+                    escaping = true;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (inChar) {
+                if (escaping) {
+                    escaping = false;
+                } else if (c == '\\') {
+                    escaping = true;
+                } else if (c == '\'') {
+                    inChar = false;
+                }
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                inLineComment = true;
+                i++;
+                continue;
+            }
+            if (c == '/' && next == '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = true;
+                continue;
+            }
+        }
+        return inLineComment || inBlockComment;
     }
 
     private CompletionList finalizeCompletionList(ParseTask task, CompletionList list) {
