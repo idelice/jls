@@ -25,12 +25,12 @@ public class CompilerMemoryInvestigationTest {
         assertTrue("expected this repo workspace to contain multiple Java files", workspaceJavaFiles > 10);
         assertTrue(
                 "one-file diagnostics should not retain a workspace-wide FULL compile; retained roots="
-                        + snapshot.fullRoots()
+                        + snapshot.workspaceRoots()
                         + " workspaceFiles="
                         + workspaceJavaFiles
                         + " heapUsedMb="
                         + snapshot.heapUsedMb(),
-                snapshot.fullRoots() <= 1);
+                snapshot.workspaceRoots() <= 1);
     }
 
     private static void forceGc() throws InterruptedException {

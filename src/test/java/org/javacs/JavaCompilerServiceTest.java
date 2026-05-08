@@ -231,12 +231,12 @@ public class JavaCompilerServiceTest {
 
         CompileBatch batch;
         try (var ignored = service.compile(file)) {
-            batch = cachedCompile(service, "cachedCompile");
+            batch = cachedCompile(service, "cachedCompile", file);
             assertThat("borrow should stay open while compile task is in use", batch.borrow.closed, is(false));
         }
 
-        assertThat("compile batch should be marked closed after task close", batch.closed, is(true));
-        assertThat("closing the compile task should fully close the underlying borrow", batch.borrow.closed, is(true));
+        assertThat("compile batch should stay open after task close", batch.closed, is(false));
+        assertThat("closing the compile task should not close the underlying borrow", batch.borrow.closed, is(false));
     }
 
     @Test
@@ -250,12 +250,12 @@ public class JavaCompilerServiceTest {
                         Collections.emptySet());
 
         var task = service.compile(file);
-        var batch = cachedCompile(service, "cachedCompile");
+        var batch = cachedCompile(service, "cachedCompile", file);
         task.close();
         task.close();
 
-        assertThat("compile batch should stay closed after repeated close", batch.closed, is(true));
-        assertThat("borrow should stay closed after repeated close", batch.borrow.closed, is(true));
+        assertThat("compile batch should stay open after repeated close", batch.closed, is(false));
+        assertThat("borrow should stay open after repeated close", batch.borrow.closed, is(false));
     }
 
     @Test
@@ -270,21 +270,21 @@ public class JavaCompilerServiceTest {
 
         CompileBatch firstBatch;
         try (var first = service.compile(file)) {
-            firstBatch = cachedCompile(service, "cachedCompile");
+            firstBatch = cachedCompile(service, "cachedCompile", file);
             assertThat("initial compile should populate the full-compile cache", firstBatch, notNullValue());
             assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
         }
 
-        assertThat("closing the first compile should mark the cached batch closed", firstBatch.closed, is(true));
+        assertThat("closing the first compile should leave the cached batch open", firstBatch.closed, is(false));
 
         CompileBatch secondBatch;
         try (var second = service.compile(file)) {
-            secondBatch = cachedCompile(service, "cachedCompile");
-            assertThat("closed cache entry should be replaced with a fresh batch", secondBatch, not(sameInstance(firstBatch)));
+            secondBatch = cachedCompile(service, "cachedCompile", file);
+            assertThat("open cached compile should reuse the same batch", secondBatch, sameInstance(firstBatch));
             assertThat(
-                    "reusing a closed cached compile would incorrectly report a cache hit",
+                    "reusing an open cached compile should report a cache hit",
                     service.lastCompileTelemetry().path(),
-                    is("cache_refresh"));
+                    is("cache_hit"));
         }
     }
 
@@ -299,17 +299,17 @@ public class JavaCompilerServiceTest {
                         Collections.emptySet());
 
         try (var first = service.compile(file)) {
-            var firstBatch = cachedCompile(service, "cachedCompile");
+            var firstBatch = cachedCompile(service, "cachedCompile", file);
             assertThat("initial compile should populate the full-compile cache", firstBatch, notNullValue());
             assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
 
             try (var second = service.compile(file)) {
-                var secondBatch = cachedCompile(service, "cachedCompile");
+                var secondBatch = cachedCompile(service, "cachedCompile", file);
                 assertThat("live cache entry should be reused", secondBatch, sameInstance(firstBatch));
                 assertThat("reusing a live cached compile should report a cache hit", service.lastCompileTelemetry().path(), is("cache_hit"));
             }
 
-            assertThat("closing the second shared compile task should close the shared batch", firstBatch.closed, is(true));
+            assertThat("closing the second shared compile task should leave the shared batch open", firstBatch.closed, is(false));
         }
     }
 
@@ -329,21 +329,21 @@ public class JavaCompilerServiceTest {
         CompileBatch firstBatch;
         try (var first =
                 service.compileFast(List.of(new SourceFileObject(file, initial, fixedTime, 1)))) {
-            firstBatch = cachedCompile(service, "cachedFastCompileNoAp");
+            firstBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
             assertThat(firstBatch.borrow.closed, is(false));
         }
-        assertThat("first cached borrow should close when the task closes", firstBatch.borrow.closed, is(true));
+        assertThat("first cached borrow should stay open when the task closes", firstBatch.borrow.closed, is(false));
 
         CompileBatch secondBatch;
         try (var second =
                 service.compileFast(List.of(new SourceFileObject(file, updated, fixedTime, 2)))) {
-            secondBatch = cachedCompile(service, "cachedFastCompileNoAp");
+            secondBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
             assertThat("cache refresh should replace the cached batch", secondBatch, not(sameInstance(firstBatch)));
             assertThat("previous cached borrow should remain closed after refresh", firstBatch.borrow.closed, is(true));
             assertThat("new cached borrow should be open while the refreshed task is in use", secondBatch.borrow.closed, is(false));
         }
 
-        assertThat("refreshed cached borrow should close when its task closes", secondBatch.borrow.closed, is(true));
+        assertThat("refreshed cached borrow should stay open when its task closes", secondBatch.borrow.closed, is(false));
     }
 
     @Test
@@ -360,18 +360,18 @@ public class JavaCompilerServiceTest {
 
         try (var first =
                 service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
-            var firstBatch = cachedCompile(service, "cachedFastCompileNoAp");
+            var firstBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
             assertThat("initial fast compile should populate the fast cache", firstBatch, notNullValue());
             assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
 
             try (var second =
                     service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
-                var secondBatch = cachedCompile(service, "cachedFastCompileNoAp");
-                assertThat("live fast cache entry should be reused", secondBatch, sameInstance(firstBatch));
-                assertThat("reusing a live fast cached compile should report a cache hit", service.lastCompileTelemetry().path(), is("cache_hit"));
+                var secondBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
+                assertThat("stale fast cache entry should be replaced", secondBatch, not(sameInstance(firstBatch)));
+                assertThat("refreshing a stale fast cached compile should report a cache refresh", service.lastCompileTelemetry().path(), is("cache_refresh"));
             }
 
-            assertThat("closing the second shared fast-compile task should close the shared batch", firstBatch.closed, is(true));
+            assertThat("closing the second shared fast-compile task should close the replaced batch", firstBatch.closed, is(true));
         }
     }
 
@@ -390,7 +390,7 @@ public class JavaCompilerServiceTest {
 //        try (var first = service.compileDiagnostics(List.of(new SourceFileObject(file)))) {
 //            assertThat(
 //                    "background compiler should not retain diagnostics compile batches",
-//                    cachedCompile(service, "cachedCompile"),
+//                    cachedCompile(service, "cachedCompile", file),
 //                    nullValue());
 //            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
 //        }
@@ -398,7 +398,7 @@ public class JavaCompilerServiceTest {
 //        try (var second = service.compileDiagnostics(List.of(new SourceFileObject(file)))) {
 //            assertThat(
 //                    "background compiler should continue compiling without a retained cache slot",
-//                    cachedCompile(service, "cachedCompile"),
+//                    cachedCompile(service, "cachedCompile", file),
 //                    nullValue());
 //            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
 //        }
@@ -419,7 +419,7 @@ public class JavaCompilerServiceTest {
 //        try (var first = service.compileDiagnostics(List.of(new SourceFileObject(file)))) {
 //            assertThat(
 //                    "diagnostics compiler should not retain compile batches after pull-diagnostic request",
-//                    cachedCompile(service, "cachedCompile"),
+//                    cachedCompile(service, "cachedCompile", file),
 //                    nullValue());
 //            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
 //        }
@@ -427,7 +427,7 @@ public class JavaCompilerServiceTest {
 //        try (var second = service.compileDiagnostics(List.of(new SourceFileObject(file)))) {
 //            assertThat(
 //                    "diagnostics compiler should not accumulate retained batches across repeated requests",
-//                    cachedCompile(service, "cachedCompile"),
+//                    cachedCompile(service, "cachedCompile", file),
 //                    nullValue());
 //            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
 //        }
@@ -451,7 +451,7 @@ public class JavaCompilerServiceTest {
 //                service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
 //            assertThat(
 //                    "index compiler should not retain fast compile batches after index extraction work",
-//                    cachedCompile(service, "cachedFastCompileNoAp"),
+//                    cachedCompile(service, "cachedFastCompileNoAp", file),
 //                    nullValue());
 //            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
 //        }
@@ -460,7 +460,7 @@ public class JavaCompilerServiceTest {
 //                service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
 //            assertThat(
 //                    "index compiler should keep using reusable compiler context without retaining compile graphs",
-//                    cachedCompile(service, "cachedFastCompileNoAp"),
+//                    cachedCompile(service, "cachedFastCompileNoAp", file),
 //                    nullValue());
 //            assertThat(service.lastCompileTelemetry().path(), is("uncached_role"));
 //        }
@@ -713,10 +713,16 @@ public class JavaCompilerServiceTest {
     }
 
     @SuppressWarnings("unchecked")
-    private static CompileBatch cachedCompile(JavaCompilerService service, String fieldName) throws Exception {
-        Field field = JavaCompilerService.class.getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return (CompileBatch) field.get(service);
+    private static CompileBatch cachedCompile(JavaCompilerService service, String fieldName, Path file) throws Exception {
+        if ("cachedCompile".equals(fieldName)) {
+            Field field = JavaCompilerService.class.getDeclaredField("workspaceCache");
+            field.setAccessible(true);
+            return (CompileBatch) field.get(service);
+        }
+        Field fileCacheField = JavaCompilerService.class.getDeclaredField("fileCache");
+        fileCacheField.setAccessible(true);
+        var fileCache = (Cache<Boolean, CompileBatch>) fileCacheField.get(service);
+        return fileCache.get(file, Boolean.FALSE);
     }
 
     private static boolean quickMaybeUsesLombok(JavaCompilerService service, Path file) throws Exception {
