@@ -25,4 +25,5 @@ JLINK_VM_OPTIONS="\
 --add-opens jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED"
 DIR=`dirname $0`
 JAVA_BIN="$DIR/windows/bin/java"
-exec "$JAVA_BIN" $JLINK_VM_OPTIONS -classpath "$DIR/classpath/*" "$@"
+JLS_JVM_DEFAULT_MEM="-Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication"
+exec "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} -classpath "$DIR/classpath/*" "$@"

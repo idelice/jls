@@ -25,4 +25,8 @@ set JLINK_VM_OPTIONS=^
 --add-opens jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED
 set CLASSPATH_OPTIONS=-classpath "%~dp0classpath/*"
 set JAVA_BIN=%~dp0windows\bin\java.exe
-"%JAVA_BIN%" %JLINK_VM_OPTIONS% %CLASSPATH_OPTIONS% %*
+if defined JLS_JVM_OPTS (
+    "%JAVA_BIN%" %JLINK_VM_OPTIONS% %JLS_JVM_OPTS% %CLASSPATH_OPTIONS% %*
+) else (
+    "%JAVA_BIN%" %JLINK_VM_OPTIONS% -Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication %CLASSPATH_OPTIONS% %*
+)

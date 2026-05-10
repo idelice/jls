@@ -116,6 +116,20 @@ mvn dependency:sources
 
 The language server will inherit the environment and use your Maven credentials for private repositories.
 
+## Memory Management
+
+By default the server launches with:
+```
+-Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication
+```
+
+Override via `JLS_JVM_OPTS` environment variable:
+```bash
+export JLS_JVM_OPTS="-Xmx1g -Xms256m"
+```
+
+The nvim-jls client also exposes a `jvm_args` config field that sets this env var automatically (see [nvim-jls](https://github.com/idelice/nvim-jls) docs).
+
 ## Usage
 
 The language server provides autocomplete and other features using:
@@ -126,6 +140,15 @@ The language server provides autocomplete and other features using:
 ## Design
 
 The Java language server uses the [Java compiler API](https://docs.oracle.com/javase/10/docs/api/jdk.compiler-summary.html) to implement language features like linting, autocomplete, and smart navigation, and the [language server protocol](https://github.com/Microsoft/vscode-languageserver-protocol) to communicate with text editors like Neovim.
+
+### Compile vs index architecture
+
+Features are split across two resolution strategies:
+
+- **Compile-based** (javac semantic attribution): go-to-definition, hover, diagnostics, code actions. Uses `compileFast` / `compileFastWithProcessors` for full type accuracy.
+- **Index-based** (parse + workspace index): autocomplete, find-references, signature help. Uses `compiler.parse()` with `ParseTypeResolver` + `TypeIndexRouter` for ~50x faster response times.
+
+This avoids full compilation on high-frequency triggers like `(` and reference scans.
 
 ### Incremental updates
 
