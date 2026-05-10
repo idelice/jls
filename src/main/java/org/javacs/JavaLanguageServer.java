@@ -1098,7 +1098,9 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
-        var help = new SignatureProvider(getOrCreateCompiler()).signatureHelp(file, line, column);
+        ensureTypeIndexReady("signatureBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
+        var snapshot = completionSnapshotRef.get();
+        var help = new SignatureProvider(getOrCreateCompiler(), snapshot.typeIndex()).signatureHelp(file, line, column);
         if (help == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(help);
     }
@@ -1144,10 +1146,9 @@ class JavaLanguageServer extends LanguageServer {
         ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
         var includeDeclaration = position.context != null && position.context.includeDeclaration;
-        var resolver = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column);
         var found =
                 new ReferenceProvider(
-                                getOrCreateCompiler(), snapshot.typeIndex(), resolver, file, includeDeclaration)
+                                getOrCreateCompiler(), snapshot.typeIndex(), file, line, column, includeDeclaration)
                         .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
@@ -1556,21 +1557,17 @@ class JavaLanguageServer extends LanguageServer {
             if (revision != completionIndexRevision.get()) {
                 return;
             }
-            var workspaceBootstrap =
-                    mode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                            && completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY;
             synchronized (completionIndexCompileMutex) {
                 var started = Instant.now();
                 CompileTask task = null;
                 String bootstrapProgressToken = null;
                 try {
-                    if (workspaceBootstrap) {
-                        var isActive = mode == CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP;
-                        LOG.info(String.format("[perf] %s bootstrap started trigger=%s files=%d",
-                                isActive ? "active" : "workspace", trigger, files.size()));
-                        bootstrapProgressToken = beginWorkDoneProgress("Bootstrap index",
-                                isActive ? "Indexing open files" : "Indexing workspace");
-                    }
+                    var progressLabel = switch (mode) {
+                        case ACTIVE_DOCUMENT_BOOTSTRAP -> "Indexing open files";
+                        case FULL_REBUILD -> "Indexing workspace";
+                        case WORKSPACE_DECLARATION_MERGE -> "Updating index";
+                    };
+                    bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
                     var compiler = indexCompiler;
                     task = compiler.compileFast(files.toArray(Path[]::new));
                     if (revision != completionIndexRevision.get()) {
@@ -1583,6 +1580,8 @@ class JavaLanguageServer extends LanguageServer {
                         return;
                     }
                     var indexStarted = Instant.now();
+                    reportWorkDoneProgress(bootstrapProgressToken,
+                            "Compiled " + files.size() + " files");
                     var nextIndex = buildIndex(task, mode, compiler);
                     if (revision != completionIndexRevision.get()) {
                         LOG.fine(String.format(
@@ -1612,14 +1611,13 @@ class JavaLanguageServer extends LanguageServer {
                                     TimeUnit.MILLISECONDS);
                         }
                     }
-                    if (workspaceBootstrap) {
-                        LOG.info(String.format(
-                                "[perf] workspace index installed trigger=%s version=%d types=%d",
-                                trigger,
-                                indexVersion,
-                                nextIndex == null ? 0 : nextIndex.size()));
-                        endWorkDoneProgress(bootstrapProgressToken, "Index ready");
-                    }
+                    LOG.info(String.format(
+                            "[perf] index installed trigger=%s version=%d types=%d took=%dms",
+                            trigger,
+                            indexVersion,
+                            nextIndex == null ? 0 : nextIndex.size(),
+                            Duration.between(started, Instant.now()).toMillis()));
+                    endWorkDoneProgress(bootstrapProgressToken, "Index ready");
                     var totalMs = Duration.between(started, Instant.now()).toMillis();
                     LOG.fine(String.format(
                             "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",

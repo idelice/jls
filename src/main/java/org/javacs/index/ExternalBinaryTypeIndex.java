@@ -174,6 +174,15 @@ public final class ExternalBinaryTypeIndex {
         return result;
     }
 
+    public List<IndexedMember> constructors(String qualifiedName) {
+        var type = rawTypeInfo(qualifiedName);
+        if (type.isEmpty()) return List.of();
+        return type.get().members.stream()
+                .filter(m -> m.kind == CompletionItemKind.Constructor)
+                .map(this::ensureExternalProvenance)
+                .toList();
+    }
+
     public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext) {
         var linked = linkedMembers(qualifiedName, staticContext);
         for (var member : linked) {

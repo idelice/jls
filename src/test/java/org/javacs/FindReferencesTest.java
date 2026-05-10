@@ -19,8 +19,7 @@ public class FindReferencesTest {
 
     protected List<String> items(String file, int row, int column) {
         var path = FindResource.path(file);
-        var resolver = new DefinitionProvider(REFERENCES.compiler, REFERENCES.index, path, row, column);
-        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, resolver, path, false).find();
+        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, path, row, column, false).find();
         var strings = new ArrayList<String>();
         for (var l : locations) {
             var fileName = StringSearch.fileName(l.uri);
