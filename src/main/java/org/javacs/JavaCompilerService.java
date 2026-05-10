@@ -109,7 +109,7 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch workspaceCache;
     private long workspaceCacheRevision = -1;
-    private final Cache<Boolean, CompileBatch> fileCache = new Cache<>("compile_file", 64);
+    private final Cache<Boolean, CompileBatch> fileCache = new Cache<>("compile_file", 16);
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
     final Map<Path, ParsedUnit> parsedUnits =
             Collections.synchronizedMap(
