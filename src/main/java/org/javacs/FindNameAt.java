@@ -57,8 +57,17 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
 
     @Override
     public TreePath visitMemberSelect(MemberSelectTree t, Long find) {
-        if (contains(t, t.getIdentifier(), find)) {
-            return getCurrentPath();
+        var pos = Trees.instance(task).getSourcePositions();
+        var end = (int) pos.getEndPosition(root, t);
+        // Only match cursor on the right-hand identifier (method name),
+        // never on the expression (variable name) which may share the same name.
+        var exprEnd = (int) pos.getEndPosition(root, t.getExpression());
+        if (exprEnd >= 0 && exprEnd < end) {
+            var nameStart = FindHelper.findNameIn(root, t.getIdentifier(), exprEnd, end, find);
+            var nameEnd = nameStart + t.getIdentifier().length();
+            if (nameStart >= 0 && nameStart <= find && find <= nameEnd) {
+                return getCurrentPath();
+            }
         }
         return super.visitMemberSelect(t, find);
     }
@@ -109,7 +118,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         var start = (int) pos.getStartPosition(root, t);
         var end = (int) pos.getEndPosition(root, t);
         if (start == -1 || end == -1) return false;
-        start = FindHelper.findNameIn(root, name, start, end);
+        start = FindHelper.findNameIn(root, name, start, end, find);
         end = start + name.length();
         if (start == -1 || end == -1) return false;
         return start <= find && find <= end;

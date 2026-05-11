@@ -31,15 +31,16 @@ public class RemoveException implements Rewrite {
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var file = compiler.findTypeDeclaration(className);
         try (var task = compiler.compile(file)) {
+            var root = task.root(file);
             var methodElement = FindHelper.findMethod(task, className, methodName, erasedParameterTypes);
             var methodTree = Trees.instance(task.task).getTree(methodElement);
             if (methodTree.getThrows().size() == 1) {
-                var delete = removeEntireThrows(task.task, task.root(), methodTree);
+                var delete = removeEntireThrows(task.task, root, methodTree);
                 if (delete == TextEdit.NONE) return CANCELLED;
                 TextEdit[] edits = {delete};
                 return Map.of(file, edits);
             }
-            TextEdit[] edits = {removeSingleException(task.task, task.root(), methodTree)};
+            TextEdit[] edits = {removeSingleException(task.task, root, methodTree)};
             return Map.of(file, edits);
         }
     }

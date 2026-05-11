@@ -76,23 +76,11 @@ public class CompileBatch implements AutoCloseable {
             }
             parseNanos = System.nanoTime() - parseStarted;
 
-            if (allowAP) {
-                // When AP is enabled, let javac drive enter+process+analyze as one pipeline.
-                // Running enter() first can lock in pre-processor symbols (missing Lombok members).
-                var analyzeStarted = System.nanoTime();
-                task.analyze();
-                analyzeNanos = System.nanoTime() - analyzeStarted;
-                if (analysisMode == AnalysisMode.FULL) {
-                    ANALYZE_INVOCATIONS.incrementAndGet();
-                }
-            } else {
-                // Without AP, task.analyze() drives enter + attribute internally.
-                var analyzeStarted = System.nanoTime();
-                task.analyze();
-                analyzeNanos = System.nanoTime() - analyzeStarted;
-                if (analysisMode == AnalysisMode.FULL) {
-                    ANALYZE_INVOCATIONS.incrementAndGet();
-                }
+            var analyzeStarted = System.nanoTime();
+            task.analyze();
+            analyzeNanos = System.nanoTime() - analyzeStarted;
+            if (analysisMode == AnalysisMode.FULL) {
+                ANALYZE_INVOCATIONS.incrementAndGet();
             }
         } catch (IOException e) {
             try {

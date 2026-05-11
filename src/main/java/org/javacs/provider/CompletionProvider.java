@@ -12,9 +12,11 @@ import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.SwitchExpressionTree;
 import com.sun.source.tree.SwitchTree;
 import com.sun.source.tree.Tree;
+import com.sun.source.tree.TypeCastTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.DocTrees;
 import com.sun.source.util.SourcePositions;
@@ -194,6 +196,9 @@ public class CompletionProvider {
     public CompletionList complete(Path file, int line, int column) {
         var started = Instant.now();
         var request = prepareRequestContext(file, line, column);
+        if (request == null) {
+            return NOT_SUPPORTED;
+        }
         CompletionList list;
         String mode;
         long resolveMs = 0;
@@ -233,7 +238,11 @@ public class CompletionProvider {
         var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
         long cursor;
         try {
-            cursor = FileStore.offset(task.root().getSourceFile().getCharContent(true).toString(), line, column);
+            var source = task.root().getSourceFile().getCharContent(true).toString();
+            cursor = FileStore.offset(source, line, column);
+            if (isInComment(source, cursor)) {
+                return null;
+            }
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }
@@ -244,6 +253,75 @@ public class CompletionProvider {
         var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
         var memberAccess = memberAccessContext(pruned, (int) cursor);
         return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, parseMs);
+    }
+
+    /**
+     * Scans source text up to cursor offset to determine if the cursor is inside a comment.
+     * Tracks string and char literals to avoid false positives where // or /* appear inside strings.
+     */
+    private static boolean isInComment(String source, long cursorOffset) {
+        var inLineComment = false;
+        var inBlockComment = false;
+        var inString = false;
+        var inChar = false;
+        var escaping = false;
+        var limit = (int) Math.min(cursorOffset, source.length());
+        for (int i = 0; i < limit; i++) {
+            var c = source.charAt(i);
+            var next = i + 1 < source.length() ? source.charAt(i + 1) : '\0';
+            if (inLineComment) {
+                if (c == '\n' || c == '\r') {
+                    inLineComment = false;
+                }
+                continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') {
+                    inBlockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (inString) {
+                if (escaping) {
+                    escaping = false;
+                } else if (c == '\\') {
+                    escaping = true;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (inChar) {
+                if (escaping) {
+                    escaping = false;
+                } else if (c == '\\') {
+                    escaping = true;
+                } else if (c == '\'') {
+                    inChar = false;
+                }
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                inLineComment = true;
+                i++;
+                continue;
+            }
+            if (c == '/' && next == '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+                continue;
+            }
+            if (c == '\'') {
+                inChar = true;
+                continue;
+            }
+        }
+        return inLineComment || inBlockComment;
     }
 
     private CompletionList finalizeCompletionList(ParseTask task, CompletionList list) {
@@ -322,7 +400,7 @@ public class CompletionProvider {
                         ? mergeMemberContexts(index, target.qualifiedType())
                         : index.members(target.qualifiedType(), target.staticContext());
         var membersMs = Duration.between(membersStarted, Instant.now()).toMillis();
-        if (members.isEmpty()) {
+        if (members.isEmpty() && !target.staticContext()) {
             return new IndexedCompletionResult(EMPTY, resolveMs + membersMs, "no_members");
         }
         var enclosingInstanceAccess =
@@ -772,6 +850,14 @@ public class CompletionProvider {
         }
         new TreePathScanner<Void, Void>() {
             @Override
+            public Void visitMethod(MethodTree t, Void __) {
+                var start = positions.getStartPosition(task.root(), t);
+                var end = positions.getEndPosition(task.root(), t);
+                if (cursor < start || cursor > end) return null;
+                return super.visitMethod(t, null);
+            }
+
+            @Override
             public Void visitVariable(VariableTree t, Void __) {
                 var parent = getCurrentPath().getParentPath();
                 if (parent != null && parent.getLeaf() instanceof ClassTree) {
@@ -786,11 +872,24 @@ public class CompletionProvider {
                     return super.visitVariable(t, null);
                 }
                 if (seen.add(name)) {
-                    list.items.add(variable(name));
+                     list.items.add(variable(name, syntacticType(t)));
                 }
                 return super.visitVariable(t, null);
             }
         }.scan(task.root(), null);
+    }
+
+    private String syntacticType(VariableTree t) {
+        var type = t.getType();
+        if (type != null) return type.toString();
+        var init = t.getInitializer();
+        if (init instanceof NewClassTree nct && nct.getIdentifier() != null) {
+            return nct.getIdentifier().toString();
+        }
+        if (init instanceof TypeCastTree cast) {
+            return cast.getType().toString();
+        }
+        return null;
     }
 
     private void addSyntacticEnclosingTypeMembers(
@@ -973,7 +1072,7 @@ public class CompletionProvider {
         if (containsCompletionLabel(list, name)) {
             return;
         }
-        list.items.add(field(name));
+        list.items.add(field(name, syntacticType(field)));
     }
 
     private void addSyntacticMethod(MethodTree method, String partial, CompletionList list) {
@@ -1668,20 +1767,20 @@ public class CompletionProvider {
         return i;
     }
 
-    private CompletionItem variable(String name) {
+    private CompletionItem variable(String name, String type) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Variable;
-        i.detail = "local";
+        i.detail = type != null ? type : "local";
         i.sortText = sortKey(Priority.LOCAL, i.label);
         return i;
     }
 
-    private CompletionItem field(String name) {
+    private CompletionItem field(String name, String type) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Field;
-        i.detail = "field";
+        i.detail = type != null ? type : "field";
         i.sortText = sortKey(Priority.FIELD, i.label);
         return i;
     }

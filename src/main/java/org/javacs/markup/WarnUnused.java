@@ -107,6 +107,14 @@ class WarnUnused extends TreeScanner<Void, Void> {
         var t = path.getLeaf();
         if (t instanceof VariableTree) {
             var v = (VariableTree) t;
+
+            // Record components are always reachable — they have implicit public accessors
+            var parent = path.getParentPath().getLeaf();
+            var isStatic = v.getModifiers().getFlags().contains(Modifier.STATIC);
+             if (parent.getKind() == Tree.Kind.RECORD && !isStatic) {
+                return true;
+            }
+
             var isPrivate = v.getModifiers().getFlags().contains(Modifier.PRIVATE);
             if (!isPrivate || isLocalVariable(path)) {
                 return true;
@@ -138,7 +146,11 @@ class WarnUnused extends TreeScanner<Void, Void> {
             return false;
         }
         var parent = path.getParentPath().getLeaf().getKind();
-        if (parent == Tree.Kind.CLASS || parent == Tree.Kind.INTERFACE) {
+        if (parent == Tree.Kind.CLASS
+                || parent == Tree.Kind.INTERFACE
+                || parent == Tree.Kind.ENUM
+                || parent == Tree.Kind.RECORD
+                || parent == Tree.Kind.ANNOTATION_TYPE) {
             return false;
         }
         if (parent == Tree.Kind.METHOD) {

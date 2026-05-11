@@ -1,12 +1,18 @@
 package org.javacs;
 
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ModifiersTree;
+import com.sun.source.util.TreePath;
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.TypeElement;
+import org.javacs.lsp.Location;
 
 /**
  * Centralized Lombok annotation semantics used across compiler, indexing, completion, and
@@ -51,8 +57,8 @@ public final class LombokAnnotations {
 
     private static final Pattern SOURCE_EXPANSION_PATTERN =
             Pattern.compile(
-                    "@(?:lombok\\.(?:experimental\\.)?)?"
-                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With)\\b");
+                    "@(?:lombok\\.(?:experimental\\.)?|lombok\\.extern\\.slf4j\\.)?"
+                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With|Slf4j)\\b");
 
     private LombokAnnotations() {}
 
@@ -190,5 +196,134 @@ public final class LombokAnnotations {
         return "boolean".equals(fieldType)
                 || "Boolean".equals(fieldType)
                 || "java.lang.Boolean".equals(fieldType);
+    }
+
+    // ---- Navigation helpers -------------------------------------------------
+
+    /**
+     * Lowercases first char unless first two chars are uppercase (to preserve "URLParser" style).
+     *
+     * @param value the string to decapitalize
+     * @return the decapitalized string
+     */
+    public static String decapitalize(String value) {
+        if (value.isEmpty()) {
+            return value;
+        }
+        if (value.length() > 1
+                && Character.isUpperCase(value.charAt(0))
+                && Character.isUpperCase(value.charAt(1))) {
+            return value;
+        }
+        return Character.toLowerCase(value.charAt(0)) + value.substring(1);
+    }
+
+    /**
+     * Reverse-map accessor method name to field name. "getFoo" → "foo", "isBar" → "bar", "setBaz" →
+     * "baz", "toString" → empty.
+     *
+     * @param methodName the accessor method name
+     * @return an Optional containing the field name, or empty if not an accessor
+     */
+    public static Optional<String> accessorFieldName(String methodName) {
+        if (methodName.startsWith("get") && methodName.length() > 3) {
+            return Optional.of(decapitalize(methodName.substring(3)));
+        }
+        if (methodName.startsWith("is") && methodName.length() > 2) {
+            return Optional.of(decapitalize(methodName.substring(2)));
+        }
+        if (methodName.startsWith("set") && methodName.length() > 3) {
+            return Optional.of(decapitalize(methodName.substring(3)));
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * If element is inside a Lombok Builder inner class, returns the outer (source) class.
+     *
+     * @param owner the element to check
+     * @return the enclosing (non-Builder) type if the element lives inside a Builder
+     */
+    public static Optional<TypeElement> builderOwner(TypeElement owner) {
+        TypeElement current = owner;
+        while (true) {
+            var ownerName = current.getSimpleName().toString();
+            if ((ownerName.endsWith("Builder") || ownerName.equals("builder"))
+                    && current.getEnclosingElement() instanceof TypeElement enclosingType) {
+                return Optional.of(enclosingType);
+            }
+            if (current.getEnclosingElement() instanceof TypeElement enclosingType) {
+                current = enclosingType;
+            } else {
+                return Optional.empty();
+            }
+        }
+    }
+
+    /**
+     * Returns the enclosing TypeElement that owns this element.
+     *
+     * @param element the element to find the owner of
+     * @return the owning TypeElement, or empty if none found
+     */
+    public static Optional<TypeElement> fieldOwner(Element element) {
+        if (element.getEnclosingElement() instanceof TypeElement owner) {
+            return Optional.of(owner);
+        }
+        if (element instanceof TypeElement owner) {
+            return Optional.of(owner);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Returns true if the TreePath points to a Lombok annotation node.
+     *
+     * @param path the tree path to inspect
+     * @return true if the leaf is a Lombok annotation
+     */
+    public static boolean isLombokAnnotationTree(TreePath path) {
+        if (path == null || !(path.getLeaf() instanceof AnnotationTree annotation)) {
+            return false;
+        }
+        var name = annotation.getAnnotationType().toString();
+        if (name.startsWith("lombok.")) {
+            return true;
+        }
+        return switch (name) {
+            case "Getter", "Setter", "Data", "Builder", "Value", "With",
+                 "NoArgsConstructor", "AllArgsConstructor", "RequiredArgsConstructor" -> true;
+            default -> false;
+        };
+    }
+
+    /**
+     * Returns true if the text at the Location range contains the given name string.
+     *
+     * @param location the LSP location to check
+     * @param name the name to search for
+     * @return true if the range text contains the name
+     */
+    public static boolean locationContainsName(Location location, String name) {
+        if (location == null || location.uri == null || name == null || name.isEmpty()) {
+            return false;
+        }
+        try {
+            var lines = Files.readString(Path.of(location.uri)).split("\n", -1);
+            var start = location.range.start;
+            var end = location.range.end;
+            if (start.line < 0 || start.line >= lines.length || end.line != start.line) {
+                return false;
+            }
+            var lineText = lines[start.line];
+            if (start.character < 0
+                    || end.character > lineText.length()
+                    || end.character < start.character) {
+                return false;
+            }
+            return lineText.substring(start.character, end.character).contains(name);
+        } catch (RuntimeException | java.io.IOException e) {
+            return false;
+        }
     }
 }

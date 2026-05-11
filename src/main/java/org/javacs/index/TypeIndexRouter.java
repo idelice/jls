@@ -6,6 +6,7 @@ import java.util.Set;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 
 import static org.javacs.index.TypeIndexRouter.OwnerStore.*;
@@ -188,6 +189,24 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
             case NONE -> List.of();
         };
 
+    }
+
+    /** Return all overloads of a named method (instance or static) from the correct store. */
+    public List<IndexedMember> methodOverloads(
+            String ownerType, String methodName, boolean staticContext) {
+        return ownerMembers(ownerType, staticContext).stream()
+                .filter(m -> m.name.equals(methodName)
+                        && (m.kind == CompletionItemKind.Method || m.kind == CompletionItemKind.Constructor))
+                .toList();
+    }
+
+    /** Return constructor overloads for a type from the correct store. */
+    public List<IndexedMember> constructors(String qualifiedName) {
+        return switch (ownerStore(qualifiedName)) {
+            case WORKSPACE -> workspace().constructors(qualifiedName);
+            case EXTERNAL -> external().constructors(qualifiedName);
+            case NONE -> List.of();
+        };
     }
 
     /**

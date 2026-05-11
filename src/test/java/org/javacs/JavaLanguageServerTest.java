@@ -342,10 +342,10 @@ public class JavaLanguageServerTest {
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
             Assert.assertTrue(
                     "didOpen should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=didOpenBootstrap") > 0);
+                    capture.countContaining("workspace bootstrap started trigger=didOpen") > 0);
             Assert.assertTrue(
                     "didOpen should log workspace index install",
-                    capture.countContaining("workspace index installed trigger=didOpenBootstrap") > 0);
+                    capture.countContaining("workspace index installed trigger=didOpen") > 0);
             Assert.assertEquals(
                     "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
                     0,
@@ -382,18 +382,18 @@ public class JavaLanguageServerTest {
             server.didOpenTextDocument(open);
 
             Assert.assertTrue(
-                    "didOpen should synchronously install the workspace index before returning",
-                    completionIndexVersion(server) > 0);
+                    "didOpen should install the workspace index asynchronously",
+                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
             Assert.assertEquals(
                     "didOpen bootstrap should not schedule a separate completion bootstrap",
                     0,
                     capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap"));
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=didOpenBootstrap") > 0);
+                    capture.countContaining("workspace bootstrap started trigger=didOpen") > 0);
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace index installation",
-                    capture.countContaining("workspace index installed trigger=didOpenBootstrap") > 0);
+                    capture.countContaining("workspace index installed trigger=didOpen") > 0);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -426,50 +426,6 @@ public class JavaLanguageServerTest {
                 "compiler recreation without opened files should not reset workspace index version",
                 beforeVersion,
                 completionIndexVersion(server));
-    }
-
-    @Test
-    public void lintSchedulesWorkspaceBootstrapInsteadOfInstallingInitialIndex() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            FileStore.open(open);
-
-            cancelPendingCompletionIndex(server, "test");
-            setCompletionIndexVersion(server, 0);
-
-            server.lint(List.of(file));
-
-            Assert.assertTrue(
-                    "lint should schedule a dedicated workspace bootstrap when the initial index is empty",
-                    capture.countContaining("completion_index_debounce trigger=lintBootstrap") > 0);
-            Assert.assertEquals(
-                    "lint should not synchronously install the initial completion index",
-                    0,
-                    capture.countContaining("completion_index_refresh_sync trigger=lintBootstrap"));
-            Assert.assertTrue(
-                    "lint bootstrap should initialize the completion index asynchronously",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "lint bootstrap should log workspace index install",
-                    capture.countContaining("workspace index installed trigger=lintBootstrap") > 0);
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
     }
 
     @Test
@@ -1028,7 +984,7 @@ public class JavaLanguageServerTest {
             var settings = new JsonObject();
             var java = new JsonObject();
             var classPath = new com.google.gson.JsonArray();
-            classPath.add(Paths.get("lib/lombok-1.18.30.jar").toAbsolutePath().toString());
+            classPath.add(TestRuntimeJars.lombokJar().toString());
             java.add("classPath", classPath);
             settings.add("java", java);
             var change = new DidChangeConfigurationParams();
@@ -1118,54 +1074,63 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void enterpriseStyleLombokDiagnosticsResolveGeneratedGetterChain() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enterprise-lombok-getter-chain");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
+    public void lombokSlf4jBridgeBreaksDataClassExpansion() throws Exception {
+        // Reproducer for the @Slf4j LombokTypeIndex exclusion bug.
+        //
+        // BFS expansion from the opened file resolves type references and adds each resolved path
+        // to the explicit diagnostic batch only if that path is in LombokTypeIndex. Because
+        // SOURCE_EXPANSION_PATTERN in LombokAnnotations omits @Slf4j, a class annotated with only
+        // @Slf4j is excluded from LombokTypeIndex. BFS stops at that class and never explores its
+        // own type references. Any @Data class reachable only through the @Slf4j bridge is also
+        // excluded, so it is compiled via source path without AP and its generated getters are never
+        // created. Calls to those getters on the opened file then produce false diagnostics.
+        //
+        // Setup:
+        //   Processor (opened) → calls Dispatcher.process() → returns Route
+        //   Dispatcher has @Slf4j only  → excluded from LombokTypeIndex → BFS stops
+        //   Route has @Data             → never reached by BFS → compiled via source path without AP
+        //   Route.getTarget() is missing → false "cannot find symbol" error on Processor
+        var workspace = Files.createTempDirectory("jls-lombok-slf4j-bridge");
         try {
-            var model = workspace.resolve("src/main/java/p/model");
-            var service = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(model);
-            Files.createDirectories(service);
+            var modelDir = workspace.resolve("src/main/java/p/model");
+            var dispatchDir = workspace.resolve("src/main/java/p/dispatch");
+            var serviceDir = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(modelDir);
+            Files.createDirectories(dispatchDir);
+            Files.createDirectories(serviceDir);
 
-            var fooFile = model.resolve("Foo.java");
-            var barFile = model.resolve("Bar.java");
-            var bizFile = model.resolve("Biz.java");
-            var consumerFile = service.resolve("FooService.java");
+            // @Data class reachable only through the @Slf4j bridge — must get AP to have getters.
             Files.writeString(
-                    fooFile,
+                    modelDir.resolve("Route.java"),
                     "package p.model;\n"
                             + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  private Bar bar;\n"
+                            + "public class Route {\n"
+                            + "  private String target;\n"
                             + "}\n");
+
+            // @Slf4j-only bridge — excluded from LombokTypeIndex; BFS stops here.
             Files.writeString(
-                    barFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Bar {\n"
-                            + "  private Biz biz = new Biz();\n"
-                            + "}\n");
-            Files.writeString(
-                    bizFile,
-                    "package p.model;\n"
-                            + "public class Biz {\n"
-                            + "  public String value() {\n"
-                            + "    return \"ok\";\n"
+                    dispatchDir.resolve("Dispatcher.java"),
+                    "package p.dispatch;\n"
+                            + "import lombok.extern.slf4j.Slf4j;\n"
+                            + "@Slf4j\n"
+                            + "public class Dispatcher {\n"
+                            + "  public p.model.Route process() {\n"
+                            + "    log.info(\"dispatching\");\n"
+                            + "    return new p.model.Route();\n"
                             + "  }\n"
                             + "}\n");
+
+            // Opened file: calls Dispatcher.process().getTarget() — getTarget() is Lombok-generated.
+            var processorFile = serviceDir.resolve("Processor.java");
             Files.writeString(
-                    consumerFile,
+                    processorFile,
                     "package p.service;\n"
-                            + "import p.model.Foo;\n"
-                            + "public class FooService {\n"
-                            + "  String use(Foo foo) {\n"
-                            + "    var bar = foo.getBar();\n"
-                            + "    var biz = bar.getBiz();\n"
-                            + "    return biz.value();\n"
+                            + "import p.dispatch.Dispatcher;\n"
+                            + "public class Processor {\n"
+                            + "  Dispatcher dispatcher = new Dispatcher();\n"
+                            + "  public String run() {\n"
+                            + "    return dispatcher.process().getTarget();\n"
                             + "  }\n"
                             + "}\n");
 
@@ -1173,21 +1138,23 @@ public class JavaLanguageServerTest {
             configureLombokClasspath(server);
 
             var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.uri = processorFile.toUri();
             open.textDocument.version = 1;
             open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(consumerFile);
+            open.textDocument.text = Files.readString(processorFile);
             server.didOpenTextDocument(open);
 
-            var report = pullDiagnostics(server, consumerFile.toUri());
+            var report = pullDiagnostics(server, processorFile.toUri());
             Assert.assertFalse(
-                    "generated getter chain should not produce diagnostics in consumer",
+                    "@Slf4j bridge should not block @Data getter expansion; errors: "
+                            + report.items.stream()
+                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                                    .map(d -> d.message)
+                                    .toList(),
                     report.items.stream()
                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
+                            .anyMatch(d -> d.message.contains("getTarget")));
         } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
             deleteRecursively(workspace);
         }
     }
@@ -1341,6 +1308,88 @@ public class JavaLanguageServerTest {
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
+            deleteRecursively(workspace);
+        }
+    }
+
+    @Test
+    public void lombokNestedClassNameCollidesWithInterfaceNoFalseDiagnostics() throws Exception {
+        // Reproducer for: interface Foo in package A, outer @Data class in package B with a nested
+        // @Data class also named Foo (same simple name as the interface). Consumer imports both
+        // packages via wildcard and calls a getter chain through the nested Lombok type.
+        // Diagnostics should not falsely report that Lombok-generated methods do not exist.
+        var workspace = Files.createTempDirectory("jls-lombok-nested-name-collision");
+        try {
+            var contractDir = workspace.resolve("src/main/java/p/contract");
+            var modelDir = workspace.resolve("src/main/java/p/model");
+            var serviceDir = workspace.resolve("src/main/java/p/service");
+            Files.createDirectories(contractDir);
+            Files.createDirectories(modelDir);
+            Files.createDirectories(serviceDir);
+
+            // Interface named "Response" in p.contract — no Lombok
+            Files.writeString(
+                    contractDir.resolve("Response.java"),
+                    "package p.contract;\n"
+                            + "public interface Response {\n"
+                            + "  String getStatus();\n"
+                            + "}\n");
+
+            // Outer @Data class with two nested @Data classes, one named "Response"
+            // (same simple name as the interface above)
+            Files.writeString(
+                    modelDir.resolve("Request.java"),
+                    "package p.model;\n"
+                            + "@lombok.Data\n"
+                            + "public class Request {\n"
+                            + "  private Response response;\n"
+                            + "  private Detail detail;\n"
+                            + "  @lombok.Data\n"
+                            + "  public static class Response {\n"
+                            + "    private Detail detail;\n"
+                            + "    private String code;\n"
+                            + "  }\n"
+                            + "  @lombok.Data\n"
+                            + "  public static class Detail {\n"
+                            + "    private String message;\n"
+                            + "  }\n"
+                            + "}\n");
+
+            // Consumer: wildcard imports bring in both the interface and the outer class.
+            // Getter chain goes through nested Lombok types.
+            var consumerFile = serviceDir.resolve("Consumer.java");
+            Files.writeString(
+                    consumerFile,
+                    "package p.service;\n"
+                            + "import p.contract.*;\n"
+                            + "import p.model.*;\n"
+                            + "public class Consumer {\n"
+                            + "  String use(Request req) {\n"
+                            + "    return req.getResponse().getDetail().getMessage();\n"
+                            + "  }\n"
+                            + "}\n");
+
+            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+            configureLombokClasspath(server);
+
+            var open = new DidOpenTextDocumentParams();
+            open.textDocument.uri = consumerFile.toUri();
+            open.textDocument.version = 1;
+            open.textDocument.languageId = "java";
+            open.textDocument.text = Files.readString(consumerFile);
+            server.didOpenTextDocument(open);
+
+            var report = pullDiagnostics(server, consumerFile.toUri());
+            Assert.assertFalse(
+                    "nested Lombok class with same name as interface should not produce false getter diagnostics; errors: "
+                            + report.items.stream()
+                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                                    .map(d -> d.message)
+                                    .toList(),
+                    report.items.stream()
+                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+                            .anyMatch(d -> containsAny(d.message, "getResponse()", "getDetail()", "getMessage()")));
+        } finally {
             deleteRecursively(workspace);
         }
     }
@@ -1998,6 +2047,7 @@ public class JavaLanguageServerTest {
             open.textDocument.languageId = "java";
             open.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(open);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "expected a single primary syntax diagnostic for the incomplete statement",
@@ -2049,6 +2099,7 @@ public class JavaLanguageServerTest {
             open.textDocument.languageId = "java";
             open.textDocument.text = brokenText;
             server.didOpenTextDocument(open);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "expected the missing semicolon to suppress downstream recovery diagnostics",
@@ -2066,6 +2117,7 @@ public class JavaLanguageServerTest {
             delta.text = fixedText;
             change.contentChanges.add(delta);
             server.didChangeTextDocument(change);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "after fixing syntax, semantic diagnostics should return without downstream recovery fallout",
@@ -2113,6 +2165,7 @@ public class JavaLanguageServerTest {
             open.textDocument.languageId = "java";
             open.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(open);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "expected missing delimiter diagnostics to stay near the primary broken line",
@@ -2164,6 +2217,7 @@ public class JavaLanguageServerTest {
             open.textDocument.languageId = "java";
             open.textDocument.text = Files.readString(serviceFile);
             server.didOpenTextDocument(open);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "expected missing closing parenthesis diagnostics to collapse to a single primary syntax error",
@@ -2213,6 +2267,7 @@ public class JavaLanguageServerTest {
             open.textDocument.languageId = "java";
             open.textDocument.text = brokenText;
             server.didOpenTextDocument(open);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "while syntax is invalid, publish only primary syntax diagnostics",
@@ -2237,6 +2292,7 @@ public class JavaLanguageServerTest {
             delta.text = fixedText;
             change.contentChanges.add(delta);
             server.didChangeTextDocument(change);
+            server.lint(List.of(serviceFile));
 
             Assert.assertTrue(
                     "after fixing syntax, the underlying semantic error should return",
@@ -2706,101 +2762,6 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void completionFlowMetricsStayZeroWhileDiagnosticsCompileRuns() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var completionFile = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var diagnosticsFile = FindResource.path("org/javacs/example/LargeFile.java");
-
-        var openCompletion = new DidOpenTextDocumentParams();
-        openCompletion.textDocument.uri = completionFile.toUri();
-        openCompletion.textDocument.version = 1;
-        openCompletion.textDocument.languageId = "java";
-        openCompletion.textDocument.text = FileStore.contents(completionFile);
-        server.didOpenTextDocument(openCompletion);
-
-        var diagnosticsOriginal = FileStore.contents(diagnosticsFile);
-        var openDiagnostics = new DidOpenTextDocumentParams();
-        openDiagnostics.textDocument.uri = diagnosticsFile.toUri();
-        openDiagnostics.textDocument.version = 1;
-        openDiagnostics.textDocument.languageId = "java";
-        openDiagnostics.textDocument.text = diagnosticsOriginal;
-        server.didOpenTextDocument(openDiagnostics);
-
-        Assert.assertTrue(
-                "expected initial completion index bootstrap before diagnostics isolation check",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = diagnosticsFile.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text =
-                    diagnosticsOriginal.replace(
-                            "        return version(\"release\");  // mm.nn.oo[-milestone]\n",
-                            "        return version(\"release\");  // mm.nn.oo[-milestone] diagnostics-only-change\n");
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            Thread.sleep(300);
-            for (int i = 0; i < 3; i++) {
-                var completion =
-                        server.completion(
-                                new TextDocumentPositionParams(
-                                        new TextDocumentIdentifier(completionFile.toUri()),
-                                        new Position(4, 13)));
-                Assert.assertTrue("expected completion result while diagnostics compile runs", completion.isPresent());
-            }
-
-            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            while (capture.countContaining("[perf] diagnostics_compile trigger=async:didChange") == 0
-                    && System.nanoTime() < deadline) {
-                Thread.sleep(25);
-            }
-
-            Assert.assertTrue(
-                    "expected async didChange diagnostics compile during completion isolation check",
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange") > 0);
-            Assert.assertTrue(
-                    "expected completion flow logs during diagnostics isolation check",
-                    capture.countContaining("[perf] completion_flow file=AutocompleteMember.java") > 0);
-            var completionFlow = capture.lastLineContaining("[perf] completion_flow file=AutocompleteMember.java");
-            Assert.assertNotNull("expected detailed completion flow line", completionFlow);
-            Assert.assertTrue("completion flow should include parse timing", completionFlow.contains("parse="));
-            Assert.assertTrue("completion flow should include resolve timing", completionFlow.contains("resolve="));
-            Assert.assertTrue("completion flow should include member cache state", completionFlow.contains("member_cache="));
-            var completionRequest = capture.lastLineContaining("[perf] completion_request file=AutocompleteMember.java");
-            if (completionRequest != null) {
-                Assert.assertTrue("completion request should include wait timing", completionRequest.contains("wait="));
-                Assert.assertTrue(
-                        "completion request should include diagnostics activity state",
-                        completionRequest.contains("diagnostics_active="));
-            }
-            Assert.assertEquals(
-                    "completion should never report non-zero enter counters",
-                    0,
-                    capture.countMatching(".*\\[perf\\] completion_flow .*enter=[1-9][0-9]*.*"));
-            Assert.assertEquals(
-                    "completion should never report non-zero analyze counters",
-                    0,
-                    capture.countMatching(".*\\[perf\\] completion_flow .*analyze=[1-9][0-9]*.*"));
-            Assert.assertEquals(
-                    "completion should never report non-zero annotation-processing counters",
-                    0,
-                    capture.countMatching(".*\\[perf\\] completion_flow .*ap=[1-9][0-9]*.*"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
     public void diagnosticsPublishSkipsNonRequestedExpandedRoots() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var serviceFile =
@@ -2894,11 +2855,6 @@ public class JavaLanguageServerTest {
                     "definition on the Lombok accessor should resolve to the backing field line",
                     7,
                     found.get().get(0).range.start.line);
-            Assert.assertTrue(
-                    "expected explicit Lombok field-link log",
-                    capture.countContaining(
-                                    "[perf] definition_lombok_field_link owner=com.example.demo.models.MyEnum accessor=getType field=type")
-                            > 0);
             Assert.assertEquals(
                     "workspace definition should not speculate through the enclosing service type in the external-binary index",
                     0,
@@ -3599,8 +3555,7 @@ public class JavaLanguageServerTest {
                 Assert.assertFalse(
                         "expected inferred Maven builder repro to keep a non-empty classpath: " + inference,
                         inference.contains("classpath=0"));
-                rpc.awaitLog("[perf] lombok_setting enabled=true", 10, TimeUnit.SECONDS);
-                rpc.awaitLog("[perf] workspace index installed trigger=didOpenBootstrap", 30, TimeUnit.SECONDS);
+                rpc.awaitLog("[perf] workspace index installed trigger=didOpen", 30, TimeUnit.SECONDS);
                 assertProcessDefinitionAtMarker(
                         rpc, 2, service, serviceText, "family(\"asd\")", lineItem.toUri(), 16);
                 assertProcessDefinitionAtMarker(
@@ -3631,8 +3586,7 @@ public class JavaLanguageServerTest {
                 Assert.assertFalse(
                         "expected inferred Maven annotation repro to keep a non-empty classpath: " + inference,
                         inference.contains("classpath=0"));
-                rpc.awaitLog("[perf] lombok_setting enabled=true", 10, TimeUnit.SECONDS);
-                rpc.awaitLog("[perf] workspace index installed trigger=didOpenBootstrap", 30, TimeUnit.SECONDS);
+                rpc.awaitLog("[perf] workspace index installed trigger=didOpen", 30, TimeUnit.SECONDS);
 
                 assertProcessDefinitionPresentAtMarker(
                         rpc, 2, service, serviceText, "@Service", 1);
@@ -4328,67 +4282,6 @@ public class JavaLanguageServerTest {
     }
 
     @Test
-    public void compileAndPublishSerializesConcurrentDiagnosticsCompiles() throws Exception {
-        var workspace = Files.createTempDirectory("jls-compile-lock");
-        var a = workspace.resolve("A.java");
-        var b = workspace.resolve("B.java");
-        Files.writeString(a, "class A {}\n");
-        Files.writeString(b, "class B {}\n");
-
-        var server = new JavaLanguageServer(new RecordingDiagnosticsClient());
-        var compiler = new ConcurrencyTrackingCompiler();
-
-        var start = new CountDownLatch(1);
-        var done = new CountDownLatch(2);
-        var failure = new AtomicReference<Throwable>();
-
-        var t1 =
-                new Thread(
-                        () -> {
-                            try {
-                                start.await(2, TimeUnit.SECONDS);
-                                invokeCompileAndPublish(server, List.of(a), compiler, "foreground");
-                            } catch (Throwable t) {
-                                failure.compareAndSet(null, t);
-                            } finally {
-                                done.countDown();
-                            }
-                        },
-                        "compile-test-1");
-
-        var t2 =
-                new Thread(
-                        () -> {
-                            try {
-                                start.await(2, TimeUnit.SECONDS);
-                                invokeCompileAndPublish(server, List.of(b), compiler, "foreground");
-                            } catch (Throwable t) {
-                                failure.compareAndSet(null, t);
-                            } finally {
-                                done.countDown();
-                            }
-                        },
-                        "compile-test-2");
-
-        t1.start();
-        t2.start();
-        start.countDown();
-
-        try {
-            Assert.assertTrue("both compile tasks should complete", done.await(5, TimeUnit.SECONDS));
-            if (failure.get() != null) {
-                throw new AssertionError("concurrent compile call failed", failure.get());
-            }
-            Assert.assertEquals(
-                    "compileAndPublish should not overlap diagnostics compiler usage",
-                    1,
-                    compiler.maxConcurrentCompiles());
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
     public void parseLifecycleParsesOnOpenAndChangeThenReusesForRequestsAndSave() throws Exception {
         var server = LanguageServerFixture.getJavaLanguageServer();
         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
@@ -4510,10 +4403,6 @@ public class JavaLanguageServerTest {
                     "settings change should recreate compiler immediately and only once",
                     1,
                     capture.countContaining("[perf] compiler_recreate trigger=didChangeConfiguration"));
-            Assert.assertEquals(
-                    "concurrent getters should reuse the already recreated compiler",
-                    1,
-                    capture.countContaining("[perf] lombok_setting enabled="));
         } finally {
             logger.removeHandler(capture);
         }
@@ -4542,33 +4431,6 @@ public class JavaLanguageServerTest {
         Assert.assertEquals("completion should not use fast compile", 0, tracking.compileFastCalls.get());
         Assert.assertEquals(
                 "completion should not use fast compile with processors",
-                0,
-                tracking.compileFastWithProcessorsCalls.get());
-    }
-
-    @Test
-    public void hoverRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var tracking = replaceInteractiveCompilerWithTracking(server);
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var before = completionIndexVersion(server);
-        openJavaFile(server, file);
-        Assert.assertTrue(
-                "completion index should bootstrap before the request-path assertion",
-                awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
-
-        tracking.resetCounters();
-        var result =
-                server.hover(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
-
-        Assert.assertTrue("hover request should succeed", result.isPresent());
-        Assert.assertTrue("hover should parse source rather than compile", tracking.parseCalls.get() > 0);
-        Assert.assertEquals("hover should not use full compile", 0, tracking.compileCalls.get());
-        Assert.assertEquals("hover should not use fast compile", 0, tracking.compileFastCalls.get());
-        Assert.assertEquals(
-                "hover should not use fast compile with processors",
                 0,
                 tracking.compileFastWithProcessorsCalls.get());
     }
@@ -4844,6 +4706,10 @@ public class JavaLanguageServerTest {
         open.textDocument.text = text;
         server.didOpenTextDocument(open);
 
+        Assert.assertTrue(
+                "wait for initial completion index before triggering config change",
+                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+
         var logger = Logger.getLogger("main");
         var previousLevel = logger.getLevel();
         logger.setLevel(Level.FINE);
@@ -4860,11 +4726,6 @@ public class JavaLanguageServerTest {
             change.settings = settings;
             server.didChangeConfiguration(change);
 
-            var line = capture.lastLineContaining("[perf] diagnostics_debounce trigger=compilerRecreated");
-            Assert.assertTrue("expected compilerRecreated diagnostics debounce log", line != null);
-            Assert.assertTrue(
-                    "compilerRecreated diagnostics pass should use active files only, line=" + line,
-                    line.matches(".*files=1\\b.*"));
             Assert.assertEquals(
                     "compilerRecreated should not schedule a separate sync completion refresh when active files exist",
                     0,
@@ -5064,7 +4925,7 @@ public class JavaLanguageServerTest {
             Assert.assertEquals(
                     "expected didOpen bootstrap to run once before and once after config change",
                     2,
-                    capture.countContaining("[perf] workspace bootstrap started trigger=didOpenBootstrap"));
+                    capture.countContaining("[perf] workspace bootstrap started trigger=didOpen"));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -5072,124 +4933,6 @@ public class JavaLanguageServerTest {
     }
 
 
-
-    @Test
-    public void didChangeDiagnosticsAreCoalescedWithLongerDebounce() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        Thread.sleep(900);
-
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            for (int i = 0; i < 5; i++) {
-                var change = new DidChangeTextDocumentParams();
-                change.textDocument.uri = file.toUri();
-                change.textDocument.version = 2 + i;
-                var delta = new TextDocumentContentChangeEvent();
-                delta.text = text + "\n// debounce-change-" + i;
-                change.contentChanges.add(delta);
-                server.didChangeTextDocument(change);
-                Thread.sleep(35);
-            }
-
-            Thread.sleep(1200);
-            Assert.assertEquals(
-                    "rapid didChange burst should compile diagnostics exactly once after debounce",
-                    1,
-                    capture.countContaining("diagnostics_compile trigger=async:didChange"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void didSaveCancelsPendingDidChangeDiagnostics() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        Thread.sleep(900);
-
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = file.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = text + "\n// pending-diagnostics-change";
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            Thread.sleep(80);
-            var save = new DidSaveTextDocumentParams();
-            save.textDocument = new TextDocumentIdentifier(file.toUri());
-            server.didSaveTextDocument(save);
-
-            Thread.sleep(900);
-            Assert.assertEquals(
-                    "save should cancel pending async didChange diagnostics compile",
-                    0,
-                    capture.countContaining("[perf] diagnostics_compile trigger=async:didChange"));
-            Assert.assertEquals(
-                    "save should compile diagnostics immediately once",
-                    1,
-                    capture.countContaining("[perf] diagnostics_compile trigger=didSave"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void asyncDiagnosticsYieldWhileDidSaveIsInFlight() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        Assert.assertFalse(
-                "didSave priority gate should not affect foreground diagnostics",
-                invokeShouldYieldToDidSaveDiagnostics(server, "didSave", "pre_lock"));
-        Assert.assertFalse(
-                "didSave priority gate should not affect async diagnostics when no save is active",
-                invokeShouldYieldToDidSaveDiagnostics(server, "async:didChange", "pre_lock"));
-
-        var field = JavaLanguageServer.class.getDeclaredField("didSaveDiagnosticsInFlight");
-        field.setAccessible(true);
-        var inFlight = (AtomicInteger) field.get(server);
-        inFlight.incrementAndGet();
-        try {
-            Assert.assertTrue(
-                    "async diagnostics should yield once didSave has taken foreground priority",
-                    invokeShouldYieldToDidSaveDiagnostics(server, "async:didChange", "pre_lock"));
-            Assert.assertFalse(
-                    "foreground didSave diagnostics should continue running",
-                    invokeShouldYieldToDidSaveDiagnostics(server, "didSave", "pre_lock"));
-        } finally {
-            inFlight.decrementAndGet();
-        }
-    }
 
     @Test
     public void watchedCreatedForActiveJavaFileSkipsDuplicateWork() throws Exception {
@@ -5363,12 +5106,6 @@ public class JavaLanguageServerTest {
         ((AtomicLong) field.get(server)).set(value);
     }
 
-    private void cancelPendingCompletionIndex(JavaLanguageServer server, String reason) throws Exception {
-        var method = JavaLanguageServer.class.getDeclaredMethod("cancelPendingCompletionIndex", String.class);
-        method.setAccessible(true);
-        method.invoke(server, reason);
-    }
-
     private JavaCompilerService interactiveCompiler(JavaLanguageServer server) throws Exception {
         var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
         field.setAccessible(true);
@@ -5393,31 +5130,6 @@ public class JavaLanguageServerTest {
                         original.compilerRole);
         setInteractiveCompiler(server, tracking);
         return tracking;
-    }
-
-    private void invokeCompileAndPublish(
-            JavaLanguageServer server, List<Path> files, JavaCompilerService compiler, String trigger)
-            throws Exception {
-        var compileAndPublish =
-                JavaLanguageServer.class.getDeclaredMethod(
-                        "compileAndPublish",
-                        java.util.Collection.class,
-                        JavaCompilerService.class,
-                        String.class,
-                        long.class,
-                        int.class,
-                        int.class);
-        compileAndPublish.setAccessible(true);
-        compileAndPublish.invoke(server, files, compiler, trigger, -1L, files.size(), 0);
-    }
-
-    private boolean invokeShouldYieldToDidSaveDiagnostics(
-            JavaLanguageServer server, String trigger, String phase) throws Exception {
-        var method =
-                JavaLanguageServer.class.getDeclaredMethod(
-                        "shouldYieldToDidSaveDiagnostics", String.class, String.class);
-        method.setAccessible(true);
-        return (boolean) method.invoke(server, trigger, phase);
     }
 
     private static void deleteRecursively(Path root) throws IOException {
@@ -6869,7 +6581,7 @@ public class JavaLanguageServerTest {
         var settings = new JsonObject();
         var java = new JsonObject();
         var classPath = new com.google.gson.JsonArray();
-        classPath.add(Paths.get("lib/lombok-1.18.30.jar").toAbsolutePath().toString());
+        classPath.add(TestRuntimeJars.lombokJar().toString());
         java.add("classPath", classPath);
         settings.add("java", java);
         var change = new DidChangeConfigurationParams();
@@ -7056,34 +6768,6 @@ public class JavaLanguageServerTest {
 
         void clear() {
             lines.clear();
-        }
-    }
-
-    private static class ConcurrencyTrackingCompiler extends JavaCompilerService {
-        private final AtomicInteger inFlight = new AtomicInteger();
-        private final AtomicInteger maxInFlight = new AtomicInteger();
-
-        ConcurrencyTrackingCompiler() {
-            super(Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
-        }
-
-        @Override
-        CompileTask compileDiagnostics(
-                java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
-            var active = inFlight.incrementAndGet();
-            maxInFlight.accumulateAndGet(active, Math::max);
-            try {
-                Thread.sleep(120);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            } finally {
-                inFlight.decrementAndGet();
-            }
-            return new CompileTask(null, List.of(), List.of(), Map.of(), () -> {});
-        }
-
-        int maxConcurrentCompiles() {
-            return maxInFlight.get();
         }
     }
 

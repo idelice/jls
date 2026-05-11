@@ -21,7 +21,7 @@ public class RenameVariable implements Rewrite {
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         try (var compile = compiler.compile(file)) {
             var trees = Trees.instance(compile.task);
-            var root = compile.root();
+            var root = compile.root(file);
             var found = new FindVariableAt(compile.task).scan(root, position);
             if (found == null) {
                 return CANCELLED;

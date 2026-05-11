@@ -3,10 +3,13 @@ package org.javacs;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.util.Collection;
@@ -967,5 +970,49 @@ public class CompletionsTest extends CompletionsBase {
     public void multilineChain() {
         var inserts = filterText("/org/javacs/example/MultilineChain.java", 6, 14);
         assertThat(inserts, hasItem("concat"));
+    }
+
+    @Test
+    public void completeInLineComment() {
+        var file = "/org/javacs/example/AutocompleteComment.java";
+        var uri = FindResource.uri(file);
+        server.lint(List.of(Paths.get(uri)));
+        var position =
+                new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(3, 11));
+        var result = server.completion(position);
+        assertTrue("completion should be empty inside // comment", result.isEmpty());
+    }
+
+    @Test
+    public void completeInBlockComment() {
+        var file = "/org/javacs/example/AutocompleteComment.java";
+        var uri = FindResource.uri(file);
+        server.lint(List.of(Paths.get(uri)));
+        var position =
+                new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(4, 11));
+        var result = server.completion(position);
+        assertTrue("completion should be empty inside /* */ comment", result.isEmpty());
+    }
+
+    @Test
+    public void completeInJavadocComment() {
+        var file = "/org/javacs/example/AutocompleteComment.java";
+        var uri = FindResource.uri(file);
+        server.lint(List.of(Paths.get(uri)));
+        var position =
+                new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(5, 12));
+        var result = server.completion(position);
+        assertTrue("completion should be empty inside /** */ comment", result.isEmpty());
+    }
+
+    @Test
+    public void completeOutsideComment() {
+        var file = "/org/javacs/example/AutocompleteComment.java";
+        var uri = FindResource.uri(file);
+        server.lint(List.of(Paths.get(uri)));
+        var position =
+                new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(9, 8));
+        var result = server.completion(position);
+        assertFalse("completion should not be empty outside comments", result.isEmpty());
     }
 }

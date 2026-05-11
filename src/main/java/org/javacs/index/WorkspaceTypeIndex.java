@@ -292,6 +292,14 @@ public class WorkspaceTypeIndex {
         return list;
     }
 
+    public List<IndexedMember> constructors(String qualifiedName) {
+        var type = typesByQualifiedName.get(qualifiedName);
+        if (type == null) return List.of();
+        return type.members.stream()
+                .filter(m -> m.kind == CompletionItemKind.Constructor)
+                .toList();
+    }
+
     public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext) {
         var type = typesByQualifiedName.get(qualifiedName);
         if (type == null) {

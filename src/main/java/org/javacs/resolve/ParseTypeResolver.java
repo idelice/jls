@@ -37,6 +37,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -67,13 +68,23 @@ import org.javacs.lsp.CompletionItemKind;
  */
 public final class ParseTypeResolver {
     public record TypeResolution(
-            String qualifiedType, boolean staticContext, boolean arrayType, String firstTypeArgument) {
+            String qualifiedType, boolean staticContext, boolean arrayType, List<String> typeArguments) {
         public TypeResolution(String qualifiedType, boolean staticContext, boolean arrayType) {
-            this(qualifiedType, staticContext, arrayType, null);
+            this(qualifiedType, staticContext, arrayType, List.of());
         }
 
-        public TypeResolution withFirstTypeArgument(String nextFirstTypeArgument) {
-            return new TypeResolution(qualifiedType, staticContext, arrayType, nextFirstTypeArgument);
+        public String firstTypeArgument() {
+            return typeArguments.isEmpty() ? null : typeArguments.get(0);
+        }
+
+        public TypeResolution withFirstTypeArgument(String arg) {
+            return new TypeResolution(qualifiedType, staticContext, arrayType,
+                    arg == null ? List.of() : List.of(arg));
+        }
+
+        public TypeResolution withTypeArguments(List<String> args) {
+            return new TypeResolution(qualifiedType, staticContext, arrayType,
+                    args == null ? List.of() : List.copyOf(args));
         }
     }
 
@@ -268,11 +279,16 @@ public final class ParseTypeResolver {
     private Optional<TypeResolution> resolveMethodInvocation(MethodInvocationTree invocationTree, int depth) {
         var select = invocationTree.getMethodSelect();
         if (select instanceof IdentifierTree identifier) {
-            return resolveThisType()
-                    .flatMap(
-                            current ->
-                                    resolveMethodReturnType(
-                                            current, identifier.getName().toString(), false));
+            var thisType = resolveThisType();
+            if (thisType.isEmpty()) {
+                return Optional.empty();
+            }
+            var classLiteralBound = resolveClassLiteralTypeVarReturn(
+                    thisType.get(), identifier.getName().toString(), false, invocationTree);
+            if (classLiteralBound.isPresent()) {
+                return classLiteralBound;
+            }
+            return resolveMethodReturnType(thisType.get(), identifier.getName().toString(), false);
         }
         if (select instanceof MemberSelectTree memberSelectTree) {
             var receiver = resolveExpressionAtDepth(memberSelectTree.getExpression(), depth + 1);
@@ -284,6 +300,14 @@ public final class ParseTypeResolver {
                             invocationTree, memberSelectTree, receiver.get(), depth + 1);
             if (functional.isPresent()) {
                 return functional;
+            }
+            var classLiteralBound = resolveClassLiteralTypeVarReturn(
+                    receiver.get(),
+                    memberSelectTree.getIdentifier().toString(),
+                    receiver.get().staticContext(),
+                    invocationTree);
+            if (classLiteralBound.isPresent()) {
+                return classLiteralBound;
             }
             return resolveMethodReturnType(
                     receiver.get(),
@@ -354,6 +378,128 @@ public final class ParseTypeResolver {
         return erasedParameterTypes == null
                 ? index.external().rawMember(ownerType, memberName, staticContext)
                 : index.external().rawMember(ownerType, memberName, staticContext, erasedParameterTypes);
+    }
+
+    /**
+     * Infer return type for methods where the return type is a method-level type variable bound by
+     * a {@code Class<T>} argument at the call site.
+     *
+     * <p>Example: {@code <T> T readValue(String content, Class<T> valueType)} — called as
+     * {@code mapper.readValue(json, Foo.class)} resolves to {@code com.example.Foo}.
+     *
+     * <p>Uses indexed generic signatures first and a reflective fallback for dependency classes
+     * when the index cannot disambiguate an overload.
+     */
+    private Optional<TypeResolution> resolveClassLiteralTypeVarReturn(
+            TypeResolution receiverType, String methodName, boolean staticContext,
+            MethodInvocationTree invocation) {
+        if (receiverType == null
+                || receiverType.qualifiedType() == null
+                || receiverType.qualifiedType().isBlank()
+                || methodName == null
+                || methodName.isBlank()) {
+            return Optional.empty();
+        }
+        return resolveIndexedClassLiteralTypeVarReturn(receiverType, methodName, staticContext, invocation);
+    }
+
+    private Optional<TypeResolution> resolveIndexedClassLiteralTypeVarReturn(
+            TypeResolution receiverType, String methodName, boolean staticContext, MethodInvocationTree invocation) {
+        TypeResolution match = null;
+        for (var member : index.members(receiverType.qualifiedType(), staticContext)) {
+            if (member.kind != CompletionItemKind.Method
+                    || !methodName.equals(member.name)
+                    || member.declaredReturnType == null
+                    || member.declaredReturnType.isBlank()
+                    || member.declaredParameterTypes == null) {
+                continue;
+            }
+            var arity = member.declaredParameterTypes.length;
+            if (arity != invocation.getArguments().size()) {
+                continue;
+            }
+            var bound = bindClassLiteralTypeVarReturn(member.declaredReturnType, member.declaredParameterTypes, invocation);
+            if (bound.isEmpty()) {
+                continue;
+            }
+            if (match != null && !Objects.equals(typeName(match), typeName(bound.get()))) {
+                return Optional.empty();
+            }
+            match = bound.get();
+        }
+        return Optional.ofNullable(match);
+    }
+
+    private Optional<TypeResolution> bindClassLiteralTypeVarReturn(
+            String declaredReturn, String[] declaredParameterTypes, MethodInvocationTree invocation) {
+        if (!isLikelyMethodTypeVar(declaredReturn) || declaredParameterTypes == null) {
+            return Optional.empty();
+        }
+        var args = invocation.getArguments();
+        for (int i = 0; i < declaredParameterTypes.length && i < args.size(); i++) {
+            if (!isClassLiteralParamForTypeVar(declaredParameterTypes[i], declaredReturn)) {
+                continue;
+            }
+            var arg = args.get(i);
+            if (!(arg instanceof MemberSelectTree classLiteral)) {
+                continue;
+            }
+            if (!"class".equals(classLiteral.getIdentifier().toString())) {
+                continue;
+            }
+            var qualifier = resolveTypeTree(classLiteral.getExpression(), root, false);
+            if (qualifier.isPresent()) {
+                return qualifier;
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Return true if {@code typeName} looks like a method-level type variable: a bare identifier
+     * with no dots, angle brackets, array brackets, or spaces.
+     *
+     * <p>Type variables by convention are short uppercase tokens. Qualified class names always
+     * contain a dot in the index, so false positives are negligible.
+     */
+    private static boolean isLikelyMethodTypeVar(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return false;
+        }
+        for (int i = 0; i < typeName.length(); i++) {
+            char c = typeName.charAt(i);
+            if (c == '.' || c == '<' || c == '[' || c == ' ') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Return true if {@code paramType} is {@code java.lang.Class<VAR>} or {@code Class<VAR>} where
+     * {@code VAR} equals {@code expectedTypeVar}.
+     */
+    private static boolean isClassLiteralParamForTypeVar(String paramType, String expectedTypeVar) {
+        if (paramType == null || expectedTypeVar == null) {
+            return false;
+        }
+        var start = paramType.indexOf('<');
+        var end = paramType.lastIndexOf('>');
+        if (start < 0 || end <= start) {
+            return false;
+        }
+        var prefix = paramType.substring(0, start);
+        if (!"java.lang.Class".equals(prefix) && !"Class".equals(prefix)) {
+            return false;
+        }
+        var typeArg = paramType.substring(start + 1, end).trim();
+        while (typeArg.startsWith("? extends ")) {
+            typeArg = typeArg.substring("? extends ".length()).trim();
+        }
+        while (typeArg.startsWith("? super ")) {
+            typeArg = typeArg.substring("? super ".length()).trim();
+        }
+        return typeArg.equals(expectedTypeVar);
     }
 
     private Optional<TypeResolution> resolveImplicitSlf4jLogger(String identifier) {
@@ -887,8 +1033,12 @@ public final class ParseTypeResolver {
         }
         var bindings = new HashMap<java.lang.reflect.TypeVariable<?>, TypeResolution>();
         var vars = rawClass.get().getTypeParameters();
-        if (vars.length > 0 && functionalType.firstTypeArgument() != null && !functionalType.firstTypeArgument().isBlank()) {
-            bindings.put(vars[0], simpleResolution(functionalType.firstTypeArgument()));
+        var typeArgs = functionalType.typeArguments();
+        for (int i = 0; i < vars.length && i < typeArgs.size(); i++) {
+            var arg = typeArgs.get(i);
+            if (arg != null && !arg.isBlank()) {
+                bindings.put(vars[i], simpleResolution(arg));
+            }
         }
         return resolveReflectiveType(sam.get().getGenericParameterTypes()[0], bindings);
     }
@@ -930,8 +1080,12 @@ public final class ParseTypeResolver {
         }
         var initial = new HashMap<java.lang.reflect.TypeVariable<?>, TypeResolution>();
         var receiverVars = receiverClass.get().getTypeParameters();
-        if (receiverVars.length > 0 && receiverType.firstTypeArgument() != null && !receiverType.firstTypeArgument().isBlank()) {
-            initial.put(receiverVars[0], simpleResolution(receiverType.firstTypeArgument()));
+        var typeArgs = receiverType.typeArguments();
+        for (int i = 0; i < receiverVars.length && i < typeArgs.size(); i++) {
+            var arg = typeArgs.get(i);
+            if (arg != null && !arg.isBlank()) {
+                initial.put(receiverVars[i], simpleResolution(arg));
+            }
         }
         return resolveBindingsForClass(receiverClass.get(), initial, declaringClass).orElse(Map.of());
     }
@@ -995,11 +1149,12 @@ public final class ParseTypeResolver {
             if (raw.isEmpty()) {
                 return Optional.empty();
             }
-            var firstArg =
-                    parameterized.getActualTypeArguments().length == 0
-                            ? Optional.<TypeResolution>empty()
-                            : resolveReflectiveType(parameterized.getActualTypeArguments()[0], bindings);
-            return Optional.of(raw.get().withFirstTypeArgument(firstArg.map(ParseTypeResolver::typeName).orElse(null)));
+            var actualArgs = parameterized.getActualTypeArguments();
+            var resolvedArgs = new ArrayList<String>();
+            for (var arg : actualArgs) {
+                resolveReflectiveType(arg, bindings).map(ParseTypeResolver::typeName).ifPresent(resolvedArgs::add);
+            }
+            return Optional.of(raw.get().withTypeArguments(resolvedArgs));
         }
         if (type instanceof java.lang.reflect.TypeVariable<?> typeVariable) {
             var bound = bindings.get(typeVariable);
@@ -1141,11 +1296,8 @@ public final class ParseTypeResolver {
             qualified = qualified.substring(0, qualified.length() - 2);
         }
         return Optional.of(
-                new TypeResolution(
-                        qualified,
-                        false,
-                        array,
-                        firstTypeArgumentFromTypeName(typeName).orElse(null)));
+                new TypeResolution(qualified, false, array)
+                        .withFirstTypeArgument(firstTypeArgumentFromTypeName(typeName).orElse(null)));
     }
 
     private boolean isWorkspaceType(String qualifiedType) {

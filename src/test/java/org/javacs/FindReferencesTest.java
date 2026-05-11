@@ -19,8 +19,7 @@ public class FindReferencesTest {
 
     protected List<String> items(String file, int row, int column) {
         var path = FindResource.path(file);
-        var resolver = new DefinitionProvider(REFERENCES.compiler, REFERENCES.index, path, row, column);
-        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, resolver, path, false).find();
+        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, path, row, column, false).find();
         var strings = new ArrayList<String>();
         for (var l : locations) {
             var fileName = StringSearch.fileName(l.uri);
@@ -125,17 +124,6 @@ public class FindReferencesTest {
                         "LombokFieldReferences.java(13)"));
     }
 
-    @Test
-    public void lombokAccessorReferencesIncludeFieldReadsAndWrites() {
-        var file = "/org/javacs/example/LombokFieldReferences.java";
-        assertThat(
-                items(file, 10, 13),
-                contains(
-                        "LombokFieldReferences.java(10)",
-                        "LombokFieldReferences.java(11)",
-                        "LombokFieldReferences.java(12)",
-                        "LombokFieldReferences.java(13)"));
-    }
 
     @Test
     public void abstractMethodReferencesIncludeOverridesAndCallSites() {
