@@ -27,6 +27,7 @@ import org.javacs.navigation.NavigationSymbolSupport;
  * opens the source via the type index.
  */
 public class DefinitionProvider {
+
     private record TypeSource(ParseTask task, TreePath classPath) {}
 
     private record FieldTarget(TreePath path, String name) {}
@@ -100,15 +101,23 @@ public class DefinitionProvider {
             var selectedName = selectedName(path);
             var trees = Trees.instance(compile.task);
             var element = trees.getElement(path);
-            if ((element == null
-                            || (element.getKind() != javax.lang.model.element.ElementKind.METHOD
-                                    && element.getKind()
-                                            != javax.lang.model.element.ElementKind.CONSTRUCTOR))
-                    && path.getLeaf() instanceof IdentifierTree mismatchId
-                    && path.getParentPath() != null
-                    && path.getParentPath().getLeaf() instanceof MethodInvocationTree mismatchInv
-                    && mismatchInv.getMethodSelect() == path.getLeaf()) {
-                var mismatchName = mismatchId.getName().toString();
+            // Handle case where local variable name shadows a method name
+            // e.g. var packageName = packageName(className);
+            String mismatchName = null;
+            if (element != null
+                    && element.getKind() != javax.lang.model.element.ElementKind.METHOD
+                    && element.getKind() != javax.lang.model.element.ElementKind.CONSTRUCTOR) {
+                if (path.getLeaf() instanceof IdentifierTree mismatchId
+                        && path.getParentPath() != null
+                        && path.getParentPath().getLeaf() instanceof MethodInvocationTree mismatchInv
+                        && mismatchInv.getMethodSelect() == path.getLeaf()) {
+                    mismatchName = mismatchId.getName().toString();
+                } else if (path.getLeaf() instanceof VariableTree varTree
+                        && varTree.getInitializer() != null) {
+                    mismatchName = varTree.getName().toString();
+                }
+            }
+            if (mismatchName != null) {
                 var encClassPath = nearestClass(path);
                 if (encClassPath != null && encClassPath.getLeaf() instanceof ClassTree encClass) {
                     var allLocs = new ArrayList<Location>();

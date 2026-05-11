@@ -525,6 +525,40 @@ public class DefinitionProviderTest {
         }
     }
 
+    @Test
+    public void debugLocalVarShadowsPrivateMethod() throws Exception {
+        var workspace = Files.createTempDirectory("definition-debug-shadow");
+        try {
+            var appDir = workspace.resolve("app");
+            Files.createDirectories(appDir);
+            var use = appDir.resolve("Use.java");
+            Files.writeString(
+                    use,
+                    "package app;\n"
+                            + "class Use {\n"
+                            + "    private String packageName(String className) {\n"
+                            + "        return className.substring(0, className.lastIndexOf('.'));\n"
+                            + "    }\n"
+                            + "    private String simpleName(String className) {\n"
+                            + "        return className.substring(className.lastIndexOf('.') + 1);\n"
+                            + "    }\n"
+                            + "    void pathToFile(String className) {\n"
+                            + "        var packageName = packageName(className);\n"
+                            + "    }\n"
+                            + "}\n");
+
+            // Cursor on RHS method call: packageName(className)
+            var locations = debugDefinition(workspace, use, "packageName(className");
+            assertThat(locations, not(empty()));
+            // Verify it resolves to method declaration (line 2 = private String packageName)
+            // not the local variable declaration
+            var loc = locations.get(0);
+            assertThat("should resolve to packageName method declaration", loc.range.start.line, is(2));
+        } finally {
+            deleteTree(workspace);
+        }
+    }
+
     @After
     public void resetWorkspaceRoots() {
         FileStore.setWorkspaceRoots(Collections.emptySet());
