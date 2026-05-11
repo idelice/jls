@@ -51,9 +51,9 @@ public class ReferenceProvider {
     }
 
     public List<Location> find() {
-        var target = resolveTarget();
+        var target = resolveTargetFromParseIndex();
         if (!isSupported(target)) {
-            return NOT_SUPPORTED;
+            return List.of();
         }
         if (target.qualifiedType() == null) {
             return findLocalReferences(target);
@@ -77,28 +77,114 @@ public class ReferenceProvider {
                         || target.memberName() != null);
     }
 
-    private SymbolIdentity resolveTarget() {
-        var defProvider = new DefinitionProvider(compiler, typeIndexRouter, file, line, column);
-        var resolved = defProvider.resolveSymbol();
-        return toSymbolIdentity(resolved);
-    }
-
-    private static SymbolIdentity toSymbolIdentity(DefinitionProvider.ResolvedSymbol resolved) {
-        if (resolved == null || resolved.locations().isEmpty()) {
-            return SymbolIdentity.unsupported(resolved != null ? resolved.simpleName() : null);
+    private SymbolIdentity resolveTargetFromParseIndex() {
+        var parse = compiler.parse(file);
+        var root = parse.root();
+        String content;
+        try {
+            content = root.getSourceFile().getCharContent(true).toString();
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
         }
-        return new SymbolIdentity(
-                resolved.qualifiedType(),
-                resolved.memberName(),
-                resolved.method(),
-                resolved.indexMember(),
-                resolved.simpleName(),
-                Optional.of(resolved.locations().getFirst()));
+        long cursor = FileStore.offset(content, line, column);
+
+        var path = new FindNameAt(parse).scan(root, cursor);
+        if (path != null) {
+            if (path.getLeaf() instanceof VariableTree) {
+                var parent = path.getParentPath().getLeaf();
+                return parent instanceof ClassTree ? getField(parse, path) : getLocal(parse, path);
+            }
+            if (path.getLeaf() instanceof ClassTree) {
+                return getType(parse, path);
+            }
+            return resolveOccurrence(parse, path);
+        }
+
+        var variablePath = findVariableAtCursor(parse, root, cursor);
+        if (variablePath != null) {
+            var parent = variablePath.getParentPath().getLeaf();
+            return parent instanceof ClassTree ? getField(parse, variablePath) : getLocal(parse, variablePath);
+        }
+
+        return SymbolIdentity.unsupported(null);
     }
 
-    private SymbolIdentity resolveIdentifierTargetIdentity(
-            ParseTask parse, TreePath path, IdentifierTree identifier) {
-        return resolveIdentifierOccurrence(parse, path, identifier);
+    /**
+     * Scans the compilation unit for any VariableTree at the cursor position.
+     * Matches ALL variable declarations: fields, parameters, local variables, catch params,
+     * enhanced-for variables, try-resource variables.
+     */
+    private static TreePath findVariableAtCursor(ParseTask parse, CompilationUnitTree root, long cursor) {
+        var positions = Trees.instance(parse.task()).getSourcePositions();
+        return new TreePathScanner<TreePath, Long>() {
+            @Override
+            public TreePath visitVariable(VariableTree tree, Long cursor) {
+                var start = positions.getStartPosition(root, tree);
+                var end = positions.getEndPosition(root, tree);
+                if (start >= 0 && end >= 0 && start <= cursor && cursor <= end) {
+                    return getCurrentPath();
+                }
+                return super.visitVariable(tree, cursor);
+            }
+
+            @Override
+            public TreePath reduce(TreePath r1, TreePath r2) {
+                return r1 != null ? r1 : r2;
+            }
+        }.scan(root, cursor);
+    }
+
+    /**
+     * Resolve a field variable declaration via parse tree + type index.
+     * Called when cursor is on a field declaration name in the source.
+     */
+    private SymbolIdentity getField(ParseTask parse, TreePath varPath) {
+        var vt = (VariableTree) varPath.getLeaf();
+        var fieldName = vt.getName().toString();
+        var enclosingType = enclosingTypeNameFromParse(parse, varPath);
+        if (enclosingType.isEmpty()) return SymbolIdentity.unsupported(fieldName);
+        var typeName = enclosingType.get();
+        var declLoc = Optional.ofNullable(FindHelper.locationStrict(parse, varPath, fieldName));
+
+        var member = typeIndexRouter.ownerMember(typeName, fieldName, false);
+        if (member.isPresent() && member.get().kind == CompletionItemKind.Field)
+            return new SymbolIdentity(typeName, fieldName, false, member.get(), fieldName, declLoc);
+        member = typeIndexRouter.ownerMember(typeName, fieldName, true);
+        if (member.isPresent() && member.get().kind == CompletionItemKind.Field)
+            return new SymbolIdentity(typeName, fieldName, false, member.get(), fieldName, declLoc);
+        return new SymbolIdentity(typeName, fieldName, false, null, fieldName, declLoc);
+    }
+
+    /**
+     * Resolve a local variable declaration: parameters, local vars, catch params, etc.
+     * Called when cursor is on a local variable declaration name.
+     * Returns local identity (qualifiedType=null) so find() routes to findLocalReferences().
+     */
+    private SymbolIdentity getLocal(ParseTask parse, TreePath varPath) {
+        var vt = (VariableTree) varPath.getLeaf();
+        var varName = vt.getName().toString();
+        var declLoc = Optional.ofNullable(FindHelper.locationStrict(parse, varPath, varName));
+        return new SymbolIdentity(null, varName, false, null, varName, declLoc);
+    }
+
+    /**
+     * Resolve a class/interface/enum/record declaration as a type reference.
+     */
+    private SymbolIdentity getType(ParseTask parse, TreePath typePath) {
+        var classTree = (ClassTree) typePath.getLeaf();
+        var className = classTree.getSimpleName().toString();
+        var declLoc = Optional.ofNullable(
+                FindHelper.locationStrict(parse, typePath, className));
+        var typeName = enclosingTypeNameFromParse(parse, typePath);
+        if (typeName.isPresent()) {
+            return new SymbolIdentity(typeName.get(), null, false, null, className, declLoc);
+        }
+        var resolvedType = typeIndexRouter.resolveType(className, parse.root());
+        if (resolvedType.isPresent()) {
+            return new SymbolIdentity(
+                    resolvedType.get().qualifiedName, null, false, null, className, declLoc);
+        }
+        return new SymbolIdentity(null, null, false, null, className, declLoc);
     }
 
     private SymbolIdentity resolveOccurrence(ParseTask parse, TreePath path) {
@@ -149,7 +235,7 @@ public class ReferenceProvider {
         if (id != null
                 && parent instanceof MethodInvocationTree inv
                 && inv.getMethodSelect() == id) {
-            var thisType = resolveEnclosingTypeName(path, parse);
+            var thisType = enclosingTypeNameFromParse(parse, path);
             if (thisType.isPresent()) {
                 var member = typeIndexRouter.ownerMember(thisType.get(), name, false);
                 return new SymbolIdentity(
@@ -173,7 +259,7 @@ public class ReferenceProvider {
                     Optional.empty());
         }
 
-        var thisType = resolveEnclosingTypeName(path, parse);
+        var thisType = enclosingTypeNameFromParse(parse, path);
         if (thisType.isPresent()) {
             var field = typeIndexRouter.ownerMember(thisType.get(), name, false);
             if (field.isPresent() && field.get().kind == CompletionItemKind.Field) {
@@ -188,11 +274,6 @@ public class ReferenceProvider {
         }
 
         return SymbolIdentity.unsupported(name);
-    }
-
-    private SymbolIdentity resolveMemberSelectTargetIdentity(
-            ParseTask parse, TreePath path, MemberSelectTree memberSelect) {
-        return resolveMemberSelectOccurrence(parse, path, memberSelect);
     }
 
     private SymbolIdentity resolveMemberSelectOccurrence(
@@ -283,10 +364,7 @@ public class ReferenceProvider {
 
     private List<Location> findFieldReferencesScoped(
             SymbolIdentity target, String logicalKey) {
-        var files =
-                includeDeclarationFile(
-                        target.qualifiedType(),
-                        compiler.findTypeReferences(target.qualifiedType()));
+        var files = FileStore.all().toArray(Path[]::new);
         var names = relatedLogicalNames(target, logicalKey);
         return scan(
                 files,
@@ -393,29 +471,16 @@ public class ReferenceProvider {
                         targetParameterTypes,
                         NavigationSymbolSupport.occurrenceParameterTypes(
                                 parse, path, typeIndexRouter, compiler))) {
-            LOG.fine(String.format("[ref] accept_ctor path=%s target=%s.%s resolved=%s.%s",
-                    path.getCompilationUnit().getSourceFile().getName(),
-                    target.qualifiedType(), target.memberName(),
-                    resolved.qualifiedType(), resolved.memberName()));
             return true;
         }
         var resolvedKey =
                 NavigationSymbolSupport.methodCanonicalKey(
                         resolved, parse, path, typeIndexRouter, compiler);
         if (!resolved.method()) {
-            LOG.fine(String.format("[ref] reject_not_method path=%s target=%s.%s resolved=%s.%s",
-                    path.getCompilationUnit().getSourceFile().getName(),
-                    target.qualifiedType(), target.memberName(),
-                    resolved.qualifiedType(), resolved.memberName()));
             return false;
         }
         var ownerMatch = methodOwnerMatches(target.qualifiedType(), resolved.qualifiedType());
         var nameMatch = Objects.equals(target.memberName(), resolved.memberName());
-        LOG.fine(String.format("[ref] matches_member path=%s target=%s.%s resolved=%s.%s owner=%s name=%s",
-                path.getCompilationUnit().getSourceFile().getName(),
-                target.qualifiedType(), target.memberName(),
-                resolved.qualifiedType(), resolved.memberName(),
-                ownerMatch, nameMatch));
         if (ownerMatch && nameMatch) {
             return signatureMatches(
                     targetParameterTypes,
@@ -440,8 +505,23 @@ public class ReferenceProvider {
 
     private boolean matchesFieldReference(
             ParseTask parse, TreePath path, String logicalKey) {
-        var resolved = resolveOccurrence(parse, path);
-        return Objects.equals(logicalKey, NavigationSymbolSupport.logicalKey(resolved));
+        // logicalKey format: "org.javacs.example.StackedFieldReferences#x"
+        var hash = logicalKey.lastIndexOf('#');
+        var targetFieldName =
+                hash >= 0 ? logicalKey.substring(hash + 1) : logicalKey;
+
+        var name = selectedName(path);
+        if (name == null) return false;
+
+        if (name.equals(targetFieldName)) {
+            return true;
+        }
+
+        var fieldName = LombokAnnotations.accessorFieldName(name);
+        if (fieldName.isPresent() && fieldName.get().equals(targetFieldName)) {
+            return true;
+        }
+        return false;
     }
 
     private boolean matchesLocalReference(
@@ -659,17 +739,14 @@ public class ReferenceProvider {
                         && mt.getName() != null
                         && mt.getName().contentEquals(name)
                         && !mt.getName().contentEquals("<init>")) {
+                    var loc = FindHelper.locationStrict(parse, new TreePath(cursor, member), name);
                     return new SymbolIdentity(
-                            encTypeName.get(), name, true, null, name, Optional.empty());
+                            encTypeName.get(), name, true, null, name, Optional.ofNullable(loc));
                 }
             }
             break;
         }
         return null;
-    }
-
-    private Optional<String> resolveEnclosingTypeName(TreePath path, ParseTask parse) {
-        return enclosingTypeNameFromParse(parse, path);
     }
 
     private Optional<String> enclosingTypeNameFromParse(ParseTask parse, TreePath path) {
