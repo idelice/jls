@@ -53,7 +53,12 @@ public interface CompilerProvider {
         return compileFast(sources);
     }
 
-   /** Returns true when Lombok is present on the project classpath. */
+    /** Per-file compile without workspace widening. For hover. */
+    default CompileTask compilePerFile(Path file) {
+        return compileFast(file);
+    }
+
+    /** Returns true when Lombok is present on the project classpath. */
     default boolean lombokPresentOnClasspath() {
         return false;
     }

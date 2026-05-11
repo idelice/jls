@@ -9,13 +9,14 @@ import java.util.*;
 import java.util.logging.Logger;
 import javax.tools.*;
 
-/**
+    /**
  * Immutable, read-only metadata computed once per compiler-creation event and shared across all
  * three compiler lanes (interactive, background, index).
  *
  * <p>This holds configuration-derived values that are identical for all lanes and safe to share:
- * normalized paths, classpath/JDK type-index sets, lombok detection, and doc metadata. It
- * explicitly does <em>not</em> hold any mutable execution state (compilers, caches, file managers).
+ * normalized paths, classpath/JDK type-index sets, lombok detection, doc metadata,
+ * and a shared per-file compile cache. It explicitly does <em>not</em> hold any mutable
+ * execution state (compilers, per-lane workspace caches, file managers).
  */
 record CompilerSharedResources(
         Set<Path> classPath,
@@ -26,7 +27,8 @@ record CompilerSharedResources(
         Set<String> classPathClasses,
         boolean lombokPresentOnClasspath,
         boolean apEnabled,
-        Docs docs) {
+        Docs docs,
+        Cache<Boolean, CompileBatch> fileCache) {
 
     private static final Logger LOG = Logger.getLogger("main");
 
@@ -90,7 +92,8 @@ record CompilerSharedResources(
                 classPathClasses,
                 lombokPresentOnClasspath,
                 apEnabled,
-                docs);
+                docs,
+                new Cache<>("compile_file", 16));
     }
 
     /**

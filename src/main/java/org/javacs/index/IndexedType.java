@@ -1,5 +1,7 @@
 package org.javacs.index;
 
+import java.io.ObjectStreamException;
+import java.io.Serializable;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -18,7 +20,8 @@ import org.javacs.lsp.Range;
  * <p>The indexes remain separate stores. {@link IndexedMember.Provenance} tells callers which
  * store produced the current snapshot.
  */
-public final class IndexedType {
+public final class IndexedType implements Serializable {
+    private static final long serialVersionUID = 1L;
     public final String qualifiedName;
     public final String simpleName;
     public final List<IndexedMember> members;
@@ -153,5 +156,55 @@ public final class IndexedType {
             }
         }
         return enclosing;
+    }
+
+    private Object writeReplace() throws ObjectStreamException {
+        return new SerializationProxy(qualifiedName, simpleName, members, fromCompiledRoot,
+                sourcePath == null ? null : sourcePath.toString(), sourceUri, superclass, interfaces,
+                nestedTypes, kind, modifiers, declarationRange, provenance);
+    }
+
+    private static class SerializationProxy implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final String qualifiedName;
+        private final String simpleName;
+        private final List<IndexedMember> members;
+        private final boolean fromCompiledRoot;
+        private final String sourcePathString;
+        private final URI sourceUri;
+        private final String superclass;
+        private final List<String> interfaces;
+        private final List<String> nestedTypes;
+        private final int kind;
+        private final Set<Modifier> modifiers;
+        private final Range declarationRange;
+        private final IndexedMember.Provenance provenance;
+
+        SerializationProxy(String qualifiedName, String simpleName, List<IndexedMember> members,
+                boolean fromCompiledRoot, String sourcePathString, URI sourceUri,
+                String superclass, List<String> interfaces, List<String> nestedTypes,
+                int kind, Set<Modifier> modifiers, Range declarationRange,
+                IndexedMember.Provenance provenance) {
+            this.qualifiedName = qualifiedName;
+            this.simpleName = simpleName;
+            this.members = members;
+            this.fromCompiledRoot = fromCompiledRoot;
+            this.sourcePathString = sourcePathString;
+            this.sourceUri = sourceUri;
+            this.superclass = superclass;
+            this.interfaces = interfaces;
+            this.nestedTypes = nestedTypes;
+            this.kind = kind;
+            this.modifiers = modifiers;
+            this.declarationRange = declarationRange;
+            this.provenance = provenance;
+        }
+
+        private Object readResolve() throws ObjectStreamException {
+            return new IndexedType(qualifiedName, simpleName, members, fromCompiledRoot,
+                    sourcePathString == null ? null : Path.of(sourcePathString),
+                    sourceUri, superclass, interfaces, nestedTypes, kind,
+                    modifiers, declarationRange, provenance);
+        }
     }
 }

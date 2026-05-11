@@ -1,6 +1,9 @@
 package org.javacs.lsp;
 
-public class Position {
+import java.io.Serializable;
+
+public class Position implements Serializable {
+    private static final long serialVersionUID = 1L;
     /** 0-based */
     public int line, character;
 

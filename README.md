@@ -12,6 +12,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Find references** - Find all usages of symbols
 - **Diagnostics** - Real-time linting and error reporting
 - **Signature help** - Parameter information for method calls
+- **Format document** - Auto-format with google-java-format AOSP style
 - **Inlay hints** - Parameter name hints at call sites (workspace files only; Lombok-generated calls are suppressed)
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
 - **Private repository support** - Seamless integration with Maven repositories requiring authentication
@@ -23,8 +24,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 
 - Java 25
 - Maven
-- protobuf
-- **Neovim 0.10+** (required for pull diagnostics — see [Client Requirements](#client-requirements))
+- Neovim 0.10+
 
 ### Build
 
@@ -145,10 +145,12 @@ The Java language server uses the [Java compiler API](https://docs.oracle.com/ja
 
 Features are split across two resolution strategies:
 
-- **Compile-based** (javac semantic attribution): go-to-definition, hover, diagnostics, code actions. Uses `compileFast` / `compileFastWithProcessors` for full type accuracy.
+- **Compile-based** (javac semantic attribution): go-to-definition, hover, diagnostics, code actions. Uses `compilePerFile` for per-file type accuracy.
 - **Index-based** (parse + workspace index): autocomplete, find-references, signature help. Uses `compiler.parse()` with `ParseTypeResolver` + `TypeIndexRouter` for ~50x faster response times.
 
 This avoids full compilation on high-frequency triggers like `(` and reference scans.
+
+The workspace index is cached to `~/.cache/jls/server/`. Repeat opens skip re-indexing and show "Cached index" in the progress bar. First open shows "Indexing workspace".
 
 ### Incremental updates
 
@@ -170,4 +172,12 @@ Assuming you have these prerequisites, you should be able to install locally usi
 
 ## Logs
 
-The Java service process logs to stderr and prints the active runtime JDK details at startup.
+The server logs to stderr. Neovim captures this at `~/.local/state/nvim/lsp.log`.
+
+## Troubleshooting
+
+**Index feels stale**: Delete `~/.cache/jls/server/` to force a full re-index.
+
+**No completion/references**: Wait for "Index ready" progress bar. Features using the index need it.
+
+**Port already in use**: Kill existing Java processes: `pkill -f lang_server`

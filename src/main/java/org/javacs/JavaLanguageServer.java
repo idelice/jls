@@ -25,6 +25,7 @@ import org.javacs.action.CodeActionProvider;
 import org.javacs.provider.CompletionProvider;
 import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.provider.SignatureProvider;
+import org.javacs.index.WorkspaceIndexCache;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.fold.FoldProvider;
@@ -1368,10 +1369,20 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     @Override
-    public void didOpenTextDocument(DidOpenTextDocumentParams params) {
+     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
+        // Warm interactive compiler cache if index is already built
+        if (completionSnapshotRef.get().scope() == CompletionIndexScope.WORKSPACE) {
+            var file = Paths.get(params.textDocument.uri);
+            try (var ignored = interactiveCompiler.compilePerFile(file)) {
+                // Cache warm — result not needed
+            } catch (Exception e) {
+                LOG.fine(String.format("[perf] cache_warm_skip file=%s reason=%s",
+                        file.getFileName(), e.getMessage()));
+            }
+        }
     }
 
     @Override
@@ -1553,11 +1564,35 @@ class JavaLanguageServer extends LanguageServer {
          * Run one queued completion-index refresh if its revision is still current, then compile,
          * index, and publish the resulting workspace snapshot.
          */
-        void runRefresh(List<Path> files, long revision, String trigger, CompletionIndexRefreshMode mode) {
-            if (revision != completionIndexRevision.get()) {
-                return;
-            }
-            synchronized (completionIndexCompileMutex) {
+         void runRefresh(List<Path> files, long revision, String trigger, CompletionIndexRefreshMode mode) {
+             if (revision != completionIndexRevision.get()) {
+                 return;
+             }
+
+             // Try disk cache for full workspace bootstrap
+             if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
+                 var cacheProjectName = workspaceRoot.getFileName().toString();
+                 var cacheKey = WorkspaceIndexCache.computeCacheKey(
+                         FileStore.all(),
+                         workspaceRoot.resolve("pom.xml"),
+                         externalDependencies());
+                 var cached = WorkspaceIndexCache.load(cacheProjectName, cacheKey);
+                 if (cached != null) {
+                     var cacheToken = beginWorkDoneProgress("Cached index", "Loading from disk");
+                     var indexVersion = completionIndexVersion.incrementAndGet();
+                     installTypeMemberIndex(
+                             cached, indexVersion, "cache:" + trigger, Duration.ZERO,
+                             CompletionIndexScope.WORKSPACE);
+                     endWorkDoneProgress(cacheToken, "Index ready");
+                     LOG.info(String.format(
+                             "[perf] workspace_bootstrap source=cache files=%d key=%s",
+                             FileStore.all().size(),
+                             cacheKey != null ? cacheKey.substring(0, 8) : "null"));
+                     return;
+                 }
+             }
+
+             synchronized (completionIndexCompileMutex) {
                 var started = Instant.now();
                 CompileTask task = null;
                 String bootstrapProgressToken = null;
@@ -1611,6 +1646,15 @@ class JavaLanguageServer extends LanguageServer {
                                     TimeUnit.MILLISECONDS);
                         }
                     }
+                    // Store to disk cache after successful full build
+                    if (mode == CompletionIndexRefreshMode.FULL_REBUILD && nextIndex != null) {
+                        var cacheProjectName = workspaceRoot.getFileName().toString();
+                        var cacheKey = WorkspaceIndexCache.computeCacheKey(
+                                FileStore.all(),
+                                workspaceRoot.resolve("pom.xml"),
+                                externalDependencies());
+                        WorkspaceIndexCache.store(cacheProjectName, cacheKey, nextIndex);
+                    }
                     LOG.info(String.format(
                             "[perf] index installed trigger=%s version=%d types=%d took=%dms",
                             trigger,
@@ -1618,6 +1662,21 @@ class JavaLanguageServer extends LanguageServer {
                             nextIndex == null ? 0 : nextIndex.size(),
                             Duration.between(started, Instant.now()).toMillis()));
                     endWorkDoneProgress(bootstrapProgressToken, "Index ready");
+                    // Warm interactive compiler cache for active files
+                    if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
+                        var active = FileStore.activeDocuments();
+                        for (var activeFile : active) {
+                            if (FileStore.isJavaFile(activeFile)) {
+                                try (var ignored = interactiveCompiler.compilePerFile(activeFile)) {
+                                    // Cache warm — result not needed
+                                } catch (Exception e) {
+                                    LOG.fine(String.format(
+                                            "[perf] cache_warm_skip file=%s reason=%s",
+                                            activeFile.getFileName(), e.getMessage()));
+                                }
+                            }
+                        }
+                    }
                     var totalMs = Duration.between(started, Instant.now()).toMillis();
                     LOG.fine(String.format(
                             "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",

@@ -1,6 +1,9 @@
 package org.javacs.lsp;
 
-public class Range {
+import java.io.Serializable;
+
+public class Range implements Serializable {
+    private static final long serialVersionUID = 1L;
     public Position start, end;
 
     public Range() {}

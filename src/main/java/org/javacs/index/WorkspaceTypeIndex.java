@@ -14,6 +14,8 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+import java.io.ObjectStreamException;
+import java.io.Serializable;
 import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -57,9 +59,11 @@ import org.javacs.resolve.TypeNames;
  * index entries. That keeps completion, definition, and references on the same symbol graph
  * instead of layering navigation-only fallback heuristics on top.
  */
-public class WorkspaceTypeIndex {
+public class WorkspaceTypeIndex implements Serializable {
+    private static final long serialVersionUID = 1L;
     public static final WorkspaceTypeIndex EMPTY = new WorkspaceTypeIndex(Map.of(), Map.of());
-    public static final class SourceFileSnapshot {
+    public static final class SourceFileSnapshot implements Serializable {
+        private static final long serialVersionUID = 1L;
         public final Path sourcePath;
         public final URI sourceUri;
         public final String packageName;
@@ -101,6 +105,36 @@ public class WorkspaceTypeIndex {
             this.imports = Collections.unmodifiableList(new ArrayList<>(imports));
             this.staticImports = Collections.unmodifiableList(new ArrayList<>(staticImports));
             this.declaredTypes = Collections.unmodifiableList(new ArrayList<>(declaredTypes));
+        }
+
+        private Object writeReplace() throws ObjectStreamException {
+            return new SourceFileSnapshotProxy(sourcePath == null ? null : sourcePath.toString(),
+                    sourceUri, packageName, imports, staticImports, declaredTypes);
+        }
+
+        private static class SourceFileSnapshotProxy implements Serializable {
+            private static final long serialVersionUID = 1L;
+            private final String sourcePathString;
+            private final URI sourceUri;
+            private final String packageName;
+            private final List<String> imports;
+            private final List<String> staticImports;
+            private final List<String> declaredTypes;
+
+            SourceFileSnapshotProxy(String sourcePathString, URI sourceUri, String packageName,
+                    List<String> imports, List<String> staticImports, List<String> declaredTypes) {
+                this.sourcePathString = sourcePathString;
+                this.sourceUri = sourceUri;
+                this.packageName = packageName;
+                this.imports = imports;
+                this.staticImports = staticImports;
+                this.declaredTypes = declaredTypes;
+            }
+
+            private Object readResolve() throws ObjectStreamException {
+                return new SourceFileSnapshot(sourcePathString == null ? null : Path.of(sourcePathString),
+                        sourceUri, packageName, imports, staticImports, declaredTypes);
+            }
         }
     }
 
@@ -1799,5 +1833,33 @@ public class WorkspaceTypeIndex {
                 existing.modifiers,
                 existing.sourceUri,
                 existing.declarationRange);
+    }
+
+    private Object writeReplace() throws ObjectStreamException {
+        var sourceFilesStringKeys = new Object2ObjectLinkedOpenHashMap<String, SourceFileSnapshot>();
+        for (var entry : sourceFiles.entrySet()) {
+            sourceFilesStringKeys.put(entry.getKey().toString(), entry.getValue());
+        }
+        return new SerializationProxy(typesByQualifiedName, sourceFilesStringKeys);
+    }
+
+    private static class SerializationProxy implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final Map<String, IndexedType> typesByQualifiedName;
+        private final Map<String, SourceFileSnapshot> sourceFilesStringKeys;
+
+        SerializationProxy(Map<String, IndexedType> typesByQualifiedName,
+                Map<String, SourceFileSnapshot> sourceFilesStringKeys) {
+            this.typesByQualifiedName = typesByQualifiedName;
+            this.sourceFilesStringKeys = sourceFilesStringKeys;
+        }
+
+        private Object readResolve() throws ObjectStreamException {
+            var sourceFiles = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+            for (var entry : sourceFilesStringKeys.entrySet()) {
+                sourceFiles.put(Paths.get(entry.getKey()), entry.getValue());
+            }
+            return new WorkspaceTypeIndex(typesByQualifiedName, sourceFiles);
+        }
     }
 }

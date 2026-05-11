@@ -18,7 +18,7 @@ public class HoverProvider {
     }
 
     public MarkupContent hover(Path file, int line, int column) {
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compilePerFile(file)) {
             var root = task.root(file);
             long cursor;
             try {

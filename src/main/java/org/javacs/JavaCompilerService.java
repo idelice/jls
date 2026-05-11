@@ -38,6 +38,9 @@ class JavaCompilerService implements CompilerProvider {
             new CompileProfile(CompileBatch.AnalysisMode.ATTR, true, true, false);
     private static final CompileProfile FAST_NO_AP_PROFILE =
             new CompileProfile(CompileBatch.AnalysisMode.ATTR, false, true, false);
+    /** Per-file ATTR compilation without workspace widening. For hover. */
+    private static final CompileProfile PER_FILE_PROFILE =
+            new CompileProfile(CompileBatch.AnalysisMode.ATTR, false, false, false);
     // Diagnostics: full analysis on the requested file(s) only.
     // Does NOT widen to FileStore.all() — pull diagnostics are strictly per-file.
     // expandAdditionalSources=true enables targeted Lombok source expansion: only Lombok-annotated
@@ -57,7 +60,6 @@ class JavaCompilerService implements CompilerProvider {
     final boolean lombokPresentOnClasspath;
     final boolean apEnabled;
     final String compilerRole;
-    final boolean cacheEnabled;
     // Diagnostics from the last compilation task
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
     // Use the same file manager for multiple tasks, so we don't repeatedly re-compile the same files
@@ -83,17 +85,13 @@ class JavaCompilerService implements CompilerProvider {
         this.lombokPresentOnClasspath = shared.lombokPresentOnClasspath();
         this.apEnabled = shared.apEnabled();
         this.compilerRole = compilerRole;
-        this.cacheEnabled =
-                !"background".equals(this.compilerRole)
-                        && !"index".equals(this.compilerRole)
-                        && !"diagnostics".equals(this.compilerRole);
         this.fileManager = new SourceFileManager();
         this.docsFileManager = shared.docs().createFileManager();
+        this.fileCache = shared.fileCache();
         LOG.info(String.format(
-                "[perf] compiler_lane_init role=%s ap_enabled=%s cache_enabled=%s took=%dms",
+                "[perf] compiler_lane_init role=%s ap_enabled=%s took=%dms",
                 this.compilerRole,
                 this.apEnabled,
-                this.cacheEnabled,
                 Duration.between(constructorStarted, Instant.now()).toMillis()));
     }
 
@@ -109,7 +107,7 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch workspaceCache;
     private long workspaceCacheRevision = -1;
-    private final Cache<Boolean, CompileBatch> fileCache = new Cache<>("compile_file", 16);
+    private final Cache<Boolean, CompileBatch> fileCache;
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
     final Map<Path, ParsedUnit> parsedUnits =
             Collections.synchronizedMap(
@@ -326,7 +324,7 @@ class JavaCompilerService implements CompilerProvider {
                                 compileSources.size(),
                                 compileSources.size());
         var effectiveSources = expandedSources.sources();
-        if (!cacheEnabled || profile == DIAGNOSTICS_PROFILE) {
+        if (profile == DIAGNOSTICS_PROFILE) {
             CacheAudit.miss("javac.none");
             var loaded =
                     compileWithExpansionIfNeeded(
@@ -1165,6 +1163,11 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
         return compileBatch(sources, FAST_NO_AP_PROFILE);
+    }
+
+    @Override
+    public CompileTask compilePerFile(Path file) {
+        return compileBatch(List.of(new SourceFileObject(file)), PER_FILE_PROFILE);
     }
 
     CompileTelemetry lastCompileTelemetry() {

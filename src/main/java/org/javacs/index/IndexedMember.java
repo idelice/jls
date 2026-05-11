@@ -1,5 +1,6 @@
 package org.javacs.index;
 
+import java.io.Serializable;
 import java.net.URI;
 import java.util.Comparator;
 import java.util.List;
@@ -16,7 +17,8 @@ import org.javacs.lsp.Range;
  * <p>The indexes remain separate stores. {@link Provenance} tells callers which store produced
  * the current snapshot.
  */
-public final class IndexedMember {
+public final class IndexedMember implements Serializable {
+    private static final long serialVersionUID = 1L;
     private static final Comparator<IndexedMember> ORDER =
             Comparator.comparingInt((IndexedMember member) -> member.priority)
                     .thenComparing(member -> member.name, String.CASE_INSENSITIVE_ORDER)
