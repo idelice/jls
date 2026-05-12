@@ -171,3 +171,47 @@ Assuming you have these prerequisites, you should be able to install locally usi
 ## Logs
 
 The Java service process logs to stderr and prints the active runtime JDK details at startup.
+
+### Debugging in editor
+
+## Configuration
+
+For using nvim as a client for debug adapter we have to install three plugins
+
+```
+vim.pack.add({
+    { src = "https://github.com/mfussenegger/nvim-dap" },
+    { src = "https://github.com/nvim-neotest/nvim-nio" },
+    { src = "https://github.com/rcarriga/nvim-dap-ui" },
+})
+```
+`nvim-dap` is a client for debug adapter, `nvim-dap-ui` nicely reflect debug info, `nvim-io` is required dependency for the later.
+
+Configure them in initt.lua as
+```
+require('dapui').setup()
+local dap = require('dap')
+dap.adapters.java = {
+  type = 'executable';
+  command = 'absolute path to jls/dist/debug_adapter_linux.sh';
+}
+dap.configurations.java = {
+  {
+    type = 'java';
+    request = 'attach';
+    name = "Debug (Attach) - Remote";
+    hostName = "127.0.0.1";
+    port = 5005;
+    sourceRoots = {os.getenv("SOURCE_ROOT")};
+  },
+}
+```
+Change the name `debug_adapter_linux.sh` according to to your OS
+
+## Usage
+
+Define OS variableiable `SOURCE_ROOT` as absolute path to Java sources under debug.   
+Typically it is the path to `src/main/java`
+Then open java file and execute vim command `Dap<Tab>`
+In menu appeared choose `DapNew`
+After that you can set break points and contnue with debug command through Dap menu
