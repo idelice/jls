@@ -172,9 +172,9 @@ Assuming you have these prerequisites, you should be able to install locally usi
 
 The Java service process logs to stderr and prints the active runtime JDK details at startup.
 
-### Debugging in editor
+## Debugging in editor
 
-## Configuration
+### Configuration
 
 For using nvim as a client for debug adapter we have to install three plugins
 
@@ -208,10 +208,10 @@ dap.configurations.java = {
 ```
 Change the name `debug_adapter_linux.sh` according to to your OS
 
-## Usage
+### Usage
 
 Define OS variableiable `SOURCE_ROOT` as absolute path to Java sources under debug.   
 Typically it is the path to `src/main/java`
 Then open java file and execute vim command `Dap<Tab>`
 In menu appeared choose `DapNew`
-After that you can set break points and contnue with debug command through Dap menu
+After that you can set break points and continue with debug command through Dap menu
