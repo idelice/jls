@@ -185,7 +185,7 @@ vim.pack.add({
     { src = "https://github.com/rcarriga/nvim-dap-ui" },
 })
 ```
-`nvim-dap` is a client for debug adapter, `nvim-dap-ui` nicely reflect debug info, `nvim-io` is required dependency for the later.
+`nvim-dap` is a client for debug adapter, `nvim-dap-ui` nicely reflects debug info, `nvim-io` is required dependency for the later.
 
 Configure them in `init.lua` as
 ```
