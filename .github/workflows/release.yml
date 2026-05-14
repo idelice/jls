@@ -16,6 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Cache JDKs
+        uses: actions/cache@v4
+        with:
+          path: jdks/
+          key: jdks-${{ hashFiles('scripts/download_*.sh') }}
+
       - name: Build
         run: ./scripts/build.sh
 

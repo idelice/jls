@@ -25,8 +25,9 @@ set JLINK_VM_OPTIONS=^
 --add-opens jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED
 set CLASSPATH_OPTIONS=-classpath "%~dp0classpath/*"
 set JAVA_BIN=%~dp0windows\bin\java.exe
+set LOGGING_CONFIG=%~dp0windows\conf\logging.properties
 if defined JLS_JVM_OPTS (
-    "%JAVA_BIN%" %JLINK_VM_OPTIONS% %JLS_JVM_OPTS% %CLASSPATH_OPTIONS% %*
+    "%JAVA_BIN%" %JLINK_VM_OPTIONS% %JLS_JVM_OPTS% -Djava.util.logging.config.file="%LOGGING_CONFIG%" %CLASSPATH_OPTIONS% %*
 ) else (
-    "%JAVA_BIN%" %JLINK_VM_OPTIONS% -Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication %CLASSPATH_OPTIONS% %*
+    "%JAVA_BIN%" %JLINK_VM_OPTIONS% -Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication -Djava.util.logging.config.file="%LOGGING_CONFIG%" %CLASSPATH_OPTIONS% %*
 )
