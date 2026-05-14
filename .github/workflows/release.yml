@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache JDKs
+        uses: actions/cache@v4
+        with:
+          path: jdks/
+          key: jdks-${{ hashFiles('scripts/download_*.sh') }}
+
+      - name: Build
+        run: ./scripts/build.sh
+
+      - name: Write VERSION
+        run: echo "${GITHUB_REF_NAME}" > dist/VERSION
+
+      - name: Package macOS aarch64
+        run: |
+          mkdir -p staging
+          cp -r dist/classpath staging/
+          cp dist/lang_server_mac.sh dist/launch_mac.sh dist/debug_adapter_mac.sh staging/
+          cp -r dist/mac staging/
+          cp dist/VERSION staging/
+          tar -czf jls-macos-aarch64.tar.gz -C staging .
+          shasum -a 256 jls-macos-aarch64.tar.gz > jls-macos-aarch64.tar.gz.sha256
+          rm -rf staging
+
+      - name: Package Linux x64
+        run: |
+          mkdir -p staging
+          cp -r dist/classpath staging/
+          cp dist/lang_server_linux.sh dist/launch_linux.sh dist/debug_adapter_linux.sh staging/
+          cp -r dist/linux staging/
+          cp dist/VERSION staging/
+          tar -czf jls-linux-x64.tar.gz -C staging .
+          shasum -a 256 jls-linux-x64.tar.gz > jls-linux-x64.tar.gz.sha256
+          rm -rf staging
+
+      - name: Package Windows x64
+        run: |
+          mkdir -p staging
+          cp -r dist/classpath staging/
+          cp dist/lang_server_windows.cmd dist/lang_server_windows.sh \
+             dist/launch_windows.cmd dist/launch_windows.sh \
+             dist/debug_adapter_windows.cmd dist/debug_adapter_windows.sh staging/
+          cp -r dist/windows staging/
+          cp dist/VERSION staging/
+          cd staging && zip -r ../jls-windows-x64.zip . && cd ..
+          shasum -a 256 jls-windows-x64.zip > jls-windows-x64.zip.sha256
+          rm -rf staging
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            jls-macos-aarch64.tar.gz
+            jls-macos-aarch64.tar.gz.sha256
+            jls-linux-x64.tar.gz
+            jls-linux-x64.tar.gz.sha256
+            jls-windows-x64.zip
+            jls-windows-x64.zip.sha256
