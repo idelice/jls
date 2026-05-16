@@ -89,8 +89,10 @@ public class LSP {
         var headerText = String.format("Content-Length: %d\r\n\r\n", messageBytes.length);
         var headerBytes = headerText.getBytes(UTF_8);
         try {
-            client.write(headerBytes);
-            client.write(messageBytes);
+            synchronized (client) {
+                client.write(headerBytes);
+                client.write(messageBytes);
+            }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
