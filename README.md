@@ -44,7 +44,7 @@ This server uses the **pull diagnostics** model ([LSP 3.17](https://microsoft.gi
 
 ## Setup with Neovim
 
-### Option 1: Using [nvim-jls](https://github.com/user/nvim-jls) (Recommended)
+### Option 1: Using [nvim-jls](https://github.com/idelice/nvim-jls) (Recommended)
 
 Install the Neovim client plugin and follow its documentation.
 
