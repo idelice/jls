@@ -18,3 +18,7 @@
 *.iml
 *.vsix
 .DS_store
+
+/result
+/.direnv
+/.envrc
