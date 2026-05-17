@@ -702,7 +702,9 @@ public class JavaDebugServer implements DebugServer {
 
     @Override
     public EvaluateResponseBody evaluate(EvaluateArguments req) {
-        throw new UnsupportedOperationException();
+        var response = new EvaluateResponseBody();
+        response.result = "method evaluate() not implemented yet";
+        return response;
     }
 
     private static final Logger LOG = Logger.getLogger("debug");

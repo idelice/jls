@@ -210,13 +210,15 @@ Change the name `debug_adapter_linux.sh` according to to your OS
 
 ### Usage
 
-- Run app needed debug with debug options, for example as
+- Compile sources with debug option for viewing variables
+- Run app needed debug with agentlib option, for example as
 
 ``
 java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005  -jar your_jar_name_here.jar
 ``
 
 - Define OS variableiable `SOURCE_ROOT` as absolute path to Java sources under debug. Typically it is the path to `src/main/java`
-- Then open java file and execute vim command `:Dap<Tab>`
+- In another termial java file and execute vim command `:Dap<Tab>`
 - In menu appeared choose `DapNew`
 - After that you can set break points and continue with debug command through Dap menu
+- or open `dapui` with vim command `:lua require('dapui').open()`
