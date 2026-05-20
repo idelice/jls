@@ -24,7 +24,7 @@ import org.javacs.lsp.Location;
 public final class LombokAnnotations {
     private static final Set<String> LOGGING_ONLY = Set.of("Slf4j");
     private static final Set<String> ACCESSOR_RELATED = Set.of("Data", "Getter", "Setter", "Value");
-    private static final Set<String> KNOWN =
+    public static final Set<String> KNOWN =
             Set.of(
                     "Data",
                     "Getter",

@@ -13,9 +13,54 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Diagnostics** - Real-time linting and error reporting
 - **Signature help** - Parameter information for method calls
 - **Inlay hints** - Parameter name hints at call sites (workspace files only; Lombok-generated calls are suppressed)
+- **Code actions** - Refactoring, quick fixes, and code generation (see [Code Actions](#code-actions))
+- **Rename** - Rename classes, methods, and variables across the workspace
 - **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
 - **Private repository support** - Seamless integration with Maven repositories requiring authentication
 - **JAR navigation** - Go-to-definition works on dependency JARs with source files
+
+## Code Actions
+
+Code actions are computed lazily — the list of available actions appears instantly, and edits are only computed when you apply one.
+
+### Refactoring (on selection)
+
+| Action | Trigger |
+|--------|---------|
+| Surround with try-catch | Select code inside a method |
+| Extract to local variable | Select an expression inside a method |
+
+### Code generation (cursor inside a class)
+
+| Action | Notes |
+|--------|-------|
+| Generate constructor | |
+| Generate equals | |
+| Generate hashCode | |
+| Generate toString | |
+| Generate getters (pick fields) | Opens a field picker |
+| Generate setters (pick fields) | Opens a field picker; excludes `final` fields |
+| Override inherited method | One entry per overridable method |
+
+### Lombok (cursor inside a class, Lombok on classpath)
+
+`Add @Data`, `Add @Getter`, `Add @Setter`, `Add @Builder`, `Add @Value`, `Add @SuperBuilder`, `Add @AllArgsConstructor`, `Add @NoArgsConstructor`, `Add @RequiredArgsConstructor`, `Add @ToString`, `Add @EqualsAndHashCode`, `Add @With`, `Add @Slf4j`
+
+### Quick fixes (triggered by diagnostics)
+
+| Diagnostic | Fix |
+|------------|-----|
+| Unresolved type | Import `'com.example.Foo'` |
+| Unreported exception | Add `throws` |
+| Does not override abstract | Implement abstract methods |
+| Missing constructor for fields | Generate constructor |
+| Missing method call | Create missing method |
+| Unused local variable | Convert to statement |
+| Unused field | Convert to block |
+| Unused class | Remove class |
+| Unused method | Remove method |
+| Unused `throws` clause | Remove exception |
+| Unchecked call warning | Suppress 'unchecked' warning |
 
 ## Installation
 

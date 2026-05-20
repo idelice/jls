@@ -417,6 +417,12 @@ public class ReferenceProvider {
                 }
 
                 @Override
+                public Void visitVariable(VariableTree tree, Void unused) {
+                    maybeAdd(parse, getCurrentPath(), tree.getName().toString());
+                    return super.visitVariable(tree, unused);
+                }
+
+                @Override
                 public Void visitNewClass(NewClassTree tree, Void unused) {
                     maybeAdd(
                             parse,
@@ -473,9 +479,6 @@ public class ReferenceProvider {
                                 parse, path, typeIndexRouter, compiler))) {
             return true;
         }
-        var resolvedKey =
-                NavigationSymbolSupport.methodCanonicalKey(
-                        resolved, parse, path, typeIndexRouter, compiler);
         if (!resolved.method()) {
             return false;
         }
@@ -509,19 +512,41 @@ public class ReferenceProvider {
         var hash = logicalKey.lastIndexOf('#');
         var targetFieldName =
                 hash >= 0 ? logicalKey.substring(hash + 1) : logicalKey;
+        var targetOwnerType = hash >= 0 ? logicalKey.substring(0, hash) : null;
 
         var name = selectedName(path);
         if (name == null) return false;
 
-        if (name.equals(targetFieldName)) {
-            return true;
+        boolean nameMatch = name.equals(targetFieldName);
+        if (!nameMatch) {
+            var fieldName = LombokAnnotations.accessorFieldName(name);
+            nameMatch = fieldName.isPresent() && fieldName.get().equals(targetFieldName);
         }
+        if (!nameMatch) return false;
 
-        var fieldName = LombokAnnotations.accessorFieldName(name);
-        if (fieldName.isPresent() && fieldName.get().equals(targetFieldName)) {
-            return true;
+        // Verify that the resolved owner type matches the target owner type, otherwise any
+        // variable or field with the same name in an unrelated class would be a false positive.
+        if (path.getLeaf() instanceof VariableTree) {
+            // Field declaration — only include when the caller asked for it.
+            if (!includeDeclaration) return false;
+            var parent = path.getParentPath() != null ? path.getParentPath().getLeaf() : null;
+            if (!(parent instanceof ClassTree)) return false;
+            if (targetOwnerType == null) return true;
+            var declOwner = enclosingTypeNameFromParse(parse, path);
+            return declOwner.isPresent() && targetOwnerType.equals(declOwner.get());
         }
-        return false;
+        if (targetOwnerType != null) {
+            var resolved = resolveOccurrence(parse, path);
+            if (resolved.qualifiedType() == null) {
+                // Owner cannot be determined (e.g. a symbol used bare via a static import).
+                // Include only if this file has a matching static import for the target field.
+                return hasMatchingStaticImport(parse, targetOwnerType, targetFieldName);
+            }
+            if (!methodOwnerMatches(targetOwnerType, resolved.qualifiedType())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean matchesLocalReference(
@@ -666,8 +691,9 @@ public class ReferenceProvider {
 
             if (leaf instanceof MethodTree method) {
                 for (var param : method.getParameters()) {
-                    if (param.getName().contentEquals(name)) {
-                        return Optional.ofNullable(FindHelper.locationStrict(parse, cursor, name));
+                    if (param != null && param.getName().contentEquals(name)) {
+                        var paramPath = new TreePath(cursor, param);
+                        return Optional.ofNullable(FindHelper.locationStrict(parse, paramPath, name));
                     }
                 }
             }
@@ -794,6 +820,9 @@ public class ReferenceProvider {
         if (leaf instanceof NewClassTree nc) {
             return TypeNames.simpleName(nc.getIdentifier().toString());
         }
+        if (leaf instanceof VariableTree vt) {
+            return vt.getName().toString();
+        }
         return null;
     }
 
@@ -822,6 +851,19 @@ public class ReferenceProvider {
             }
         }
         return null;
+    }
+
+    private boolean hasMatchingStaticImport(
+            ParseTask parse, String ownerType, String fieldName) {
+        for (var importDecl : parse.root().getImports()) {
+            if (!importDecl.isStatic()) continue;
+            var importName = importDecl.getQualifiedIdentifier().toString();
+            if (importName.equals(ownerType + "." + fieldName)
+                    || importName.equals(ownerType + ".*")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @FunctionalInterface

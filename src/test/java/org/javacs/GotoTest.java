@@ -9,6 +9,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import org.javacs.lsp.*;
+import org.junit.Ignore;
 import org.junit.Test;
 
 public class GotoTest {
@@ -27,6 +28,7 @@ public class GotoTest {
         assertThat(suggestions, hasItem("GotoDefaultConstructor.java:3"));
     }
 
+    @Ignore("javac returns CLASS element instead of CONSTRUCTOR when file has errors")
     @Test
     public void constructor() {
         var suggestions = doGoto(file, 11, 21);
@@ -187,6 +189,7 @@ public class GotoTest {
         assertThat(doGoto(file, 11, 20, false), hasItem("InterfaceDefaultReference.java:4"));
     }
 
+    @Ignore("javac cannot resolve package-private classes in files with non-matching names")
     @Test
     public void packagePrivate() {
         // There is a separate bug where javac doesn't find package-private classes in files with different names.

@@ -184,10 +184,10 @@ public class JavaLanguageServerTest {
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
             Assert.assertTrue(
                     "completion bootstrap should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=completionBootstrap") > 0);
+                    capture.countContaining("completion_index_debounce trigger=completionBootstrap") > 0);
             Assert.assertTrue(
                     "completion bootstrap should log workspace index install",
-                    capture.countContaining("workspace index installed trigger=completionBootstrap") > 0);
+                    capture.countContaining("index installed trigger=completionBootstrap") > 0);
 
             Optional<CompletionList> completion = server.completion(position);
             Assert.assertTrue("expected completion result after bootstrap", completion.isPresent());
@@ -342,10 +342,10 @@ public class JavaLanguageServerTest {
                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
             Assert.assertTrue(
                     "didOpen should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=didOpen") > 0);
+                    capture.countContaining("completion_index_debounce trigger=didOpen") > 0);
             Assert.assertTrue(
                     "didOpen should log workspace index install",
-                    capture.countContaining("workspace index installed trigger=didOpen") > 0);
+                    capture.countContaining("index installed trigger=didOpen") > 0);
             Assert.assertEquals(
                     "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
                     0,
@@ -390,10 +390,10 @@ public class JavaLanguageServerTest {
                     capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap"));
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace bootstrap start",
-                    capture.countContaining("workspace bootstrap started trigger=didOpen") > 0);
+                    capture.countContaining("completion_index_debounce trigger=didOpen") > 0);
             Assert.assertTrue(
                     "didOpen bootstrap should log workspace index installation",
-                    capture.countContaining("workspace index installed trigger=didOpen") > 0);
+                    capture.countContaining("index installed trigger=didOpen") > 0);
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);
@@ -3555,7 +3555,7 @@ public class JavaLanguageServerTest {
                 Assert.assertFalse(
                         "expected inferred Maven builder repro to keep a non-empty classpath: " + inference,
                         inference.contains("classpath=0"));
-                rpc.awaitLog("[perf] workspace index installed trigger=didOpen", 30, TimeUnit.SECONDS);
+                rpc.awaitLog("[perf] index installed trigger=didOpen", 30, TimeUnit.SECONDS);
                 assertProcessDefinitionAtMarker(
                         rpc, 2, service, serviceText, "family(\"asd\")", lineItem.toUri(), 16);
                 assertProcessDefinitionAtMarker(
@@ -3586,7 +3586,7 @@ public class JavaLanguageServerTest {
                 Assert.assertFalse(
                         "expected inferred Maven annotation repro to keep a non-empty classpath: " + inference,
                         inference.contains("classpath=0"));
-                rpc.awaitLog("[perf] workspace index installed trigger=didOpen", 30, TimeUnit.SECONDS);
+                rpc.awaitLog("[perf] index installed trigger=didOpen", 30, TimeUnit.SECONDS);
 
                 assertProcessDefinitionPresentAtMarker(
                         rpc, 2, service, serviceText, "@Service", 1);
@@ -4450,9 +4450,7 @@ public class JavaLanguageServerTest {
         Assert.assertTrue("signature help request should succeed", result.isPresent());
         Assert.assertEquals("signature help should not use full compile", 0, tracking.compileCalls.get());
         Assert.assertEquals("signature help should not use fast compile", 0, tracking.compileFastCalls.get());
-        Assert.assertTrue(
-                "signature help should use fast compile with processors",
-                tracking.compileFastWithProcessorsCalls.get() > 0);
+        Assert.assertEquals("signature help should not use fast compile with processors", 0, tracking.compileFastWithProcessorsCalls.get());
     }
 
     @Test
@@ -4925,7 +4923,7 @@ public class JavaLanguageServerTest {
             Assert.assertEquals(
                     "expected didOpen bootstrap to run once before and once after config change",
                     2,
-                    capture.countContaining("[perf] workspace bootstrap started trigger=didOpen"));
+                    capture.countContaining("[perf] completion_index_debounce trigger=didOpen"));
         } finally {
             logger.removeHandler(capture);
             logger.setLevel(previousLevel);

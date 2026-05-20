@@ -425,6 +425,13 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
+                    case "codeAction/resolve":
+                        {
+                            var params = gson.fromJson(r.params, CodeAction.class);
+                            var response = server.resolveCodeAction(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
                     case "textDocument/codeLens":
                         {
                             var params = gson.fromJson(r.params, CodeLensParams.class);
@@ -450,6 +457,13 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, RenameParams.class);
                             var response = server.rename(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "workspace/executeCommand":
+                        {
+                            var params = gson.fromJson(r.params, ExecuteCommandParams.class);
+                            var response = server.executeCommand(params);
                             respond(send, r.id, response);
                             break;
                         }

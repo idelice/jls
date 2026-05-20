@@ -121,6 +121,17 @@ class JavaLanguageServer extends LanguageServer {
 
     private final Set<String> shownWorkspaceWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** LRU cache of pending Rewrite objects keyed by UUID, used for codeAction/resolve. */
+    private static final int REWRITE_REGISTRY_MAX = 200;
+    private final Map<String, org.javacs.rewrite.Rewrite> rewriteRegistry =
+            Collections.synchronizedMap(
+                    new LinkedHashMap<>(REWRITE_REGISTRY_MAX, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(Map.Entry<String, org.javacs.rewrite.Rewrite> eldest) {
+                            return size() > REWRITE_REGISTRY_MAX;
+                        }
+                    });
+
     private enum CompletionIndexRefreshMode {
         ACTIVE_DOCUMENT_BOOTSTRAP,
         FULL_REBUILD,
@@ -873,10 +884,18 @@ class JavaLanguageServer extends LanguageServer {
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
         c.addProperty("inlayHintProvider", true);
-        c.addProperty("codeActionProvider", true);
+        var codeActionOptions = new JsonObject();
+        codeActionOptions.addProperty("resolveProvider", true);
+        c.add("codeActionProvider", codeActionOptions);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
         c.add("renameProvider", renameOptions);
+        var executeCommandOptions = new JsonObject();
+        var commands = new JsonArray();
+        commands.add("java.pickAndGenerate");
+        commands.add("java.generateFields");
+        executeCommandOptions.add("commands", commands);
+        c.add("executeCommandProvider", executeCommandOptions);
         var diagnosticOptions = new JsonObject();
         diagnosticOptions.addProperty("interFileDependencies", false);
         diagnosticOptions.addProperty("workspaceDiagnostics", false);
@@ -1244,10 +1263,8 @@ class JavaLanguageServer extends LanguageServer {
 
     private boolean canRename(Element rename) {
         return switch (rename.getKind()) {
-            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER -> true;
-            default ->
-                // TODO rename other types
-                    false;
+            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER, CLASS -> true;
+            default -> false;
         };
     }
 
@@ -1266,7 +1283,32 @@ class JavaLanguageServer extends LanguageServer {
         var response = new WorkspaceEdit();
         var map = rw.rewrite(getOrCreateCompiler());
         for (var editedFile : map.keySet()) {
-            response.changes.put(editedFile.toUri(), List.of(map.get(editedFile)));
+            response.changes.put(editedFile.toUri(), Arrays.asList(map.get(editedFile)));
+        }
+        // Schedule index refresh for modified files
+        if (!map.isEmpty()) {
+            completionIndexScheduler.scheduleRefresh(
+                    map.keySet(),
+                    "codeAction",
+                    0,
+                    CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
+        }
+        // For class renames, notify client to rename the file on disk
+        if (rw instanceof RenameClass rc) {
+            var sourceFile = getOrCreateCompiler().findTypeDeclaration(rc.oldQualifiedName);
+            if (sourceFile != null && sourceFile != CompilerProvider.NOT_FOUND) {
+                var oldPath = sourceFile.toAbsolutePath().normalize().toString();
+                var parent = sourceFile.getParent();
+                var newFileName = rc.newSimpleName + ".java";
+                var newPath =
+                        parent != null
+                                ? parent.resolve(newFileName).toAbsolutePath().normalize().toString()
+                                : newFileName;
+                var notificationParams = new HashMap<String, String>();
+                notificationParams.put("oldPath", oldPath);
+                notificationParams.put("newPath", newPath);
+                client.customNotification("java/renameFile", new Gson().toJsonTree(notificationParams));
+            }
         }
         return response;
     }
@@ -1292,6 +1334,10 @@ class JavaLanguageServer extends LanguageServer {
                 case FIELD -> renameField(task, (VariableElement) el, params.newName);
                 case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER ->
                         renameVariable(task, (VariableElement) el, params.newName);
+                case CLASS -> {
+                    var type = (TypeElement) el;
+                    yield new RenameClass(type.getQualifiedName().toString(), params.newName);
+                }
                 default -> Rewrite.NOT_SUPPORTED;
             };
         }
@@ -1398,12 +1444,63 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<CodeAction> codeAction(CodeActionParams params) {
-        var provider = new CodeActionProvider(getOrCreateCompiler());
+        var provider = new CodeActionProvider(getOrCreateCompiler(), rewriteRegistry);
         if (params.context.diagnostics.isEmpty()) {
             return provider.codeActionsForCursor(params);
         } else {
             return provider.codeActionForDiagnostics(params);
         }
+    }
+
+    @Override
+    public CodeAction resolveCodeAction(CodeAction action) {
+        if (action.data == null || !action.data.isJsonPrimitive()) return action;
+        var id = action.data.getAsString();
+        var rewrite = rewriteRegistry.remove(id);
+        if (rewrite == null) return action;
+        var edits = rewrite.rewrite(getOrCreateCompiler());
+        if (edits == null || edits == org.javacs.rewrite.Rewrite.CANCELLED) return action;
+        action.edit = new WorkspaceEdit();
+        for (var entry : edits.entrySet()) {
+            action.edit.changes.put(entry.getKey().toUri(), List.of(entry.getValue()));
+        }
+        return action;
+    }
+
+    @Override
+    public Object executeCommand(ExecuteCommandParams params) {
+        if ("java.pickAndGenerate".equals(params.command)) {
+            var args = params.arguments;
+            if (args == null || args.size() < 3) return null;
+            var fields = args.get(2).getAsString();
+            return Map.of(
+                    "action", "pickFields",
+                    "className", args.get(0).getAsString(),
+                    "methodKind", args.get(1).getAsString(),
+                    "fields", fields);
+        }
+        if ("java.generateFields".equals(params.command)) {
+            var args = params.arguments;
+            if (args == null || args.size() < 3) return null;
+            var className = args.get(0).getAsString();
+            var methodKind = args.get(1).getAsString();
+            var selectedFields = new java.util.HashSet<String>();
+            for (var part : args.get(2).getAsString().split(",")) {
+                var trimmed = part.trim();
+                if (!trimmed.isEmpty()) selectedFields.add(trimmed);
+            }
+            if (selectedFields.isEmpty()) return null;
+            var rewrite = new org.javacs.rewrite.GenerateMethods(className, methodKind, 0, selectedFields);
+            var edits = rewrite.rewrite(getOrCreateCompiler());
+            if (edits != null && !edits.isEmpty()) {
+                var workspaceEdit = new WorkspaceEdit();
+                for (var entry : edits.entrySet()) {
+                    workspaceEdit.changes.put(entry.getKey().toUri(), Arrays.asList(entry.getValue()));
+                }
+                return workspaceEdit;
+            }
+        }
+        return null;
     }
 
     @Override
