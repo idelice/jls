@@ -82,11 +82,13 @@ public class ExtractVariable implements Rewrite {
                             new Position(exprEndLine - 1, exprEndCol - 1));
             TextEdit edit2 = new TextEdit(exprRange, varName);
 
-            // Sort edits position-order so LSP can apply end-to-start without offset shifts
+            // edit1 is at the statement line (lower offset), edit2 at the expression
+            // (higher offset). Apply in reverse order: edit2 first, then edit1, so that
+            // edit1's line insertion does not shift edit2's position.
             TextEdit[] edits = {edit1, edit2};
             return Map.of(file, edits);
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            return CANCELLED;
         }
     }
 

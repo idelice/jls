@@ -121,6 +121,17 @@ class JavaLanguageServer extends LanguageServer {
 
     private final Set<String> shownWorkspaceWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /** LRU cache of pending Rewrite objects keyed by UUID, used for codeAction/resolve. */
+    private static final int REWRITE_REGISTRY_MAX = 200;
+    private final Map<String, org.javacs.rewrite.Rewrite> rewriteRegistry =
+            Collections.synchronizedMap(
+                    new LinkedHashMap<>(REWRITE_REGISTRY_MAX, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(Map.Entry<String, org.javacs.rewrite.Rewrite> eldest) {
+                            return size() > REWRITE_REGISTRY_MAX;
+                        }
+                    });
+
     private enum CompletionIndexRefreshMode {
         ACTIVE_DOCUMENT_BOOTSTRAP,
         FULL_REBUILD,
@@ -873,7 +884,9 @@ class JavaLanguageServer extends LanguageServer {
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
         c.addProperty("inlayHintProvider", true);
-        c.addProperty("codeActionProvider", true);
+        var codeActionOptions = new JsonObject();
+        codeActionOptions.addProperty("resolveProvider", true);
+        c.add("codeActionProvider", codeActionOptions);
         var renameOptions = new JsonObject();
         renameOptions.addProperty("prepareProvider", true);
         c.add("renameProvider", renameOptions);
@@ -1431,12 +1444,27 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<CodeAction> codeAction(CodeActionParams params) {
-        var provider = new CodeActionProvider(getOrCreateCompiler());
+        var provider = new CodeActionProvider(getOrCreateCompiler(), rewriteRegistry);
         if (params.context.diagnostics.isEmpty()) {
             return provider.codeActionsForCursor(params);
         } else {
             return provider.codeActionForDiagnostics(params);
         }
+    }
+
+    @Override
+    public CodeAction resolveCodeAction(CodeAction action) {
+        if (action.data == null || !action.data.isJsonPrimitive()) return action;
+        var id = action.data.getAsString();
+        var rewrite = rewriteRegistry.remove(id);
+        if (rewrite == null) return action;
+        var edits = rewrite.rewrite(getOrCreateCompiler());
+        if (edits == null || edits == org.javacs.rewrite.Rewrite.CANCELLED) return action;
+        action.edit = new WorkspaceEdit();
+        for (var entry : edits.entrySet()) {
+            action.edit.changes.put(entry.getKey().toUri(), List.of(entry.getValue()));
+        }
+        return action;
     }
 
     @Override

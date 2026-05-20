@@ -29,14 +29,11 @@ public class RenameClass implements Rewrite {
         if (oldSimpleName.equals(newSimpleName)) return CANCELLED;
 
         var sourceFile = compiler.findTypeDeclaration(oldQualifiedName);
-        LOG.info("[debug] findTypeDeclaration(" + oldQualifiedName + ") = " + sourceFile);
         if (sourceFile == null || sourceFile.equals(CompilerProvider.NOT_FOUND)) {
-            LOG.info("[debug] CANCELLED: sourceFile not found");
             return CANCELLED;
         }
 
         var referenceFiles = compiler.findTypeReferences(oldQualifiedName);
-        LOG.info("[debug] findTypeReferences=" + referenceFiles.length);
         var allPaths = new LinkedHashSet<Path>();
         allPaths.add(sourceFile);
         Collections.addAll(allPaths, referenceFiles);
@@ -44,19 +41,15 @@ public class RenameClass implements Rewrite {
         try (var compile = compiler.compile(allPaths.toArray(new Path[0]))) {
             var trees = Trees.instance(compile.task);
             var oldType = compile.task.getElements().getTypeElement(oldQualifiedName);
-            LOG.info("[debug] getTypeElement(" + oldQualifiedName + ") = " + oldType);
             if (oldType == null) {
-                LOG.info("[debug] CANCELLED: getTypeElement returned null");
                 return CANCELLED;
             }
 
             var result = new HashMap<Path, TextEdit[]>();
-            var helper = new RenameHelper(compile);
 
             for (var root : compile.roots) {
                 var file = Paths.get(root.getSourceFile().toUri());
                 List<TreePath> references = new ArrayList<>();
-                LOG.info("[debug] root file=" + file + " equalsSource=" + file.equals(sourceFile));
 
                 // For the source file: only rename class declaration and constructors.
                 // FindTypeReferences is NOT used here — Lombok annotations on the class
@@ -88,16 +81,11 @@ public class RenameClass implements Rewrite {
                     var fileEdits = replaceAll(new ArrayList<>(seen), newSimpleName, compile.task);
                     result.put(file, fileEdits);
                     LOG.info("renameEdits file=" + file.getFileName() + " refs=" + references.size() + " edits=" + fileEdits.length);
-                    for (var e : fileEdits) {
-                        LOG.info("  edit range=[" + e.range.start.line + ":" + e.range.start.character
-                                + "-" + e.range.end.line + ":" + e.range.end.character + "] newText=[" + e.newText.substring(0, Math.min(e.newText.length(), 30)) + "]");
-                    }
                 }
             }
 
             // If only deleted edits (file remove), don't lose them
             if (!result.isEmpty()) return result;
-            LOG.info("[debug] CANCELLED: result is empty after processing " + compile.roots.size() + " roots");
             return CANCELLED;
         }
     }
@@ -139,8 +127,6 @@ public class RenameClass implements Rewrite {
                             if (end > src.length()) return;
                             var actual = src.subSequence((int) start, (int) end).toString();
                             if (!actual.equals(oldSimpleName)) {
-                                LOG.info("findTypeRefs SKIP synthetic node: name=" + id.getName()
-                                        + " start=" + start + " srcText=[" + actual + "]");
                                 return;
                             }
                         }
@@ -152,8 +138,6 @@ public class RenameClass implements Rewrite {
                     var element = trees.getElement(path);
                     if (oldType.equals(element)) {
                         found.add(path);
-                        LOG.info("findTypeRefs MATCH " + leaf.getKind()
-                                + " element=" + (element != null ? element.toString() : "null"));
                     }
                 };
         new FindTypeReferences().scan(root, forEach);
@@ -201,20 +185,6 @@ public class RenameClass implements Rewrite {
                         && Character.isWhitespace(content.charAt(nameStart))) {
                     nameStart++;
                 }
-                var oldSimple = oldQualifiedName.substring(oldQualifiedName.lastIndexOf('.') + 1);
-                // Log a snippet around nameStart to verify correct position
-                var ctxStart = Math.max(0, nameStart - 20);
-                var ctxEnd = Math.min(content.length(), nameStart + 30);
-                var context = content.subSequence(ctxStart, ctxEnd).toString()
-                        .replace("\n", "\\n").replace("\r", "\\r");
-                LOG.info("classDeclarationPos classStart=" + classStart
-                        + " nameStart=" + nameStart
-                        + " nameLen=" + classTree.getSimpleName().length()
-                        + " oldSimple=" + oldSimple
-                        + " oldLen=" + oldSimple.length()
-                        + " treeName=" + classTree.getSimpleName()
-                        + " newName=" + newSimpleName
-                        + " context=[" + context + "]");
                 return new TreePath(
                         trees.getPath(root, classTree), new SyntheticTree(nameStart));
             }
@@ -289,11 +259,6 @@ public class RenameClass implements Rewrite {
                 nameStart = ((SyntheticTree) leaf).position();
                 nameEnd = nameStart + oldQualifiedName.substring(
                         oldQualifiedName.lastIndexOf('.') + 1).length();
-                LOG.info("replaceAll Synthetic nameStart=" + nameStart
-                        + " nameEnd=" + nameEnd
-                        + " line=" + lines.getLineNumber(nameStart)
-                        + " startCol=" + lines.getColumnNumber(nameStart)
-                        + " endCol=" + lines.getColumnNumber(nameEnd));
             } else if (leaf instanceof IdentifierTree) {
                 var id = (IdentifierTree) leaf;
                 nameStart = pos.getStartPosition(root, id);

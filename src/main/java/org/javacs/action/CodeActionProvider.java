@@ -10,6 +10,8 @@ import java.time.Instant;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.util.UUID;
+import com.google.gson.JsonPrimitive;
 import javax.lang.model.element.*;
 import javax.lang.model.type.*;
 import org.javacs.*;
@@ -19,9 +21,15 @@ import org.javacs.rewrite.*;
 
 public class CodeActionProvider {
     private final CompilerProvider compiler;
+    private final Map<String, Rewrite> rewriteRegistry;
 
     public CodeActionProvider(CompilerProvider compiler) {
+        this(compiler, null);
+    }
+
+    public CodeActionProvider(CompilerProvider compiler, Map<String, Rewrite> rewriteRegistry) {
         this.compiler = compiler;
+        this.rewriteRegistry = rewriteRegistry;
     }
 
     public List<CodeAction> codeActionsForCursor(CodeActionParams params) {
@@ -185,6 +193,15 @@ public class CodeActionProvider {
     }
 
     private List<CodeAction> createAction(String title, String kind, Rewrite rewrite) {
+        if (rewriteRegistry != null) {
+            var id = UUID.randomUUID().toString();
+            rewriteRegistry.put(id, rewrite);
+            var a = new CodeAction();
+            a.kind = kind;
+            a.title = title;
+            a.data = new JsonPrimitive(id);
+            return List.of(a);
+        }
         var edits = rewrite.rewrite(compiler);
         if (edits == Rewrite.CANCELLED) return List.of();
         var a = new CodeAction();

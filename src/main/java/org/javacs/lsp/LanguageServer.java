@@ -84,6 +84,10 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public CodeAction resolveCodeAction(CodeAction params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
     public List<CodeLens> codeLens(CodeLensParams params) {
         throw new RuntimeException("Unimplemented");
     }

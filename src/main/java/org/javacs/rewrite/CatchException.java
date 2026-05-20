@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Map;
 import org.javacs.CompilerProvider;
+import org.javacs.action.FindMethodDeclarationAt;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
@@ -35,7 +36,7 @@ public class CatchException implements Rewrite {
             var pos = trees.getSourcePositions();
             var lines = root.getLineMap();
 
-            var method = findEnclosingMethod(root, task.task);
+            var method = new FindMethodDeclarationAt(task.task).scan(root, (long) startPosition);
             if (method == null) {
                 return CANCELLED;
             }
@@ -76,7 +77,6 @@ public class CatchException implements Rewrite {
             var originalSource = source.subSequence((int) stmtStart, (int) stmtEnd).toString();
 
             var stmtLine = lines.getLineNumber(stmtStart);
-            var stmtCol = lines.getColumnNumber(stmtStart);
             var stmtLineStartPos = lines.getStartPosition(stmtLine);
             var indent = (int) (stmtStart - stmtLineStartPos);
 
@@ -132,38 +132,4 @@ public class CatchException implements Rewrite {
         return false;
     }
 
-    private MethodTree findEnclosingMethod(CompilationUnitTree root, JavacTask task) {
-        var finder = new MethodFinder(task);
-        return finder.scan(root, (long) startPosition);
-    }
-
-    private static class MethodFinder extends TreeScanner<MethodTree, Long> {
-        private final SourcePositions pos;
-        private CompilationUnitTree root;
-
-        MethodFinder(JavacTask task) {
-            pos = Trees.instance(task).getSourcePositions();
-        }
-
-        @Override
-        public MethodTree visitCompilationUnit(CompilationUnitTree t, Long find) {
-            root = t;
-            return super.visitCompilationUnit(t, find);
-        }
-
-        @Override
-        public MethodTree visitMethod(MethodTree t, Long find) {
-            var smaller = super.visitMethod(t, find);
-            if (smaller != null) return smaller;
-            if (pos.getStartPosition(root, t) <= find && find < pos.getEndPosition(root, t)) {
-                return t;
-            }
-            return null;
-        }
-
-        @Override
-        public MethodTree reduce(MethodTree r1, MethodTree r2) {
-            return r1 != null ? r1 : r2;
-        }
-    }
 }
