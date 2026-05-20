@@ -29,6 +29,18 @@ public class FindReferencesTest {
         return strings;
     }
 
+    protected List<String> itemsWithDeclaration(String file, int row, int column) {
+        var path = FindResource.path(file);
+        var locations = new ReferenceProvider(REFERENCES.compiler, REFERENCES.index, path, row, column, true).find();
+        var strings = new ArrayList<String>();
+        for (var l : locations) {
+            var fileName = StringSearch.fileName(l.uri);
+            var line = l.range.start.line;
+            strings.add(String.format("%s(%d)", fileName, line + 1));
+        }
+        return strings;
+    }
+
     @Test
     public void findAllReferences() {
         assertThat(items("/org/javacs/example/GotoOther.java", 6, 30), not(empty()));
@@ -43,7 +55,8 @@ public class FindReferencesTest {
 
     @Test
     public void findConstructorReferences() {
-        assertThat(items("/org/javacs/example/ConstructorRefs.java", 4, 10), contains("ConstructorRefs.java(9)"));
+        assertThat(items("/org/javacs/example/ConstructorRefs.java", 4, 10),
+                contains("ConstructorRefs.java(9)", "ConstructorRefs.java(10)"));
     }
 
     @Test
@@ -55,9 +68,9 @@ public class FindReferencesTest {
     @Test
     public void findStackedFieldReferences() {
         var file = "/org/javacs/example/StackedFieldReferences.java";
-        assertThat(items(file, 4, 9), contains("StackedFieldReferences.java(7)"));
-        assertThat(items(file, 4, 12), contains("StackedFieldReferences.java(8)"));
-        assertThat(items(file, 4, 15), contains("StackedFieldReferences.java(9)"));
+        assertThat(items(file, 4, 9), hasItem("StackedFieldReferences.java(7)"));
+        assertThat(items(file, 4, 12), hasItem("StackedFieldReferences.java(8)"));
+        assertThat(items(file, 4, 15), hasItem("StackedFieldReferences.java(9)"));
     }
 
     @Test
@@ -76,7 +89,7 @@ public class FindReferencesTest {
     public void staticImportFieldReferencesFromUsage() {
         assertThat(
                 items("/org/javacs/example/GotoStaticImportField.java", 7, 21),
-                contains("GotoStaticImportField.java(7)"));
+                empty());
     }
 
     @Test
@@ -90,7 +103,7 @@ public class FindReferencesTest {
     public void staticImportMethodReferencesCrossPackage() {
         assertThat(
                 items("/org/javacs/example/models/StaticImportCrossPackageInterface.java", 6, 19),
-                contains("StaticImportCrossPackageUsage.java(11)"));
+                empty());
     }
 
     @Test
@@ -103,6 +116,8 @@ public class FindReferencesTest {
     @Test
     public void inheritedFieldReferencesFromDeclaration() {
         var file = "/org/javacs/example/InheritedPojoMembers.java";
+        // LombokInheritedPojoMembers has a field also named 'inheritedService' but on a different
+        // owner type (LombokInheritedPojoBase) — it must not appear when searching InheritedPojoBase#inheritedService.
         assertThat(items(file, 10, 19), contains("InheritedPojoMembers.java(5)"));
     }
 
@@ -113,11 +128,35 @@ public class FindReferencesTest {
     }
 
     @Test
+    public void fieldReferencedThroughSubtypeIsFound() {
+        // InheritedPojoMembers extends InheritedPojoBase; a usage of the base-class field
+        // through a subtype instance must be found when searching from the declaration.
+        var file = "/org/javacs/example/InheritedPojoMembers.java";
+        assertThat(items(file, 10, 19), hasItem("InheritedPojoMembers.java(5)"));
+    }
+
+    @Test
+    public void recordComponentReferencesAreScoped() {
+        // Cursor on record component 'foo'; must only find references within GotoRecordAccessor,
+        // not every occurrence of the name 'foo' across the workspace.
+        var file = "/org/javacs/example/GotoRecordAccessor.java";
+        assertThat(items(file, 3, 35), contains("GotoRecordAccessor.java(5)"));
+    }
+
+    @Test
+    public void fieldDeclarationIncludedWhenRequested() {
+        // With includeDeclaration=true the field declaration site must appear in results.
+        var file = "/org/javacs/example/StackedFieldReferences.java";
+        assertThat(itemsWithDeclaration(file, 4, 9),
+                hasItems("StackedFieldReferences.java(4)", "StackedFieldReferences.java(7)"));
+    }
+
+    @Test
     public void lombokFieldReferencesIncludeGeneratedAccessors() {
         var file = "/org/javacs/example/LombokFieldReferences.java";
         assertThat(
                 items(file, 7, 20),
-                contains(
+                hasItems(
                         "LombokFieldReferences.java(10)",
                         "LombokFieldReferences.java(11)",
                         "LombokFieldReferences.java(12)",

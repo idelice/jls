@@ -11,6 +11,7 @@ import java.util.*;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.lang.model.element.*;
+import javax.lang.model.type.*;
 import org.javacs.*;
 import org.javacs.FindTypeDeclarationAt;
 import org.javacs.lsp.*;
@@ -34,21 +35,195 @@ public class CodeActionProvider {
         // task to generate the code actions
         // If we switch to resolving code actions asynchronously using Command, that will fix this problem.
         var rewrites = new TreeMap<String, Rewrite>();
+        var variedActions = new ArrayList<VariedAction>();
+        var actions = new ArrayList<CodeAction>();
         try (var task = compiler.compile(file)) {
             var elapsed = Duration.between(started, Instant.now()).toMillis();
             LOG.info(String.format("...compiled in %d ms", elapsed));
-            var lines = task.root(file).getLineMap();
+            var root = task.root(file);
+            var lines = root.getLineMap();
             var cursor = lines.getPosition(params.range.start.line + 1, params.range.start.character + 1);
+
             rewrites.putAll(overrideInheritedMethods(task, file, cursor));
+
+            var hasSelection = params.range.start.line != params.range.end.line
+                    || params.range.start.character != params.range.end.character;
+            if (hasSelection) {
+                var selectionEnd = lines.getPosition(params.range.end.line + 1, params.range.end.character + 1);
+                var methodAtEnd = new FindMethodDeclarationAt(task.task).scan(root, selectionEnd);
+                var methodAtStart = new FindMethodDeclarationAt(task.task).scan(root, cursor);
+                var insideMethod = (methodAtEnd != null || methodAtStart != null);
+                if (insideMethod) {
+                    var methodDetectPos = (methodAtEnd != null) ? selectionEnd : cursor;
+                    var classTree = new FindTypeDeclarationAt(task.task).scan(root, methodDetectPos);
+                    if (classTree != null) {
+                        var className = qualifiedName(task, root, classTree);
+                        var rangeStart =
+                                (int)
+                                        lines.getPosition(
+                                                params.range.start.line + 1,
+                                                params.range.start.character + 1);
+                        var rangeEnd =
+                                (int)
+                                        lines.getPosition(
+                                                params.range.end.line + 1,
+                                                params.range.end.character + 1);
+
+                        variedActions.add(
+                                new VariedAction(
+                                        "Surround with try-catch",
+                                        CodeActionKind.RefactorRewrite,
+                                        new CatchException(className, "Exception", rangeStart, rangeEnd)));
+
+                        var typePos = rangeEnd - 1;
+                        try {
+                            var content = root.getSourceFile().getCharContent(true);
+                            while (typePos > rangeStart && typePos < content.length()
+                                    && (content.charAt(typePos) == ';'
+                                            || Character.isWhitespace(content.charAt(typePos)))) {
+                                typePos--;
+                            }
+                        } catch (IOException e) {
+                            // use original position
+                        }
+                        var type = inferType(task, root, typePos);
+                        variedActions.add(
+                                new VariedAction(
+                                        "Extract to local variable",
+                                        CodeActionKind.RefactorExtract,
+                                        new ExtractVariable(className, type, rangeStart, rangeEnd)));
+                    }
+                }
+            }
+
+            if (!hasSelection) {
+                var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
+                if (classTree != null) {
+                    var className = qualifiedName(task, root, classTree);
+                    for (var kind :
+                            new String[] {
+                                "constructor", "equals", "hashCode", "toString"
+                            }) {
+                        variedActions.add(
+                                new VariedAction(
+                                        "Generate " + kind,
+                                        CodeActionKind.Source,
+                                        new GenerateMethods(className, kind, (int) cursor)));
+                    }
+                    if (compiler.lombokPresentOnClasspath()) {
+                        for (var ann : LombokAnnotations.KNOWN) {
+                            variedActions.add(
+                                    new VariedAction(
+                                            "Add @" + ann,
+                                            CodeActionKind.RefactorRewrite,
+                                            new AddLombokAnnotations(
+                                                    className, Set.of(ann), (int) cursor)));
+                        }
+                    }
+                    // Field collection for command-based picker
+                    var fields = new ArrayList<VariableTree>();
+                    for (var member : classTree.getMembers()) {
+                        if (member instanceof VariableTree) {
+                            var field = (VariableTree) member;
+                            if (!field.getModifiers().getFlags().contains(javax.lang.model.element.Modifier.STATIC)) {
+                                fields.add(field);
+                            }
+                        }
+                    }
+                    // Command-based multi-select getters/setters picker
+                    if (!fields.isEmpty()) {
+                        var allFieldNames = joinFieldNames(fields);
+
+                        var getterCmd = new Command();
+                        getterCmd.command = "java.pickAndGenerate";
+                        var getterArgs = new com.google.gson.JsonArray();
+                        getterArgs.add(className);
+                        getterArgs.add("getters");
+                        getterArgs.add(allFieldNames);
+                        getterCmd.arguments = getterArgs;
+                        var getterAction = new CodeAction();
+                        getterAction.title = "Generate getters (pick fields)";
+                        getterAction.kind = CodeActionKind.Source;
+                        getterAction.command = getterCmd;
+                        actions.add(getterAction);
+
+                        // Setters: exclude final fields
+                        var nonFinalFields = new ArrayList<VariableTree>();
+                        for (var f : fields) {
+                            if (!f.getModifiers().getFlags().contains(Modifier.FINAL)) {
+                                nonFinalFields.add(f);
+                            }
+                        }
+                        if (!nonFinalFields.isEmpty()) {
+                            var setterCmd = new Command();
+                            setterCmd.command = "java.pickAndGenerate";
+                            var setterArgs = new com.google.gson.JsonArray();
+                            setterArgs.add(className);
+                            setterArgs.add("setters");
+                            setterArgs.add(joinFieldNames(nonFinalFields));
+                            setterCmd.arguments = setterArgs;
+                            var setterAction = new CodeAction();
+                            setterAction.title = "Generate setters (pick fields)";
+                            setterAction.kind = CodeActionKind.Source;
+                            setterAction.command = setterCmd;
+                            actions.add(setterAction);
+                        }
+                    }
+                }
+            }
         }
-        var actions = new ArrayList<CodeAction>();
         for (var title : rewrites.keySet()) {
             // TODO are these all quick fixes?
             actions.addAll(createQuickFix(title, rewrites.get(title)));
         }
+        for (var va : variedActions) {
+            actions.addAll(createAction(va.title, va.kind, va.rewrite));
+        }
         var elapsed = Duration.between(started, Instant.now()).toMillis();
         LOG.info(String.format("...created %d actions in %d ms", actions.size(), elapsed));
         return actions;
+    }
+
+    private List<CodeAction> createAction(String title, String kind, Rewrite rewrite) {
+        var edits = rewrite.rewrite(compiler);
+        if (edits == Rewrite.CANCELLED) return List.of();
+        var a = new CodeAction();
+        a.kind = kind;
+        a.title = title;
+        a.edit = new WorkspaceEdit();
+        for (var file : edits.keySet()) {
+            a.edit.changes.put(file.toUri(), List.of(edits.get(file)));
+        }
+        return List.of(a);
+    }
+
+    private JavaType inferType(CompileTask task, CompilationUnitTree root, int pos) {
+        var trees = Trees.instance(task.task);
+        var sourcePos = trees.getSourcePositions();
+        var finder = new TreeAtFinder(sourcePos, root);
+        var treeAt = finder.scan(root, (long) pos);
+        if (treeAt == null) return new JavaType("Object", new JavaType[0]);
+        var path = trees.getPath(root, treeAt);
+        if (path == null) return new JavaType("Object", new JavaType[0]);
+        var typeMirror = trees.getTypeMirror(path);
+        if (typeMirror == null) return new JavaType("Object", new JavaType[0]);
+        return new JavaType(simpleTypeName(typeMirror), new JavaType[0]);
+    }
+
+    private static String simpleTypeName(TypeMirror type) {
+        if (type instanceof DeclaredType declared) {
+            var element = (TypeElement) declared.asElement();
+            var name = element.getSimpleName().toString();
+            if (!declared.getTypeArguments().isEmpty()) {
+                var args = new StringJoiner(", ");
+                for (var arg : declared.getTypeArguments()) {
+                    args.add(simpleTypeName(arg));
+                }
+                return name + "<" + args + ">";
+            }
+            return name;
+        }
+        return type.toString();
     }
 
     private Map<String, Rewrite> overrideInheritedMethods(CompileTask task, Path file, long cursor) {
@@ -320,6 +495,44 @@ public class CodeActionProvider {
         }
         return List.of(a);
     }
+
+    private static class TreeAtFinder extends TreeScanner<Tree, Long> {
+        private final SourcePositions pos;
+        private CompilationUnitTree root;
+
+        TreeAtFinder(SourcePositions pos, CompilationUnitTree root) {
+            this.pos = pos;
+            this.root = root;
+        }
+
+        @Override
+        public Tree reduce(Tree a, Tree b) {
+            return a != null ? a : b;
+        }
+
+        @Override
+        public Tree scan(Tree tree, Long find) {
+            if (tree == null) return null;
+            var start = pos.getStartPosition(root, tree);
+            var end = pos.getEndPosition(root, tree);
+            if (start <= find && find < end) {
+                var inner = super.scan(tree, find);
+                return inner != null ? inner : tree;
+            }
+            return null;
+        }
+    }
+
+    private static String joinFieldNames(List<VariableTree> fields) {
+        var sb = new StringBuilder();
+        for (var f : fields) {
+            if (sb.length() > 0) sb.append(",");
+            sb.append(f.getName());
+        }
+        return sb.toString();
+    }
+
+    private record VariedAction(String title, String kind, Rewrite rewrite) {}
 
     private static final Logger LOG = Logger.getLogger("main");
 }

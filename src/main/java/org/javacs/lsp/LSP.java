@@ -453,6 +453,13 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
+                    case "workspace/executeCommand":
+                        {
+                            var params = gson.fromJson(r.params, ExecuteCommandParams.class);
+                            var response = server.executeCommand(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
                     case "textDocument/formatting":
                         {
                             var params = gson.fromJson(r.params, DocumentFormattingParams.class);

@@ -104,6 +104,10 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public Object executeCommand(ExecuteCommandParams params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
     public List<TextEdit> formatting(DocumentFormattingParams params) {
         throw new RuntimeException("Unimplemented");
     }

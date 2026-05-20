@@ -313,8 +313,12 @@ class JavaCompilerService implements CompilerProvider {
         var useAnnotationProcessing = profile.allowAnnotationProcessing() && apEnabled;
         // Workspace-wide profiles widen to FileStore.all() for cross-file type resolution.
         // Per-file profiles compile only the requested source.
+        // widenedToWorkspace tracks whether we actually expanded to all workspace files;
+        // this is separate from profile.widenToWorkspace() because multi-file callers
+        // (e.g. RenameClass with explicit allPaths) must NOT reuse the workspace cache.
+        var widenedToWorkspace = profile.widenToWorkspace() && sources.size() <= 1;
         var compileSources =
-                profile.widenToWorkspace() && sources.size() <= 1
+                widenedToWorkspace
                         ? FileStore.all().stream().<JavaFileObject>map(SourceFileObject::new).toList()
                         : sources;
         var expandedSources =
@@ -349,10 +353,30 @@ class JavaCompilerService implements CompilerProvider {
             return new CompileTask(
                     loaded.task, loaded.roots, diags, loaded.sourceStamps, loaded::close);
         }
-        var cacheType = profile.widenToWorkspace() ? "workspace" : "file";
-        var cacheName = profile.widenToWorkspace() ? "compile_workspace" : "compile_file";
+        // Multi-file explicit compilations (e.g. RenameClass with allPaths) must not
+        // use the workspace slot, which may still be held open by the workspace cache.
+        // Compile fresh with a null slot; the caller gets the close responsibility.
+        if (!widenedToWorkspace && effectiveSources.size() > 1) {
+            CacheAudit.miss("javac.multi_file");
+            var loaded =
+                    compileWithExpansionIfNeeded(
+                            effectiveSources,
+                            profile,
+                            useAnnotationProcessing,
+                            null);
+            var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+            LOG.fine(
+                    String.format(
+                            "[perf] compile_exit role=%s profile=%s duration=%dms",
+                            compilerRole, profile.analysisMode().name(), durationMs));
+            return new CompileTask(
+                    loaded.task, loaded.roots, diags, loaded.sourceStamps, loaded::close);
+        }
+
+        var cacheType = widenedToWorkspace ? "workspace" : "file";
+        var cacheName = widenedToWorkspace ? "compile_workspace" : "compile_file";
         var fileName = cacheFileName(effectiveSources);
-        if (profile.widenToWorkspace()) {
+        if (widenedToWorkspace) {
             var currentContentRevision = FileStore.contentRevision();
             var reason = workspaceCacheMissReason(currentContentRevision);
             if (reason == null) {
