@@ -7,6 +7,8 @@ import com.sun.jdi.event.*;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
 import com.sun.jdi.request.StepRequest;
+import groovy.lang.Binding;
+import groovy.lang.GroovyShell;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.nio.file.Files;
@@ -699,11 +701,45 @@ public class JavaDebugServer implements DebugServer {
         }
         return object.toString();
     }
-
+   
+    /**
+     * Evaluates req.expression as Groovy script
+     * <br>Script can use class fields, local variables and StackFrame object
+     */
     @Override
     public EvaluateResponseBody evaluate(EvaluateArguments req) {
-        var response = new EvaluateResponseBody();
-        response.result = "method evaluate() not implemented yet";
+        EvaluateResponseBody response = new EvaluateResponseBody();
+        try {
+            com.sun.jdi.StackFrame frame = findFrame(req.frameId);
+            Binding binding = new Binding();
+            // set frame available in script
+            binding.setProperty("frame", frame);
+            // add class fields
+            try {
+                for (Field field : frame.thisObject().referenceType().allFields()) {
+                    if (field.isStatic()) { 
+                        binding.setVariable(field.name(), frame.thisObject().referenceType().getValue(field));
+                    } else {
+                        binding.setProperty(field.name(), frame.thisObject().getValue(field));
+                    }
+                }
+            } catch (ClassNotPreparedException e) {
+                // ignore
+            }
+            // add visible varialbles
+            try {
+                for (LocalVariable variable : frame.visibleVariables()) {
+                    binding.setVariable(variable.name(), frame.getValue(variable));
+                }
+            } catch (AbsentInformationException e) {
+                // ignore
+            }
+            GroovyShell shell = new GroovyShell(binding);
+            Object result = shell.evaluate(req.expression);
+            response.result = result.toString();
+        } catch (Exception e) {
+            response.result = "Evaluation error " + e.getMessage();
+        }
         return response;
     }
 
