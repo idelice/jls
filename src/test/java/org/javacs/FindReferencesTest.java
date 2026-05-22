@@ -181,6 +181,14 @@ public class FindReferencesTest {
         assertThat(items(file, 4, 28), contains("InterfaceDefaultReference.java(11)"));
     }
 
+    @Test
+    public void privateMethodReferencesFromDeclaration() {
+        var file = "/org/javacs/example/PrivateMethodRefs.java";
+        // cursor on "helper" declaration at line 17
+        assertThat(items(file, 17, 18),
+                hasItems("PrivateMethodRefs.java(10)", "PrivateMethodRefs.java(14)"));
+    }
+
     private static ReferenceContext referenceContext() {
         var workspaceRoot = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT;
         FileStore.reset();

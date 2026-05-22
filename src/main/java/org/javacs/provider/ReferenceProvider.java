@@ -199,10 +199,23 @@ public class ReferenceProvider {
             return resolveMemberReferenceIdentity(mr, parse, path);
         }
         var name = selectedName(path);
-        if (name != null && leaf instanceof MethodTree) {
-            return resolveIdentifierOccurrence(parse, path, null);
+        if (name != null && leaf instanceof MethodTree mt) {
+            return resolveMethodDeclaration(parse, path, mt);
         }
         return SymbolIdentity.unsupported(null);
+    }
+
+    /**
+     * Resolve a method declaration directly from its MethodTree path.
+     * Unlike resolveIdentifierOccurrence → resolveMemberFromParse, this uses the actual
+     * MethodTree the cursor is on, so overloaded methods get distinct identities.
+     */
+    private SymbolIdentity resolveMethodDeclaration(ParseTask parse, TreePath path, MethodTree mt) {
+        var name = mt.getName().toString();
+        var enclosingType = enclosingTypeNameFromParse(parse, path);
+        if (enclosingType.isEmpty()) return SymbolIdentity.unsupported(name);
+        var declLoc = Optional.ofNullable(FindHelper.locationStrict(parse, path, name));
+        return new SymbolIdentity(enclosingType.get(), name, true, null, name, declLoc);
     }
 
     private SymbolIdentity resolveIdentifierOccurrence(
@@ -571,11 +584,23 @@ public class ReferenceProvider {
         if (targetParameterTypes.isEmpty() || occurrenceParameterTypes.isEmpty()) {
             return true;
         }
+        if (targetParameterTypes.size() != occurrenceParameterTypes.size()) {
+            return false;
+        }
         if (targetParameterTypes.stream().anyMatch(String::isBlank)
                 || occurrenceParameterTypes.stream().anyMatch(String::isBlank)) {
             return true;
         }
-        return targetParameterTypes.equals(occurrenceParameterTypes);
+        for (int i = 0; i < targetParameterTypes.size(); i++) {
+            var target = targetParameterTypes.get(i);
+            var occurrence = occurrenceParameterTypes.get(i);
+            if (target.equals(occurrence)) continue;
+            // java.lang.Object is the common erasure fallback when generics can't be resolved;
+            // treat it as a wildcard to avoid false negatives.
+            if ("java.lang.Object".equals(occurrence)) continue;
+            return false;
+        }
+        return true;
     }
 
     private boolean isConstructorTarget(SymbolIdentity target) {
