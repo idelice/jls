@@ -152,12 +152,9 @@ public class JavaDebugServerTest {
         stoppedEvents.take();
         // Find the main thread
         var threads = server.threads().threads;
-        System.out.println("threads "+threads);
         for (var t : threads) {
             if (t.name.equals("main")) {
                 var next = new NextArguments();
-        System.out.println("thread id "+t.id);
-
                 next.threadId = t.id;
                 server.next(next);
                 // Wait for stop
