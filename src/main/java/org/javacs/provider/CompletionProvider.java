@@ -42,7 +42,6 @@ import java.util.Set;
 import java.util.StringJoiner;
 import java.util.TreeMap;
 import java.util.logging.Logger;
-import javax.lang.model.element.Element;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
 
@@ -1738,24 +1737,6 @@ public class CompletionProvider {
         i.insertTextFormat = InsertTextFormat.Snippet;
         i.sortText = sortKey(Priority.SNIPPET, i.label);
         return i;
-    }
-
-    private Integer kind(Element e) {
-        return switch (e.getKind()) {
-            case ANNOTATION_TYPE, INTERFACE -> CompletionItemKind.Interface;
-            case CLASS -> CompletionItemKind.Class;
-            case CONSTRUCTOR -> CompletionItemKind.Constructor;
-            case ENUM -> CompletionItemKind.Enum;
-            case ENUM_CONSTANT -> CompletionItemKind.EnumMember;
-            case EXCEPTION_PARAMETER, PARAMETER -> CompletionItemKind.Property;
-            case FIELD -> CompletionItemKind.Field;
-            case STATIC_INIT, INSTANCE_INIT -> CompletionItemKind.Function;
-            case LOCAL_VARIABLE, RESOURCE_VARIABLE -> CompletionItemKind.Variable;
-            case METHOD -> CompletionItemKind.Method;
-            case PACKAGE -> CompletionItemKind.Module;
-            case TYPE_PARAMETER -> CompletionItemKind.TypeParameter;
-            default -> null;
-        };
     }
 
     private CompletionItem keyword(String keyword) {

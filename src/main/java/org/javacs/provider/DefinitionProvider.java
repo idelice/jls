@@ -10,7 +10,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import javax.tools.JavaFileObject;
 
 import org.javacs.*;
 import org.javacs.index.IndexedMember;
@@ -868,20 +867,6 @@ public class DefinitionProvider {
                                 .decompileClass(key)
                                 .map(compiler::parse)
                                 .flatMap(parse -> openParsedSource(parse, key)));
-    }
-
-    private Optional<TypeSource> openDecompiledTypeSource(
-            String qualifiedType, TypeIndexRouter.OwnerStore store) {
-        if (store != TypeIndexRouter.OwnerStore.EXTERNAL) {
-            return Optional.empty();
-        }
-        var decompiledSource = typeIndexRouter.externalDecompiledSourcePath(qualifiedType);
-        if (decompiledSource.isEmpty()) {
-            return Optional.empty();
-        }
-        var parse = compiler.parse(decompiledSource.get());
-        var path = findTypePath(parse, qualifiedType);
-        return path.map(classPath -> new TypeSource(parse, classPath));
     }
 
     private Optional<TreePath> findTypePath(ParseTask parse, String qualifiedType) {

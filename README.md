@@ -10,6 +10,7 @@ This is a fork and continuation of [georgewfraser/java-language-server](https://
 - **Go-to-definition** - Navigate to class definitions in workspace and JARs (including private repositories)
 - **Hover information** - Type information and Javadoc documentation with proper formatting
 - **Find references** - Find all usages of symbols
+- **Document highlight** - Highlight all occurrences of the symbol under the cursor within the current file
 - **Diagnostics** - Real-time linting and error reporting
 - **Signature help** - Parameter information for method calls
 - **Inlay hints** - Parameter name hints at call sites (workspace files only; Lombok-generated calls are suppressed)

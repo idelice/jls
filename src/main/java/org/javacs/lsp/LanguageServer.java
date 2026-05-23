@@ -72,6 +72,10 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public Optional<List<DocumentHighlight>> documentHighlight(TextDocumentPositionParams params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
     public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
         throw new RuntimeException("Unimplemented");
     }

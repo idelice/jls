@@ -35,6 +35,7 @@ import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.provider.DefinitionProvider;
+import org.javacs.provider.DocumentHighlightProvider;
 import org.javacs.provider.InlayHintProvider;
 import org.javacs.provider.ReferenceProvider;
 import org.javacs.rewrite.*;
@@ -877,6 +878,7 @@ class JavaLanguageServer extends LanguageServer {
         c.add("signatureHelpProvider", signatureHelpOptions);
         c.addProperty("referencesProvider", true);
         c.addProperty("definitionProvider", true);
+        c.addProperty("documentHighlightProvider", true);
         c.addProperty("workspaceSymbolProvider", true);
         c.addProperty("documentSymbolProvider", true);
         c.addProperty("documentFormattingProvider", true);
@@ -1172,6 +1174,21 @@ class JavaLanguageServer extends LanguageServer {
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
+        return Optional.of(found);
+    }
+
+    @Override
+    public Optional<List<DocumentHighlight>> documentHighlight(TextDocumentPositionParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
+        var file = Paths.get(params.textDocument.uri);
+        var line = params.position.line + 1;
+        var column = params.position.character + 1;
+        ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
+        var snapshot = completionSnapshotRef.get();
+        var found = new DocumentHighlightProvider(
+                        getOrCreateCompiler(), snapshot.typeIndex(), file, line, column)
+                .find();
+        if (found.isEmpty()) return Optional.empty();
         return Optional.of(found);
     }
 
