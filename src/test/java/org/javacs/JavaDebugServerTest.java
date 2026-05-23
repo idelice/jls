@@ -9,6 +9,8 @@ import java.util.logging.Logger;
 import org.javacs.debug.*;
 import org.javacs.debug.proto.*;
 import org.junit.Test;
+import static org.hamcrest.Matchers.*;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 public class JavaDebugServerTest {
     Path workingDirectory = Paths.get("src/test/examples/debug");
@@ -177,6 +179,41 @@ public class JavaDebugServerTest {
         setBreakpoint("Hello", 6);
         server.continue_(new ContinueArguments());
         stoppedEvents.take();
+        // Wait for process to exit
+        server.continue_(new ContinueArguments());
+        process.waitFor();
+    }
+
+    @Test
+    public void evaluate() throws IOException, InterruptedException {
+        launchProcess("Eval");
+        attach(5005);
+        setBreakpoint("Eval", 16);
+        server.configurationDone();
+        stoppedEvents.take();
+        EvaluateArguments arguments = new EvaluateArguments();
+        var threads = server.threads().threads;
+        for (var t : threads) {
+            if (t.name.equals("main")) {
+                var requestTrace = new StackTraceArguments();
+                requestTrace.threadId = t.id;
+                var stack = server.stackTrace(requestTrace);
+                arguments.frameId = (int)stack.stackFrames[0].id;
+            }
+        }
+        // check 2 + 2 = 4
+        arguments.expression = "2 + 2";
+        assertThat(server.evaluate(arguments).result, equalTo("4"));
+
+        arguments.expression = "classVar";
+        assertThat(server.evaluate(arguments).result, equalTo("1"));
+
+        arguments.expression = "objVar";
+        assertThat(server.evaluate(arguments).result, equalTo("2"));
+
+        arguments.expression = "localVar";
+        assertThat(server.evaluate(arguments).result, containsString("Hello "));
+
         // Wait for process to exit
         server.continue_(new ContinueArguments());
         process.waitFor();
