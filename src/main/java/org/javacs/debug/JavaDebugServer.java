@@ -23,6 +23,21 @@ import java.util.logging.*;
 import org.javacs.LogFormat;
 import org.javacs.debug.proto.*;
 
+/**
+ * Debug Adapter Protocol (DAP) server implementation backed by the Java Debug Interface (JDI).
+ *
+ * <p>This class connects to a running JVM via a socket (dt_socket transport), exchanges DAP
+ * messages with a client (e.g. Neovim via nvim-dap), and translates them into JDI operations.
+ *
+ * <p>Supported features include:
+ * <ul>
+ *   <li>Breakpoints (pending until class load, then resolved lazily)</li>
+ *   <li>Stepping: over, into, out</li>
+ *   <li>Thread and stack-trace enumeration</li>
+ *   <li>Local variable and argument inspection</li>
+ *   <li>Groovy-based expression evaluation in the context of a stopped frame</li>
+ * </ul>
+ */
 public class JavaDebugServer implements DebugServer {
     public static void main(String[] args) { // TODO don't show references for main method
         // createLogFile();
@@ -43,12 +58,28 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /** DAP client used to send events such as {@code stopped}, {@code exited}, or {@code output}. */
     private final DebugClient client;
+
+    /** Local source roots used to map JDI locations back to absolute file paths. */
     private List<Path> sourceRoots = List.of();
+
+    /** The attached JVM, available after a successful {@link #attach} call. */
     private VirtualMachine vm;
+
+    /**
+     * Breakpoints requested before their target class has been loaded by the VM.
+     * They are resolved lazily when a matching {@link ClassPrepareEvent} is received.
+     */
     private final List<Breakpoint> pendingBreakpoints = new ArrayList<>();
+
+    /** Monotonically increasing counter used to assign IDs to pending breakpoints. */
     private static int breakPointCounter = 0;
 
+    /**
+     * Background thread that continuously reads events from the JDI {@link EventQueue}
+     * and dispatches them to the DAP client as protocol events.
+     */
     class ReceiveVmEvents implements Runnable {
         @Override
         public void run() {
@@ -69,6 +100,7 @@ public class JavaDebugServer implements DebugServer {
             }
         }
 
+        /** Dispatches a single JDI event to the appropriate DAP client method. */
         private void process(com.sun.jdi.event.Event event) {
             LOG.info("Received " + event.toString() + " from VM");
             if (event instanceof ClassPrepareEvent) {
@@ -101,6 +133,15 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /**
+     * Constructs a new debug server for the given DAP client.
+     *
+     * <p>Installs a custom {@link Handler} that forwards {@code java.util.logging} records from the
+     * {@code "debug"} logger to the client as DAP {@link OutputEventBody} messages. This allows
+     * internal logging to appear in the client's debug console.
+     *
+     * @param client the DAP client to notify with events
+     */
     public JavaDebugServer(DebugClient client) {
         this.client = client;
         class LogToConsole extends Handler {
@@ -130,6 +171,16 @@ public class JavaDebugServer implements DebugServer {
         return resp;
     }
 
+    /**
+     * Sets or clears breakpoints for a single source file.
+     *
+     * <p>All existing breakpoints in the requested source are disabled first, then each breakpoint
+     * in the request is enabled. If the target class is not yet loaded, the breakpoint becomes
+     * {@link #pendingBreakpoints pending} and will be resolved when the class is prepared.
+     *
+     * @param req DAP breakpoint request containing the source file and line numbers
+     * @return the status of each requested breakpoint (verified or pending)
+     */
     @Override
     public SetBreakpointsResponseBody setBreakpoints(SetBreakpointsArguments req) {
         LOG.info("Received " + req.breakpoints.length + " breakpoints in " + req.source.path);
@@ -143,6 +194,7 @@ public class JavaDebugServer implements DebugServer {
         return resp;
     }
 
+    /** Disables every existing JDI {@link BreakpointRequest} that belongs to the given source file. */
     private void disableBreakpoints(Source source) {
         for (var b : vm.eventRequestManager().breakpointRequests()) {
             if (matchesFile(b, source)) {
@@ -152,6 +204,20 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /**
+     * Attempts to activate a single source breakpoint.
+     *
+     * <p>The implementation searches three places in order:
+     * <ol>
+     *   <li>Disabled breakpoints in the same file and line — re-enable them.</li>
+     *   <li>Already-loaded classes that match the source file — set immediately via JDI.</li>
+     *   <li>If none of the above, store as a {@link #pendingBreakpoints pending breakpoint}.</li>
+     * </ol>
+     *
+     * @param source   the source file descriptor
+     * @param b        the breakpoint specification (line, optional column, condition)
+     * @return a DAP {@link Breakpoint} describing its current status
+     */
     private Breakpoint enableBreakpoint(Source source, SourceBreakpoint b) {
         // Check for breakpoint in disabled breakpoints
         for (var req : vm.eventRequestManager().breakpointRequests()) {
@@ -167,6 +233,13 @@ public class JavaDebugServer implements DebugServer {
         return enableBreakpointLater(source, b);
     }
 
+    /**
+     * Returns {@code true} if the given JDI breakpoint request was set in the same source file.
+     *
+     * <p>This method can fail with {@link AbsentInformationException} when the class was compiled
+     * without debug information (e.g. {@code -g:none}). In that case we conservatively return
+     * {@code false}.
+     */
     private boolean matchesFile(BreakpointRequest b, Source source) {
         try {
             var relativePath = b.location().sourcePath(vm.getDefaultStratum());
@@ -177,10 +250,12 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /** Returns {@code true} if the JDI breakpoint request is located on the given line number. */
     private boolean matchesLine(BreakpointRequest b, int line) {
         return line == b.location().lineNumber(vm.getDefaultStratum());
     }
 
+    /** Returns all JDI {@link ReferenceType}s whose source path matches the given absolute file path. */
     private List<ReferenceType> loadedTypesMatching(String absolutePath) {
         var matches = new ArrayList<ReferenceType>();
         for (var type : vm.allClasses()) {
@@ -192,6 +267,13 @@ public class JavaDebugServer implements DebugServer {
         return matches;
     }
 
+    /**
+     * Re-enables a previously disabled breakpoint request and returns its updated DAP descriptor.
+     *
+     * @param source the source file that owns the breakpoint
+     * @param b      the disabled JDI breakpoint request
+     * @return a verified DAP {@link Breakpoint}
+     */
     private Breakpoint enableDisabledBreakpoint(Source source, BreakpointRequest b) {
         LOG.info(String.format("Enable disabled breakpoint %s:%d", source.path, b.location().lineNumber()));
         b.enable();
@@ -202,6 +284,14 @@ public class JavaDebugServer implements DebugServer {
         return ok;
     }
 
+    /**
+     * Creates a JDI breakpoint in an already-loaded class.
+     *
+     * @param source the source file
+     * @param b      the requested line breakpoint
+     * @param type   the JDI reference type that corresponds to the source file
+     * @return a verified breakpoint, or an unverified one if the line has no executable code
+     */
     private Breakpoint enableBreakpointImmediately(Source source, SourceBreakpoint b, ReferenceType type) {
         if (!tryEnableBreakpointImmediately(source, b, type)) {
             var failed = new Breakpoint();
@@ -216,6 +306,15 @@ public class JavaDebugServer implements DebugServer {
         return ok;
     }
 
+    /**
+     * Attempts to create a JDI {@link BreakpointRequest} for every executable location mapped
+     * to the given line in the reference type.
+     *
+     * @param source the source file
+     * @param b      the requested line breakpoint
+     * @param type   the JDI reference type
+     * @return {@code true} if at least one JDI breakpoint request was created
+     */
     private boolean tryEnableBreakpointImmediately(Source source, SourceBreakpoint b, ReferenceType type) {
         List<Location> locations;
         try {
@@ -233,6 +332,15 @@ public class JavaDebugServer implements DebugServer {
         return true;
     }
 
+    /**
+     * Stores a breakpoint in {@link #pendingBreakpoints} because its class has not yet been loaded.
+     * A {@link ClassPrepareRequest} is already (or will be) registered so that the breakpoint is
+     * resolved automatically once the class becomes available.
+     *
+     * @param source the source file
+     * @param b      the requested line breakpoint
+     * @return a DAP {@link Breakpoint} marked as unverified with an explanatory message
+     */
     private Breakpoint enableBreakpointLater(Source source, SourceBreakpoint b) {
         LOG.info(String.format("Enable %s:%d later", source.path, b.line));
         var pending = new Breakpoint();
@@ -258,6 +366,14 @@ public class JavaDebugServer implements DebugServer {
         LOG.warning("Not yet implemented");
     }
 
+    /**
+     * Finalises the configuration phase of the DAP session.
+     *
+     * <p>At this point the client has finished sending breakpoints and other setup requests.
+     * We register listeners for {@link ClassPrepareEvent}s so that pending breakpoints can be
+     * resolved lazily, attempt to resolve any breakpoints in classes that are already loaded,
+     * and finally resume the VM so execution can proceed.
+     */
     @Override
     public void configurationDone() {
         listenForClassPrepareEvents();
@@ -265,7 +381,7 @@ public class JavaDebugServer implements DebugServer {
         vm.resume();
     }
 
-    /* Request to be notified when files with pending breakpoints are loaded */
+    /** Registers a {@link ClassPrepareRequest} for every distinct source file that has pending breakpoints. */
     private void listenForClassPrepareEvents() {
         Objects.requireNonNull(vm, "vm has not been initialized");
         // Get all file names
@@ -290,6 +406,7 @@ public class JavaDebugServer implements DebugServer {
         throw new UnsupportedOperationException();
     }
 
+    /** Looks up an {@link AttachingConnector} that supports the requested transport (e.g. {@code "dt_socket"}). */
     private static AttachingConnector connector(String transport) {
         var found = new ArrayList<String>();
         for (var conn : Bootstrap.virtualMachineManager().attachingConnectors()) {
@@ -301,6 +418,20 @@ public class JavaDebugServer implements DebugServer {
         throw new RuntimeException("Couldn't find connector for transport " + transport + " in " + found);
     }
 
+    /**
+     * Attaches this debug server to a JVM listening on the given port.
+     *
+     * <p>The method performs three steps:
+     * <ol>
+     *   <li>Validates and stores the source roots.</li>
+     *   <li>Connects to the target VM via the {@code dt_socket} transport, retrying for up to
+     *       15 seconds in case the debuggee has not opened its port yet.</li>
+     *   <li>Starts a daemon thread ({@link ReceiveVmEvents}) to drain JDI events and notify the client.
+     *       Then sends an {@link InitializedEvent} so the client can begin sending breakpoints.</li>
+     * </ol>
+     *
+     * @param req attach arguments containing the port and source roots
+     */
     @Override
     public void attach(AttachRequestArguments req) {
         // Remember available source roots
@@ -330,6 +461,16 @@ public class JavaDebugServer implements DebugServer {
         client.initialized();
     }
 
+    /**
+     * Retries the JDI socket connection with exponential-like back-off.
+     *
+     * <p>Waits 500 ms between attempts, giving up after roughly 15 seconds (30 attempts).
+     * This grace period is necessary because the debuggee may start its JDWP listener slightly
+     * after the DAP client begins the attach flow.
+     *
+     * @param port the JDWP port exposed by the target VM
+     * @return {@code true} if the connection succeeded
+     */
     private boolean tryToConnect(int port) {
         var conn = connector("dt_socket");
         var args = conn.defaultArguments();
@@ -355,7 +496,7 @@ public class JavaDebugServer implements DebugServer {
         return false;
     }
 
-    /* Set breakpoints for already-loaded classes */
+    /** Attempts to resolve every pending breakpoint against already-loaded classes. */
     private void enablePendingBreakpointsInLoadedClasses() {
         Objects.requireNonNull(vm, "vm has not been initialized");
         for (var type : vm.allClasses()) {
@@ -363,6 +504,12 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /**
+     * Checks whether the given reference type matches any pending breakpoint source path.
+     * If so, the breakpoints are converted to real JDI requests and removed from the pending list.
+     *
+     * @param type the JDI reference type that was just prepared or is already loaded
+     */
     private void enablePendingBreakpointsIn(ReferenceType type) {
         // Check that class has source information
         var path = relativePath(type);
@@ -378,6 +525,13 @@ public class JavaDebugServer implements DebugServer {
         pendingBreakpoints.removeAll(enabled);
     }
 
+    /**
+     * Creates JDI breakpoint requests for a single pending breakpoint and notifies the client
+     * of the result via a {@link BreakpointEventBody}.
+     *
+     * @param b    the pending DAP breakpoint
+     * @param type the JDI reference type that now contains the target source
+     */
     private void enablePendingBreakpoint(Breakpoint b, ReferenceType type) {
         try {
             var locations = type.locationsOfLine(b.line);
@@ -414,6 +568,7 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /** Returns the relative source path of a type according to the VM's default stratum, or "" if unavailable. */
     private String relativePath(ReferenceType type) {
         try {
             for (var path : type.sourcePaths(vm.getDefaultStratum())) {
@@ -494,6 +649,7 @@ public class JavaDebugServer implements DebugServer {
         return threads;
     }
 
+    /** Converts a JDI thread list to DAP {@link org.javacs.debug.proto.Thread} array. */
     private org.javacs.debug.proto.Thread[] asThreads(List<ThreadReference> ts) {
         var result = new org.javacs.debug.proto.Thread[ts.size()];
         for (var i = 0; i < ts.size(); i++) {
@@ -502,6 +658,7 @@ public class JavaDebugServer implements DebugServer {
         return result;
     }
 
+    /** Converts a single JDI {@link ThreadReference} into a DAP thread descriptor. */
     private org.javacs.debug.proto.Thread asThread(ThreadReference t) {
         var thread = new org.javacs.debug.proto.Thread();
         thread.id = t.uniqueID();
@@ -509,6 +666,7 @@ public class JavaDebugServer implements DebugServer {
         return thread;
     }
 
+    /** Finds a JDI thread by its unique ID, or {@code null} if not found. */
     private ThreadReference findThread(long threadId) {
         for (var thread : vm.allThreads()) {
             if (thread.uniqueID() == threadId) {
@@ -518,6 +676,12 @@ public class JavaDebugServer implements DebugServer {
         return null;
     }
 
+    /**
+     * Returns a stack trace slice for the requested thread.
+     *
+     * @param req contains the thread ID, start frame, and maximum number of levels
+     * @return the requested stack frames and total frame count
+     */
     @Override
     public StackTraceResponseBody stackTrace(StackTraceArguments req) {
         try {
@@ -539,6 +703,7 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /** Converts a list of JDI stack frames into DAP {@link StackFrame} objects. */
     private org.javacs.debug.proto.StackFrame[] asStackFrames(List<com.sun.jdi.StackFrame> fs) {
         var result = new org.javacs.debug.proto.StackFrame[fs.size()];
         for (var i = 0; i < fs.size(); i++) {
@@ -547,6 +712,7 @@ public class JavaDebugServer implements DebugServer {
         return result;
     }
 
+    /** Converts a single JDI {@link com.sun.jdi.StackFrame} into a DAP stack frame. */
     private org.javacs.debug.proto.StackFrame asStackFrame(com.sun.jdi.StackFrame f) {
         var frame = new org.javacs.debug.proto.StackFrame();
         frame.id = uniqueFrameId(f);
@@ -556,6 +722,7 @@ public class JavaDebugServer implements DebugServer {
         return frame;
     }
 
+    /** Builds a DAP {@link Source} from a JDI location, attempting to resolve an absolute file path. */
     private Source asSource(Location l) {
         try {
             var path = findSource(l);
@@ -572,8 +739,16 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /** Tracks source paths we have already warned about to avoid spamming the log. */
     private static final Set<String> warnedCouldNotFind = new HashSet<>();
 
+    /**
+     * Resolves an absolute source file path from a JDI location by searching {@link #sourceRoots}.
+     *
+     * @param l a JDI location that exposes a relative source path
+     * @return the absolute path, or {@code null} if none of the roots contain the file
+     * @throws AbsentInformationException if the location has no source information
+     */
     private Path findSource(Location l) throws AbsentInformationException {
         var relative = l.sourcePath();
         for (var root : sourceRoots) {
@@ -589,9 +764,22 @@ public class JavaDebugServer implements DebugServer {
         return null;
     }
 
-    /** Debug adapter protocol doesn't seem to like frame 0 */
+    /**
+     * The DAP specification reserves low frame IDs (e.g. 0) for special purposes, so we offset
+     * every generated frame ID by this constant to avoid collisions.
+     */
     private static final int FRAME_OFFSET = 100;
 
+    /**
+     * Generates a stable, unique identifier for a JDI stack frame that can be used in DAP
+     * {@link StackFrame} and {@link ScopesArguments} messages.
+     *
+     * <p>The ID is computed by enumerating every thread and every frame in order, starting from
+     * {@link #FRAME_OFFSET}. This makes the mapping reversible via {@link #findFrame}.
+     *
+     * @param f the JDI stack frame
+     * @return a positive integer uniquely identifying the frame
+     */
     private long uniqueFrameId(com.sun.jdi.StackFrame f) {
         try {
             long count = FRAME_OFFSET;
@@ -614,6 +802,13 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /**
+     * Reverses {@link #uniqueFrameId} to locate the JDI stack frame corresponding to a DAP frame ID.
+     *
+     * @param id the frame identifier received from the client
+     * @return the matching JDI stack frame
+     * @throws RuntimeException if the frame cannot be found
+     */
     private com.sun.jdi.StackFrame findFrame(long id) {
         try {
             long count = FRAME_OFFSET;
@@ -631,6 +826,22 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /**
+     * Returns the variable scopes visible in a given stack frame.
+     *
+     * <p>Two scopes are produced for each frame:
+     * <ul>
+     *   <li>{@code Locals} — variables whose {@code isArgument()} is {@code false}</li>
+     *   <li>{@code Arguments} — variables whose {@code isArgument()} is {@code true}</li>
+     * </ul>
+     *
+     * <p>The scopes are encoded into the {@code variablesReference} field by the formula
+     * {@code frameId * 2} (locals) and {@code frameId * 2 + 1} (arguments), which
+     * {@link #variables} later decodes.
+     *
+     * @param req contains the frame ID
+     * @return the locals and arguments scopes for that frame
+     */
     @Override
     public ScopesResponseBody scopes(ScopesArguments req) {
         var resp = new ScopesResponseBody();
@@ -646,6 +857,18 @@ public class JavaDebugServer implements DebugServer {
         return resp;
     }
 
+    /**
+     * Returns the variables belonging to a scope.
+     *
+     * <p>The {@code variablesReference} is decoded as follows:
+     * <ul>
+     *   <li>frame ID = {@code variablesReference / 2}</li>
+     *   <li>scope kind = {@code variablesReference % 2} ({@code 0} = locals, {@code 1} = arguments)</li>
+     * </ul>
+     *
+     * @param req contains the variables reference returned by {@link #scopes}
+     * @return the list of variables with name, type, and stringified value
+     */
     @Override
     public VariablesResponseBody variables(VariablesArguments req) {
         var frameId = req.variablesReference / 2;
@@ -677,6 +900,17 @@ public class JavaDebugServer implements DebugServer {
         return resp;
     }
 
+    /**
+     * Formats a JDI {@link Value} as a human-readable string.
+     *
+     * <p>Primitive values are rendered with {@link Value#toString()}. Object references are
+     * delegated to {@link #printObject} which attempts to call the object's {@code toString()} method
+     * inside the debuggee VM so that overridden implementations are respected.
+     *
+     * @param value  the JDI value
+     * @param thread the thread in which to invoke methods (for object references)
+     * @return a display string suitable for the DAP client
+     */
     private String print(Value value, ThreadReference t) {
         if (value == null) {
             return "null";
@@ -687,6 +921,17 @@ public class JavaDebugServer implements DebugServer {
         }
     }
 
+    /**
+     * Invokes {@code toString()} on an object reference within the debuggee VM.
+     *
+     * <p>If the invocation throws an exception, the exception type name is returned instead of the
+     * string value. If no {@code toString()} method is found, falls back to the reference's
+     * default string representation.
+     *
+     * @param object the object whose string representation is desired
+     * @param t      the suspended thread on which to perform the invocation
+     * @return the result of {@code toString()}, or an error description
+     */
     private String printObject(ObjectReference object, ThreadReference t) {
         var type = object.referenceType();
         for (var method : type.methodsByName("toString", "()Ljava/lang/String;")) {
@@ -701,10 +946,16 @@ public class JavaDebugServer implements DebugServer {
         }
         return object.toString();
     }
-   
+
     /**
-     * Evaluates req.expression as Groovy script
-     * <br>Script can use class fields, local variables and StackFrame object
+     * Evaluates an expression as a Groovy script within the context of a stopped stack frame.
+     *
+     * <p>The script can reference class fields, local variables, and the special variable
+     * {@code frame} which is bound to the JDI {@link com.sun.jdi.StackFrame} object. This is useful
+     * for ad-hoc inspection or arithmetic when debugging.
+     *
+     * @param req contains the expression text and the frame ID to evaluate in
+     * @return the string result of the evaluation, or an error message if the script fails
      */
     @Override
     public EvaluateResponseBody evaluate(EvaluateArguments req) {
@@ -712,12 +963,12 @@ public class JavaDebugServer implements DebugServer {
         try {
             com.sun.jdi.StackFrame frame = findFrame(req.frameId);
             Binding binding = new Binding();
-            // set frame available in script
+            // Make the JDI StackFrame available under the name "frame"
             binding.setProperty("frame", frame);
-            // add class fields
+            // Inject class fields into the binding
             try {
                 for (Field field : frame.thisObject().referenceType().allFields()) {
-                    if (field.isStatic()) { 
+                    if (field.isStatic()) {
                         binding.setVariable(field.name(), frame.thisObject().referenceType().getValue(field));
                     } else {
                         binding.setProperty(field.name(), frame.thisObject().getValue(field));
@@ -726,7 +977,7 @@ public class JavaDebugServer implements DebugServer {
             } catch (ClassNotPreparedException e) {
                 // ignore
             }
-            // add visible varialbles
+            // Inject visible local variables into the binding
             try {
                 for (LocalVariable variable : frame.visibleVariables()) {
                     binding.setVariable(variable.name(), frame.getValue(variable));
