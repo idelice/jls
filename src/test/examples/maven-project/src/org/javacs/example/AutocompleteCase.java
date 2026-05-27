@@ -11,6 +11,10 @@ class AutocompleteCase {
         return MyEnum.Foo;
     }
 
+    void testEnumInstance() {
+        myEnum().
+    }
+
     enum MyEnum {
         Foo,
         Bar

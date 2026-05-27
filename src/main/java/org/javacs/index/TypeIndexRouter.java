@@ -2,6 +2,9 @@ package org.javacs.index;
 
 import com.sun.source.tree.CompilationUnitTree;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -37,9 +40,61 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
     public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
         var workspaceMembers = workspace.members(qualifiedName, staticContext);
         if (!workspaceMembers.isEmpty() || isWorkspaceOwnedType(qualifiedName)) {
-            return workspaceMembers;
+            // Also include inherited members from external supertypes (e.g. java.lang.Object).
+            // The compiled-path index gets these via elements.getAllMembers(); the parse-only
+            // path does not, so we supplement lazily here.
+            var externalInherited = externalInheritedMembers(qualifiedName, staticContext);
+            if (externalInherited.isEmpty()) {
+                return workspaceMembers;
+            }
+            var covered = new HashSet<String>(workspaceMembers.size() * 2);
+            for (var m : workspaceMembers) covered.add(m.canonicalKey);
+            var merged = new ArrayList<>(workspaceMembers);
+            for (var m : externalInherited) {
+                if (covered.add(m.canonicalKey)) merged.add(m);
+            }
+            return merged;
         }
         return external.members(qualifiedName, staticContext);
+    }
+
+    /**
+     * Returns members inherited from external (non-workspace) supertypes of the given workspace
+     * type. Walks the full transitive supertype chain; workspace supertypes are skipped because
+     * their members are already covered by {@link WorkspaceTypeIndex#members}.
+     */
+    private List<IndexedMember> externalInheritedMembers(String qualifiedName, boolean staticContext) {
+        var result = new ArrayList<IndexedMember>();
+        var visited = new HashSet<String>();
+        var queue = new ArrayDeque<String>();
+        var typeInfo = workspace.typeInfo(qualifiedName).orElse(null);
+        if (typeInfo != null) {
+            queue.addAll(typeInfo.directSupertypes);
+            // All concrete workspace types implicitly inherit from java.lang.Object, but the
+            // parse-only index omits it when there is no explicit extends clause.
+            if (typeInfo.superclass == null && typeInfo.kind != CompletionItemKind.Interface) {
+                // Enums implicitly extend java.lang.Enum (which itself extends Object).
+                // Seeding Enum gives us name(), ordinal(), compareTo(), etc. plus Object via BFS.
+                if (typeInfo.kind == CompletionItemKind.Enum) {
+                    queue.add("java.lang.Enum");
+                } else {
+                    queue.add("java.lang.Object");
+                }
+            }
+        }
+        while (!queue.isEmpty()) {
+            var supertype = queue.poll();
+            if (!visited.add(supertype)) continue;
+            if (workspace.containsType(supertype)) {
+                // Workspace supertype — its members are already in the workspace index.
+                workspace.typeInfo(supertype).ifPresent(t -> queue.addAll(t.directSupertypes));
+            } else {
+                // External supertype — pull members and continue walking its supertypes.
+                result.addAll(external.members(supertype, staticContext));
+                external.typeInfo(supertype).ifPresent(t -> queue.addAll(t.directSupertypes));
+            }
+        }
+        return result;
     }
 
     public Optional<IndexedMember> member(String qualifiedName, String name, boolean staticContext) {

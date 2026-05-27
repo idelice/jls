@@ -1,15 +1,19 @@
 package org.javacs.index;
 
-import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePathScanner;
+import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
+import java.util.ArrayDeque;
+import java.util.function.Predicate;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
@@ -25,7 +29,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Predicate;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
@@ -39,9 +42,12 @@ import javax.lang.model.type.TypeMirror;
 import javax.lang.model.type.TypeVariable;
 import javax.lang.model.type.UnionType;
 import javax.lang.model.type.WildcardType;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
 import org.javacs.CompileTask;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
+import org.javacs.ParseTask;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 import org.javacs.resolve.TypeNames;
@@ -638,6 +644,475 @@ public class WorkspaceTypeIndex {
 
     public static WorkspaceTypeIndex workspaceDeclarations(CompileTask task) {
         return from(task, false);
+    }
+
+    /**
+     * Build a workspace type index from parse trees only, without attribution.
+     *
+     * <p>This is ~15x faster than {@link #from(CompileTask)} because it skips javac's
+     * type-attribution phase. Member type names are raw strings from the parse tree (may be simple
+     * names rather than fully qualified), but are sufficient for bootstrap completion candidate
+     * lists. {@link org.javacs.resolve.ParseTypeResolver} resolves these at query time.
+     *
+     * <p>Inherited workspace members are resolved by walking the superclass chain after all direct
+     * members are collected. External inherited members are resolved lazily at query time via
+     * {@link ExternalBinaryTypeIndex}.
+     *
+     * <p>Record component accessors are synthesized from the parse tree without attribution.
+     * Lombok synthetics use the same parse-tree-based path as the compiled index.
+     */
+    public static WorkspaceTypeIndex fromParseTrees(java.util.List<ParseTask> parseTasks) {
+        // === Phase 1: Scan all roots — collect type names, class trees, and file metadata ===
+        var allQualifiedNames = new ObjectOpenHashSet<String>();
+        var typeClassTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
+        var typeSources = new Object2ObjectOpenHashMap<String, Path>();
+        var typeSourceUris = new Object2ObjectOpenHashMap<String, java.net.URI>();
+        var typeKinds = new Object2ObjectOpenHashMap<String, Integer>();
+        var typeModifiers = new Object2ObjectOpenHashMap<String, Set<Modifier>>();
+        var nestedTypesByOwner = new Object2ObjectOpenHashMap<String, Set<String>>();
+        var typeRoots = new Object2ObjectOpenHashMap<String, CompilationUnitTree>();
+        var sourceFileSnapshots = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+
+        for (var parseTask : parseTasks) {
+            collectParseTypeMetadata(parseTask.root(), allQualifiedNames, typeClassTrees,
+                    typeSources, typeSourceUris, typeKinds, typeModifiers,
+                    nestedTypesByOwner, typeRoots, sourceFileSnapshots);
+        }
+
+        // Predicate used to resolve simple type names via imports/same-package lookup
+        Predicate<String> workspaceContains = allQualifiedNames::contains;
+
+        // === Phase 2: Extract direct members from parse trees ===
+        var typeDirectMembers =
+                new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
+        var typeSupertypes = new Object2ObjectOpenHashMap<String, String>();
+        var typeInterfacesList = new Object2ObjectOpenHashMap<String, java.util.List<String>>();
+
+        for (var qualifiedName : allQualifiedNames) {
+            var classTree = typeClassTrees.get(qualifiedName);
+            var root = typeRoots.get(qualifiedName);
+            var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
+            typeDirectMembers.put(qualifiedName, seen);
+
+            typeSupertypes.put(qualifiedName,
+                    resolveParseSupertypeFromTree(classTree.getExtendsClause(), root, workspaceContains, qualifiedName));
+            typeInterfacesList.put(qualifiedName,
+                    resolveParseInterfacesFromTree(classTree, root, workspaceContains, qualifiedName));
+
+            var enclosingIsInterface = classTree.getKind() == Tree.Kind.INTERFACE
+                    || classTree.getKind() == Tree.Kind.ANNOTATION_TYPE;
+            for (var member : classTree.getMembers()) {
+                if (member instanceof MethodTree method) {
+                    addParseTreeMethod(qualifiedName, method, seen);
+                } else if (member instanceof VariableTree variable) {
+                    addParseTreeField(qualifiedName, variable, seen, enclosingIsInterface);
+                }
+            }
+
+            // Synthesize record component accessors without attribution
+            if (classTree.getKind() == Tree.Kind.RECORD) {
+                addRecordComponentAccessorsFromParseTree(qualifiedName, classTree, seen);
+            }
+        }
+
+        // === Phase 3: Walk workspace inheritance chain — add inherited members ===
+        for (var qualifiedName : allQualifiedNames) {
+            var seen = typeDirectMembers.get(qualifiedName);
+            var visited = new ObjectOpenHashSet<String>();
+            visited.add(qualifiedName);
+            addInheritedWorkspaceMembers(qualifiedName, seen, typeDirectMembers,
+                    typeSupertypes, typeInterfacesList, visited);
+        }
+
+        // === Phase 4: Synthetics + build IndexedType entries ===
+        var typeEntries = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
+
+        for (var qualifiedName : allQualifiedNames) {
+            var seen = typeDirectMembers.get(qualifiedName);
+            var classTree = typeClassTrees.get(qualifiedName);
+            var sourcePath = typeSources.get(qualifiedName);
+
+            addSyntheticLombokAccessors(qualifiedName, classTree, seen);
+            addSyntheticSlf4jLoggerField(qualifiedName, classTree, seen);
+            addSyntheticLombokBuilderType(qualifiedName, classTree, sourcePath,
+                    sourcePath != null, seen, typeEntries, typeSources, null);
+
+            var members = new ArrayList<>(seen.values());
+            IndexedMember.sort(members);
+
+            var nestedTypes =
+                    nestedTypesByOwner.containsKey(qualifiedName)
+                            ? List.copyOf(nestedTypesByOwner.get(qualifiedName))
+                            : List.<String>of();
+
+            typeEntries.put(qualifiedName, new IndexedType(
+                    qualifiedName,
+                    TypeNames.simpleName(qualifiedName),
+                    members,
+                    sourcePath != null,
+                    sourcePath,
+                    typeSourceUris.get(qualifiedName),
+                    typeSupertypes.get(qualifiedName),
+                    typeInterfacesList.getOrDefault(qualifiedName, List.of()),
+                    nestedTypes,
+                    typeKinds.getOrDefault(qualifiedName, CompletionItemKind.Class),
+                    typeModifiers.getOrDefault(qualifiedName, Set.of()),
+                    null,
+                    IndexedMember.Provenance.WORKSPACE));
+        }
+
+        normalizeLombokBuilderTypes(typeEntries, typeClassTrees, typeSources);
+
+        return new WorkspaceTypeIndex(
+                Collections.unmodifiableMap(typeEntries),
+                Collections.unmodifiableMap(sourceFileSnapshots));
+    }
+
+    /** First-pass scanner: collects all qualified type names and per-file metadata from a single root. */
+    private static void collectParseTypeMetadata(
+            CompilationUnitTree root,
+            Set<String> allQualifiedNames,
+            Map<String, ClassTree> typeClassTrees,
+            Map<String, Path> typeSources,
+            Map<String, java.net.URI> typeSourceUris,
+            Map<String, Integer> typeKinds,
+            Map<String, Set<Modifier>> typeModifiers,
+            Map<String, Set<String>> nestedTypesByOwner,
+            Map<String, CompilationUnitTree> typeRoots,
+            Map<Path, SourceFileSnapshot> sourceFileSnapshots) {
+        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+        Path sourcePath = null;
+        java.net.URI sourceUri = null;
+        var sourceUriObj = root.getSourceFile().toUri();
+        if (sourceUriObj != null && "file".equals(sourceUriObj.getScheme())) {
+            sourcePath = Paths.get(sourceUriObj);
+            sourceUri = sourceUriObj;
+        }
+        final var finalSourcePath = sourcePath;
+        final var finalSourceUri = sourceUri;
+
+        var explicitImports = new ArrayList<String>();
+        var staticImports = new ArrayList<String>();
+        for (var importTree : root.getImports()) {
+            var imported = importTree.getQualifiedIdentifier().toString();
+            if (importTree.isStatic()) staticImports.add(imported);
+            else explicitImports.add(imported);
+        }
+
+        var declaredTypesInFile = new ArrayList<String>();
+        var qualifiedNameStack = new ArrayDeque<String>();
+
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void visitClass(ClassTree tree, Void p) {
+                var simpleName = tree.getSimpleName() == null ? null : tree.getSimpleName().toString();
+                if (simpleName == null || simpleName.isBlank()) {
+                    return super.visitClass(tree, p); // anonymous class — skip
+                }
+                var qualified = qualifiedNameStack.isEmpty()
+                        ? (packageName.isBlank() ? simpleName : packageName + "." + simpleName)
+                        : qualifiedNameStack.peek() + "." + simpleName;
+                if (!isValidIndexKey(qualified)) {
+                    return super.visitClass(tree, p);
+                }
+
+                // Record nesting relationship before pushing
+                if (!qualifiedNameStack.isEmpty()) {
+                    var parentName = qualifiedNameStack.peek();
+                    nestedTypesByOwner
+                            .computeIfAbsent(parentName, __ -> new ObjectLinkedOpenHashSet<>())
+                            .add(qualified);
+                }
+
+                qualifiedNameStack.push(qualified);
+                allQualifiedNames.add(qualified);
+                typeClassTrees.put(qualified, tree);
+                typeRoots.put(qualified, root);
+                typeKinds.put(qualified, parseTreeKindToCompletionItemKind(tree.getKind()));
+                typeModifiers.put(qualified, Set.copyOf(tree.getModifiers().getFlags()));
+                declaredTypesInFile.add(qualified);
+                if (finalSourcePath != null) {
+                    typeSources.put(qualified, finalSourcePath);
+                    typeSourceUris.put(qualified, finalSourceUri);
+                }
+
+                var result = super.visitClass(tree, p);
+                qualifiedNameStack.pop();
+                return result;
+            }
+        }.scan(root, null);
+
+        if (finalSourcePath != null) {
+            sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
+                    finalSourcePath, finalSourceUri, packageName,
+                    explicitImports, staticImports, declaredTypesInFile));
+        }
+    }
+
+    private static int parseTreeKindToCompletionItemKind(Tree.Kind kind) {
+        return switch (kind) {
+            case INTERFACE, ANNOTATION_TYPE -> CompletionItemKind.Interface;
+            case ENUM -> CompletionItemKind.Enum;
+            default -> CompletionItemKind.Class; // CLASS, RECORD
+        };
+    }
+
+    private static String resolveParseSupertypeFromTree(
+            Tree extendsClause, CompilationUnitTree root, Predicate<String> containsType,
+            String ownerQualifiedName) {
+        if (extendsClause == null) return null;
+        var baseName = TypeNames.normalize(extendsClause.toString());
+        if (baseName == null || baseName.isBlank()) return null;
+        if (baseName.contains(".")) return baseName; // already qualified
+        // Try sibling/ancestor inner-class scopes before import-based resolution.
+        // e.g. "Sub extends Super" inside CompleteMembers — Super resolves to
+        // org.javacs.example.CompleteMembers.Super, not a top-level import.
+        var enclosingCandidate = resolveInEnclosingScopes(baseName, ownerQualifiedName, containsType);
+        if (enclosingCandidate != null) return enclosingCandidate;
+        return TypeNames.resolveSimpleName(baseName, root, containsType).orElse(null);
+    }
+
+    private static java.util.List<String> resolveParseInterfacesFromTree(
+            ClassTree classTree, CompilationUnitTree root, Predicate<String> containsType,
+            String ownerQualifiedName) {
+        var result = new ArrayList<String>();
+        for (var iface : classTree.getImplementsClause()) {
+            var baseName = TypeNames.normalize(iface.toString());
+            if (baseName == null || baseName.isBlank()) continue;
+            if (baseName.contains(".")) {
+                result.add(baseName);
+            } else {
+                var enclosing = resolveInEnclosingScopes(baseName, ownerQualifiedName, containsType);
+                if (enclosing != null) result.add(enclosing);
+                else TypeNames.resolveSimpleName(baseName, root, containsType).ifPresent(result::add);
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * Walk enclosing class scopes of {@code ownerQualifiedName} (innermost first) looking for a
+     * sibling nested class named {@code simpleName}.
+     *
+     * <p>For example, given owner {@code com.example.Outer.Sub} and simple name {@code Super}:
+     * <ol>
+     *   <li>try {@code com.example.Outer.Super} — found → return it
+     *   <li>try {@code com.example.Super} — not a known class → skip
+     * </ol>
+     *
+     * @return the qualified name if found in {@code containsType}, otherwise {@code null}
+     */
+    private static String resolveInEnclosingScopes(
+            String simpleName, String ownerQualifiedName, Predicate<String> containsType) {
+        var dot = ownerQualifiedName.lastIndexOf('.');
+        while (dot > 0) {
+            var prefix = ownerQualifiedName.substring(0, dot);
+            if (containsType.test(prefix)) {
+                // prefix is a known workspace class — try a nested type with this name
+                var candidate = prefix + "." + simpleName;
+                if (containsType.test(candidate)) return candidate;
+            }
+            dot = prefix.lastIndexOf('.');
+        }
+        return null;
+    }
+
+    /**
+     * Add a method member from the parse tree.
+     *
+     * <p>Constructors ({@code <init>}) are skipped. Parameter types use
+     * {@link TypeNames#normalize} to strip generics for the erased-parameter-types slot (best
+     * effort at parse time). The raw declared type string is stored in
+     * {@code declaredParameterTypes}.
+     */
+    private static void addParseTreeMethod(
+            String ownerQualifiedName, MethodTree method, Map<String, IndexedMember> seen) {
+        var name = method.getName() == null ? null : method.getName().toString();
+        if (name == null || name.isBlank() || "<init>".equals(name)) return;
+
+        var flags = method.getModifiers().getFlags();
+        var isStatic = flags.contains(Modifier.STATIC);
+        var isPrivate = flags.contains(Modifier.PRIVATE);
+        var isProtected = flags.contains(Modifier.PROTECTED);
+        var isPublic = flags.contains(Modifier.PUBLIC);
+        var isAbstract = flags.contains(Modifier.ABSTRACT);
+
+        var returnTypeStr = method.getReturnType() == null ? "void" : method.getReturnType().toString();
+
+        var params = method.getParameters();
+        var paramNames = new String[params.size()];
+        var erasedParamTypes = new String[params.size()];
+        var declaredParamTypes = new String[params.size()];
+        for (int i = 0; i < params.size(); i++) {
+            var param = params.get(i);
+            paramNames[i] = param.getName() == null ? "arg" + i : param.getName().toString();
+            var rawType = param.getType() == null ? "Object" : param.getType().toString();
+            declaredParamTypes[i] = rawType;
+            erasedParamTypes[i] = TypeNames.normalize(rawType); // strip generics, keep array
+        }
+
+        var canonicalKey = IndexedMember.canonicalKey(
+                ownerQualifiedName, CompletionItemKind.Method, name, erasedParamTypes);
+        var detail = returnTypeStr + " " + name + "(" + String.join(", ", declaredParamTypes) + ")";
+
+        var next = new IndexedMember(
+                ownerQualifiedName, name, CompletionItemKind.Method,
+                isStatic, isPrivate, isProtected, isPublic, isAbstract,
+                0, detail, returnTypeStr, returnTypeStr,
+                paramNames, erasedParamTypes, declaredParamTypes,
+                canonicalKey, canonicalKey, null, false,
+                IndexedMember.Origin.DECLARED, Set.copyOf(flags), null, null);
+
+        seen.putIfAbsent(memberStorageKey(next), next);
+    }
+
+    /**
+     * Add a field member from the parse tree.
+     *
+     * <p>The type string is the raw parse-tree text (may include generics or be a simple name).
+     * {@link org.javacs.resolve.ParseTypeResolver} resolves these at query time.
+     */
+    private static void addParseTreeField(
+            String ownerQualifiedName, VariableTree variable, Map<String, IndexedMember> seen,
+            boolean enclosingIsInterface) {
+        var name = variable.getName() == null ? null : variable.getName().toString();
+        if (name == null || name.isBlank()) return;
+
+        var flags = variable.getModifiers().getFlags();
+        // Detect enum constants via internal javac flag (ENUM is not a javax.lang.model.element.Modifier).
+        var isEnumConstant = variable instanceof JCVariableDecl jcVar
+                && (jcVar.mods.flags & Flags.ENUM) != 0;
+        var isStatic = flags.contains(Modifier.STATIC)
+                // Interface fields are implicitly public static final — no explicit STATIC in source.
+                || (enclosingIsInterface && !flags.contains(Modifier.PRIVATE));
+        var isPrivate = flags.contains(Modifier.PRIVATE);
+        var isProtected = flags.contains(Modifier.PROTECTED);
+        var isPublic = flags.contains(Modifier.PUBLIC)
+                // Interface fields are implicitly public.
+                || (enclosingIsInterface && !isPrivate && !isProtected);
+
+        // For enum constants, use the owner type as the return type so that isEnumCaseConstant
+        // can match them even in the parse-only index (where the type string is the simple name).
+        var rawTypeStr = variable.getType() == null ? "Object" : variable.getType().toString();
+        var typeStr = isEnumConstant ? ownerQualifiedName : rawTypeStr;
+        var kind = isEnumConstant ? CompletionItemKind.EnumMember : CompletionItemKind.Field;
+        var canonicalKey = IndexedMember.canonicalKey(
+                ownerQualifiedName, kind, name, null);
+
+        var next = new IndexedMember(
+                ownerQualifiedName, name, kind,
+                isStatic, isPrivate, isProtected, isPublic, false,
+                0, typeStr + " " + name, typeStr, typeStr,
+                null, null, null,
+                canonicalKey, canonicalKey, null, false,
+                IndexedMember.Origin.DECLARED, Set.copyOf(flags), null, null);
+
+        seen.putIfAbsent(memberStorageKey(next), next);
+    }
+
+    /**
+     * Synthesize record component accessor methods from the parse tree without attribution.
+     *
+     * <p>Record components in the parse tree appear as {@link VariableTree} members with no
+     * explicit access modifier ({@code public}/{@code private}/{@code protected}), no
+     * {@code static} modifier, and no initializer expression. This reliably distinguishes them
+     * from explicit instance fields (which always carry at least one visibility or other modifier
+     * in real-world code).
+     */
+    private static void addRecordComponentAccessorsFromParseTree(
+            String ownerQualifiedName, ClassTree classTree, Map<String, IndexedMember> seen) {
+        // Record component accessor methods are synthesized by javac during desugaring and are NOT
+        // present in classTree.getMembers() at parse time. However, the backing fields for each
+        // component ARE present, marked with the internal Flags.RECORD bit (PRIVATE | FINAL | RECORD).
+        // Synthesize the public accessor methods from those backing field entries.
+        for (var member : classTree.getMembers()) {
+            if (!(member instanceof VariableTree vt)) continue;
+            if (!(vt instanceof JCVariableDecl jcVar)) continue;
+            if ((jcVar.mods.flags & Flags.RECORD) == 0) continue;
+
+            var name = jcVar.getName() == null ? null : jcVar.getName().toString();
+            if (name == null || name.isBlank()) continue;
+
+            var typeStr = jcVar.vartype == null ? "Object" : jcVar.vartype.toString();
+            var accessorKey = IndexedMember.canonicalKey(
+                    ownerQualifiedName, CompletionItemKind.Method, name, new String[0]);
+            var logicalKey = IndexedMember.canonicalKey(
+                    ownerQualifiedName, CompletionItemKind.Field, name, null);
+
+            if (!seen.containsKey(accessorKey)) {
+                seen.put(accessorKey, new IndexedMember(
+                        ownerQualifiedName, name, CompletionItemKind.Method,
+                        false, false, false, true, false,
+                        0, typeStr + " " + name + "()", typeStr, typeStr,
+                        new String[0], new String[0], new String[0],
+                        accessorKey, logicalKey, name, true,
+                        IndexedMember.Origin.RECORD_COMPONENT, Set.of(Modifier.PUBLIC), null, null)
+                        .withNavigation(ownerQualifiedName, logicalKey));
+            }
+        }
+    }
+
+    /**
+     * Walk the workspace superclass and interface chains to add inherited members.
+     *
+     * <p>Only workspace-declared types are walked here. External inherited members are resolved
+     * lazily at completion-query time via {@link ExternalBinaryTypeIndex}.
+     *
+     * <p>Declared members (priority 0) in the child always win over inherited members (priority 1).
+     * The {@code visited} set prevents infinite loops on cyclic class hierarchies.
+     */
+    private static void addInheritedWorkspaceMembers(
+            String qualifiedName,
+            Map<String, IndexedMember> seen,
+            Map<String, Map<String, IndexedMember>> typeDirectMembers,
+            Map<String, String> typeSupertypes,
+            Map<String, java.util.List<String>> typeInterfaces,
+            Set<String> visited) {
+        var superclass = typeSupertypes.get(qualifiedName);
+        if (superclass != null && !superclass.isBlank() && visited.add(superclass)) {
+            var parentMembers = typeDirectMembers.get(superclass);
+            if (parentMembers != null) {
+                copyInheritedParseMembers(parentMembers, seen);
+                // Recurse: grandparent members reach the child transitively
+                addInheritedWorkspaceMembers(superclass, seen, typeDirectMembers,
+                        typeSupertypes, typeInterfaces, visited);
+            }
+        }
+        var ifaces = typeInterfaces.get(qualifiedName);
+        if (ifaces != null) {
+            for (var iface : ifaces) {
+                if (!iface.isBlank() && visited.add(iface)) {
+                    var ifaceMembers = typeDirectMembers.get(iface);
+                    if (ifaceMembers != null) {
+                        copyInheritedParseMembers(ifaceMembers, seen);
+                        addInheritedWorkspaceMembers(iface, seen, typeDirectMembers,
+                                typeSupertypes, typeInterfaces, visited);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Copy non-private parent members into the child's seen map at inherited priority. */
+    private static void copyInheritedParseMembers(
+            Map<String, IndexedMember> parentMembers, Map<String, IndexedMember> childSeen) {
+        for (var entry : parentMembers.entrySet()) {
+            var parentMember = entry.getValue();
+            if (parentMember.isPrivate) continue;
+            childSeen.putIfAbsent(entry.getKey(), withInheritedPriority(parentMember));
+        }
+    }
+
+    private static IndexedMember withInheritedPriority(IndexedMember member) {
+        return new IndexedMember(
+                member.ownerType, member.name, member.kind,
+                member.isStatic, member.isPrivate, member.isProtected, member.isPublic, member.isAbstract,
+                1,
+                member.detail, member.returnType, member.declaredReturnType,
+                member.parameterNames, member.erasedParameterTypes, member.declaredParameterTypes,
+                member.canonicalKey, member.logicalKey, member.backingFieldName, member.synthetic,
+                member.origin, member.provenance, member.modifiers, member.sourceUri,
+                member.declarationRange, member.declarationOwnerType, member.targetDeclarationKey);
     }
 
     private static WorkspaceTypeIndex from(CompileTask task, boolean includeReferencedTypes) {

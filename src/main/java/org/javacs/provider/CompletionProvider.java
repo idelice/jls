@@ -448,6 +448,27 @@ public class CompletionProvider {
             method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
             list.add(method);
         }
+        // Nested types (e.g. IndexedMember.Origin) are stored in IndexedType.nestedTypes, not as
+        // IndexedMember entries. Add them in static-access context (e.g. ClassName.).
+        if (target.staticContext() && !memberAccess.methodReference()) {
+            completionIndex.typeInfo(target.qualifiedType()).ifPresent(typeInfo -> {
+                for (var nested : typeInfo.nestedTypes) {
+                    var simpleName = TypeNames.simpleName(nested);
+                    if (simpleName == null || simpleName.isBlank()) continue;
+                    if (!matchesCompletionPrefix(simpleName, memberAccess.partial)) continue;
+                    var nestedKind = completionIndex.typeInfo(nested)
+                            .map(t -> t.kind)
+                            .orElse(CompletionItemKind.Class);
+                    var item = new CompletionItem();
+                    item.label = simpleName;
+                    item.kind = nestedKind;
+                    item.detail = target.qualifiedType();
+                    // Priority consistent with indexMemberPriority() for class/enum/interface kinds.
+                    item.sortText = sortKey(45, simpleName);
+                    list.add(item);
+                }
+            });
+        }
         if (memberAccess.methodReference() && target.staticContext()) {
             list.add(keyword("new"));
         } else if (target.staticContext()) {
@@ -902,6 +923,7 @@ public class CompletionProvider {
         }
         var classTree = (ClassTree) classPath.getLeaf();
         var staticContext = !hasAccessibleEnclosingInstance(path);
+        var enclosingOwnerType = qualifiedEnclosingClassName(parseTask.root(), classPath);
         for (var member : classTree.getMembers()) {
             switch (member.getKind()) {
                 case VARIABLE:
@@ -922,7 +944,7 @@ public class CompletionProvider {
                 case INTERFACE:
                 case ENUM:
                 case ANNOTATION_TYPE:
-                    addSyntacticNestedType(member, partial, list);
+                    addSyntacticNestedType(member, partial, enclosingOwnerType, list);
                     break;
                 default:
                     break;
@@ -1082,10 +1104,10 @@ public class CompletionProvider {
         if (containsCompletionLabel(list, name)) {
             return;
         }
-        list.items.add(syntacticMethod(name));
+        list.items.add(syntacticMethod(name, method));
     }
 
-    private void addSyntacticNestedType(Tree member, String partial, CompletionList list) {
+    private void addSyntacticNestedType(Tree member, String partial, String ownerType, CompletionList list) {
         var nested = (ClassTree) member;
         var name = nested.getSimpleName().toString();
         if (name.isEmpty() || !matchesCompletionPrefix(name, partial)) {
@@ -1094,7 +1116,7 @@ public class CompletionProvider {
         if (containsCompletionLabel(list, name)) {
             return;
         }
-        list.items.add(syntacticType(name, nested.getKind()));
+        list.items.add(syntacticType(name, nested.getKind(), ownerType));
     }
 
     private boolean isTypeLikeIdentifier(String name) {
@@ -1197,9 +1219,10 @@ public class CompletionProvider {
     }
 
     private boolean isSyntacticMethodPlaceholder(CompletionItem item) {
+        // Syntactic placeholders have no completion data (data is set on indexed items) and no
+        // insertText (indexed method items set insertText to "name()" or "name($0)").
         return item != null
                 && item.kind == CompletionItemKind.Method
-                && Objects.equals(item.detail, "method")
                 && item.data == null;
     }
 
@@ -1766,22 +1789,22 @@ public class CompletionProvider {
         return i;
     }
 
-    private CompletionItem syntacticMethod(String name) {
+    private CompletionItem syntacticMethod(String name, MethodTree method) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Method;
-        i.detail = "method";
+        i.detail = method.getReturnType() != null ? method.getReturnType().toString() : "void";
         i.sortText = sortKey(Priority.METHOD, i.label);
         return i;
     }
 
-    private CompletionItem syntacticType(String name, Tree.Kind kind) {
+    private CompletionItem syntacticType(String name, Tree.Kind kind, String ownerType) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = kind == Tree.Kind.INTERFACE || kind == Tree.Kind.ANNOTATION_TYPE
                 ? CompletionItemKind.Interface
                 : kind == Tree.Kind.ENUM ? CompletionItemKind.Enum : CompletionItemKind.Class;
-        i.detail = "member type";
+        i.detail = ownerType != null ? ownerType : "member type";
         i.sortText = sortKey(Priority.IMPORTED_CLASS, i.label);
         return i;
     }

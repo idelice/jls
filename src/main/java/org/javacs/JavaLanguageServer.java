@@ -1683,20 +1683,43 @@ class JavaLanguageServer extends LanguageServer {
                     };
                     bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
                     var compiler = indexCompiler;
-                    task = compiler.compileFast(files.toArray(Path[]::new));
-                    if (revision != completionIndexRevision.get()) {
-                        LOG.fine(String.format(
-                                "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
-                                trigger,
-                                revision,
-                                completionIndexRevision.get()));
-                        endWorkDoneProgress(bootstrapProgressToken, null);
-                        return;
+                    WorkspaceTypeIndex nextIndex;
+                    Instant indexStarted;
+                    if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
+                        // Parse-only path: ~15x faster than compilation for large workspaces.
+                        // Type names in the index are raw parse-tree strings; ParseTypeResolver
+                        // resolves them at query time. Inherited external members are resolved
+                        // lazily by ExternalBinaryTypeIndex.
+                        reportWorkDoneProgress(bootstrapProgressToken,
+                                "Parsing " + files.size() + " files");
+                        var parseTasks = compiler.parseAll(files);
+                        if (revision != completionIndexRevision.get()) {
+                            LOG.fine(String.format(
+                                    "[perf] completion_index_refresh_skip trigger=%s phase=post_parse expected=%d current=%d",
+                                    trigger, revision, completionIndexRevision.get()));
+                            endWorkDoneProgress(bootstrapProgressToken, null);
+                            return;
+                        }
+                        indexStarted = Instant.now();
+                        nextIndex = WorkspaceTypeIndex.fromParseTrees(parseTasks);
+                    } else {
+                        // WORKSPACE_DECLARATION_MERGE: single-file compile with AP for accurate
+                        // erased parameter types and Lombok-generated members.
+                        // ACTIVE_DOCUMENT_BOOTSTRAP: compile open files with AP so Lombok
+                        // classes show their generated accessors immediately.
+                        task = compiler.compileFastWithProcessors(files.toArray(Path[]::new));
+                        if (revision != completionIndexRevision.get()) {
+                            LOG.fine(String.format(
+                                    "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
+                                    trigger, revision, completionIndexRevision.get()));
+                            endWorkDoneProgress(bootstrapProgressToken, null);
+                            return;
+                        }
+                        indexStarted = Instant.now();
+                        reportWorkDoneProgress(bootstrapProgressToken,
+                                "Compiled " + files.size() + " files");
+                        nextIndex = buildIndex(task, mode, compiler);
                     }
-                    var indexStarted = Instant.now();
-                    reportWorkDoneProgress(bootstrapProgressToken,
-                            "Compiled " + files.size() + " files");
-                    var nextIndex = buildIndex(task, mode, compiler);
                     if (revision != completionIndexRevision.get()) {
                         LOG.fine(String.format(
                                 "[perf] completion_index_refresh_skip trigger=%s phase=post_index expected=%d current=%d",

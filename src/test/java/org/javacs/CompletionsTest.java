@@ -326,6 +326,26 @@ public class CompletionsTest extends CompletionsBase {
     }
 
     @Test
+    public void recordComponentAccessorCompletion() {
+        refreshServer();
+        var file = "/org/javacs/example/CompleteRecordMembers.java";
+        var suggestions = filterText(file, 5, 16);
+        // RecordSymbols(String id, int count) — id() and count() are record accessors
+        assertThat(suggestions, hasItems("id", "count"));
+        // format() is an explicit method declared in the record body
+        assertThat(suggestions, hasItem("format"));
+    }
+
+    @Test
+    public void nestedTypeCompletion() {
+        refreshServer();
+        var file = "/org/javacs/example/CompleteNestedTypes.java";
+        var suggestions = filterText(file, 6, 28);
+        assertThat("suggests inner class from outside declaring class", suggestions, hasItem("InnerClass"));
+        assertThat("suggests inner enum from outside declaring class", suggestions, hasItem("InnerEnum"));
+    }
+
+    @Test
     public void lombokSlf4jLoggerMemberCompletion() {
         refreshServer();
         var file = "/org/javacs/example/LombokSlf4jCompletion.java";
@@ -1014,5 +1034,34 @@ public class CompletionsTest extends CompletionsBase {
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(9, 8));
         var result = server.completion(position);
         assertFalse("completion should not be empty outside comments", result.isEmpty());
+    }
+
+    @Test
+    public void enumInstanceMethods() {
+        // myEnum() returns a workspace-defined enum (MyEnum). Completing on the instance
+        // should surface methods inherited from java.lang.Enum (name, ordinal, etc.) and
+        // from java.lang.Object (getClass, hashCode, etc.) via externalInheritedMembers.
+        var file = "/org/javacs/example/AutocompleteCase.java";
+        var suggestions = filterText(file, 15, 18);
+        assertThat("enum instance has name() from java.lang.Enum", suggestions, hasItem("name"));
+        assertThat("enum instance has ordinal() from java.lang.Enum", suggestions, hasItem("ordinal"));
+        assertThat("enum instance has getClass() from java.lang.Object", suggestions, hasItem("getClass"));
+    }
+
+    @Test
+    public void sourcePathMethodDetail() {
+        // Completing this. in AutocompleteMember uses the workspace type index (parse-only
+        // addParseTreeMethod). After resolve(), the detail should contain the full signature
+        // including the return type, method name, and throws clause.
+        var file = "/org/javacs/example/AutocompleteMember.java";
+        var matchItem = items(file, 5, 14).stream()
+                .filter(i -> "testMethods".equals(i.label))
+                .findFirst();
+        assertThat("testMethods appears in this. completion", matchItem.isPresent(), is(true));
+        var resolved = resolve(matchItem.get());
+        assertThat(
+                "resolved detail contains return type and throws",
+                resolved.detail,
+                is("String testMethods() throws Exception"));
     }
 }
