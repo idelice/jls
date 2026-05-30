@@ -368,7 +368,9 @@ class JavaCompilerService implements CompilerProvider {
         // Multi-file explicit compilations (e.g. RenameClass with allPaths) must not
         // use the workspace slot, which may still be held open by the workspace cache.
         // Compile fresh with a null slot; the caller gets the close responsibility.
-        if (!widenedToWorkspace && effectiveSources.size() > 1) {
+        // Lombok-expanded single-file requests (sources.size()==1 but effectiveSources > 1)
+        // still use the file cache keyed by the primary file.
+        if (!widenedToWorkspace && sources.size() > 1) {
             CacheAudit.miss("javac.multi_file");
             var loaded =
                     compileWithExpansionIfNeeded(
