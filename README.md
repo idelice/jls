@@ -2,135 +2,104 @@
 
 A Java [Language Server Protocol](https://github.com/Microsoft/vscode-languageserver-protocol) implementation built on the [Java compiler API](https://docs.oracle.com/javase/10/docs/api/jdk.compiler-summary.html), optimized for Neovim.
 
-This is a fork and continuation of [georgewfraser/java-language-server](https://github.com/georgewfraser/java-language-server). I'm deeply grateful for the original author's amazing work and am continuing development with a focus solely on Neovim LSP integration.
+Fork of [georgewfraser/java-language-server](https://github.com/georgewfraser/java-language-server).
 
-## Features
+## Requirements
 
-- **Autocomplete** - Symbols, members, imports with auto-completion
-- **Go-to-definition** - Navigate to class definitions in workspace and JARs (including private repositories)
-- **Hover information** - Type information and Javadoc documentation with proper formatting
-- **Find references** - Find all usages of symbols
-- **Document highlight** - Highlight all occurrences of the symbol under the cursor within the current file
-- **Diagnostics** - Real-time linting and error reporting
-- **Signature help** - Parameter information for method calls
-- **Inlay hints** - Parameter name hints at call sites (workspace files only; Lombok-generated calls are suppressed)
-- **Code actions** - Refactoring, quick fixes, and code generation (see [Code Actions](#code-actions))
-- **Rename** - Rename classes, methods, and variables across the workspace
-- **Lombok support** - Synthetic members from Lombok annotations (@Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.)
-- **Private repository support** - Seamless integration with Maven repositories requiring authentication
-- **JAR navigation** - Go-to-definition works on dependency JARs with source files
+- **Neovim 0.10+**
+- **Java 25** (runtime — bundled JRE is included in releases)
 
-## Code Actions
+## Setup
 
-Code actions are computed lazily — the list of available actions appears instantly, and edits are only computed when you apply one.
+### Option 1: nvim-jls plugin (Recommended)
 
-### Refactoring (on selection)
+[nvim-jls](https://github.com/idelice/nvim-jls) handles installation, configuration, and diagnostics automatically.
 
-| Action | Trigger |
-|--------|---------|
-| Surround with try-catch | Select code inside a method |
-| Extract to local variable | Select an expression inside a method |
+### Option 2: Mason + lspconfig
 
-### Code generation (cursor inside a class)
+```lua
+require('mason').setup()
+require('mason-lspconfig').setup()
+require('lspconfig').jls.setup({})
+```
 
-| Action | Notes |
-|--------|-------|
-| Generate constructor | |
-| Generate equals | |
-| Generate hashCode | |
-| Generate toString | |
-| Generate getters (pick fields) | Opens a field picker |
-| Generate setters (pick fields) | Opens a field picker; excludes `final` fields |
-| Override inherited method | One entry per overridable method |
+### Option 3: Manual
 
-### Lombok (cursor inside a class, Lombok on classpath)
-
-`Add @Data`, `Add @Getter`, `Add @Setter`, `Add @Builder`, `Add @Value`, `Add @SuperBuilder`, `Add @AllArgsConstructor`, `Add @NoArgsConstructor`, `Add @RequiredArgsConstructor`, `Add @ToString`, `Add @EqualsAndHashCode`, `Add @With`, `Add @Slf4j`
-
-### Quick fixes (triggered by diagnostics)
-
-| Diagnostic | Fix |
-|------------|-----|
-| Unresolved type | Import `'com.example.Foo'` |
-| Unreported exception | Add `throws` |
-| Does not override abstract | Implement abstract methods |
-| Missing constructor for fields | Generate constructor |
-| Missing method call | Create missing method |
-| Unused local variable | Convert to statement |
-| Unused field | Convert to block |
-| Unused class | Remove class |
-| Unused method | Remove method |
-| Unused `throws` clause | Remove exception |
-| Unchecked call warning | Suppress 'unchecked' warning |
-
-## Installation
-
-### Prerequisites
-
-- Java 25
-- Maven
-- protobuf
-- **Neovim 0.10+** (required for pull diagnostics — see [Client Requirements](#client-requirements))
-
-### Build
+Build from source:
 
 ```bash
 ./scripts/build.sh
 ```
 
-The language server will be built to `dist/lang_server_{linux|mac|windows}.sh`
-
-## Client Requirements
-
-This server uses the **pull diagnostics** model ([LSP 3.17](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_diagnostic)): it does not push errors to the client after save. Instead, the client requests diagnostics on demand via `textDocument/diagnostic`.
-
-- **Neovim 0.10+**: Pull diagnostics are supported natively. No extra configuration is needed — `nvim-lspconfig` will enable them automatically.
-- **Neovim 0.9 and older**: Not supported. Diagnostics will not appear.
-- **Vim (not Neovim)**: Not supported. Vim has no built-in LSP client, and common Vim LSP plugins (`coc.nvim`, `vim-lsp`, `ale`) do not implement pull diagnostics.
-
-## Setup with Neovim
-
-### Option 1: Using [nvim-jls](https://github.com/idelice/nvim-jls) (Recommended)
-
-Install the Neovim client plugin and follow its documentation.
-
-### Option 2: Manual setup with lspconfig
-
-Add to your `init.lua`:
+Then configure lspconfig:
 
 ```lua
-local lspconfig = require('lspconfig')
-
-lspconfig.jls.setup({
-    cmd = { '<path-to-jls>/dist/lang_server_linux.sh' }, -- or mac/windows
-    root_dir = lspconfig.util.root_pattern('pom.xml', 'build.gradle', '.git'),
+require('lspconfig').jls.setup({
+    cmd = { '<path-to-jls>/dist/lang_server_mac.sh' }, -- or linux/windows
 })
 ```
 
-## Configuration
+## Features
 
-The language server will automatically detect dependencies from:
-- Maven (`pom.xml`)
-- Gradle (`build.gradle`)
-- Bazel (`BUILD` files)
+- **Autocomplete** — symbols, members, imports
+- **Go-to-definition** — workspace files, dependency JARs (with source), decompiled classes
+- **Find references** — all usages across workspace
+- **Hover** — type information and Javadoc
+- **Document highlight** — occurrences of symbol under cursor
+- **Diagnostics** — pull-based (real-time linting without keystroke lag)
+- **Signature help** — parameter info for method calls
+- **Inlay hints** — parameter name hints at call sites
+- **Code actions** — refactoring, quick fixes, code generation
+- **Rename** — classes, methods, variables across workspace
+- **Lombok** — @Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.
+- **Private repositories** — Maven authentication inherited from `~/.m2/settings.xml`
+- **JAR navigation** — go-to-definition into dependency source JARs
 
-### Manual dependency specification
+### Code actions
 
-If automatic detection doesn't work, you can specify dependencies in your project root in a `.java-language-server.json` file:
+Code actions are computed lazily — the list appears instantly, edits are computed on apply.
+
+**Refactoring (on selection):**
+- Surround with try-catch
+- Extract to local variable
+
+**Code generation (cursor inside a class):**
+- Generate constructor, equals, hashCode, toString
+- Generate getters/setters (field picker)
+- Override inherited method
+
+**Lombok (cursor inside a class, Lombok on classpath):**
+- Add @Data, @Getter, @Setter, @Builder, @Value, @SuperBuilder, @AllArgsConstructor, @NoArgsConstructor, @RequiredArgsConstructor, @ToString, @EqualsAndHashCode, @With, @Slf4j
+
+**Quick fixes:**
+- Import unresolved type
+- Add `throws`
+- Implement abstract methods
+- Generate constructor for fields
+- Create missing method
+- Remove unused variable/field/class/method/throws
+- Suppress 'unchecked' warning
+
+## Project Configuration
+
+The server auto-detects dependencies from Maven (`pom.xml`), Gradle (`build.gradle`), or Bazel (`BUILD`).
+
+### `.java-language-server.json`
+
+Place in your project root for project-specific settings that travel with the repo:
 
 ```json
 {
+    "addExports": [
+        "jdk.compiler/com.sun.tools.javac.api",
+        "jdk.compiler/com.sun.tools.javac.tree"
+    ],
+    "extraCompilerArgs": [
+        "--release 21"
+    ],
     "externalDependencies": [
-        "junit:junit:jar:4.12:test",
         "junit:junit:4.12"
-    ]
-}
-```
-
-Or specify them directly:
-
-```json
-{
+    ],
     "classPath": [
         "lib/some-dependency.jar"
     ],
@@ -140,131 +109,115 @@ Or specify them directly:
 }
 ```
 
-### Enabling private repository support
+| Field | Purpose |
+|-------|---------|
+| `addExports` | `--add-exports` flags passed to javac (e.g. for internal JDK APIs) |
+| `extraCompilerArgs` | Additional javac arguments |
+| `externalDependencies` | Maven coordinates to resolve |
+| `classPath` | Explicit JAR paths |
+| `docPath` | Source JAR paths for hover/navigation |
 
-Ensure your Maven credentials are configured in `~/.m2/settings.xml`:
+### Private repositories
 
-```xml
-<servers>
-    <server>
-        <id>my-private-repo</id>
-        <username>your-username</username>
-        <password>your-password</password>
-    </server>
-</servers>
-```
-
-Then download source JARs:
+Ensure Maven credentials are in `~/.m2/settings.xml`, then:
 
 ```bash
 mvn dependency:sources
 ```
 
-The language server will inherit the environment and use your Maven credentials for private repositories.
+The server inherits your environment and uses Maven credentials automatically.
 
 ## Memory Management
 
-By default the server launches with:
+Default JVM flags:
 ```
 -Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication
 ```
 
-Override via `JLS_JVM_OPTS` environment variable:
+Override via `JLS_JVM_OPTS`:
 ```bash
 export JLS_JVM_OPTS="-Xmx1g -Xms256m"
 ```
 
-The nvim-jls client also exposes a `jvm_args` config field that sets this env var automatically (see [nvim-jls](https://github.com/idelice/nvim-jls) docs).
+The nvim-jls client exposes a `jvm_args` config field that sets this automatically.
 
-## Usage
+## Debugging
 
-The language server provides autocomplete and other features using:
-- `.java` files in your workspace
-- Java platform classes
-- External dependencies from Maven, Gradle, Bazel, or manual configuration
+### Prerequisites
 
-## Design
+Install a debug adapter client:
 
-The Java language server uses the [Java compiler API](https://docs.oracle.com/javase/10/docs/api/jdk.compiler-summary.html) to implement language features like linting, autocomplete, and smart navigation, and the [language server protocol](https://github.com/Microsoft/vscode-languageserver-protocol) to communicate with text editors like Neovim.
-
-### Compile vs index architecture
-
-Features are split across two resolution strategies:
-
-- **Compile-based** (javac semantic attribution): go-to-definition, hover, diagnostics, code actions. Uses `compileFast` / `compileFastWithProcessors` for full type accuracy.
-- **Index-based** (parse + workspace index): autocomplete, find-references, signature help. Uses `compiler.parse()` with `ParseTypeResolver` + `TypeIndexRouter` for ~50x faster response times.
-
-This avoids full compilation on high-frequency triggers like `(` and reference scans.
-
-### Incremental updates
-
-The Java compiler API provides incremental compilation at the level of files: you can create a long-lived instance of the Java compiler, and as the user edits, you only need to recompile files that have changed. The Java language server optimizes this further by *focusing* compilation on the region of interest by erasing irrelevant code.
-
-## Contributing
-
-### Installing
-
-Before installing locally, you need to install prerequisites: maven, protobuf.
-
-You also need to have Java 25 installed if you are building without `./scripts/build.sh`.
-
-Assuming you have these prerequisites, you should be able to install locally using:
-
-```bash
-./scripts/build.sh
-```
-
-## Logs
-
-The Java service process logs to stderr and prints the active runtime JDK details at startup.
-
-## Debugging in editor
-
-### Configuration
-
-For using nvim as a client for debug adapter we have to install three plugins
-
-```
+Using `vim.pack.add`:
+```lua
 vim.pack.add({
     { src = "https://github.com/mfussenegger/nvim-dap" },
     { src = "https://github.com/nvim-neotest/nvim-nio" },
     { src = "https://github.com/rcarriga/nvim-dap-ui" },
 })
 ```
-`nvim-dap` is a client for debug adapter, `nvim-dap-ui` nicely reflects debug info, `nvim-io` is required dependency for the later.
 
-Configure them in `init.lua` as
+Using lazy.nvim:
+```lua
+{
+    "mfussenegger/nvim-dap",
+    dependencies = {
+        "nvim-neotest/nvim-nio",
+        "rcarriga/nvim-dap-ui",
+    },
+}
 ```
+
+### Configuration
+
+```lua
 require('dapui').setup()
 local dap = require('dap')
 dap.adapters.java = {
-  type = 'executable';
-  command = 'absolute path to jls/dist/debug_adapter_linux.sh';
+    type = 'executable',
+    command = 'absolute path to jls/dist/debug_adapter_mac.sh', -- or linux/windows
 }
 dap.configurations.java = {
-  {
-    type = 'java';
-    request = 'attach';
-    name = "Debug (Attach) - Remote";
-    hostName = "127.0.0.1";
-    port = 5005;
-    sourceRoots = {os.getenv("SOURCE_ROOT")};
-  },
+    {
+        type = 'java',
+        request = 'attach',
+        name = "Debug (Attach) - Remote",
+        hostName = "127.0.0.1",
+        port = 5005,
+        sourceRoots = { os.getenv("SOURCE_ROOT") },
+    },
 }
 ```
-Change the name `debug_adapter_linux.sh` according to to your OS
 
 ### Usage
 
-- Compile sources with debug option for viewing variables
-- Run app needed debug with agentlib option, for example as
+1. Compile with debug info: `javac -g ...`
+2. Run with debug agent:
+   ```
+   java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -jar your_app.jar
+   ```
+3. Set `SOURCE_ROOT` to your `src/main/java` path
+4. In Neovim: `:DapNew` → select the attach configuration
+5. Set breakpoints and use `:lua require('dapui').open()`
 
-``
-java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005  -jar your_jar_name_here.jar
-``
+## Architecture
 
-- Define OS variableiable `SOURCE_ROOT` as absolute path to Java sources under debug. Typically it is the path to `src/main/java`
-- In another termial java file and execute vim command `:Dap<Tab>`
-- In menu appeared choose `DapNew`
-- After that you can set break points and continue with debug command through Dap menu
-- or open `dapui` with vim command `:lua require('dapui').open()`
+Features are split across two resolution strategies:
+
+- **Compile-based** (javac attribution): go-to-definition, hover, diagnostics, code actions
+- **Index-based** (parse + workspace index): autocomplete, find-references, signature help
+
+This avoids full compilation on high-frequency triggers like `(` and reference scans.
+
+## Building from source
+
+Prerequisites: Java 25, Maven, protobuf.
+
+```bash
+./scripts/build.sh
+```
+
+Output: `dist/lang_server_{linux|mac|windows}.sh`
+
+## Logs
+
+The server logs to stderr. Startup prints the active JDK version.
