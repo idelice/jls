@@ -153,6 +153,19 @@ public class FileStore {
         return isJavaFile(file) && javaSources.containsKey(file);
     }
 
+    /**
+     * Returns a hash of the current content of the file — from the active in-memory document if
+     * open, otherwise from disk mtime as a proxy. Used for content-based cache staleness checks.
+     */
+    static int contentHash(Path file) {
+        var active = activeDocuments.get(file);
+        if (active != null) return active.contentHash;
+        // For closed files, use disk mtime as a proxy (avoids reading the whole file)
+        if (!javaSources.containsKey(file)) readInfoFromDisk(file);
+        var info = javaSources.get(file);
+        return info != null ? Long.hashCode(info.modified.toEpochMilli()) : 0;
+    }
+
     static Instant modified(Path file) {
         // If file is open, use last in-memory modification time
         if (activeDocuments.containsKey(file)) {
@@ -244,8 +257,13 @@ public class FileStore {
         if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var document = params.textDocument;
         var file = Paths.get(document.uri);
-        activeDocuments.put(file, new VersionedContent(document.text, document.version));
-        bumpContentRevision();
+        var existing = activeDocuments.get(file);
+        var newContent = new VersionedContent(document.text, document.version);
+        activeDocuments.put(file, newContent);
+        // Only invalidate caches if the content actually changed (not just opened)
+        if (existing == null || existing.contentHash != newContent.contentHash) {
+            bumpContentRevision();
+        }
     }
 
     static void change(DidChangeTextDocumentParams params) {
@@ -269,8 +287,16 @@ public class FileStore {
     static void close(DidCloseTextDocumentParams params) {
         if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
-        activeDocuments.remove(file);
-        bumpContentRevision();
+        var removed = activeDocuments.remove(file);
+        // If the in-memory content differed from disk, caches are stale.
+        if (removed != null) {
+            readInfoFromDisk(file);
+            var diskHash = javaSources.containsKey(file)
+                    ? Long.hashCode(javaSources.get(file).modified.toEpochMilli()) : 0;
+            if (diskHash != removed.contentHash) {
+                bumpContentRevision();
+            }
+        }
     }
 
     static void save(Path file) {
@@ -508,10 +534,12 @@ class VersionedContent {
     final String content;
     final int version;
     final Instant modified = Instant.now();
+    final int contentHash;
 
     VersionedContent(String content, int version) {
         Objects.requireNonNull(content, "content is null");
         this.content = content;
         this.version = version;
+        this.contentHash = content.hashCode();
     }
 }

@@ -3,7 +3,6 @@ package org.javacs;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalCause;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -39,10 +38,11 @@ class Cache<K, V> {
 
     private static class Value<V> {
         final V value;
-        final Instant created = Instant.now();
+        final int contentHash;
 
-        Value(V value) {
+        Value(V value, int contentHash) {
             this.value = value;
+            this.contentHash = contentHash;
         }
     }
 
@@ -98,23 +98,14 @@ class Cache<K, V> {
     }
 
     boolean needs(Path file, K k) {
-        // If key is not in map, it needs to be loaded
         var key = new Key<K>(file, k);
         var value = cache.getIfPresent(key);
         if (value == null) {
             CacheAudit.miss(name);
             return true;
         }
-
-        // If key was loaded before file was last modified, it needs to be reloaded
-        var modified = FileStore.modified(file);
-        if (modified == null) {
-            invalidateFile(file);
-            CacheAudit.miss(name);
-            return true;
-        }
-        var stale = value.created.isBefore(modified);
-        if (stale) {
+        var currentHash = FileStore.contentHash(file);
+        if (value.contentHash != currentHash) {
             invalidateFile(file);
             CacheAudit.miss(name);
             return true;
@@ -125,7 +116,7 @@ class Cache<K, V> {
 
     void load(Path file, K k, V v) {
         var key = new Key<K>(file, k);
-        var value = new Value<>(v);
+        var value = new Value<>(v, FileStore.contentHash(file));
         cache.put(key, value);
         indexKey(key);
         CacheAudit.load(name);

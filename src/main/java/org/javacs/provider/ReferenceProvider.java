@@ -377,8 +377,13 @@ public class ReferenceProvider {
 
     private List<Location> findFieldReferencesScoped(
             SymbolIdentity target, String logicalKey) {
-        var files = FileStore.all().toArray(Path[]::new);
         var names = relatedLogicalNames(target, logicalKey);
+        // Pre-filter: only parse files that contain at least one of the related names.
+        var candidateSet = new java.util.LinkedHashSet<Path>();
+        for (var name : names) {
+            Collections.addAll(candidateSet, compiler.findMemberReferences(target.qualifiedType(), name));
+        }
+        var files = candidateSet.toArray(Path[]::new);
         return scan(
                 files,
                 names,

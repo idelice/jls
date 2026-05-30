@@ -41,8 +41,18 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         if (name.contentEquals("<init>")) {
             name = surroundingClass.getSimpleName();
         }
-        if (contains(t, name, find)) {
-            return getCurrentPath();
+        // Only match the cursor on the method name token itself, not on same-named
+        // identifiers inside the body (e.g. a recursive call or a local variable).
+        var pos = Trees.instance(task).getSourcePositions();
+        var start = (int) pos.getStartPosition(root, t);
+        var end = t.getBody() != null
+                ? (int) pos.getStartPosition(root, t.getBody())
+                : (int) pos.getEndPosition(root, t);
+        if (start >= 0 && end > start) {
+            var nameStart = FindHelper.findNameIn(root, name, start, end, find);
+            if (nameStart >= 0 && nameStart <= find && find <= nameStart + name.length()) {
+                return getCurrentPath();
+            }
         }
         return super.visitMethod(t, find);
     }
@@ -91,8 +101,18 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
 
     @Override
     public TreePath visitVariable(VariableTree t, Long find) {
-        if (contains(t, t.getName(), find)) {
-            return getCurrentPath();
+        // Only match the cursor on the variable name itself, not on same-named identifiers
+        // in the initializer (e.g. `var canonicalKey = IndexedMember.canonicalKey(...)`).
+        var pos = Trees.instance(task).getSourcePositions();
+        var start = (int) pos.getStartPosition(root, t);
+        var end = t.getInitializer() != null
+                ? (int) pos.getStartPosition(root, t.getInitializer())
+                : (int) pos.getEndPosition(root, t);
+        if (start >= 0 && end > start) {
+            var nameStart = FindHelper.findNameIn(root, t.getName(), start, end, find);
+            if (nameStart >= 0 && nameStart <= find && find <= nameStart + t.getName().length()) {
+                return getCurrentPath();
+            }
         }
         return super.visitVariable(t, find);
     }

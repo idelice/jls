@@ -719,12 +719,15 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private List<String> extraCompilerArgs() {
-        if (!settings.has("extraCompilerArgs")) return List.of();
-        var array = settings.getAsJsonArray("extraCompilerArgs");
         var args = new ArrayList<String>();
-        for (var each : array) {
-            // split "a b  c" to ["a","b","c"]
-            args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
+        var file = projectSettings();
+        if (file.has("extraCompilerArgs")) {
+            for (var each : file.getAsJsonArray("extraCompilerArgs"))
+                args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
+        }
+        if (settings.has("extraCompilerArgs")) {
+            for (var each : settings.getAsJsonArray("extraCompilerArgs"))
+                args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
         }
         return List.copyOf(args);
     }
@@ -784,13 +787,31 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private Set<String> addExports() {
-        if (!settings.has("addExports")) return Set.of();
-        var array = settings.getAsJsonArray("addExports");
-        var strings = new HashSet<String>();
-        for (var each : array) {
-            strings.add(each.getAsString());
+        var merged = new HashSet<String>();
+        // Project file first, then client settings override/extend
+        var file = projectSettings();
+        if (file.has("addExports")) {
+            for (var each : file.getAsJsonArray("addExports")) merged.add(each.getAsString());
         }
-        return strings;
+        if (settings.has("addExports")) {
+            for (var each : settings.getAsJsonArray("addExports")) merged.add(each.getAsString());
+        }
+        return merged;
+    }
+
+    /** Read .java-language-server.json from the workspace root, or empty object if absent/invalid. */
+    private JsonObject projectSettings() {
+        if (workspaceRoot == null) return new JsonObject();
+        var file = workspaceRoot.resolve(".java-language-server.json");
+        if (!Files.exists(file)) return new JsonObject();
+        try {
+            var text = Files.readString(file);
+            var parsed = JsonParser.parseString(text);
+            return parsed.isJsonObject() ? parsed.getAsJsonObject() : new JsonObject();
+        } catch (Exception e) {
+            LOG.warning("Failed to read .java-language-server.json: " + e.getMessage());
+            return new JsonObject();
+        }
     }
 
     private static boolean supportsWorkDoneProgress(JsonElement capabilities) {

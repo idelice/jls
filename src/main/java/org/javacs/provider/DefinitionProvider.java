@@ -203,6 +203,26 @@ public class DefinitionProvider {
                         break;
                     }
                 }
+                // trees.getPath may return null for synthetic record components in ATTR compiles;
+                // fall back to scanning the in-batch compilation unit directly.
+                if (declarationPath == null) {
+                    var componentName = element.getSimpleName().toString();
+                    var ownerName = type.getQualifiedName().toString();
+                    for (var batchRoot : compile.roots) {
+                        var classTree = FindHelper.findType(
+                                new ParseTask(compile.task, batchRoot), ownerName);
+                        if (classTree == null) continue;
+                        var classPath = new TreePath(new TreePath(batchRoot), classTree);
+                        for (var member : classTree.getMembers()) {
+                            if (member instanceof VariableTree vt
+                                    && vt.getName().contentEquals(componentName)) {
+                                declarationPath = new TreePath(classPath, member);
+                                break;
+                            }
+                        }
+                        if (declarationPath != null) break;
+                    }
+                }
             }
             if (declarationPath != null) {
                 // In-batch declaration found; resolve directly.

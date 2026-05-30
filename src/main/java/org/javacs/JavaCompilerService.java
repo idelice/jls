@@ -109,7 +109,7 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch workspaceCache;
     private long workspaceCacheRevision = -1;
-    private final Cache<Boolean, CompileBatch> fileCache = new Cache<>("compile_file", 16);
+    private final Cache<Void, CompileBatch> fileCache = new Cache<>("compile_file", 16);
     private final Map<String, Optional<JavaFileObject>> jdkSourceCache = new ConcurrentHashMap<>();
     final Map<Path, ParsedUnit> parsedUnits =
             Collections.synchronizedMap(
@@ -350,8 +350,20 @@ class JavaCompilerService implements CompilerProvider {
                     String.format(
                             "[perf] compile_exit role=%s profile=%s duration=%dms",
                             compilerRole, profile.analysisMode().name(), durationMs));
+            // Store FULL compile in file cache so interactive requests (gd, hover, hints)
+            // get a cache hit instead of a redundant ATTR compile.
+            if (cacheEnabled && profile == DIAGNOSTICS_PROFILE && effectiveSources.size() == 1) {
+                var singleFile = firstSourcePath(effectiveSources);
+                if (singleFile != null) {
+                    var existing = getCachedFileBatch(singleFile, null);
+                    if (existing != null && !existing.closed) existing.close();
+                    fileCache.load(singleFile, null, loaded);
+                }
+            }
+            Runnable closeAction = (cacheEnabled && profile == DIAGNOSTICS_PROFILE && effectiveSources.size() == 1)
+                    ? () -> {} : loaded::close;
             return new CompileTask(
-                    loaded.task, loaded.roots, diags, loaded.sourceStamps, loaded::close);
+                    loaded.task, loaded.roots, diags, loaded.sourceStamps, closeAction);
         }
         // Multi-file explicit compilations (e.g. RenameClass with allPaths) must not
         // use the workspace slot, which may still be held open by the workspace cache.
@@ -463,9 +475,8 @@ class JavaCompilerService implements CompilerProvider {
                     loaded.task, loaded.roots, diags, loaded.sourceStamps, loaded::close);
         }
 
-        var fileCacheKey = Boolean.valueOf(useAnnotationProcessing);
-        var cached = getCachedFileBatch(file, fileCacheKey);
-        var reason = fileCacheMissReason(file, fileCacheKey, cached);
+        var cached = getCachedFileBatch(file, null);
+        var reason = fileCacheMissReason(file, null, cached);
         if (reason == null) {
             LOG.fine(
                     String.format(
@@ -486,9 +497,7 @@ class JavaCompilerService implements CompilerProvider {
                 String.format(
                         "[cache] decision=miss type=%s file=%s withAP=%s reason=%s",
                         cacheType, fileName, useAnnotationProcessing, reason));
-        if ("no_entry".equals(reason) || "closed".equals(reason) || "version_mismatch".equals(reason)) {
-            CacheAudit.miss(cacheName);
-        }
+        CacheAudit.miss(cacheName);
         if (cached != null && !cached.closed) {
             cached.close();
         }
@@ -498,7 +507,7 @@ class JavaCompilerService implements CompilerProvider {
                         profile,
                         useAnnotationProcessing,
                         slotFor(profile));
-        fileCache.load(file, fileCacheKey, loaded);
+        fileCache.load(file, null, loaded);
         var compilerPath =
                 useAnnotationProcessing && !loaded.annotationProcessingEnabled
                         ? "ap_fallback_no_cache"
@@ -526,7 +535,7 @@ class JavaCompilerService implements CompilerProvider {
         return null;
     }
 
-    private CompileBatch getCachedFileBatch(Path file, Boolean key) {
+    private CompileBatch getCachedFileBatch(Path file, Void key) {
         try {
             return fileCache.get(file, key);
         } catch (IllegalArgumentException ignored) {
@@ -534,12 +543,11 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
-    private String fileCacheMissReason(Path file, Boolean key, CompileBatch cached) {
+    private String fileCacheMissReason(Path file, Void key, CompileBatch cached) {
         if (cached == null) return "no_entry";
         if (cached.closed) return "closed";
         var stamp = cached.sourceStamps.get(file);
-        var currentVersion = FileStore.version(file);
-        if (stamp != null && currentVersion != stamp.version()) return "version_mismatch";
+        if (stamp != null && FileStore.contentHash(file) != stamp.contentHash()) return "content_changed";
         if (fileCache.needs(file, key)) return "revision_mismatch";
         return null;
     }

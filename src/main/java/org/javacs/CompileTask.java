@@ -10,7 +10,7 @@ import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 
 public class CompileTask implements AutoCloseable {
-    public record SourceStamp(long modifiedMillis, int version) {
+    public record SourceStamp(long modifiedMillis, int contentHash) {
     }
 
     public final JavacTask task;
