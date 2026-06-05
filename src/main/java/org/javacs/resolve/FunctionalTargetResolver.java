@@ -3,6 +3,7 @@ package org.javacs.resolve;
 import com.sun.source.tree.AssignmentTree;
 import com.sun.source.tree.ArrayAccessTree;
 import com.sun.source.tree.BlockTree;
+import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
@@ -321,11 +322,36 @@ final class FunctionalTargetResolver {
         if (invocation.getArguments().isEmpty()) {
             return Optional.empty();
         }
-        var first = support.resolveExpression(invocation.getArguments().getFirst(), depth + 1);
+        var arg = invocation.getArguments().getFirst();
+        var first = support.resolveExpression(arg, depth + 1);
         if (first.isEmpty() || !first.get().arrayType()) {
+            // Fallback: values() inside an enum returns an array of the enclosing enum type
+            var enumType = resolveEnumValuesCall(arg);
+            if (enumType.isPresent()) {
+                return Optional.of(streamType(enumType.get()));
+            }
             return Optional.empty();
         }
         return Optional.of(streamTypeForArrayComponent(first.get().qualifiedType()));
+    }
+
+    /**
+     * Detect {@code values()} call inside an enum and return the enum's qualified name.
+     * {@code values()} is a synthetic method not present in indexes.
+     */
+    private Optional<String> resolveEnumValuesCall(Tree arg) {
+        if (!(arg instanceof MethodInvocationTree call)) return Optional.empty();
+        if (!(call.getMethodSelect() instanceof IdentifierTree id)) return Optional.empty();
+        if (!"values".contentEquals(id.getName()) || !call.getArguments().isEmpty()) return Optional.empty();
+        // Find the first enum in this compilation unit
+        var pkg = root.getPackageName();
+        var prefix = pkg != null ? pkg.toString() + "." : "";
+        for (var decl : root.getTypeDecls()) {
+            if (decl instanceof ClassTree classTree && classTree.getKind() == Tree.Kind.ENUM) {
+                return Optional.of(prefix + classTree.getSimpleName().toString());
+            }
+        }
+        return Optional.empty();
     }
 
     private Optional<TypeResolution> resolveStreamOf(MethodInvocationTree invocation, int depth) {
