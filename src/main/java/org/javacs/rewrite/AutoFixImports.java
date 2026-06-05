@@ -34,10 +34,9 @@ public class AutoFixImports implements Rewrite {
             all.addAll(used);
             all.addAll(resolved.values());
             all.sort(String::compareTo); // TODO this is not always a good order
-            var edits = new ArrayList<TextEdit>();
-            edits.addAll(deleteImports(task));
-            edits.add(insertImports(task, all));
-            return Map.of(file, edits.toArray(new TextEdit[edits.size()]));
+            var edit = replaceImports(task, all);
+            if (edit == null) return Map.of(file, new TextEdit[0]);
+            return Map.of(file, new TextEdit[] {edit});
         }
     }
 
@@ -89,27 +88,33 @@ public class AutoFixImports implements Rewrite {
         return resolved;
     }
 
-    private List<TextEdit> deleteImports(CompileTask task) {
-        var edits = new ArrayList<TextEdit>();
+    private TextEdit replaceImports(CompileTask task, List<String> qualifiedNames) {
         var pos = Trees.instance(task.task).getSourcePositions();
         var root = task.root(file);
+        // Find the range covering all existing non-static imports
+        Position start = null;
+        Position end = null;
         for (var i : root.getImports()) {
             if (i.isStatic()) continue;
-            var start = pos.getStartPosition(root, i);
-            var line = (int) root.getLineMap().getLineNumber(start);
-            var delete = new TextEdit(new Range(new Position(line - 1, 0), new Position(line, 0)), "");
-            edits.add(delete);
+            var s = pos.getStartPosition(root, i);
+            var line = (int) root.getLineMap().getLineNumber(s);
+            if (start == null) {
+                start = new Position(line - 1, 0);
+            }
+            end = new Position(line, 0);
         }
-        return edits;
-    }
-
-    private TextEdit insertImports(CompileTask task, List<String> qualifiedNames) {
-        var pos = insertPosition(task);
+        // Build replacement text
         var text = new StringBuilder();
         for (var i : qualifiedNames) {
             text.append("import ").append(i).append(";\n");
         }
-        return new TextEdit(new Range(pos, pos), text.toString());
+        if (start == null) {
+            // No existing imports — insert after package declaration
+            var insertPos = insertPosition(task);
+            if (text.isEmpty()) return null;
+            return new TextEdit(new Range(insertPos, insertPos), text.toString());
+        }
+        return new TextEdit(new Range(start, end), text.toString());
     }
 
     private Position insertPosition(CompileTask task) {
