@@ -57,22 +57,45 @@ public class JavaCompilerServiceTest {
 
     @Before
     public void setWorkspaceRoot() {
+        FileStore.reset();
         FileStore.setWorkspaceRoots(Set.of(simpleProjectSrc()));
     }
 
     @Test
     public void compileCacheUsesSourceVersionWhenModifiedMillisIsUnchanged() {
-        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var file = simpleProjectSrc().resolve("HelloWorld.java").toAbsolutePath().normalize();
         var initial = FileStore.contents(file);
         var updated = initial.replace("Hello world!", "Hello world 2!");
-        var fixedTime = Instant.EPOCH;
 
-        try (var first = compiler.compileFast(List.of(new SourceFileObject(file, initial, fixedTime, 1)))) {
+        // Open the file in FileStore so the compiler sees in-memory content
+        var openParams = new org.javacs.lsp.DidOpenTextDocumentParams();
+        openParams.textDocument.uri = file.toUri();
+        openParams.textDocument.version = 1;
+        openParams.textDocument.languageId = "java";
+        openParams.textDocument.text = initial;
+        FileStore.open(openParams);
+
+        try (var first = compiler.compileFast(file)) {
             assertThat(first.root().toString(), containsString("Hello world!"));
         }
-        try (var second = compiler.compileFast(List.of(new SourceFileObject(file, updated, fixedTime, 2)))) {
+
+        // Update the open document content
+        var changeParams = new org.javacs.lsp.DidChangeTextDocumentParams();
+        changeParams.textDocument.uri = file.toUri();
+        changeParams.textDocument.version = 2;
+        var change = new org.javacs.lsp.TextDocumentContentChangeEvent();
+        change.text = updated;
+        changeParams.contentChanges = List.of(change);
+        FileStore.change(changeParams);
+
+        try (var second = compiler.compileFast(file)) {
             assertThat(second.root().toString(), containsString("Hello world 2!"));
         }
+
+        // Close the document to restore original state
+        var closeParams = new org.javacs.lsp.DidCloseTextDocumentParams();
+        closeParams.textDocument.uri = file.toUri();
+        FileStore.close(closeParams);
     }
 
     @Test
@@ -315,10 +338,9 @@ public class JavaCompilerServiceTest {
 
     @Test
     public void cacheRefreshClosesPreviousCachedBorrow() throws Exception {
-        var file = FindResource.path("org/javacs/example/HelloWorld.java");
+        var file = simpleProjectSrc().resolve("HelloWorld.java").toAbsolutePath().normalize();
         var initial = FileStore.contents(file);
         var updated = initial.replace("Hello world!", "Hello world 2!");
-        var fixedTime = Instant.EPOCH;
         var service =
                 new JavaCompilerService(
                         Collections.emptySet(),
@@ -326,17 +348,32 @@ public class JavaCompilerServiceTest {
                         Collections.emptySet(),
                         Collections.emptySet());
 
+        // Open file in FileStore
+        var openParams = new org.javacs.lsp.DidOpenTextDocumentParams();
+        openParams.textDocument.uri = file.toUri();
+        openParams.textDocument.version = 1;
+        openParams.textDocument.languageId = "java";
+        openParams.textDocument.text = initial;
+        FileStore.open(openParams);
+
         CompileBatch firstBatch;
-        try (var first =
-                service.compileFast(List.of(new SourceFileObject(file, initial, fixedTime, 1)))) {
+        try (var first = service.compileFast(file)) {
             firstBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
             assertThat(firstBatch.borrow.closed, is(false));
         }
         assertThat("first cached borrow should stay open when the task closes", firstBatch.borrow.closed, is(false));
 
+        // Change content to trigger cache invalidation
+        var changeParams = new org.javacs.lsp.DidChangeTextDocumentParams();
+        changeParams.textDocument.uri = file.toUri();
+        changeParams.textDocument.version = 2;
+        var change = new org.javacs.lsp.TextDocumentContentChangeEvent();
+        change.text = updated;
+        changeParams.contentChanges = List.of(change);
+        FileStore.change(changeParams);
+
         CompileBatch secondBatch;
-        try (var second =
-                service.compileFast(List.of(new SourceFileObject(file, updated, fixedTime, 2)))) {
+        try (var second = service.compileFast(file)) {
             secondBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
             assertThat("cache refresh should replace the cached batch", secondBatch, not(sameInstance(firstBatch)));
             assertThat("previous cached borrow should remain closed after refresh", firstBatch.borrow.closed, is(true));
@@ -344,13 +381,15 @@ public class JavaCompilerServiceTest {
         }
 
         assertThat("refreshed cached borrow should stay open when its task closes", secondBatch.borrow.closed, is(false));
+
+        var closeParams = new org.javacs.lsp.DidCloseTextDocumentParams();
+        closeParams.textDocument.uri = file.toUri();
+        FileStore.close(closeParams);
     }
 
     @Test
     public void openCachedFastCompileReportsCacheHitAndSharesBatchLifetime() throws Exception {
-        var file = FindResource.path("org/javacs/example/HelloWorld.java");
-        var source = FileStore.contents(file);
-        var fixedTime = Instant.EPOCH;
+        var file = simpleProjectSrc().resolve("HelloWorld.java").toAbsolutePath().normalize();
         var service =
                 new JavaCompilerService(
                         Collections.emptySet(),
@@ -358,20 +397,18 @@ public class JavaCompilerServiceTest {
                         Collections.emptySet(),
                         Collections.emptySet());
 
-        try (var first =
-                service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
+        try (var first = service.compileFast(file)) {
             var firstBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
             assertThat("initial fast compile should populate the fast cache", firstBatch, notNullValue());
             assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
 
-            try (var second =
-                    service.compileFast(List.of(new SourceFileObject(file, source, fixedTime, 1)))) {
+            try (var second = service.compileFast(file)) {
                 var secondBatch = cachedCompile(service, "cachedFastCompileNoAp", file);
-                assertThat("stale fast cache entry should be replaced", secondBatch, not(sameInstance(firstBatch)));
-                assertThat("refreshing a stale fast cached compile should report a cache refresh", service.lastCompileTelemetry().path(), is("cache_refresh"));
+                assertThat("unchanged content should hit the cache", secondBatch, sameInstance(firstBatch));
+                assertThat("cache hit should report cache_hit", service.lastCompileTelemetry().path(), is("cache_hit"));
             }
 
-            assertThat("closing the second shared fast-compile task should close the replaced batch", firstBatch.closed, is(true));
+            assertThat("cached batch should remain open after cache hit", firstBatch.closed, is(false));
         }
     }
 
@@ -721,8 +758,8 @@ public class JavaCompilerServiceTest {
         }
         Field fileCacheField = JavaCompilerService.class.getDeclaredField("fileCache");
         fileCacheField.setAccessible(true);
-        var fileCache = (Cache<Boolean, CompileBatch>) fileCacheField.get(service);
-        return fileCache.get(file, Boolean.FALSE);
+        var fileCache = (Cache<Void, CompileBatch>) fileCacheField.get(service);
+        return fileCache.get(file, null);
     }
 
     private static boolean quickMaybeUsesLombok(JavaCompilerService service, Path file) throws Exception {
