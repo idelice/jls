@@ -198,6 +198,13 @@ public class WarningsTest {
         assertThat(diag.get().message, is("cannot resolve symbol 'totals'"));
     }
 
+    @Test
+    public void recordComponentsNotFalseUnused() {
+        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedRecord.java")));
+        assertThat(errors, not(hasItem("unused_field(4)"))); // record components are not unused fields
+        assertThat(errors, not(hasItem("unused_param(4)"))); // record components are not unused params
+    }
+
     // TODO warn on type.equals(otherType)
     // TODO warn on map.get(wrongKeyType)
 }
