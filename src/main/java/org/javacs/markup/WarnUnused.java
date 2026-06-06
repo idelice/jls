@@ -140,6 +140,16 @@ class WarnUnused extends TreeScanner<Void, Void> {
         return used.contains(el);
     }
 
+    private boolean isRecordConstructorParam(TreePath path) {
+        if (path.getLeaf().getKind() != Tree.Kind.VARIABLE) return false;
+        var parent = path.getParentPath();
+        if (parent == null || !(parent.getLeaf() instanceof MethodTree method)) return false;
+        if (method.getReturnType() != null) return false; // not a constructor
+        var grandParent = parent.getParentPath();
+        if (grandParent == null) return false;
+        return grandParent.getLeaf().getKind() == Tree.Kind.RECORD;
+    }
+
     private boolean isLocalVariable(TreePath path) {
         var kind = path.getLeaf().getKind();
         if (kind != Tree.Kind.VARIABLE) {
@@ -164,7 +174,9 @@ class WarnUnused extends TreeScanner<Void, Void> {
 
     @Override
     public Void visitVariable(VariableTree t, Void __) {
-        if (isLocalVariable(path)) {
+        if (isRecordConstructorParam(path)) {
+            super.visitVariable(t, null);
+        } else if (isLocalVariable(path)) {
             foundLocalVariable();
             super.visitVariable(t, null);
         } else if (isReachable(path)) {
