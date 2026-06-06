@@ -14,7 +14,7 @@ public class HoverTest {
     public void classIdentifier() {
         assertThat(
                 symbolAt("/org/javacs/example/SymbolUnderCursor.java", 12, 23),
-                containsString("org.javacs.example.SymbolUnderCursor"));
+                containsString("class SymbolUnderCursor"));
     }
 
     @Test
@@ -46,6 +46,12 @@ public class HoverTest {
         var found = symbolAt("/org/javacs/example/SymbolUnderCursor.java", 21, 8);
         assertThat(found, containsString("@interface Override"));
         assertThat(found, not(containsString("extends none")));
+    }
+
+    @Test
+    public void annotationHoverHasPackage() {
+        var found = symbolAt("/org/javacs/example/SymbolUnderCursor.java", 21, 8);
+        assertThat(found, containsString("**java.lang**"));
     }
 
     @Test

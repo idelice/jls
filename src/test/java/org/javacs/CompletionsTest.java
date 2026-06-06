@@ -26,8 +26,6 @@ import org.junit.Test;
 
 public class CompletionsTest extends CompletionsBase {
 
-    // TODO rename Autocomplete Complete because Autocomplete is long and ugly
-
     @Test
     public void completeClass() {
         refreshServer(); // TODO figure out how to get rid of this
@@ -1089,5 +1087,45 @@ public class CompletionsTest extends CompletionsBase {
         // Cursor after 'v' inside @Getter(v) — should suggest 'value' attribute
         var suggestions = filterText(file, 6, 14);
         assertThat("Should suggest value attribute", suggestions, hasItem("value"));
+    }
+
+    @Test
+    public void methodReference() {
+        var file = "/org/javacs/example/CompleteEdgeCases.java";
+        // After CompleteItemModel::g — should suggest methods starting with g
+        var suggestions = filterText(file, 10, 48);
+        assertThat(suggestions, hasItems("getSku", "getQuantity", "getParent"));
+    }
+
+    @Test
+    public void chainedWorkspaceMembers() {
+        var file = "/org/javacs/example/CompleteEdgeCases.java";
+        // After items.get(0).getParent(). — getParent returns CompleteItemModel
+        var suggestions = filterText(file, 14, 34);
+        assertThat(suggestions, hasItems("getSku", "getQuantity", "getParent"));
+    }
+
+    @Test
+    public void lambdaParameterInference() {
+        var file = "/org/javacs/example/CompleteEdgeCases.java";
+        // After item -> item. inside stream().map() — item is CompleteItemModel
+        var suggestions = filterText(file, 18, 41);
+        assertThat(suggestions, hasItems("getSku", "getQuantity", "getParent"));
+    }
+
+    @Test
+    public void varEnhancedFor() {
+        var file = "/org/javacs/example/CompleteEdgeCases.java";
+        // After item. inside for (var item : items) — item is CompleteItemModel
+        var suggestions = filterText(file, 23, 18);
+        assertThat(suggestions, hasItems("getSku", "getQuantity", "getParent"));
+    }
+
+    @Test
+    public void unfinishedLine() {
+        var file = "/org/javacs/example/CompleteEdgeCases.java";
+        // After items.get(0). with another statement on the next line
+        var suggestions = filterText(file, 28, 22);
+        assertThat(suggestions, hasItems("getSku", "getQuantity", "getParent"));
     }
 }

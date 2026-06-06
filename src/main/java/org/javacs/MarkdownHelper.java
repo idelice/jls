@@ -114,14 +114,14 @@ public class MarkdownHelper {
     }
 
     private static String formatBlock(String label, String body) {
-        if (body.isBlank()) return label;
-        return label + " " + body;
+        if (body.isBlank()) return "*" + label + "*";
+        return "*" + label + "* " + body;
     }
 
     private static String formatParam(String name, String desc, boolean typeParam) {
         var prefix = typeParam ? "@typeparam" : "@param";
-        if (desc.isBlank()) return prefix + " " + name;
-        return prefix + " " + name + " - " + desc;
+        if (desc.isBlank()) return "*" + prefix + "* `" + name + "`";
+        return "*" + prefix + "* `" + name + "` — " + desc;
     }
 
     private static String normalizeMarkdown(String text) {
@@ -278,7 +278,7 @@ public class MarkdownHelper {
     }
 
     /** If `commentText` looks like HTML, convert it to markdown */
-    static String asMarkdown(String commentText) {
+    public static String asMarkdown(String commentText) {
         if (isHtml(commentText)) {
             try {
                 commentText = htmlToMarkdown(commentText);
@@ -334,15 +334,15 @@ public class MarkdownHelper {
                     out.append("\n\n```\n");
                     break;
                 case "code":
-                    out.append("`");
+                    if (!inCodeOrPre(openTags)) out.append("`");
                     break;
                 case "b":
                 case "strong":
-                    out.append("**");
+                    if (!inCodeOrPre(openTags)) out.append("**");
                     break;
                 case "i":
                 case "em":
-                    out.append("*");
+                    if (!inCodeOrPre(openTags)) out.append("*");
                     break;
                 default:
                     break;
@@ -352,20 +352,21 @@ public class MarkdownHelper {
         }
         if (tree instanceof EndElementTree) {
             var name = ((EndElementTree) tree).getName().toString().toLowerCase();
+            openTags.removeFirstOccurrence(name);
             switch (name) {
                 case "pre":
                     out.append("\n```\n");
                     break;
                 case "code":
-                    out.append("`");
+                    if (!inCodeOrPre(openTags)) out.append("`");
                     break;
                 case "b":
                 case "strong":
-                    out.append("**");
+                    if (!inCodeOrPre(openTags)) out.append("**");
                     break;
                 case "i":
                 case "em":
-                    out.append("*");
+                    if (!inCodeOrPre(openTags)) out.append("*");
                     break;
                 case "p":
                     out.append("\n\n");
@@ -373,7 +374,6 @@ public class MarkdownHelper {
                 default:
                     break;
             }
-            openTags.removeFirstOccurrence(name);
             return;
         }
         if (tree instanceof EntityTree) {
@@ -401,6 +401,16 @@ public class MarkdownHelper {
     }
 
     private static String decodeEntity(String name) {
+        if (name.startsWith("#")) {
+            try {
+                int codePoint = name.startsWith("#x") || name.startsWith("#X")
+                        ? Integer.parseInt(name.substring(2), 16)
+                        : Integer.parseInt(name.substring(1));
+                return String.valueOf((char) codePoint);
+            } catch (NumberFormatException e) {
+                return "&" + name + ";";
+            }
+        }
         return switch (name) {
             case "lt" -> "<";
             case "gt" -> ">";

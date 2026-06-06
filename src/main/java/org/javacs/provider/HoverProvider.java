@@ -35,13 +35,16 @@ public class HoverProvider {
             var markdown = new StringBuilder();
 
             var typeElement = enclosingType(element);
+            if (typeElement == null && element instanceof TypeElement self) {
+                typeElement = self;
+            }
             if (typeElement != null) {
                 var qualified = typeElement.getQualifiedName().toString();
                 var lastDot = qualified.lastIndexOf('.');
                 if (lastDot >= 0) {
                     markdown.append("**")
                             .append(qualified.substring(0, lastDot))
-                            .append("**\n");
+                            .append("**\n\n");
                 }
             }
 
@@ -109,7 +112,6 @@ public class HoverProvider {
 
     private String renderClassSignature(TypeElement type) {
         var sb = new StringBuilder();
-        sb.append(type.getQualifiedName()).append("\n");
         var modifiers = type.getModifiers().stream()
                 .map(m -> m.toString().toLowerCase())
                 .filter(m -> !m.isEmpty())
@@ -164,10 +166,13 @@ public class HoverProvider {
     private String getDocComment(Element element, CompileTask task) {
         var elements = task.task.getElements();
         var doc = elements.getDocComment(element);
-        if (doc != null && !doc.isEmpty()) return doc.trim();
+        if (doc != null && !doc.isEmpty()) return MarkdownHelper.asMarkdown(doc.trim());
 
         if (element instanceof ExecutableElement method) {
             return methodDocFromSource(method, task);
+        }
+        if (element instanceof TypeElement type) {
+            return typeDocFromSource(type, task);
         }
         return "";
     }
@@ -184,8 +189,26 @@ public class HoverProvider {
             var erasedTypes = FindHelper.erasedParameterTypes(task, method);
             var methodTree = FindHelper.findMethod(
                     parse, className, method.getSimpleName().toString(), erasedTypes);
-            var path = Trees.instance(task.task).getPath(parse.root(), methodTree);
-            var docTree = DocTrees.instance(task.task).getDocCommentTree(path);
+            var path = Trees.instance(parse.task()).getPath(parse.root(), methodTree);
+            var docTree = DocTrees.instance(parse.task()).getDocCommentTree(path);
+            return docTree != null ? MarkdownHelper.asMarkdown(docTree) : "";
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    private String typeDocFromSource(TypeElement type, CompileTask task) {
+        var className = type.getQualifiedName().toString();
+        var sourceFile = compiler.findAnywhere(className);
+        if (sourceFile.isEmpty()) return "";
+
+        try {
+            var parse = compiler.parse(sourceFile.get());
+            var typeTree = FindHelper.findType(parse, className);
+            if (typeTree == null) return "";
+            var path = Trees.instance(parse.task()).getPath(parse.root(), typeTree);
+            if (path == null) return "";
+            var docTree = DocTrees.instance(parse.task()).getDocCommentTree(path);
             return docTree != null ? MarkdownHelper.asMarkdown(docTree) : "";
         } catch (RuntimeException e) {
             return "";

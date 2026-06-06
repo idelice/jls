@@ -339,11 +339,24 @@ public final class ExternalBinaryTypeIndex {
                     var parameterNames = new String[method.getParameterCount()];
                     var erasedParameterTypes = new String[method.getParameterCount()];
                     var parameters = new StringJoiner(", ");
+                    boolean hasSyntheticNames = false;
                     for (int i = 0; i < method.getParameterCount(); i++) {
                         var parameter = method.getParameters()[i];
                         parameterNames[i] = parameter.getName();
+                        if (!parameter.isNamePresent()) hasSyntheticNames = true;
                         erasedParameterTypes[i] = method.getParameterTypes()[i].getTypeName();
                         parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + parameter.getName());
+                    }
+                    if (hasSyntheticNames && method.getParameterCount() > 0) {
+                        var sourceNames = resolveParameterNamesFromSource(
+                                declaring, method.getName(), method.getParameterCount(), erasedParameterTypes);
+                        if (sourceNames != null) {
+                            parameters = new StringJoiner(", ");
+                            for (int i = 0; i < method.getParameterCount(); i++) {
+                                parameterNames[i] = sourceNames[i];
+                                parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + sourceNames[i]);
+                            }
+                        }
                     }
                     var detail =
                             canonicalTypeName(method.getReturnType())
@@ -1018,6 +1031,67 @@ public final class ExternalBinaryTypeIndex {
                 break;
         }
         return baseType + "[]".repeat(dimensions);
+    }
+
+    private String[] resolveParameterNamesFromSource(
+            String className, String methodName, int paramCount, String[] erasedParameterTypes) {
+        if (compiler == null) return null;
+        try {
+            var source = compiler.findAnywhere(className);
+            if (source.isEmpty()) return null;
+            var parse = compiler.parse(source.get());
+            var root = parse.root();
+            for (var decl : root.getTypeDecls()) {
+                var result = findMethodParamNames(decl, methodName, paramCount, erasedParameterTypes);
+                if (result != null) return result;
+            }
+        } catch (Exception e) {
+            // Source parsing is best-effort
+        }
+        return null;
+    }
+
+    private String[] findMethodParamNames(
+            com.sun.source.tree.Tree decl, String methodName, int paramCount, String[] erasedParameterTypes) {
+        if (!(decl instanceof com.sun.source.tree.ClassTree classTree)) return null;
+        for (var member : classTree.getMembers()) {
+            if (member instanceof com.sun.source.tree.MethodTree method) {
+                if (!method.getName().toString().equals(methodName)) continue;
+                var params = method.getParameters();
+                if (params.size() != paramCount) continue;
+                // Verify types match by comparing simple type names
+                boolean match = true;
+                for (int i = 0; i < paramCount; i++) {
+                    var sourceType = params.get(i).getType().toString();
+                    // Strip generics and array/varargs markers
+                    var sourceTypeRaw = sourceType.contains("<")
+                            ? sourceType.substring(0, sourceType.indexOf('<')) : sourceType;
+                    sourceTypeRaw = sourceTypeRaw.replace("...", "").replace("[]", "").trim();
+                    var erasedSimple = TypeNames.simpleName(erasedParameterTypes[i])
+                            .replace("[]", "").trim();
+                    boolean isTypeVariable = sourceTypeRaw.length() <= 2
+                            && Character.isUpperCase(sourceTypeRaw.charAt(0));
+                    if (!isTypeVariable
+                            && !sourceTypeRaw.equals(erasedSimple)
+                            && !sourceTypeRaw.endsWith("." + erasedSimple)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match) continue;
+                var names = new String[paramCount];
+                for (int i = 0; i < paramCount; i++) {
+                    names[i] = params.get(i).getName().toString();
+                }
+                return names;
+            }
+            // Recurse into nested classes
+            if (member instanceof com.sun.source.tree.ClassTree nested) {
+                var result = findMethodParamNames(nested, methodName, paramCount, erasedParameterTypes);
+                if (result != null) return result;
+            }
+        }
+        return null;
     }
 
     private record BinaryClassModel(

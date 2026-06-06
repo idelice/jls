@@ -58,6 +58,16 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     }
 
     @Override
+    public TreePath visitImport(ImportTree t, Long find) {
+        if (t.isStatic() && t.getQualifiedIdentifier() instanceof MemberSelectTree select) {
+            if (contains(t.getQualifiedIdentifier(), select.getIdentifier(), find)) {
+                return new TreePath(getCurrentPath(), t.getQualifiedIdentifier());
+            }
+        }
+        return super.visitImport(t, find);
+    }
+
+    @Override
     public TreePath visitIdentifier(IdentifierTree t, Long find) {
         if (contains(t, t.getName(), find)) {
             return getCurrentPath();

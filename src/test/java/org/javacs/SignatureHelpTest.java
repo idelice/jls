@@ -78,6 +78,14 @@ public class SignatureHelpTest {
         assertThat(help.signatures, notNullValue());
     }
 
+    @Test
+    public void staticImportSignatureHelp() {
+        var help = doHelp("/org/javacs/example/SignatureHelpStaticImport.java", 8, 23);
+        assertThat(help.signatures, not(empty()));
+        var label = help.signatures.get(0).label;
+        assertThat(label, not(containsString("arg0")));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private SignatureHelp doHelp(String file, int row, int column) {

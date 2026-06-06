@@ -109,10 +109,31 @@ public class SignatureProvider {
             ParseTask parse, CompilationUnitTree root, MethodInvocationTree invoke, long cursor) {
         var select = invoke.getMethodSelect();
         if (select instanceof IdentifierTree id) {
-            return resolveUnqualifiedMethod(root, id, parse, cursor);
+            var results = resolveUnqualifiedMethod(root, id, parse, cursor);
+            if (results.isEmpty()) {
+                results = resolveStaticImportMethod(root, id.getName().toString());
+            }
+            return results;
         }
         if (select instanceof MemberSelectTree ms) {
             return resolveQualifiedMethod(parse, ms, cursor);
+        }
+        return List.of();
+    }
+
+    private List<IndexedMember> resolveStaticImportMethod(CompilationUnitTree root, String methodName) {
+        for (var imp : root.getImports()) {
+            if (!imp.isStatic()) continue;
+            var imported = imp.getQualifiedIdentifier().toString();
+            if (imported.endsWith(".*")) {
+                var ownerType = imported.substring(0, imported.length() - 2);
+                var results = index.methodOverloads(ownerType, methodName, true);
+                if (!results.isEmpty()) return results;
+            } else if (imported.endsWith("." + methodName)) {
+                var ownerType = imported.substring(0, imported.lastIndexOf('.'));
+                var results = index.methodOverloads(ownerType, methodName, true);
+                if (!results.isEmpty()) return results;
+            }
         }
         return List.of();
     }
