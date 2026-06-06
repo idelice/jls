@@ -174,6 +174,18 @@ public class WarningsTest {
         assertTrue("expected unused_import diagnostic for 'Map'", importDiag.isPresent());
     }
 
+    @Test
+    public void diagnosticMessageStripsPackageNames() {
+        var diags = new ArrayList<Diagnostic>();
+        var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
+        srv.lint(List.of(FindResource.path("org/javacs/err/MissingOverride.java")));
+        var diag = diags.stream()
+                .filter(d -> d.code != null && d.code.contains("does.not.override.abstract"))
+                .findFirst();
+        assertTrue("expected does.not.override.abstract error", diag.isPresent());
+        assertThat(diag.get().message, not(containsString("java.lang.")));
+    }
+
     // TODO warn on type.equals(otherType)
     // TODO warn on map.get(wrongKeyType)
 }

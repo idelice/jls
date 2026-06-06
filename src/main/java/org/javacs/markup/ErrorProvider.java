@@ -259,7 +259,7 @@ public class ErrorProvider {
         var end = d.getEndPosition();
         var severity = severity(d.getKind());
         var code = d.getCode();
-        var message = d.getMessage(null);
+        var message = simplifyMessage(d.getMessage(null));
         var result = new Diagnostic();
         result.severity = severity;
         result.code = code;
@@ -285,6 +285,12 @@ public class ErrorProvider {
             default:
                 return DiagnosticSeverity.Hint;
         }
+    }
+
+    private static final Pattern QUALIFIED_NAME = Pattern.compile("\\b([a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+)\\.([A-Z][\\w]*)");
+
+    private static String simplifyMessage(String message) {
+        return QUALIFIED_NAME.matcher(message).replaceAll("$3");
     }
 
     private Diagnostic warnNotThrown(String name, TreePath path) {
