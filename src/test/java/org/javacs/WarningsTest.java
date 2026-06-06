@@ -163,6 +163,17 @@ public class WarningsTest {
                 range.start.line != range.end.line || range.start.character != range.end.character);
     }
 
+    @Test
+    public void unusedImport() {
+        var diags = new ArrayList<Diagnostic>();
+        var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
+        srv.lint(List.of(FindResource.path("org/javacs/warn/UnusedImport.java")));
+        var importDiag = diags.stream()
+                .filter(d -> "unused_import".equals(d.code) && d.message.contains("Map"))
+                .findFirst();
+        assertTrue("expected unused_import diagnostic for 'Map'", importDiag.isPresent());
+    }
+
     // TODO warn on type.equals(otherType)
     // TODO warn on map.get(wrongKeyType)
 }

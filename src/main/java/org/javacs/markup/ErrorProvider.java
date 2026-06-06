@@ -2,16 +2,20 @@ package org.javacs.markup;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
+import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
-import javax.tools.Diagnostic;
+import javax.lang.model.element.TypeElement;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.FileStore;
@@ -19,7 +23,7 @@ import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
-    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
+    private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
                     "compiler.err.expected",
@@ -29,7 +33,7 @@ public class ErrorProvider {
                     "compiler.err.illegal.start.of.stmt");
 
     private record DiagnosticFilterResult(
-            List<org.javacs.lsp.Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
+            List<Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
 
     public record ErrorReport(
             List<PublishDiagnosticsParams> diagnostics,
@@ -45,8 +49,8 @@ public class ErrorProvider {
         this.task = task;
     }
 
-    public ErrorReport errors(Set<java.net.URI> requestedUris) {
-        var requested = requestedUris == null ? Set.<java.net.URI>of() : new LinkedHashSet<>(requestedUris);
+    public ErrorReport errors(Set<URI> requestedUris) {
+        var requested = requestedUris == null ? Set.<URI>of() : new LinkedHashSet<>(requestedUris);
         var result = new ArrayList<PublishDiagnosticsParams>();
         long convertNanos = 0;
         long warningNanos = 0;
@@ -93,7 +97,7 @@ public class ErrorProvider {
                 warningNanos / 1_000_000);
     }
 
-    private boolean isJarOrCachedSource(java.net.URI uri) {
+    private boolean isJarOrCachedSource(URI uri) {
         // Check if it's a jar: URI
         if ("jar".equals(uri.getScheme())) {
             return true;
@@ -103,8 +107,8 @@ public class ErrorProvider {
         return path != null && path.contains("jls-jar-sources");
     }
 
-    private List<org.javacs.lsp.Diagnostic> compilerErrors(CompilationUnitTree root) {
-        var result = new ArrayList<org.javacs.lsp.Diagnostic>();
+    private List<Diagnostic> compilerErrors(CompilationUnitTree root) {
+        var result = new ArrayList<Diagnostic>();
 
         // Create a copy to avoid ConcurrentModificationException during cache compilation
         var diagnosticsCopy = new ArrayList<>(task.diagnostics);
@@ -119,14 +123,14 @@ public class ErrorProvider {
     }
 
     private DiagnosticFilterResult filterCompilerDiagnostics(
-            List<org.javacs.lsp.Diagnostic> compilerDiagnostics, CompilationUnitTree root) {
+            List<Diagnostic> compilerDiagnostics, CompilationUnitTree root) {
         var deduped = dedupeDiagnostics(compilerDiagnostics);
         var firstSyntaxLine = firstSyntaxBlockingLine(deduped);
         if (firstSyntaxLine == -1) {
             return new DiagnosticFilterResult(deduped, false, compilerDiagnostics.size() - deduped.size());
         }
 
-        org.javacs.lsp.Diagnostic primarySyntaxDiagnostic = null;
+        Diagnostic primarySyntaxDiagnostic = null;
         for (var diagnostic : deduped) {
             if (diagnostic.severity == null || diagnostic.severity != DiagnosticSeverity.Error) {
                 continue;
@@ -136,22 +140,22 @@ public class ErrorProvider {
                 break;
             }
         }
-        var filtered = new ArrayList<org.javacs.lsp.Diagnostic>();
+        var filtered = new ArrayList<Diagnostic>();
         if (primarySyntaxDiagnostic != null) {
             filtered.add(primarySyntaxDiagnostic);
         }
         return new DiagnosticFilterResult(filtered, true, compilerDiagnostics.size() - filtered.size());
     }
 
-    private List<org.javacs.lsp.Diagnostic> dedupeDiagnostics(List<org.javacs.lsp.Diagnostic> diagnostics) {
-        var unique = new LinkedHashMap<String, org.javacs.lsp.Diagnostic>();
+    private List<Diagnostic> dedupeDiagnostics(List<Diagnostic> diagnostics) {
+        var unique = new LinkedHashMap<String, Diagnostic>();
         for (var diagnostic : diagnostics) {
             unique.putIfAbsent(diagnosticKey(diagnostic), diagnostic);
         }
         return new ArrayList<>(unique.values());
     }
 
-    private int firstSyntaxBlockingLine(List<org.javacs.lsp.Diagnostic> diagnostics) {
+    private int firstSyntaxBlockingLine(List<Diagnostic> diagnostics) {
         var firstLine = Integer.MAX_VALUE;
         for (var diagnostic : diagnostics) {
             if (!isSyntaxBlockingDiagnostic(diagnostic)) {
@@ -162,11 +166,11 @@ public class ErrorProvider {
         return firstLine == Integer.MAX_VALUE ? -1 : firstLine;
     }
 
-    private boolean isSyntaxBlockingDiagnostic(org.javacs.lsp.Diagnostic diagnostic) {
+    private boolean isSyntaxBlockingDiagnostic(Diagnostic diagnostic) {
         return diagnostic.code != null && SYNTAX_BLOCKING_CODES.contains(diagnostic.code);
     }
 
-    private String diagnosticKey(org.javacs.lsp.Diagnostic diagnostic) {
+    private String diagnosticKey(Diagnostic diagnostic) {
         return diagnostic.code
                 + "|"
                 + diagnostic.message
@@ -180,18 +184,64 @@ public class ErrorProvider {
                 + diagnostic.range.end.character;
     }
 
-    private List<org.javacs.lsp.Diagnostic> unusedWarnings(CompilationUnitTree root) {
-        var result = new ArrayList<org.javacs.lsp.Diagnostic>();
+    private List<Diagnostic> unusedWarnings(CompilationUnitTree root) {
+        var result = new ArrayList<Diagnostic>();
         var warnUnused = new WarnUnused(task.task);
         warnUnused.scan(root, null);
         for (var unusedEl : warnUnused.notUsed()) {
             result.add(warnUnused(unusedEl));
         }
+        result.addAll(unusedImportWarnings(root));
         return result;
     }
 
-    private List<org.javacs.lsp.Diagnostic> notThrownWarnings(CompilationUnitTree root) {
-        var result = new ArrayList<org.javacs.lsp.Diagnostic>();
+    private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {
+        var result = new ArrayList<Diagnostic>();
+        var trees = Trees.instance(task.task);
+        var pos = trees.getSourcePositions();
+        var importTrees = new ArrayList<ImportTree>();
+        var importNames = new ArrayList<String>();
+        for (var imp : root.getImports()) {
+            if (imp.isStatic()) continue;
+            var qualName = imp.getQualifiedIdentifier().toString();
+            if (qualName.endsWith(".*")) continue;
+            importTrees.add(imp);
+            importNames.add(qualName);
+        }
+        if (importTrees.isEmpty()) return result;
+        var usedImports = new HashSet<String>();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitIdentifier(IdentifierTree t, Void __) {
+                var el = trees.getElement(getCurrentPath());
+                if (el instanceof TypeElement te) {
+                    usedImports.add(te.getQualifiedName().toString());
+                }
+                return super.visitIdentifier(t, null);
+            }
+        }.scan(root, null);
+        for (int i = 0; i < importTrees.size(); i++) {
+            if (!usedImports.contains(importNames.get(i))) {
+                var imp = importTrees.get(i);
+                var start = (int) pos.getStartPosition(root, imp);
+                var end = (int) pos.getEndPosition(root, imp);
+                var simpleName = importNames.get(i);
+                var dot = simpleName.lastIndexOf('.');
+                if (dot != -1) simpleName = simpleName.substring(dot + 1);
+                var d = new Diagnostic();
+                d.message = String.format("'%s' is not used", simpleName);
+                d.range = RangeHelper.range(root, start, end);
+                d.code = "unused_import";
+                d.severity = DiagnosticSeverity.Information;
+                d.tags = List.of(DiagnosticTag.Unnecessary);
+                result.add(d);
+            }
+        }
+        return result;
+    }
+
+    private List<Diagnostic> notThrownWarnings(CompilationUnitTree root) {
+        var result = new ArrayList<Diagnostic>();
         var notThrown = new HashMap<TreePath, String>();
         new WarnNotThrown(task.task).scan(root, notThrown);
         for (var location : notThrown.keySet()) {
@@ -204,19 +254,19 @@ public class ErrorProvider {
      * lspDiagnostic(d, lines) converts d to LSP format, with its position shifted appropriately for the latest version
      * of the file.
      */
-    private org.javacs.lsp.Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d, LineMap lines) {
+    private Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d, LineMap lines) {
         var start = d.getStartPosition();
         var end = d.getEndPosition();
         var severity = severity(d.getKind());
         var code = d.getCode();
         var message = d.getMessage(null);
-        var result = new org.javacs.lsp.Diagnostic();
+        var result = new Diagnostic();
         result.severity = severity;
         result.code = code;
         result.message = message;
         try {
-            result.range = org.javacs.FileStore.range(d.getSource().getCharContent(true).toString(), start, end);
-        } catch (java.io.IOException e) {
+            result.range = FileStore.range(d.getSource().getCharContent(true).toString(), start, end);
+        } catch (IOException e) {
             throw new RuntimeException(e);
         }
         return result;
@@ -237,13 +287,13 @@ public class ErrorProvider {
         }
     }
 
-    private org.javacs.lsp.Diagnostic warnNotThrown(String name, TreePath path) {
+    private Diagnostic warnNotThrown(String name, TreePath path) {
         var trees = Trees.instance(task.task);
         var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = pos.getStartPosition(root, path.getLeaf());
         var end = pos.getEndPosition(root, path.getLeaf());
-        var d = new org.javacs.lsp.Diagnostic();
+        var d = new Diagnostic();
         d.message = String.format("'%s' is not thrown in the body of the method", name);
         d.range = RangeHelper.range(root, start, end);
         d.code = "unused_throws";
@@ -252,7 +302,7 @@ public class ErrorProvider {
         return d;
     }
 
-    private org.javacs.lsp.Diagnostic warnUnused(Element unusedEl) {
+    private Diagnostic warnUnused(Element unusedEl) {
         var trees = Trees.instance(task.task);
         var path = trees.getPath(unusedEl);
         if (path == null) {
@@ -278,7 +328,7 @@ public class ErrorProvider {
         }
         var leafStart = (int) pos.getStartPosition(root, leaf);
         var leafEnd = (int) pos.getEndPosition(root, leaf);
-        var region = contents.subSequence(start, end == Diagnostic.NOPOS ? contents.length() : end);
+        var region = contents.subSequence(start, end == javax.tools.Diagnostic.NOPOS ? contents.length() : end);
         var matcher = Pattern.compile("\\b" + name + "\\b").matcher(region);
         if (matcher.find()) {
             start += matcher.start();
@@ -318,9 +368,9 @@ public class ErrorProvider {
         return lspWarnUnused(severity, code, message, start, end, root);
     }
 
-    private static org.javacs.lsp.Diagnostic lspWarnUnused(
+    private static Diagnostic lspWarnUnused(
             int severity, String code, String message, int start, int end, CompilationUnitTree root) {
-        var result = new org.javacs.lsp.Diagnostic();
+        var result = new Diagnostic();
         result.severity = severity;
         result.code = code;
         result.message = message;
