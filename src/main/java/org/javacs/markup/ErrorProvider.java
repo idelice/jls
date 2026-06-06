@@ -116,7 +116,7 @@ public class ErrorProvider {
         for (var d : diagnosticsCopy) {
             if (d.getSource() == null || !d.getSource().toUri().equals(root.getSourceFile().toUri())) continue;
             if (d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
-            if ("compiler.err.proc.messager".equals(d.getCode())) continue;
+            if ("compiler.warn.proc.messager".equals(d.getCode())) continue;
 
             result.add(lspDiagnostic(d, root.getLineMap()));
         }
