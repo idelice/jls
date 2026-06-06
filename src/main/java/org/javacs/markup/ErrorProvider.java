@@ -288,8 +288,13 @@ public class ErrorProvider {
     }
 
     private static final Pattern QUALIFIED_NAME = Pattern.compile("\\b([a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+)\\.([A-Z][\\w]*)");
+    private static final Pattern CANT_RESOLVE = Pattern.compile("(?s)cannot find symbol\\s+symbol:\\s+(?:variable|method|class)\\s+(\\S+).*");
 
     private static String simplifyMessage(String message) {
+        var m = CANT_RESOLVE.matcher(message);
+        if (m.matches()) {
+            return "cannot resolve symbol '" + m.group(1) + "'";
+        }
         return QUALIFIED_NAME.matcher(message).replaceAll("$3");
     }
 

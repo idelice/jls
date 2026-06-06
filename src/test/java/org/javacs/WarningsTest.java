@@ -186,6 +186,18 @@ public class WarningsTest {
         assertThat(diag.get().message, not(containsString("java.lang.")));
     }
 
+    @Test
+    public void diagnosticMessageSimplifiesCantResolve() {
+        var diags = new ArrayList<Diagnostic>();
+        var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
+        srv.lint(List.of(FindResource.path("org/javacs/err/CantResolve.java")));
+        var diag = diags.stream()
+                .filter(d -> d.code != null && d.code.contains("cant.resolve"))
+                .findFirst();
+        assertTrue("expected cant.resolve error", diag.isPresent());
+        assertThat(diag.get().message, is("cannot resolve symbol 'totals'"));
+    }
+
     // TODO warn on type.equals(otherType)
     // TODO warn on map.get(wrongKeyType)
 }
