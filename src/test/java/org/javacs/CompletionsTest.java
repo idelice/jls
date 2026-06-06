@@ -1064,4 +1064,30 @@ public class CompletionsTest extends CompletionsBase {
                 resolved.detail,
                 is("String testMethods() throws Exception"));
     }
+
+    @Test
+    public void completeAnnotationSingleValue() {
+        var file = "/org/javacs/example/CompleteAnnotationValue.java";
+        // Cursor after 'A' inside @Getter(A) — should suggest AccessLevel, not annotation attributes
+        var suggestions = filterText(file, 6, 14);
+        assertThat("Should suggest AccessLevel for @Getter value", suggestions, hasItem("AccessLevel"));
+        assertThat("Should not suggest annotation attributes", suggestions, not(hasItem("annotationType")));
+    }
+
+    @Test
+    public void completeAnnotationValueAfterEquals() {
+        var file = "/org/javacs/example/CompleteAnnotationValueEquals.java";
+        // Cursor after 'AccessLevel.' inside @Getter(value = AccessLevel.)
+        var suggestions = filterText(file, 7, 33);
+        assertThat("Should suggest enum constants like NONE", suggestions, hasItem("NONE"));
+        assertThat("Should not suggest annotation attributes", suggestions, not(hasItem("annotationType")));
+    }
+
+    @Test
+    public void completeAnnotationAttributeName() {
+        var file = "/org/javacs/example/CompleteAnnotationAttributeName.java";
+        // Cursor after 'v' inside @Getter(v) — should suggest 'value' attribute
+        var suggestions = filterText(file, 6, 14);
+        assertThat("Should suggest value attribute", suggestions, hasItem("value"));
+    }
 }

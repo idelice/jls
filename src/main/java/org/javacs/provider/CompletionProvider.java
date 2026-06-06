@@ -75,8 +75,9 @@ public class CompletionProvider {
 
     private record MemberAccessContext(String receiver, String partial, boolean dotTrigger, boolean methodReference, int separatorEnd) { }
     private record IndexedCompletionResult(CompletionList list, long resolveMs, String cacheState) {}
+    private record AnnotationContext(String qualifiedAnnotationType, String partial) {}
     private record CompletionRequestContext(
-            ParseTask task, String contents, long cursor, TreePath parsePath, MemberAccessContext memberAccess, long parseMs) {}
+            ParseTask task, String contents, long cursor, TreePath parsePath, MemberAccessContext memberAccess, AnnotationContext annotationContext, long parseMs) {}
     private record MemberCompletionCacheKey(
             long indexVersion,
             String targetType,
@@ -218,6 +219,12 @@ public class CompletionProvider {
             resolveMs = indexed.resolveMs();
             memberCacheState = indexed.cacheState();
             mode = "member_index";
+        } else if (request.annotationContext() != null) {
+            var partial = partialIdentifier(request.contents(), (int) request.cursor());
+            list = completeParseOnly(request.task(), request.contents(), request.cursor(), partial);
+            var attrs = completeAnnotationAttributes(request.annotationContext());
+            list.items.addAll(0, attrs.items);
+            mode = "annotation";
         } else {
             list = completeParseOnly(
                     request.task(), request.contents(), request.cursor(), partialIdentifier(request.contents(), (int) request.cursor()));
@@ -251,7 +258,8 @@ public class CompletionProvider {
         var pruned = contents.toString();
         var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
         var memberAccess = memberAccessContext(pruned, (int) cursor);
-        return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, parseMs);
+        var annotationContext = findAnnotationContext(task, cursor);
+        return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, annotationContext, parseMs);
     }
 
     /**
@@ -1867,6 +1875,72 @@ public class CompletionProvider {
         merged.addAll(index.members(qualifiedType, true));
         merged.addAll(index.members(qualifiedType, false));
         return merged;
+    }
+
+    private AnnotationContext findAnnotationContext(ParseTask task, long cursor) {
+        if (completionIndex == null) return null;
+        var positions = Trees.instance(task.task()).getSourcePositions();
+        var root = task.root();
+        var result = new com.sun.source.tree.AnnotationTree[1];
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void visitAnnotation(com.sun.source.tree.AnnotationTree node, Void p) {
+                var start = positions.getStartPosition(root, node);
+                var end = positions.getEndPosition(root, node);
+                if (start <= cursor && cursor <= end) {
+                    // Check cursor is inside the parentheses, not on the annotation name
+                    var typeEnd = positions.getEndPosition(root, node.getAnnotationType());
+                    if (cursor > typeEnd) {
+                        result[0] = node;
+                    }
+                }
+                return super.visitAnnotation(node, p);
+            }
+        }.scan(root, null);
+        if (result[0] == null) return null;
+        String source;
+        try {
+            source = root.getSourceFile().getCharContent(true).toString();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+        var partial = partialIdentifier(source, (int) cursor);
+        // After '=' means value position — let normal completion handle it
+        var beforePartial = (int) cursor - partial.length();
+        for (int i = beforePartial - 1; i >= 0; i--) {
+            var c = source.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            if (c == '=') return null;
+            break;
+        }
+        var typeName = result[0].getAnnotationType().toString();
+        var qualified = completionIndex.resolveTypeName(typeName, root);
+        if (qualified.isEmpty()) return null;
+        return new AnnotationContext(qualified.get(), partial);
+    }
+
+    private static final Set<String> ANNOTATION_INHERITED_METHODS =
+            Set.of("annotationType", "toString", "equals", "hashCode");
+
+    private CompletionList completeAnnotationAttributes(AnnotationContext ctx) {
+        var members = completionIndex.members(ctx.qualifiedAnnotationType(), false);
+        if (members.isEmpty()) return new CompletionList(false, List.of());
+        var list = new ArrayList<CompletionItem>();
+        for (var member : members) {
+            if (member.kind != CompletionItemKind.Method) continue;
+            if (ANNOTATION_INHERITED_METHODS.contains(member.name)) continue;
+            if (!matchesCompletionPrefix(member.name, ctx.partial())) continue;
+            var item = new CompletionItem();
+            item.label = member.name;
+            item.kind = CompletionItemKind.Property;
+            item.detail = member.declaredReturnType != null ? member.declaredReturnType : "";
+            item.insertText = member.name + " = ";
+            item.insertTextFormat = InsertTextFormat.PlainText;
+            item.sortText = sortKey(Priority.FIELD, member.name);
+            list.add(item);
+        }
+        sortCompletionItems(list);
+        return new CompletionList(false, list);
     }
 
     private MemberAccessContext memberAccessContext(String contents, int cursor) {

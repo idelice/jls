@@ -148,6 +148,21 @@ public class WarningsTest {
         assertThat(errors, empty());
     }
 
+    @Test
+    public void unusedLombokSlf4jHasNonZeroRange() {
+        var diags = new ArrayList<Diagnostic>();
+        var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
+        srv.lint(List.of(FindResource.path("org/javacs/warn/UnusedSlf4j.java")));
+        var slf4jDiag = diags.stream()
+                .filter(d -> "unused_field".equals(d.code) && d.message.contains("log"))
+                .findFirst();
+        assertTrue("expected unused_field diagnostic for 'log'", slf4jDiag.isPresent());
+        var range = slf4jDiag.get().range;
+        assertTrue(
+                "diagnostic range should not be zero-width",
+                range.start.line != range.end.line || range.start.character != range.end.character);
+    }
+
     // TODO warn on type.equals(otherType)
     // TODO warn on map.get(wrongKeyType)
 }

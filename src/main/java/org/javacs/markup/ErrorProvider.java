@@ -276,11 +276,16 @@ public class ErrorProvider {
         if (name.contentEquals("<init>")) {
             name = unusedEl.getEnclosingElement().getSimpleName();
         }
+        var leafStart = (int) pos.getStartPosition(root, leaf);
+        var leafEnd = (int) pos.getEndPosition(root, leaf);
         var region = contents.subSequence(start, end == Diagnostic.NOPOS ? contents.length() : end);
         var matcher = Pattern.compile("\\b" + name + "\\b").matcher(region);
         if (matcher.find()) {
             start += matcher.start();
             end = start + name.length();
+        } else if (start >= end) {
+            start = leafStart;
+            end = leafEnd;
         }
         var message = String.format("'%s' is not used", name);
         String code;

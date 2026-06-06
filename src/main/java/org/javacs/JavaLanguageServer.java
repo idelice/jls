@@ -245,6 +245,13 @@ class JavaLanguageServer extends LanguageServer {
                                 + " reason=incomplete_source");
                 return false;
             }
+            if (contentChanges != null && isWhitespaceOnlyChange(contentChanges)) {
+                LOG.fine(
+                        "[perf] completion_index_didChange_skip file="
+                                + file.getFileName()
+                                + " reason=whitespace_only");
+                return false;
+            }
             if (contentChanges != null && !contentChanges.isEmpty()) {
                 var positions = Trees.instance(parse.task()).getSourcePositions();
                 var spans = new ArrayList<long[]>();
@@ -444,6 +451,16 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         return braces != 0 || parens != 0 || inString || inChar || inBlockComment;
+    }
+
+    private static boolean isWhitespaceOnlyChange(List<TextDocumentContentChangeEvent> changes) {
+        for (var change : changes) {
+            if (change.text == null) return false;
+            for (int i = 0; i < change.text.length(); i++) {
+                if (!Character.isWhitespace(change.text.charAt(i))) return false;
+            }
+        }
+        return true;
     }
 
     private Collection<Path> otherActiveDocuments(Path file) {
