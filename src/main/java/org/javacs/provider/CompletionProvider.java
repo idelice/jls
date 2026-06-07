@@ -89,7 +89,7 @@ public class CompletionProvider {
             String currentType) {}
 
     private final CompilerProvider compiler;
-    private final TypeIndexRouter completionIndex;
+    private final TypeIndexRouter typeIndexRouter;
     private final long completionIndexVersion;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
@@ -163,9 +163,9 @@ public class CompletionProvider {
         "double",
     };
 
-    public CompletionProvider(CompilerProvider compiler, TypeIndexRouter completionIndex, long completionIndexVersion) {
+    public CompletionProvider(CompilerProvider compiler, TypeIndexRouter typeIndexRouter, long completionIndexVersion) {
         this.compiler = compiler;
-        this.completionIndex = completionIndex == null ? TypeIndexRouter.EMPTY : completionIndex;
+        this.typeIndexRouter = typeIndexRouter == null ? TypeIndexRouter.EMPTY : typeIndexRouter;
         this.completionIndexVersion = Math.max(0L, completionIndexVersion);
     }
 
@@ -374,10 +374,10 @@ public class CompletionProvider {
             long cursor,
             MemberAccessContext memberAccess,
             boolean endsWithParen) {
-        if (completionIndex == null) {
+        if (typeIndexRouter == null) {
             return new IndexedCompletionResult(EMPTY, 0, "index_empty");
         }
-        var index = completionIndex;
+        var index = typeIndexRouter;
         var started = Instant.now();
         var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
         var expression = memberReceiverExpression(parsePath);
@@ -459,12 +459,12 @@ public class CompletionProvider {
         // Nested types (e.g. IndexedMember.Origin) are stored in IndexedType.nestedTypes, not as
         // IndexedMember entries. Add them in static-access context (e.g. ClassName.).
         if (target.staticContext() && !memberAccess.methodReference()) {
-            completionIndex.typeInfo(target.qualifiedType()).ifPresent(typeInfo -> {
+            typeIndexRouter.typeInfo(target.qualifiedType()).ifPresent(typeInfo -> {
                 for (var nested : typeInfo.nestedTypes) {
                     var simpleName = TypeNames.simpleName(nested);
                     if (simpleName == null || simpleName.isBlank()) continue;
                     if (!matchesCompletionPrefix(simpleName, memberAccess.partial)) continue;
-                    var nestedKind = completionIndex.typeInfo(nested)
+                    var nestedKind = typeIndexRouter.typeInfo(nested)
                             .map(t -> t.kind)
                             .orElse(CompletionItemKind.Class);
                     var item = new CompletionItem();
@@ -967,7 +967,7 @@ public class CompletionProvider {
      */
     private void addIndexedEnclosingTypeMembers(
             ParseTask parseTask, TreePath path, String partial, CompletionList list, boolean endsWithParen) {
-        if (completionIndex == null || path == null) {
+        if (typeIndexRouter == null || path == null) {
             return;
         }
         var seen = new HashSet<String>();
@@ -1022,14 +1022,14 @@ public class CompletionProvider {
     }
 
     private CompletionList completeEnumCase(ParseTask parseTask, TreePath path, long cursor, String partial) {
-        if (completionIndex == null || path == null) {
+        if (typeIndexRouter == null || path == null) {
             return null;
         }
         var switchExpression = switchExpression(path);
         if (switchExpression == null) {
             return null;
         }
-        var resolver = new ParseTypeResolver(parseTask, compiler, completionIndex, cursor);
+        var resolver = new ParseTypeResolver(parseTask, compiler, typeIndexRouter, cursor);
         var resolved = resolver.resolve(switchExpression, null);
         if (resolved.isEmpty()) {
             return null;
@@ -1040,7 +1040,7 @@ public class CompletionProvider {
         }
         var list = new CompletionList();
         var seen = new HashSet<String>();
-        for (var member : completionIndex.members(enumType, true)) {
+        for (var member : typeIndexRouter.members(enumType, true)) {
             if (!matchesCompletionPrefix(member.name, partial)) continue;
             if (!isEnumCaseConstant(member, enumType)) continue;
             if (!seen.add(member.name)) continue;
@@ -1315,7 +1315,7 @@ public class CompletionProvider {
 
     private void addStaticImportsFromIndex(
             CompilationUnitTree root, String partial, boolean endsWithParen, CompletionList list) {
-        if (completionIndex == null || root == null) {
+        if (typeIndexRouter == null || root == null) {
             return;
         }
         var methods = new TreeMap<String, List<IndexedMember>>();
@@ -1332,7 +1332,7 @@ public class CompletionProvider {
             if (!(importTree.getQualifiedIdentifier() instanceof MemberSelectTree id)) continue;
             var ownerType = id.getExpression().toString();
             if (!importMatchesPartial(id.getIdentifier(), partial)) continue;
-            for (var member : completionIndex.members(ownerType, true)) {
+            for (var member : typeIndexRouter.members(ownerType, true)) {
                 if (!memberMatchesImport(id.getIdentifier(), member.name)) continue;
                 if (!matchesCompletionPrefix(member.name, partial)) continue;
                 if (member.kind == CompletionItemKind.Method) {
@@ -1685,7 +1685,7 @@ public class CompletionProvider {
             Map<String, List<IndexedMember>> methods,
             Map<String, Integer> methodPriority,
             CompletionList list) {
-        for (var member : completionIndex.members(qualifiedType, staticContext)) {
+        for (var member : typeIndexRouter.members(qualifiedType, staticContext)) {
             if (!matchesCompletionPrefix(member.name, partial)) continue;
             if (member.kind == CompletionItemKind.Method) {
                 methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
@@ -1878,7 +1878,7 @@ public class CompletionProvider {
     }
 
     private AnnotationContext findAnnotationContext(ParseTask task, long cursor) {
-        if (completionIndex == null) return null;
+        if (typeIndexRouter == null) return null;
         var positions = Trees.instance(task.task()).getSourcePositions();
         var root = task.root();
         var result = new com.sun.source.tree.AnnotationTree[1];
@@ -1914,7 +1914,7 @@ public class CompletionProvider {
             break;
         }
         var typeName = result[0].getAnnotationType().toString();
-        var qualified = completionIndex.resolveTypeName(typeName, root);
+        var qualified = typeIndexRouter.resolveTypeName(typeName, root);
         if (qualified.isEmpty()) return null;
         return new AnnotationContext(qualified.get(), partial);
     }
@@ -1923,7 +1923,7 @@ public class CompletionProvider {
             Set.of("annotationType", "toString", "equals", "hashCode");
 
     private CompletionList completeAnnotationAttributes(AnnotationContext ctx) {
-        var members = completionIndex.members(ctx.qualifiedAnnotationType(), false);
+        var members = typeIndexRouter.members(ctx.qualifiedAnnotationType(), false);
         if (members.isEmpty()) return new CompletionList(false, List.of());
         var list = new ArrayList<CompletionItem>();
         for (var member : members) {
