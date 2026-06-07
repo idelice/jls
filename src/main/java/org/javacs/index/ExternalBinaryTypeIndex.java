@@ -36,6 +36,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.CacheAudit;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
+import org.javacs.ScanClassPath;
 import org.javacs.completion.ExternalBinaryDecompiler;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.TypeNames;
@@ -59,10 +60,12 @@ public final class ExternalBinaryTypeIndex {
     private final String classPathFingerprint;
     private final Set<Path> classPathRoots;
     private final ClassLoader classLoader;
+    private final Set<String> knownClassNames;
     private final Cache<String, Optional<IndexedType>> rawTypeCache;
     private final Cache<String, Optional<IndexedType>> typeCache;
     private final Cache<String, Optional<Path>> decompiledSourceCache;
     private final Cache<String, Optional<BinaryClassModel>> classFileCache;
+    private final Cache<String, Boolean> negativeTypeCache;
     private final ExternalBinaryDecompiler decompiler;
 
     /**
@@ -81,10 +84,12 @@ public final class ExternalBinaryTypeIndex {
         this.classPathFingerprint = "";
         this.classPathRoots = Set.of();
         this.classLoader = ExternalBinaryTypeIndex.class.getClassLoader();
+        this.knownClassNames = Set.of();
         this.rawTypeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.typeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.decompiledSourceCache = Caffeine.newBuilder().maximumSize(1).build();
         this.classFileCache = Caffeine.newBuilder().maximumSize(1).build();
+        this.negativeTypeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.decompiler = new ExternalBinaryDecompiler(Set.of(), "", classLoader);
     }
 
@@ -122,6 +127,9 @@ public final class ExternalBinaryTypeIndex {
         this.classPathRoots = Set.copyOf(classPath);
         this.classPathFingerprint = fingerprint(classPath);
         this.classLoader = buildClassLoader(classPath);
+        var combined = new HashSet<String>(ScanClassPath.jdkTopLevelClasses());
+        combined.addAll(ScanClassPath.classPathTopLevelClasses(classPath));
+        this.knownClassNames = Set.copyOf(combined);
         this.rawTypeCache =
                 Caffeine.newBuilder()
                         .maximumSize(20_000)
@@ -142,6 +150,11 @@ public final class ExternalBinaryTypeIndex {
                         .maximumSize(20_000)
                         .expireAfterAccess(Duration.ofMinutes(30))
                         .build();
+        this.negativeTypeCache =
+                Caffeine.newBuilder()
+                        .maximumSize(100_000)
+                        .expireAfterAccess(Duration.ofMinutes(30))
+                        .build();
         this.decompiler = new ExternalBinaryDecompiler(this.classPathRoots, this.classPathFingerprint, this.classLoader);
     }
 
@@ -157,7 +170,11 @@ public final class ExternalBinaryTypeIndex {
     }
 
     public boolean containsType(String qualifiedName) {
-        return rawTypeInfo(qualifiedName).isPresent();
+        if (knownClassNames.contains(qualifiedName)) return true;
+        if (negativeTypeCache.getIfPresent(qualifiedName) != null) return false;
+        var present = rawTypeInfo(qualifiedName).isPresent();
+        if (!present) negativeTypeCache.put(qualifiedName, Boolean.TRUE);
+        return present;
     }
 
     public List<IndexedMember> members(String qualifiedName, boolean staticContext) {

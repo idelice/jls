@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import org.javacs.guava.ClassPath;
 
-class ScanClassPath {
+public class ScanClassPath {
     private static final java.util.Map<Path, Set<String>> JDK_TOP_LEVEL_CLASSES_CACHE = new ConcurrentHashMap<>();
     private static final java.util.Map<Set<Path>, Set<String>> CLASS_PATH_TOP_LEVEL_CLASSES_CACHE =
             new ConcurrentHashMap<>();
@@ -117,7 +117,7 @@ class ScanClassPath {
         "jdk.zipfs",
     };
 
-    static Set<String> jdkTopLevelClasses() {
+    public static Set<String> jdkTopLevelClasses() {
         var javaHome = JavaHomeHelper.javaHome();
         var cached = JDK_TOP_LEVEL_CLASSES_CACHE.get(javaHome);
         if (cached != null) {
@@ -160,7 +160,7 @@ class ScanClassPath {
         return immutable;
     }
 
-    static Set<String> classPathTopLevelClasses(Set<Path> classPath) {
+    public static Set<String> classPathTopLevelClasses(Set<Path> classPath) {
         var key = Set.copyOf(classPath);
         var cached = CLASS_PATH_TOP_LEVEL_CLASSES_CACHE.get(key);
         if (cached != null) {

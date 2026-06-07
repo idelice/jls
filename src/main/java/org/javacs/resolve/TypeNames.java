@@ -67,6 +67,10 @@ public final class TypeNames {
         if (simpleName == null || simpleName.isBlank() || root == null || containsType == null) {
             return Optional.empty();
         }
+        // Short-circuit: Java type names start with uppercase; reject obvious non-types
+        if (Character.isLowerCase(simpleName.charAt(0)) && simpleName.indexOf('.') < 0) {
+            return Optional.empty();
+        }
         for (var importTree : root.getImports()) {
             if (importTree.isStatic()) {
                 continue;
