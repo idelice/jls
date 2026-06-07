@@ -27,7 +27,7 @@ public class AddException implements Rewrite {
         if (file == CompilerProvider.NOT_FOUND) {
             return CANCELLED;
         }
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileFast(file)) {
             var trees = Trees.instance(task.task);
             var methodElement = FindHelper.findMethod(task, className, methodName, erasedParameterTypes);
             var methodTree = trees.getTree(methodElement);

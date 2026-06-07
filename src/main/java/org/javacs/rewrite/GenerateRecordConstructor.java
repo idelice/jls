@@ -32,7 +32,7 @@ public class GenerateRecordConstructor implements Rewrite {
         LOG.info("Generate default constructor for " + className + "...");
         // TODO this needs to fall back on looking for inner classes and package-private classes
         var file = compiler.findTypeDeclaration(className);
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var root = task.root(file);
             var typeElement = task.task.getElements().getTypeElement(className);
             var typeTree = Trees.instance(task.task).getTree(typeElement);

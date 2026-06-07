@@ -39,7 +39,7 @@ public class OverrideInheritedMethod implements Rewrite {
     }
 
     private String insertText(CompilerProvider compiler) {
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var root = task.root(file);
             var types = task.task.getTypes();
             var trees = Trees.instance(task.task);

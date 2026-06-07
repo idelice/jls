@@ -30,7 +30,7 @@ public class RemoveException implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var file = compiler.findTypeDeclaration(className);
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileFast(file)) {
             var root = task.root(file);
             var methodElement = FindHelper.findMethod(task, className, methodName, erasedParameterTypes);
             var methodTree = Trees.instance(task.task).getTree(methodElement);

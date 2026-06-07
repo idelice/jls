@@ -1280,7 +1280,7 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         LOG.info("Try to rename...");
         var file = Paths.get(params.textDocument.uri);
-        try (var task = getOrCreateCompiler().compile(file)) {
+        try (var task = getOrCreateCompiler().compileFast(file)) {
             long cursor;
             try {
                 cursor =
@@ -1370,7 +1370,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private Rewrite createRewrite(RenameParams params) {
         var file = Paths.get(params.textDocument.uri);
-        try (var task = getOrCreateCompiler().compile(file)) {
+        try (var task = getOrCreateCompiler().compileFast(file)) {
             long position;
             try {
                 position =
@@ -1544,7 +1544,7 @@ class JavaLanguageServer extends LanguageServer {
                 var trimmed = part.trim();
                 if (!trimmed.isEmpty()) selectedFields.add(trimmed);
             }
-            if (selectedFields.isEmpty()) return null;
+            if (selectedFields.isEmpty() && !"constructor".equals(methodKind)) return null;
             var rewrite = new org.javacs.rewrite.GenerateMethods(className, methodKind, 0, selectedFields);
             var edits = rewrite.rewrite(getOrCreateCompiler());
             if (edits != null && !edits.isEmpty()) {

@@ -27,7 +27,7 @@ public class GenerateFieldMethod implements Rewrite {
         if (file == CompilerProvider.NOT_FOUND) {
             return CANCELLED;
         }
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var root = task.root(file);
             if (root == null) {
                 return CANCELLED;

@@ -28,7 +28,7 @@ public class AddLombokAnnotations implements Rewrite {
         if (file == CompilerProvider.NOT_FOUND) {
             return CANCELLED;
         }
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileFast(file)) {
             var root = task.root(file);
             if (root == null) {
                 return CANCELLED;

@@ -25,7 +25,7 @@ public class InlayHintProvider {
     }
 
     public List<InlayHint> inlayHints(Path file, Range range) {
-        try (var task = compiler.compileFastWithProcessors(file)) {
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var root = task.root(file);
             var lineMap = root.getLineMap();
             var trees = Trees.instance(task.task);

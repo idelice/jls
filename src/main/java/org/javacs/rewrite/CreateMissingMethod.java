@@ -32,7 +32,7 @@ public class CreateMissingMethod implements Rewrite {
 
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.compileFast(file)) {
             var trees = Trees.instance(task.task);
             var root = task.root(file);
             var call = new FindMethodCallAt(task.task).scan(root, position);

@@ -45,7 +45,7 @@ public class CodeActionProvider {
         var rewrites = new TreeMap<String, Rewrite>();
         var variedActions = new ArrayList<VariedAction>();
         var actions = new ArrayList<CodeAction>();
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var elapsed = Duration.between(started, Instant.now()).toMillis();
             LOG.info(String.format("...compiled in %d ms", elapsed));
             var root = task.root(file);
@@ -110,7 +110,7 @@ public class CodeActionProvider {
                     var className = qualifiedName(task, root, classTree);
                     for (var kind :
                             new String[] {
-                                "constructor", "equals", "hashCode", "toString"
+                                "equals", "hashCode", "toString"
                             }) {
                         variedActions.add(
                                 new VariedAction(
@@ -138,9 +138,22 @@ public class CodeActionProvider {
                             }
                         }
                     }
-                    // Command-based multi-select getters/setters picker
+                    // Command-based multi-select getters/setters/constructor picker
                     if (!fields.isEmpty()) {
                         var allFieldNames = joinFieldNames(fields);
+
+                        var ctorCmd = new Command();
+                        ctorCmd.command = "java.pickAndGenerate";
+                        var ctorArgs = new com.google.gson.JsonArray();
+                        ctorArgs.add(className);
+                        ctorArgs.add("constructor");
+                        ctorArgs.add(allFieldNames);
+                        ctorCmd.arguments = ctorArgs;
+                        var ctorAction = new CodeAction();
+                        ctorAction.title = "Generate constructor (pick fields)";
+                        ctorAction.kind = CodeActionKind.Source;
+                        ctorAction.command = ctorCmd;
+                        actions.add(ctorAction);
 
                         var getterCmd = new Command();
                         getterCmd.command = "java.pickAndGenerate";
@@ -300,7 +313,7 @@ public class CodeActionProvider {
         LOG.info(String.format("Check %d diagnostics for quick fixes...", params.context.diagnostics.size()));
         var started = Instant.now();
         var file = Paths.get(params.textDocument.uri);
-        try (var task = compiler.compile(file)) {
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var actions = new ArrayList<CodeAction>();
             for (var d : params.context.diagnostics) {
                 var newActions = codeActionForDiagnostic(task, file, d);

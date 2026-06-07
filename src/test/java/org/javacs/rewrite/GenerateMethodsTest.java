@@ -23,7 +23,7 @@ public class GenerateMethodsTest {
         var edits =
                 new GenerateMethods("org.javacs.rewrite.TestGenerateMethods", "constructor", 1)
                         .rewrite(compiler);
-        assertThat(edits, is(equalTo(Rewrite.CANCELLED)));
+        assertThat(edits, hasKey(file("TestGenerateMethods.java")));
     }
 
     @Test

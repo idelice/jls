@@ -2,14 +2,24 @@ package org.javacs.provider;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
+import com.sun.tools.javac.code.Symbol.ClassSymbol;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.TypeKind;
+import javax.tools.JavaFileObject;
 
 import org.javacs.*;
 import org.javacs.index.IndexedMember;
@@ -75,16 +85,14 @@ public class DefinitionProvider {
         // succeeds (SOURCE_PATH files are entered into javac's compiledTopLevels) or returns
         // null and the fallback resolveElementCrossFile() handles it via the type index.
         // This reuses the completion ATTR cache — definition is always a cache hit.
-        var compile = compiler.compileFastWithProcessors(file);
-
-        try {
+        try (var compile = lombokUsed ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
             var root = compile.root(file);
             long cursor;
             try {
                 cursor =
                         FileStore.offset(
                                 root.getSourceFile().getCharContent(true).toString(), line, column);
-            } catch (java.io.IOException e) {
+            } catch (IOException e) {
                 throw new RuntimeException(e);
             }
             var path = new FindNameAt(compile).scan(root, cursor);
@@ -104,8 +112,8 @@ public class DefinitionProvider {
             // e.g. var packageName = packageName(className);
             String mismatchName = null;
             if (element != null
-                    && element.getKind() != javax.lang.model.element.ElementKind.METHOD
-                    && element.getKind() != javax.lang.model.element.ElementKind.CONSTRUCTOR) {
+                    && element.getKind() != ElementKind.METHOD
+                    && element.getKind() != ElementKind.CONSTRUCTOR) {
                 if (path.getLeaf() instanceof IdentifierTree mismatchId
                         && path.getParentPath() != null
                         && path.getParentPath().getLeaf() instanceof MethodInvocationTree mismatchInv
@@ -130,7 +138,7 @@ public class DefinitionProvider {
                     if (!allLocs.isEmpty()) {
                         var encClassEl = trees.getElement(encClassPath);
                         var qualName =
-                                encClassEl instanceof javax.lang.model.element.TypeElement te
+                                encClassEl instanceof TypeElement te
                                         ? te.getQualifiedName().toString()
                                         : null;
                         return new ResolvedSymbol(
@@ -160,17 +168,17 @@ public class DefinitionProvider {
             }
             var declarationPath = trees.getPath(element);
 
-            if (element.getKind() == javax.lang.model.element.ElementKind.METHOD
-                    && element instanceof javax.lang.model.element.ExecutableElement method) {
+            if (element.getKind() == ElementKind.METHOD
+                    && element instanceof ExecutableElement method) {
                 var enclosingClass =
-                        (javax.lang.model.element.TypeElement) method.getEnclosingElement();
+                        (TypeElement) method.getEnclosingElement();
                 var enclosingType = enclosingClass.asType();
                 var types = compile.task.getTypes();
                 var elements = compile.task.getElements();
                 for (var superClass : types.directSupertypes(enclosingType)) {
-                    var e = (javax.lang.model.element.TypeElement) types.asElement(superClass);
+                    var e = (TypeElement) types.asElement(superClass);
                     for (var other : e.getEnclosedElements()) {
-                        if (!(other instanceof javax.lang.model.element.ExecutableElement otherMethod))
+                        if (!(other instanceof ExecutableElement otherMethod))
                             continue;
                         if (elements.overrides(method, otherMethod, enclosingClass)) {
                             element = otherMethod;
@@ -186,18 +194,18 @@ public class DefinitionProvider {
 
             // Edge case: constructors may not have a direct path; navigate to the enclosing class.
             if (declarationPath == null
-                    && element.getKind() == javax.lang.model.element.ElementKind.CONSTRUCTOR) {
+                    && element.getKind() == ElementKind.CONSTRUCTOR) {
                 declarationPath = trees.getPath(element.getEnclosingElement());
             }
             // Edge case: record component accessor methods navigate to the record component.
             if (declarationPath == null
-                    && element.getKind() == javax.lang.model.element.ElementKind.METHOD
+                    && element.getKind() == ElementKind.METHOD
                     && element.getEnclosingElement()
-                            instanceof javax.lang.model.element.TypeElement type
-                    && type.getKind() == javax.lang.model.element.ElementKind.RECORD) {
+                            instanceof TypeElement type
+                    && type.getKind() == ElementKind.RECORD) {
                 for (var member : type.getEnclosedElements()) {
                     if (member.getKind()
-                                    == javax.lang.model.element.ElementKind.RECORD_COMPONENT
+                                    == ElementKind.RECORD_COMPONENT
                             && member.getSimpleName().contentEquals(element.getSimpleName())) {
                         declarationPath = trees.getPath(member);
                         break;
@@ -227,7 +235,7 @@ public class DefinitionProvider {
             if (declarationPath != null) {
                 // In-batch declaration found; resolve directly.
                 CharSequence declarationName = element.getSimpleName();
-                if (element.getKind() == javax.lang.model.element.ElementKind.CONSTRUCTOR) {
+                if (element.getKind() == ElementKind.CONSTRUCTOR) {
                     declarationName = element.getEnclosingElement().getSimpleName();
                 }
                 var location = FindHelper.location(compile, declarationPath, declarationName);
@@ -253,17 +261,17 @@ public class DefinitionProvider {
                 }
                 var enclosing = element.getEnclosingElement();
                 var qualifiedType =
-                        element instanceof javax.lang.model.element.TypeElement t
+                        element instanceof TypeElement t
                                 ? t.getQualifiedName().toString()
-                                : enclosing instanceof javax.lang.model.element.TypeElement t
+                                : enclosing instanceof TypeElement t
                                         ? t.getQualifiedName().toString()
                                         : null;
                 var isMethod =
-                        element.getKind() == javax.lang.model.element.ElementKind.METHOD
+                        element.getKind() == ElementKind.METHOD
                                 || element.getKind()
-                                        == javax.lang.model.element.ElementKind.CONSTRUCTOR;
+                                        == ElementKind.CONSTRUCTOR;
                 var memberName =
-                        element instanceof javax.lang.model.element.TypeElement
+                        element instanceof TypeElement
                                 ? null
                                 : declarationName.toString();
                 return new ResolvedSymbol(
@@ -295,20 +303,18 @@ public class DefinitionProvider {
                 }
             }
             return resolveElementCrossFile(element, lombokUsed);
-        } finally {
-            compile.close();
         }
     }
 
     private ResolvedSymbol resolveElementCrossFile(
-            javax.lang.model.element.Element element, boolean lombokUsed) {
+            Element element, boolean lombokUsed) {
         var kind = element.getKind();
-        if (kind == javax.lang.model.element.ElementKind.CLASS
-                || kind == javax.lang.model.element.ElementKind.INTERFACE
-                || kind == javax.lang.model.element.ElementKind.ENUM
-                || kind == javax.lang.model.element.ElementKind.RECORD
-                || kind == javax.lang.model.element.ElementKind.ANNOTATION_TYPE) {
-            var typeElement = (javax.lang.model.element.TypeElement) element;
+        if (kind == ElementKind.CLASS
+                || kind == ElementKind.INTERFACE
+                || kind == ElementKind.ENUM
+                || kind == ElementKind.RECORD
+                || kind == ElementKind.ANNOTATION_TYPE) {
+            var typeElement = (TypeElement) element;
             var qualifiedName = typeElement.getQualifiedName().toString();
             var simpleName = element.getSimpleName().toString();
             var source = openSourceForElement(typeElement);
@@ -321,13 +327,13 @@ public class DefinitionProvider {
                     null,
                     simpleName);
         }
-        if (!(element.getEnclosingElement() instanceof javax.lang.model.element.TypeElement owner)) {
+        if (!(element.getEnclosingElement() instanceof TypeElement owner)) {
             return unsupported(element.getSimpleName().toString());
         }
         var ownerQualified = owner.getQualifiedName().toString();
         var memberName = element.getSimpleName().toString();
-        if (kind == javax.lang.model.element.ElementKind.FIELD
-                || kind == javax.lang.model.element.ElementKind.ENUM_CONSTANT) {
+        if (kind == ElementKind.FIELD
+                || kind == ElementKind.ENUM_CONSTANT) {
             var source = openSourceForElement(owner);
             var locations = source.map(s -> locateField(s, memberName)).orElseGet(List::of);
             return new ResolvedSymbol(
@@ -338,13 +344,13 @@ public class DefinitionProvider {
                     null,
                     memberName);
         }
-        if (kind == javax.lang.model.element.ElementKind.METHOD) {
-            var exec = (javax.lang.model.element.ExecutableElement) element;
+        if (kind == ElementKind.METHOD) {
+            var exec = (ExecutableElement) element;
             var argCount = exec.getParameters().size();
             var ownerSimple = owner.getSimpleName().toString();
 
             // Record component accessor: always navigate to the component field.
-            if (owner.getKind() == javax.lang.model.element.ElementKind.RECORD) {
+            if (owner.getKind() == ElementKind.RECORD) {
                 var source = openSourceForElement(owner);
                 var fieldLocations =
                         source.map(s -> locateField(s, memberName)).orElseGet(List::of);
@@ -478,8 +484,8 @@ public class DefinitionProvider {
             return new ResolvedSymbol(
                     NOT_SUPPORTED, ownerQualified, memberName, true, null, memberName);
         }
-        if (kind == javax.lang.model.element.ElementKind.CONSTRUCTOR) {
-            var exec = (javax.lang.model.element.ExecutableElement) element;
+        if (kind == ElementKind.CONSTRUCTOR) {
+            var exec = (ExecutableElement) element;
             var argCount = exec.getParameters().size();
             var constructorName = owner.getSimpleName().toString();
             var source = openSourceForElement(owner);
@@ -529,9 +535,9 @@ public class DefinitionProvider {
     }
 
     private Optional<FieldTarget> lombokGeneratedField(
-            org.javacs.CompileTask compile,
+            CompileTask compile,
             Trees trees,
-            javax.lang.model.element.Element element,
+            Element element,
             String selectedName,
             TreePath declarationPath,
             Location location) {
@@ -562,7 +568,7 @@ public class DefinitionProvider {
         if (targetField.isEmpty()) {
             return Optional.empty();
         }
-        if (element.getKind() == javax.lang.model.element.ElementKind.METHOD
+        if (element.getKind() == ElementKind.METHOD
                 && location != null
                 && !LombokAnnotations.isLombokAnnotationTree(declarationPath)
                 && declarationPath != null
@@ -600,7 +606,7 @@ public class DefinitionProvider {
     }
 
     private Optional<FieldTarget> lombokBuilderFieldFromReceiver(
-            org.javacs.CompileTask compile,
+            CompileTask compile,
             Trees trees,
             TreePath path,
             String selectedName) {
@@ -616,7 +622,7 @@ public class DefinitionProvider {
             return Optional.empty();
         }
         var receiverElement = compile.task.getTypes().asElement(receiverType);
-        if (!(receiverElement instanceof javax.lang.model.element.TypeElement receiver)) {
+        if (!(receiverElement instanceof TypeElement receiver)) {
             return Optional.empty();
         }
         return LombokAnnotations.builderOwner(receiver)
@@ -626,11 +632,11 @@ public class DefinitionProvider {
     }
 
     private class FindMemberSelectAt
-            extends com.sun.source.util.TreePathScanner<TreePath, Long> {
-        private final org.javacs.CompileTask compile;
+            extends TreePathScanner<TreePath, Long> {
+        private final CompileTask compile;
         private CompilationUnitTree root;
 
-        FindMemberSelectAt(org.javacs.CompileTask compile) {
+        FindMemberSelectAt(CompileTask compile) {
             this.compile = compile;
         }
 
@@ -666,12 +672,12 @@ public class DefinitionProvider {
     }
 
     private Optional<FieldTarget> findFieldInType(
-            org.javacs.CompileTask compile,
+            CompileTask compile,
             Trees trees,
-            javax.lang.model.element.TypeElement type,
+            TypeElement type,
             String fieldName) {
         for (var member : type.getEnclosedElements()) {
-            if (member.getKind() != javax.lang.model.element.ElementKind.FIELD) {
+            if (member.getKind() != ElementKind.FIELD) {
                 continue;
             }
             if (!member.getSimpleName().contentEquals(fieldName)) {
@@ -683,11 +689,11 @@ public class DefinitionProvider {
             }
         }
         var superclass = type.getSuperclass();
-        if (superclass == null || superclass.getKind() == javax.lang.model.type.TypeKind.NONE) {
+        if (superclass == null || superclass.getKind() == TypeKind.NONE) {
             return Optional.empty();
         }
         var superElement = compile.task.getTypes().asElement(superclass);
-        if (superElement instanceof javax.lang.model.element.TypeElement superType) {
+        if (superElement instanceof TypeElement superType) {
             return findFieldInType(compile, trees, superType, fieldName);
         }
         return Optional.empty();
@@ -703,13 +709,13 @@ public class DefinitionProvider {
     }
 
     private String declaredClassName(ParseTask parse, TreePath path) {
-        var classes = new java.util.ArrayList<String>();
+        var classes = new ArrayList<String>();
         for (var current = path; current != null; current = current.getParentPath()) {
             if (current.getLeaf() instanceof ClassTree classTree) {
                 classes.add(classTree.getSimpleName().toString());
             }
         }
-        java.util.Collections.reverse(classes);
+        Collections.reverse(classes);
         var packageName =
                 parse.root().getPackageName() == null
                         ? ""
@@ -822,7 +828,7 @@ public class DefinitionProvider {
      * Open a parse-only {@link TypeSource} for the given owner element without touching the type
      * index.
      *
-     * <p>The element is cast to {@link com.sun.tools.javac.code.Symbol.ClassSymbol}. If {@code
+     * <p>The element is cast to {@link ClassSymbol}. If {@code
      * sourcefile} is non-null and of kind {@link javax.tools.JavaFileObject.Kind#SOURCE} (workspace
      * source or attached external source), it is parsed directly. For binary-only types javac sets
      * {@code sourcefile} to an internal {@code ClassReader$SourceFileObject} whose kind is {@code
@@ -830,15 +836,15 @@ public class DefinitionProvider {
      * UnsupportedOperationException}. Those cases fall through to Vineflower decompilation.
      */
     private Optional<TypeSource> openSourceForElement(
-            javax.lang.model.element.TypeElement typeElement) {
+            TypeElement typeElement) {
         var qualifiedName = typeElement.getQualifiedName().toString();
         return openedTypeSources.computeIfAbsent(
                 qualifiedName,
                 key -> {
-                    if (typeElement instanceof com.sun.tools.javac.code.Symbol.ClassSymbol sym
+                    if (typeElement instanceof ClassSymbol sym
                             && sym.sourcefile != null
                             && sym.sourcefile.getKind()
-                                    == javax.tools.JavaFileObject.Kind.SOURCE
+                                    == JavaFileObject.Kind.SOURCE
                             && sym.sourcefile.toUri().isAbsolute()) {
                         // Real source-backed file (workspace source or attached source jar).
                         // ClassReader$SourceFileObject is excluded because its toUri() returns a
@@ -858,10 +864,10 @@ public class DefinitionProvider {
 
     /** Returns source only if this element has an absolute-URI workspace source file. */
     private Optional<TypeSource> openWorkspaceSourceForElement(
-            javax.lang.model.element.TypeElement typeElement) {
-        if (!(typeElement instanceof com.sun.tools.javac.code.Symbol.ClassSymbol sym)
+            TypeElement typeElement) {
+        if (!(typeElement instanceof ClassSymbol sym)
                 || sym.sourcefile == null
-                || sym.sourcefile.getKind() != javax.tools.JavaFileObject.Kind.SOURCE
+                || sym.sourcefile.getKind() != JavaFileObject.Kind.SOURCE
                 || !sym.sourcefile.toUri().isAbsolute()) {
             return Optional.empty();
         }
@@ -872,10 +878,10 @@ public class DefinitionProvider {
 
     /** Returns decompiled source only if this element does not have a workspace source file. */
     private Optional<TypeSource> openExternalSourceForElement(
-            javax.lang.model.element.TypeElement typeElement) {
-        if (typeElement instanceof com.sun.tools.javac.code.Symbol.ClassSymbol sym
+            TypeElement typeElement) {
+        if (typeElement instanceof ClassSymbol sym
                 && sym.sourcefile != null
-                && sym.sourcefile.getKind() == javax.tools.JavaFileObject.Kind.SOURCE
+                && sym.sourcefile.getKind() == JavaFileObject.Kind.SOURCE
                 && sym.sourcefile.toUri().isAbsolute()) {
             return Optional.empty();
         }
@@ -908,7 +914,7 @@ public class DefinitionProvider {
 
     private Optional<TreePath> declaredClassPath(ParseTask parse, String qualifiedType) {
         final TreePath[] match = {null};
-        new com.sun.source.util.TreePathScanner<Void, Void>() {
+        new TreePathScanner<Void, Void>() {
             @Override
             public Void visitClass(ClassTree classTree, Void unused) {
                 var current = getCurrentPath();
@@ -964,7 +970,7 @@ public class DefinitionProvider {
         CharSequence contents;
         try {
             contents = root.getSourceFile().getCharContent(true);
-        } catch (java.io.IOException e) {
+        } catch (IOException e) {
             throw new RuntimeException(e);
         }
         var bodyStart = -1;
