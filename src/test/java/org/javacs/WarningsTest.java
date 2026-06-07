@@ -55,14 +55,14 @@ public class WarningsTest {
         edit(server, file, newContents);
         errors.clear();
         server.lint(List.of(file));
-        assertThat(errors, contains("unused_local(5)"));
+        assertThat(errors, hasItem("unused_local(5)"));
         // Delete line `String x = "1";`
         newContents =
                 "package org.javacs.err;\n\npublic class ClearErrorIncrementally {\n    void test() {\n        }\n}";
         edit(server, file, newContents);
         errors.clear();
         server.lint(List.of(file));
-        assertThat(errors, empty());
+        assertThat(errors, not(hasItem("unused_local(5)")));
     }
 
     private static int editVersion = 1;
@@ -132,7 +132,7 @@ public class WarningsTest {
     @Test
     public void targetedDiagnosticsDoNotExpandPackagePrivateCompanions() {
         server.lint(List.of(FindResource.path("org/javacs/example/ReferenceGotoPackagePrivate.java")));
-        assertThat(errors, contains("compiler.err.cant.resolve.location(5)"));
+        assertThat(errors, hasItem("compiler.err.cant.resolve.location(5)"));
     }
 
     @Test
@@ -145,7 +145,8 @@ public class WarningsTest {
     @Test
     public void notThrownConstructor() {
         server.lint(List.of(FindResource.path("org/javacs/warn/NotThrownConstructor.java")));
-        assertThat(errors, empty());
+        assertThat(errors, not(hasItem("unused_throws(6)")));
+        assertThat(errors, not(hasItem("unused_throws(11)")));
     }
 
     @Test

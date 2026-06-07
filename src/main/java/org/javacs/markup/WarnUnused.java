@@ -41,6 +41,7 @@ class WarnUnused extends TreeScanner<Void, Void> {
 
     private final Trees trees;
     private final Map<Element, TreePath> privateDeclarations = new HashMap<>(), localVariables = new HashMap<>();
+    private final Map<Element, TreePath> nonPrivateDeclarations = new HashMap<>();
     private final Set<Element> used = new HashSet<>();
 
     WarnUnused(JavacTask task) {
@@ -60,8 +61,22 @@ class WarnUnused extends TreeScanner<Void, Void> {
         return unused;
     }
 
+    /** Non-private members not referenced within the same file. Needs workspace confirmation. */
+    Set<Element> potentiallyUnusedNonPrivate() {
+        var unused = new HashSet<Element>();
+        unused.addAll(nonPrivateDeclarations.keySet());
+        unused.removeAll(used);
+        unused.removeIf(Objects::isNull);
+        unused.removeIf(i -> i.toString().equals("<error>"));
+        return unused;
+    }
+
     private void foundPrivateDeclaration() {
         privateDeclarations.put(trees.getElement(path), path);
+    }
+
+    private void foundNonPrivateDeclaration() {
+        nonPrivateDeclarations.put(trees.getElement(path), path);
     }
 
     private void foundLocalVariable() {
@@ -140,6 +155,28 @@ class WarnUnused extends TreeScanner<Void, Void> {
         return used.contains(el);
     }
 
+    /** Should this non-private member be tracked for potential unused detection? */
+    private boolean shouldTrackNonPrivate(TreePath path) {
+        var t = path.getLeaf();
+        if (t instanceof MethodTree m) {
+            var isEmptyConstructor = m.getParameters().isEmpty() && m.getReturnType() == null;
+            if (isEmptyConstructor) return false;
+            var name = m.getName().toString();
+            if (name.equals("<init>") || name.equals("main")) return false;
+            if (name.equals("equals") || name.equals("hashCode") || name.equals("toString")) return false;
+            for (var ann : m.getModifiers().getAnnotations()) {
+                if (ann.getAnnotationType().toString().contains("Override")) return false;
+            }
+            return true;
+        }
+        if (t instanceof VariableTree v) {
+            if (v.getName().toString().equals("serialVersionUID")) return false;
+            return true;
+        }
+        if (t instanceof ClassTree) return true;
+        return false;
+    }
+
     private boolean isRecordConstructorParam(TreePath path) {
         if (path.getLeaf().getKind() != Tree.Kind.VARIABLE) return false;
         var parent = path.getParentPath();
@@ -148,6 +185,18 @@ class WarnUnused extends TreeScanner<Void, Void> {
         var grandParent = parent.getParentPath();
         if (grandParent == null) return false;
         return grandParent.getLeaf().getKind() == Tree.Kind.RECORD;
+    }
+
+    /** Record component implicit fields: parent is the RECORD ClassTree itself. */
+    private boolean isRecordComponentField(TreePath path) {
+        if (path.getLeaf().getKind() != Tree.Kind.VARIABLE) return false;
+        var parent = path.getParentPath();
+        if (parent == null) return false;
+        var parentLeaf = parent.getLeaf();
+        if (!(parentLeaf instanceof ClassTree)) return false;
+        if (parentLeaf.getKind() != Tree.Kind.RECORD) return false;
+        var v = (VariableTree) path.getLeaf();
+        return !v.getModifiers().getFlags().contains(Modifier.STATIC);
     }
 
     private boolean isLocalVariable(TreePath path) {
@@ -174,12 +223,13 @@ class WarnUnused extends TreeScanner<Void, Void> {
 
     @Override
     public Void visitVariable(VariableTree t, Void __) {
-        if (isRecordConstructorParam(path)) {
+        if (isRecordConstructorParam(path) || isRecordComponentField(path)) {
             super.visitVariable(t, null);
         } else if (isLocalVariable(path)) {
             foundLocalVariable();
             super.visitVariable(t, null);
         } else if (isReachable(path)) {
+            if (shouldTrackNonPrivate(path)) foundNonPrivateDeclaration();
             super.visitVariable(t, null);
         } else {
             foundPrivateDeclaration();
@@ -190,6 +240,7 @@ class WarnUnused extends TreeScanner<Void, Void> {
     @Override
     public Void visitMethod(MethodTree t, Void __) {
         if (isReachable(path)) {
+            if (shouldTrackNonPrivate(path)) foundNonPrivateDeclaration();
             super.visitMethod(t, null);
         } else {
             foundPrivateDeclaration();
@@ -200,6 +251,7 @@ class WarnUnused extends TreeScanner<Void, Void> {
     @Override
     public Void visitClass(ClassTree t, Void __) {
         if (isReachable(path)) {
+            if (shouldTrackNonPrivate(path)) foundNonPrivateDeclaration();
             super.visitClass(t, null);
         } else {
             foundPrivateDeclaration();

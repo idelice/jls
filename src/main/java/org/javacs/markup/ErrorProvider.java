@@ -4,6 +4,7 @@ import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -23,6 +24,7 @@ import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
+    final org.javacs.index.WordIndex wordIndex;
     private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
@@ -45,8 +47,9 @@ public class ErrorProvider {
             long convertMs,
             long warningMs) {}
 
-    public ErrorProvider(CompileTask task) {
+    public ErrorProvider(CompileTask task, org.javacs.index.WordIndex wordIndex) {
         this.task = task;
+        this.wordIndex = wordIndex != null ? wordIndex : org.javacs.index.WordIndex.EMPTY;
     }
 
     public ErrorReport errors(Set<URI> requestedUris) {
@@ -192,8 +195,62 @@ public class ErrorProvider {
         for (var unusedEl : warnUnused.notUsed()) {
             result.add(warnUnused(unusedEl));
         }
+        // Non-private members with zero same-file references — confirm with workspace word index
+        var declaringFile = Paths.get(root.getSourceFile().toUri());
+        var candidates = warnUnused.potentiallyUnusedNonPrivate();
+        if (!candidates.isEmpty() && wordIndex.size() > 0) {
+            var candidateNames = new HashMap<String, Element>();
+            for (var el : candidates) {
+                candidateNames.put(el.getSimpleName().toString(), el);
+            }
+            var referencedNames = wordIndex.referencedNames(candidateNames.keySet(), declaringFile);
+            for (var entry : candidateNames.entrySet()) {
+                if (!referencedNames.contains(entry.getKey())) {
+                    result.add(warnUnused(entry.getValue()));
+                }
+            }
+        } else if (!candidates.isEmpty()) {
+            // Fallback: text search when WordIndex not yet available
+            var candidateNames = new HashMap<String, Element>();
+            for (var el : candidates) {
+                candidateNames.put(el.getSimpleName().toString(), el);
+            }
+            var referencedNames = textSearchReferencedNames(candidateNames.keySet(), declaringFile);
+            for (var entry : candidateNames.entrySet()) {
+                if (!referencedNames.contains(entry.getKey())) {
+                    result.add(warnUnused(entry.getValue()));
+                }
+            }
+        }
         result.addAll(unusedImportWarnings(root));
         return result;
+    }
+
+    /** Single pass over workspace files: returns member names that appear in at least one other file. */
+    /** Fallback text search when WordIndex is not available. */
+    private Set<String> textSearchReferencedNames(Set<String> memberNames, Path declaringFile) {
+        var found = new HashSet<String>();
+        var patterns = new HashMap<String, java.util.regex.Pattern>();
+        for (var name : memberNames) {
+            patterns.put(name, java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(name) + "\\b"));
+        }
+        for (var f : org.javacs.FileStore.all()) {
+            if (f.equals(declaringFile)) continue;
+            if (found.size() == memberNames.size()) break;
+            try {
+                var content = org.javacs.FileStore.contents(f);
+                for (var iter = patterns.entrySet().iterator(); iter.hasNext(); ) {
+                    var entry = iter.next();
+                    if (entry.getValue().matcher(content).find()) {
+                        found.add(entry.getKey());
+                        iter.remove();
+                    }
+                }
+            } catch (Exception e) {
+                // skip unreadable files
+            }
+        }
+        return found;
     }
 
     private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {

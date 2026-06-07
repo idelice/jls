@@ -3,9 +3,13 @@ package org.javacs;
 import com.google.gson.*;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.IdentifierTree;
+import com.sun.source.tree.MemberReferenceTree;
+import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePathScanner;
+import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +28,7 @@ import javax.lang.model.element.*;
 import org.javacs.action.CodeActionProvider;
 import org.javacs.provider.CompletionProvider;
 import org.javacs.index.ExternalBinaryTypeIndex;
+import org.javacs.index.WordIndex;
 import org.javacs.provider.SignatureProvider;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.TypeIndexRouter;
@@ -68,23 +73,27 @@ class JavaLanguageServer extends LanguageServer {
             WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
             TypeIndexRouter typeIndex,
+            WordIndex wordIndex,
             long version,
             CompletionIndexScope scope) {
         private static final CompletionSnapshot EMPTY =
-                create(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, 0, CompletionIndexScope.EMPTY);
+                create(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, WordIndex.EMPTY, 0, CompletionIndexScope.EMPTY);
 
         private static CompletionSnapshot create(
                 WorkspaceTypeIndex workspaceIndex,
                 ExternalBinaryTypeIndex externalIndex,
+                WordIndex wordIndex,
                 long version,
                 CompletionIndexScope scope) {
             var safeWorkspace = workspaceIndex == null ? WorkspaceTypeIndex.EMPTY : workspaceIndex;
             var safeExternal = externalIndex == null  ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
             var safeScope = scope == null ? CompletionIndexScope.EMPTY : scope;
+            var safeWordIndex = wordIndex == null ? WordIndex.EMPTY : wordIndex;
             return new CompletionSnapshot(
                     safeWorkspace,
                     safeExternal,
                     new TypeIndexRouter(safeWorkspace, safeExternal),
+                    safeWordIndex,
                     Math.max(0L, version),
                     safeScope);
         }
@@ -154,9 +163,10 @@ class JavaLanguageServer extends LanguageServer {
     private void publishCompletionSnapshot(
             WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
+            WordIndex wordIndex,
             long version,
             CompletionIndexScope scope) {
-        var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, version, scope);
+        var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, wordIndex, version, scope);
         completionIndexVersion.set(snapshot.version());
         completionSnapshotRef.set(snapshot);
     }
@@ -186,6 +196,7 @@ class JavaLanguageServer extends LanguageServer {
         publishCompletionSnapshot(
                 currentSnapshot.workspaceIndex(),
                 new ExternalBinaryTypeIndex(getOrCreateCompiler()),
+                currentSnapshot.wordIndex(),
                 currentSnapshot.version(),
                 currentSnapshot.scope());
     }
@@ -214,6 +225,7 @@ class JavaLanguageServer extends LanguageServer {
                 publishCompletionSnapshot(
                         WorkspaceTypeIndex.EMPTY,
                         currentSnapshot.externalIndex(),
+                        WordIndex.EMPTY,
                         currentSnapshot.version(),
                         CompletionIndexScope.EMPTY);
             }
@@ -1437,7 +1449,7 @@ class JavaLanguageServer extends LanguageServer {
         try {
             task = getOrCreateCompiler().compileDiagnostics(List.of(new SourceFileObject(file)));
             var requestedUris = Set.of(fileUri);
-            var report = new ErrorProvider(task).errors(requestedUris);
+            var report = new ErrorProvider(task, completionSnapshotRef.get().wordIndex()).errors(requestedUris);
             var diagnostics = report.diagnostics().stream()
                     .filter(p -> fileUri.equals(p.uri))
                     .flatMap(p -> p.diagnostics.stream())
@@ -1563,6 +1575,7 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         FileStore.save(file);
+        refreshWordIndex(file);
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
                 && !FileStore.activeDocuments().isEmpty()) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didSaveBootstrap");
@@ -1572,6 +1585,39 @@ class JavaLanguageServer extends LanguageServer {
                     "didSave",
                     0,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
+        }
+    }
+
+    private void refreshWordIndex(Path file) {
+        var currentSnapshot = completionSnapshotRef.get();
+        if (currentSnapshot.wordIndex() == WordIndex.EMPTY) return;
+        try {
+            var parse = Parser.parseJavaFileObject(new SourceFileObject(file));
+            var words = new HashSet<String>();
+            new TreeScanner<Void, Void>() {
+                @Override public Void visitIdentifier(IdentifierTree t, Void v) {
+                    words.add(t.getName().toString()); return null;
+                }
+                @Override public Void visitMemberSelect(MemberSelectTree t, Void v) {
+                    words.add(t.getIdentifier().toString()); return super.visitMemberSelect(t, v);
+                }
+                @Override public Void visitMemberReference(MemberReferenceTree t, Void v) {
+                    words.add(t.getName().toString()); return super.visitMemberReference(t, v);
+                }
+                @Override public Void visitMethod(MethodTree t, Void v) {
+                    words.add(t.getName().toString()); return super.visitMethod(t, v);
+                }
+            }.scan(parse.root, null);
+            var updated = currentSnapshot.wordIndex().replaceFiles(Map.of(file, words));
+            completionSnapshotRef.set(new CompletionSnapshot(
+                    currentSnapshot.workspaceIndex(),
+                    currentSnapshot.externalIndex(),
+                    currentSnapshot.typeIndex(),
+                    updated,
+                    currentSnapshot.version(),
+                    currentSnapshot.scope()));
+        } catch (Exception e) {
+            LOG.fine("[perf] word_index_refresh_failed file=" + file.getFileName() + " reason=" + e.getMessage());
         }
     }
 
@@ -1585,6 +1631,7 @@ class JavaLanguageServer extends LanguageServer {
         /** Publish a rebuilt workspace index snapshot, replacing the previous workspace view. */
         void installTypeMemberIndex(
                 WorkspaceTypeIndex nextIndex,
+                WordIndex wordIndex,
                 long indexVersion,
                 String trigger,
                 Duration took,
@@ -1594,6 +1641,7 @@ class JavaLanguageServer extends LanguageServer {
             publishCompletionSnapshot(
                     rebuilt,
                     currentSnapshot.externalIndex(),
+                    wordIndex != null ? wordIndex : currentSnapshot.wordIndex(),
                     indexVersion,
                     rebuilt == WorkspaceTypeIndex.EMPTY ? CompletionIndexScope.EMPTY : scope);
             LOG.fine(String.format(
@@ -1627,7 +1675,7 @@ class JavaLanguageServer extends LanguageServer {
                             : baseSnapshot.scope() == CompletionIndexScope.EMPTY
                                     ? CompletionIndexScope.ACTIVE
                                     : baseSnapshot.scope();
-            publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), indexVersion, nextScope);
+            publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), baseSnapshot.wordIndex(), indexVersion, nextScope);
             LOG.fine(String.format(
                     "[perf] completion_type_index_merge trigger=%s base_version=%d version=%d types=%d files=%d took=%dms",
                     trigger,
@@ -1722,6 +1770,7 @@ class JavaLanguageServer extends LanguageServer {
                     bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
                     var compiler = indexCompiler;
                     WorkspaceTypeIndex nextIndex;
+                    WordIndex nextWordIndex = null;
                     Instant indexStarted;
                     if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
                         // Parse-only path: ~15x faster than compilation for large workspaces.
@@ -1739,7 +1788,9 @@ class JavaLanguageServer extends LanguageServer {
                             return;
                         }
                         indexStarted = Instant.now();
-                        nextIndex = WorkspaceTypeIndex.fromParseTrees(parseTasks);
+                        var parseResult = WorkspaceTypeIndex.fromParseTreesWithWordIndex(parseTasks);
+                        nextIndex = parseResult.typeIndex();
+                        nextWordIndex = parseResult.wordIndex();
                     } else {
                         // WORKSPACE_DECLARATION_MERGE: single-file compile with AP for accurate
                         // erased parameter types and Lombok-generated members.
@@ -1778,7 +1829,7 @@ class JavaLanguageServer extends LanguageServer {
                                         ? CompletionIndexScope.WORKSPACE
                                         : CompletionIndexScope.ACTIVE;
                         installTypeMemberIndex(
-                                nextIndex, indexVersion, "index:" + trigger, installTook, scope);
+                                nextIndex, nextWordIndex, indexVersion, "index:" + trigger, installTook, scope);
                         if (scope == CompletionIndexScope.ACTIVE) {
                             completionIndexExecutor.schedule(
                                     () -> scheduleProjectBootstrapIfNeeded("active-bootstrap-upgrade"),
@@ -1787,10 +1838,11 @@ class JavaLanguageServer extends LanguageServer {
                         }
                     }
                     LOG.info(String.format(
-                            "[perf] index installed trigger=%s version=%d types=%d took=%dms",
+                            "[perf] index installed trigger=%s version=%d types=%d words=%d took=%dms",
                             trigger,
                             indexVersion,
                             nextIndex == null ? 0 : nextIndex.size(),
+                            nextWordIndex == null ? 0 : nextWordIndex.size(),
                             Duration.between(started, Instant.now()).toMillis()));
                     endWorkDoneProgress(bootstrapProgressToken, "Index ready");
                     var totalMs = Duration.between(started, Instant.now()).toMillis();

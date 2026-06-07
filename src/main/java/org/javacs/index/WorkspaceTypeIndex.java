@@ -4,6 +4,7 @@ import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
+import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
@@ -24,6 +25,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -661,7 +663,13 @@ public class WorkspaceTypeIndex {
      * <p>Record component accessors are synthesized from the parse tree without attribution.
      * Lombok synthetics use the same parse-tree-based path as the compiled index.
      */
+    public record ParseIndexResult(WorkspaceTypeIndex typeIndex, WordIndex wordIndex) {}
+
     public static WorkspaceTypeIndex fromParseTrees(java.util.List<ParseTask> parseTasks) {
+        return fromParseTreesWithWordIndex(parseTasks).typeIndex();
+    }
+
+    public static ParseIndexResult fromParseTreesWithWordIndex(java.util.List<ParseTask> parseTasks) {
         // === Phase 1: Scan all roots — collect type names, class trees, and file metadata ===
         var allQualifiedNames = new ObjectOpenHashSet<String>();
         var typeClassTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
@@ -677,6 +685,39 @@ public class WorkspaceTypeIndex {
             collectParseTypeMetadata(parseTask.root(), allQualifiedNames, typeClassTrees,
                     typeSources, typeSourceUris, typeKinds, typeModifiers,
                     nestedTypesByOwner, typeRoots, sourceFileSnapshots);
+        }
+
+        // Build word index: collect all identifier names per file
+        var wordIndexBuilder = new WordIndex.Builder();
+        for (var parseTask : parseTasks) {
+            var root = parseTask.root();
+            var uri = root.getSourceFile().toUri();
+            if (uri == null || !"file".equals(uri.getScheme())) continue;
+            var filePath = Path.of(uri);
+            var words = new HashSet<String>();
+            new TreeScanner<Void, Void>() {
+                @Override
+                public Void visitIdentifier(IdentifierTree t, Void v) {
+                    words.add(t.getName().toString());
+                    return null;
+                }
+                @Override
+                public Void visitMemberSelect(MemberSelectTree t, Void v) {
+                    words.add(t.getIdentifier().toString());
+                    return super.visitMemberSelect(t, v);
+                }
+                @Override
+                public Void visitMemberReference(MemberReferenceTree t, Void v) {
+                    words.add(t.getName().toString());
+                    return super.visitMemberReference(t, v);
+                }
+                @Override
+                public Void visitMethod(MethodTree t, Void v) {
+                    words.add(t.getName().toString());
+                    return super.visitMethod(t, v);
+                }
+            }.scan(root, null);
+            wordIndexBuilder.addWords(filePath, words);
         }
 
         // Predicate used to resolve simple type names via imports/same-package lookup
@@ -763,9 +804,11 @@ public class WorkspaceTypeIndex {
 
         normalizeLombokBuilderTypes(typeEntries, typeClassTrees, typeSources);
 
-        return new WorkspaceTypeIndex(
-                Collections.unmodifiableMap(typeEntries),
-                Collections.unmodifiableMap(sourceFileSnapshots));
+        return new ParseIndexResult(
+                new WorkspaceTypeIndex(
+                        Collections.unmodifiableMap(typeEntries),
+                        Collections.unmodifiableMap(sourceFileSnapshots)),
+                wordIndexBuilder.build());
     }
 
     /** First-pass scanner: collects all qualified type names and per-file metadata from a single root. */
