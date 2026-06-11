@@ -735,7 +735,52 @@ public final class ParseTypeResolver {
                 return declared;
             }
         }
-        return resolveDeclaredTypeName(member.returnType);
+        var result = resolveDeclaredTypeName(member.returnType);
+        if (result.isPresent()) {
+            return result;
+        }
+        // Fallback: resolve using the declaring type's source imports when the current file
+        // doesn't import the return type. This handles parse-tree-indexed simple names.
+        // TODO: fix root cause in addParseTreeMethod by qualifying return types at index time.
+        return resolveViaOwnerSource(member);
+    }
+
+    private Optional<TypeResolution> resolveViaOwnerSource(IndexedMember member) {
+        // Only useful for workspace members — external members have qualified return types already.
+        if (member.provenance == IndexedMember.Provenance.EXTERNAL_BINARY) {
+            return Optional.empty();
+        }
+        if (member.ownerType == null || member.ownerType.isBlank() || compiler == null) {
+            return Optional.empty();
+        }
+        // Workaround for parse-tree-indexed members (addParseTreeMethod) that store simple
+        // return type names (raw AST tokens) instead of qualified names. The compiled index
+        // path stores qualified names and never reaches here. This fallback resolves the
+        // simple name against the owner's import scope instead of the caller's.
+        var source = compiler.findAnywhere(member.ownerType);
+        if (source.isEmpty()) {
+            return Optional.empty();
+        }
+        var ownerRoot = compiler.parse(source.get()).root();
+        if (ownerRoot == null) {
+            return Optional.empty();
+        }
+        var typeName = member.declaredReturnType != null && !member.declaredReturnType.isBlank()
+                ? member.declaredReturnType : member.returnType;
+        var normalized = TypeNames.normalize(typeName);
+        if (normalized.isEmpty()) {
+            return Optional.empty();
+        }
+        var resolved = index.resolveType(normalized, ownerRoot).map(indexed -> indexed.qualifiedName);
+        if (resolved.isEmpty()) {
+            return Optional.empty();
+        }
+        var array = normalized.endsWith("[]");
+        var qualified = resolved.get();
+        if (array && qualified.endsWith("[]")) {
+            qualified = qualified.substring(0, qualified.length() - 2);
+        }
+        return Optional.of(new TypeResolution(qualified, false, array));
     }
 
     private Optional<TypeResolution> resolveDirectMemberType(TypeResolution receiverType, String memberName) {

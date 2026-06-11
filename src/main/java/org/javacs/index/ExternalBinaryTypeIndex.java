@@ -267,8 +267,11 @@ public final class ExternalBinaryTypeIndex {
         if (TypeNames.isPrimitive(raw)) {
             return Optional.of(raw);
         }
-        if (raw.contains(".") && containsType(raw)) {
-            return Optional.of(raw);
+        // A dotted name is either already qualified (fast path) or a package reference —
+        // never pass it to resolveSimpleName, which would generate bogus candidates like
+        // "currentPackage.java.util" and trigger spurious loadRawTypeInfo misses.
+        if (raw.contains(".")) {
+            return containsType(raw) ? Optional.of(raw) : Optional.empty();
         }
 
         return TypeNames.resolveSimpleName(raw, root, this::containsType);
