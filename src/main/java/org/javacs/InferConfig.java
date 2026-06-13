@@ -104,7 +104,8 @@ class InferConfig {
         }
 
         // Maven
-        var pomXml = workspaceRoot.resolve("pom.xml");
+        var buildRoot = findBuildRoot();
+        var pomXml = buildRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
             return mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars);
         }
@@ -115,7 +116,69 @@ class InferConfig {
             return bazelClasspath(bazelWorkspaceRoot);
         }
 
+        // Gradle
+        LOG.info("[gradle] Resolving classpath via Gradle Tooling API — this may take a minute for large projects...");
+        var graph = GradleTooling.resolveModuleGraph(buildRoot, cacheHome(this.envVars));
+        if (graph != ModuleGraph.EMPTY) {
+            // Scope to the active module's own external classpath only.
+            // Inter-module deps are resolved via compiled .class files (added by compileDependencies).
+            var activeModule = graph.moduleForFile(workspaceRoot);
+            if (activeModule.isPresent()) {
+                return new HashSet<>(activeModule.get().externalClasspath());
+            }
+            // Fallback: root module
+            var rootModule = graph.modules().get(":");
+            if (rootModule != null) {
+                return new HashSet<>(rootModule.externalClasspath());
+            }
+            return Collections.emptySet();
+        }
+
         return Collections.emptySet();
+    }
+
+    /** Resolve the module graph for this workspace (cached). Returns EMPTY for single-module projects. */
+    ModuleGraph moduleGraph() {
+        var buildRoot = findBuildRoot();
+        // Determine build system at the root — don't cross-contaminate
+        if (Files.exists(buildRoot.resolve("settings.gradle"))
+                || Files.exists(buildRoot.resolve("settings.gradle.kts"))) {
+            return GradleTooling.resolveModuleGraph(buildRoot, cacheHome(this.envVars));
+        }
+        if (Files.exists(buildRoot.resolve("pom.xml"))) {
+            return MavenTooling.resolveModuleGraph(buildRoot);
+        }
+        return ModuleGraph.EMPTY;
+    }
+
+    /**
+     * Walk up from workspaceRoot to find the actual build root containing settings.gradle or
+     * root pom.xml with modules. Handles the common case where the user opens a submodule
+     * directory in their editor rather than the repository root.
+     */
+    Path findBuildRoot() {
+        for (var dir = workspaceRoot; dir != null; dir = dir.getParent()) {
+            if (Files.exists(dir.resolve("settings.gradle"))
+                    || Files.exists(dir.resolve("settings.gradle.kts"))) {
+                return dir;
+            }
+            // A pom.xml with <modules> means this is a multi-module root
+            var pom = dir.resolve("pom.xml");
+            if (Files.exists(pom) && hasModules(pom)) {
+                return dir;
+            }
+        }
+        // Fall back to workspaceRoot if nothing found above
+        return workspaceRoot;
+    }
+
+    private static boolean hasModules(Path pomXml) {
+        try {
+            var content = Files.readString(pomXml);
+            return content.contains("<modules>");
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private Path bazelWorkspaceRoot() {
@@ -159,12 +222,12 @@ class InferConfig {
         return Collections.emptySet();
     }
 
-    MavenCompilerArgs compilerArgs() {
+    CompilerArgs compilerArgs() {
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (!Files.exists(pomXml)) {
-            return MavenCompilerArgs.none();
+            return CompilerArgs.none();
         }
-        return inferMavenCompilerArgs(pomXml, mavenHome, envVars);
+        return inferCompilerArgs(pomXml, mavenHome, envVars);
     }
 
     private Path findAnyJar(Artifact artifact, boolean source) {
@@ -289,19 +352,19 @@ class InferConfig {
         }
     }
 
-    static final class MavenCompilerArgs {
+    static final class CompilerArgs {
         final List<String> args;
         final String source;
         final boolean mixedModules;
 
-        MavenCompilerArgs(List<String> args, String source, boolean mixedModules) {
+        CompilerArgs(List<String> args, String source, boolean mixedModules) {
             this.args = List.copyOf(args);
             this.source = source;
             this.mixedModules = mixedModules;
         }
 
-        static MavenCompilerArgs none() {
-            return new MavenCompilerArgs(List.of(), "none", false);
+        static CompilerArgs none() {
+            return new CompilerArgs(List.of(), "none", false);
         }
 
         List<String> args() {
@@ -438,7 +501,7 @@ class InferConfig {
         return Set.copyOf(result);
     }
 
-    static MavenCompilerArgs loadCachedMavenCompilerArgs(Path pomXml, Path mavenHome, Path cacheHome) {
+    static CompilerArgs loadCachedCompilerArgs(Path pomXml, Path mavenHome, Path cacheHome) {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cache = readCacheFile(workspaceCacheFile(workspaceRoot, cacheHome));
         if (cache == null || cache.compilerLevel == null) {
@@ -449,7 +512,7 @@ class InferConfig {
                 || !Objects.equals(cache.compilerLevel.settings, inputs.settings())) {
             return null;
         }
-        return new MavenCompilerArgs(
+        return new CompilerArgs(
                 cache.compilerLevel.args == null ? List.of() : cache.compilerLevel.args,
                 cache.compilerLevel.source == null ? "none" : cache.compilerLevel.source,
                 cache.compilerLevel.mixedModules);
@@ -490,8 +553,8 @@ class InferConfig {
         }
     }
 
-    static void storeCachedMavenCompilerArgs(
-            Path pomXml, Path mavenHome, Path cacheHome, MavenCompilerArgs compilerArgs) {
+    static void storeCachedCompilerArgs(
+            Path pomXml, Path mavenHome, Path cacheHome, CompilerArgs compilerArgs) {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome);
         var cache = readCacheFile(cacheFile);
@@ -589,12 +652,12 @@ class InferConfig {
                 .substring(0, 8);
     }
 
-    static MavenCompilerArgs inferMavenCompilerArgs(Path pomXml, Path mavenHome, Map<String, String> envVars) {
+    static CompilerArgs inferCompilerArgs(Path pomXml, Path mavenHome, Map<String, String> envVars) {
         Objects.requireNonNull(pomXml, "pom.xml path is null");
         Objects.requireNonNull(mavenHome, "mavenHome is null");
         var started = Instant.now();
         var cacheHome = cacheHome(envVars);
-        var cached = loadCachedMavenCompilerArgs(pomXml, mavenHome, cacheHome);
+        var cached = loadCachedCompilerArgs(pomXml, mavenHome, cacheHome);
         if (cached != null) {
             CacheAudit.hit("infer_config.maven_compiler_args");
             CacheAudit.load("infer_config.maven_compiler_args");
@@ -606,8 +669,8 @@ class InferConfig {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var rawLevels = rawWorkspaceCompilerLevels(workspaceRoot);
         if (rawLevels.size() > 1) {
-            var mixed = new MavenCompilerArgs(List.of(), "fallback_mixed_modules", true);
-            storeCachedMavenCompilerArgs(pomXml, mavenHome, cacheHome, mixed);
+            var mixed = new CompilerArgs(List.of(), "fallback_mixed_modules", true);
+            storeCachedCompilerArgs(pomXml, mavenHome, cacheHome, mixed);
             CacheAudit.store("infer_config.maven_compiler_args");
             logCompilerArgsInference("fresh", mixed, started);
             return mixed;
@@ -615,9 +678,9 @@ class InferConfig {
 
         var effectivePom = mvnEffectivePom(pomXml, envVars);
         if (effectivePom == NOT_FOUND) {
-            return rawLevels.isEmpty() ? MavenCompilerArgs.none() : rawLevels.values().iterator().next();
+            return rawLevels.isEmpty() ? CompilerArgs.none() : rawLevels.values().iterator().next();
         }
-        MavenCompilerArgs inferred;
+        CompilerArgs inferred;
         try {
             inferred = parseEffectivePomCompilerArgs(effectivePom);
         } finally {
@@ -626,13 +689,13 @@ class InferConfig {
         if (inferred.args().isEmpty() && rawLevels.size() == 1) {
             inferred = rawLevels.values().iterator().next();
         }
-        storeCachedMavenCompilerArgs(pomXml, mavenHome, cacheHome, inferred);
+        storeCachedCompilerArgs(pomXml, mavenHome, cacheHome, inferred);
         CacheAudit.store("infer_config.maven_compiler_args");
         logCompilerArgsInference("fresh", inferred, started);
         return inferred;
     }
 
-    private static void logCompilerArgsInference(String source, MavenCompilerArgs inferred, Instant started) {
+    private static void logCompilerArgsInference(String source, CompilerArgs inferred, Instant started) {
         LOG.info(
                 String.format(
                         "[perf] infer_config_maven_compiler source=%s selected=%s args=%d took=%dms",
@@ -642,8 +705,8 @@ class InferConfig {
                         Duration.between(started, Instant.now()).toMillis()));
     }
 
-    private static Map<String, MavenCompilerArgs> rawWorkspaceCompilerLevels(Path workspaceRoot) {
-        var levels = new LinkedHashMap<String, MavenCompilerArgs>();
+    private static Map<String, CompilerArgs> rawWorkspaceCompilerLevels(Path workspaceRoot) {
+        var levels = new LinkedHashMap<String, CompilerArgs>();
         for (var pom : workspacePomFiles(workspaceRoot)) {
             var document = parseXml(pom);
             if (document == null) {
@@ -657,24 +720,24 @@ class InferConfig {
         return levels;
     }
 
-    private static MavenCompilerArgs parseEffectivePomCompilerArgs(Path effectivePom) {
+    private static CompilerArgs parseEffectivePomCompilerArgs(Path effectivePom) {
         var document = parseXml(effectivePom);
-        return document == null ? MavenCompilerArgs.none() : parseCompilerArgs(document, false);
+        return document == null ? CompilerArgs.none() : parseCompilerArgs(document, false);
     }
 
-    private static MavenCompilerArgs parseCompilerArgs(Document document, boolean includeJavaVersionProperty) {
+    private static CompilerArgs parseCompilerArgs(Document document, boolean includeJavaVersionProperty) {
         var release = property(document, "maven.compiler.release");
         if (isConcreteJavaLevel(release)) {
-            return new MavenCompilerArgs(List.of("--release", release), "maven_release", false);
+            return new CompilerArgs(List.of("--release", release), "maven_release", false);
         }
         var pluginRelease = compilerPluginRelease(document);
         if (isConcreteJavaLevel(pluginRelease)) {
-            return new MavenCompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
+            return new CompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
         }
         if (includeJavaVersionProperty) {
             var javaVersion = property(document, "java.version");
             if (isConcreteJavaLevel(javaVersion)) {
-                return new MavenCompilerArgs(List.of("--release", javaVersion), "maven_release", false);
+                return new CompilerArgs(List.of("--release", javaVersion), "maven_release", false);
             }
         }
         var source = property(document, "maven.compiler.source");
@@ -693,15 +756,15 @@ class InferConfig {
         return nestedText(plugin, "configuration", "release");
     }
 
-    private static MavenCompilerArgs compilerPluginSourceTarget(Document document) {
+    private static CompilerArgs compilerPluginSourceTarget(Document document) {
         var plugin = compilerPlugin(document);
         if (plugin == null) {
-            return MavenCompilerArgs.none();
+            return CompilerArgs.none();
         }
         var source = nestedText(plugin, "configuration", "source");
         var target = nestedText(plugin, "configuration", "target");
         return !isConcreteJavaLevel(source) || !isConcreteJavaLevel(target)
-                ? MavenCompilerArgs.none()
+                ? CompilerArgs.none()
                 : sourceTargetArgs(source, target);
     }
 
@@ -721,8 +784,8 @@ class InferConfig {
         return null;
     }
 
-    private static MavenCompilerArgs sourceTargetArgs(String source, String target) {
-        return new MavenCompilerArgs(List.of("-source", source, "-target", target), "maven_source_target", false);
+    private static CompilerArgs sourceTargetArgs(String source, String target) {
+        return new CompilerArgs(List.of("-source", source, "-target", target), "maven_source_target", false);
     }
 
     private static String property(Document document, String name) {

@@ -258,6 +258,16 @@ public class CompletionProvider {
         var pruned = contents.toString();
         var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
         var memberAccess = memberAccessContext(pruned, (int) cursor);
+        if (memberAccess == null) {
+            // Log what's around the cursor to debug why member access wasn't detected
+            var start = Math.max(0, (int) cursor - 20);
+            var end = Math.min(pruned.length(), (int) cursor + 10);
+            LOG.fine(String.format("[completion] memberAccess=null cursor=%d context='%s'",
+                    cursor, pruned.substring(start, end).replace("\n", "\\n")));
+        } else {
+            LOG.fine(String.format("[completion] memberAccess receiver='%s' partial='%s'",
+                    memberAccess.receiver(), memberAccess.partial()));
+        }
         var annotationContext = findAnnotationContext(task, cursor);
         return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, annotationContext, parseMs);
     }
@@ -390,6 +400,8 @@ public class CompletionProvider {
         var resolved = resolver.resolve(expression, memberAccess.receiver());
         var resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
         if (resolved.isEmpty()) {
+            LOG.fine(String.format("[completion] unresolved_type receiver='%s' expression=%s",
+                    memberAccess.receiver(), expression != null ? expression.getClass().getSimpleName() : "null"));
             return new IndexedCompletionResult(EMPTY, resolveMs, "unresolved_type");
         }
         var target = resolved.get();

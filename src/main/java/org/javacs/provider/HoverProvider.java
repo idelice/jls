@@ -91,9 +91,20 @@ public class HoverProvider {
 
         sb.append(simpleTypeName(method.getReturnType())).append(" ");
         sb.append(method.getSimpleName()).append("(");
+
+        // Resolve real parameter names from source if javac gives synthetic arg0/arg1
+        var paramElements = method.getParameters();
+        String[] resolvedNames = null;
+        if (!paramElements.isEmpty() && hasSyntheticNames(paramElements)) {
+            resolvedNames = resolveParamNamesFromSource(method);
+        }
+
         var params = new StringJoiner(", ");
-        for (var p : method.getParameters()) {
-            params.add(simpleTypeName(p.asType()) + " " + p.getSimpleName());
+        for (int i = 0; i < paramElements.size(); i++) {
+            var p = paramElements.get(i);
+            var name = (resolvedNames != null && resolvedNames[i] != null)
+                    ? resolvedNames[i] : p.getSimpleName().toString();
+            params.add(simpleTypeName(p.asType()) + " " + name);
         }
         sb.append(params).append(")");
         var thrown = method.getThrownTypes();
@@ -104,6 +115,39 @@ public class HoverProvider {
             sb.append(tj);
         }
         return sb.toString();
+    }
+
+    private static boolean hasSyntheticNames(java.util.List<? extends VariableElement> params) {
+        for (var p : params) {
+            var name = p.getSimpleName().toString();
+            if (name.matches("arg\\d+")) return true;
+        }
+        return false;
+    }
+
+    private String[] resolveParamNamesFromSource(ExecutableElement method) {
+        var enclosing = method.getEnclosingElement();
+        if (!(enclosing instanceof TypeElement type)) return null;
+        var className = type.getQualifiedName().toString();
+        var sourceFile = compiler.findAnywhere(className);
+        if (sourceFile.isEmpty()) return null;
+        try {
+            var parse = compiler.parse(sourceFile.get());
+            // Build erased parameter types from the element (already erased for .class-loaded elements)
+            var erasedTypes = new String[method.getParameters().size()];
+            for (int i = 0; i < erasedTypes.length; i++) {
+                erasedTypes[i] = method.getParameters().get(i).asType().toString();
+            }
+            var methodTree = FindHelper.findMethod(
+                    parse, className, method.getSimpleName().toString(), erasedTypes);
+            var names = new String[methodTree.getParameters().size()];
+            for (int i = 0; i < names.length; i++) {
+                names[i] = methodTree.getParameters().get(i).getName().toString();
+            }
+            return names;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private String renderFieldSignature(VariableElement field) {

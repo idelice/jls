@@ -1,6 +1,10 @@
 package org.javacs;
 
-import com.google.gson.*;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.IdentifierTree;
@@ -17,6 +21,8 @@ import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -25,10 +31,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
+import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
 import org.javacs.provider.CompletionProvider;
 import org.javacs.index.ExternalBinaryTypeIndex;
-import org.javacs.index.WordIndex;
 import org.javacs.provider.SignatureProvider;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.TypeIndexRouter;
@@ -40,7 +46,6 @@ import org.javacs.lens.CodeLensProvider;
 import org.javacs.lsp.*;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.provider.DefinitionProvider;
-import org.javacs.provider.DocumentHighlightProvider;
 import org.javacs.provider.InlayHintProvider;
 import org.javacs.provider.ReferenceProvider;
 import org.javacs.rewrite.*;
@@ -60,6 +65,8 @@ class JavaLanguageServer extends LanguageServer {
     private static final long COMPLETION_BOOTSTRAP_WAIT_MS = 700;
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private static final long NAVIGATION_BOOTSTRAP_WAIT_MS = 1500;
+    /** Above this file count, defer full workspace indexing to avoid OOM on large modules. */
+    private static final int LARGE_WORKSPACE_THRESHOLD = 1000;
 
     private record TypeIndexAvailability(
             long versionBefore, long versionAfter, CompletionIndexScope scopeBefore, CompletionIndexScope scopeAfter, long waitMs) {}
@@ -73,27 +80,23 @@ class JavaLanguageServer extends LanguageServer {
             WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
             TypeIndexRouter typeIndex,
-            WordIndex wordIndex,
             long version,
             CompletionIndexScope scope) {
         private static final CompletionSnapshot EMPTY =
-                create(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, WordIndex.EMPTY, 0, CompletionIndexScope.EMPTY);
+                create(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, 0, CompletionIndexScope.EMPTY);
 
         private static CompletionSnapshot create(
                 WorkspaceTypeIndex workspaceIndex,
                 ExternalBinaryTypeIndex externalIndex,
-                WordIndex wordIndex,
                 long version,
                 CompletionIndexScope scope) {
             var safeWorkspace = workspaceIndex == null ? WorkspaceTypeIndex.EMPTY : workspaceIndex;
             var safeExternal = externalIndex == null  ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
             var safeScope = scope == null ? CompletionIndexScope.EMPTY : scope;
-            var safeWordIndex = wordIndex == null ? WordIndex.EMPTY : wordIndex;
             return new CompletionSnapshot(
                     safeWorkspace,
                     safeExternal,
                     new TypeIndexRouter(safeWorkspace, safeExternal),
-                    safeWordIndex,
                     Math.max(0L, version),
                     safeScope);
         }
@@ -104,12 +107,27 @@ class JavaLanguageServer extends LanguageServer {
     private final LanguageClient client;
     private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
 
-    // Two compilers, each owned by exactly one thread/task:
-    //   mainCompiler / interactiveCompiler — LSP main thread (definition, hover, completion, references …)
-    //   indexCompiler                    — background completion-index builds (runRefresh / CompletionIndexScheduler)
-    // No two of these are ever used concurrently. JavaCompilerService is not thread-safe.
+    // Three compilers, each owned by exactly one thread/task:
+    //   interactiveCompiler  — LSP main thread (definition, hover, completion, references …)
+    //   indexCompiler        — background completion-index builds (runRefresh / CompletionIndexScheduler)
+    //   diagnosticCompiler   — background ATTR compiles for type diagnostics (diagnosticExecutor thread)
+    // No two threads share a compiler. JavaCompilerService is not thread-safe.
     private JavaCompilerService interactiveCompiler;
     private JavaCompilerService indexCompiler;
+    private JavaCompilerService diagnosticCompiler;
+
+    // Background thread for ATTR diagnostic compiles.
+    private final ExecutorService diagnosticExecutor =
+            Executors.newSingleThreadExecutor(
+                    Thread.ofPlatform().daemon().name("javacs-diagnostics").factory());
+
+    // Gradle module graph — populated during createCompilers() for Gradle projects.
+    // Null until first compiler initialization; EMPTY for non-Gradle projects.
+    private ModuleGraph moduleGraph = ModuleGraph.EMPTY;
+
+    // Per-module interactive compilers, lazily created by getOrCreateCompiler(Path).
+    // Keyed by Gradle project path (e.g. ":server"). Cleared and rebuilt on createCompilers().
+    private final Map<String, JavaCompilerService> moduleCompilers = new LinkedHashMap<>();
 
     private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
@@ -129,7 +147,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private ScheduledFuture<?> pendingCompletionIndex;
 
-    private final Set<String> shownWorkspaceWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<String> shownWorkspaceWarnings = ConcurrentHashMap.newKeySet();
 
     /** LRU cache of pending Rewrite objects keyed by UUID, used for codeAction/resolve. */
     private static final int REWRITE_REGISTRY_MAX = 200;
@@ -160,13 +178,13 @@ class JavaLanguageServer extends LanguageServer {
         return interactiveCompiler;
     }
 
+
     private void publishCompletionSnapshot(
             WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
-            WordIndex wordIndex,
             long version,
             CompletionIndexScope scope) {
-        var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, wordIndex, version, scope);
+        var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, version, scope);
         completionIndexVersion.set(snapshot.version());
         completionSnapshotRef.set(snapshot);
     }
@@ -193,10 +211,14 @@ class JavaLanguageServer extends LanguageServer {
 
     private void publishExternalBinaryIndexSnapshot() {
         var currentSnapshot = completionSnapshotRef.get();
+        // Use the module-scoped compiler when available — scanning 107k classes from
+        // the union classpath is too slow. The active module's ~15k classes is sufficient.
+        var activeFile = FileStore.activeDocuments().stream().findFirst().orElse(null);
+        var compiler = activeFile != null ? getOrCreateCompiler() : getOrCreateCompiler();
+        var externalIndex = new ExternalBinaryTypeIndex(compiler);
         publishCompletionSnapshot(
                 currentSnapshot.workspaceIndex(),
-                new ExternalBinaryTypeIndex(getOrCreateCompiler()),
-                currentSnapshot.wordIndex(),
+                externalIndex,
                 currentSnapshot.version(),
                 currentSnapshot.scope());
     }
@@ -225,7 +247,6 @@ class JavaLanguageServer extends LanguageServer {
                 publishCompletionSnapshot(
                         WorkspaceTypeIndex.EMPTY,
                         currentSnapshot.externalIndex(),
-                        WordIndex.EMPTY,
                         currentSnapshot.version(),
                         CompletionIndexScope.EMPTY);
             }
@@ -687,8 +708,15 @@ class JavaLanguageServer extends LanguageServer {
         // Otherwise, combine inference with user-specified external dependencies
         else {
             var infer = new InferConfig(workspaceRoot, externalDependencies);
+            var buildRoot = infer.findBuildRoot();
+            var isGradle = Files.exists(buildRoot.resolve("settings.gradle"))
+                    || Files.exists(buildRoot.resolve("settings.gradle.kts"));
+            var isMaven = !isGradle && Files.exists(buildRoot.resolve("pom.xml"));
 
-            reportWorkDoneProgress(progressToken, "Inferring class path");
+            reportWorkDoneProgress(progressToken,
+                    isGradle ? "Resolving Gradle dependencies (may take a minute on first run)"
+                    : isMaven ? "Resolving Maven dependencies"
+                    : "Resolving dependencies");
             var inferClassPathStarted = Instant.now();
             classPath = infer.classPath();
             var inferredClassPath = Instant.now();
@@ -697,7 +725,8 @@ class JavaLanguageServer extends LanguageServer {
             var inferDocPathStarted = Instant.now();
             resolvedDocPath = infer.buildDocPath();
             LOG.info(String.format(
-                    "[perf] compiler_config_inference mode=inferred external=%d classpath=%d docpath=%d classpath_infer=%dms docpath_infer=%dms total=%dms",
+                    "[perf] compiler_config_inference mode=inferred build_system=%s external=%d classpath=%d docpath=%d classpath_infer=%dms docpath_infer=%dms total=%dms",
+                    isGradle ? "gradle" : isMaven ? "maven" : "unknown",
                     externalDependencies.size(),
                     classPath.size(),
                     resolvedDocPath.size(),
@@ -706,6 +735,53 @@ class JavaLanguageServer extends LanguageServer {
                     Duration.between(settingsLoaded, Instant.now()).toMillis()));
         }
         var inferenceFinished = Instant.now();
+
+        // Populate module graph and compile inter-module deps before creating compilers.
+        var inferForGraph = new InferConfig(workspaceRoot, externalDependencies());
+        moduleGraph = inferForGraph.moduleGraph();
+        moduleCompilers.clear();
+        if (moduleGraph != ModuleGraph.EMPTY) {
+            var buildRoot = inferForGraph.findBuildRoot();
+            var isGradleProject = Files.exists(buildRoot.resolve("settings.gradle"))
+                    || Files.exists(buildRoot.resolve("settings.gradle.kts"));
+            LOG.info(String.format("[module-graph] loaded %d modules (build_system=%s)",
+                    moduleGraph.modules().size(), isGradleProject ? "gradle" : "maven"));
+            // Compile transitive inter-module deps — only supported for Gradle via Tooling API.
+            // Maven projects compile via `mvn compile` which the user runs manually.
+            if (isGradleProject) {
+                var activeModule = moduleGraph.moduleForFile(workspaceRoot);
+                if (activeModule.isPresent()) {
+                    // Scope workspace to active module's own source dirs only.
+                    // Type resolution for deps uses the classpath (compiled .class files).
+                    // Other modules' sources are added lazily in didOpenTextDocument.
+                    var scopedRoots = new LinkedHashSet<Path>();
+                    for (var dir : activeModule.get().sourceDirs()) {
+                        if (Files.exists(dir)) scopedRoots.add(dir);
+                    }
+                    if (!scopedRoots.isEmpty()) {
+                        FileStore.setWorkspaceRoots(scopedRoots);
+                        LOG.info(String.format("[multi-module] scoped workspace to %d source dirs for %s (files=%d)",
+                                scopedRoots.size(), activeModule.get().projectPath(), FileStore.all().size()));
+                    }
+                    reportWorkDoneProgress(progressToken,
+                            "Building Gradle module dependencies (" + activeModule.get().projectPath() + ")");
+                    GradleTooling.compileDependencies(buildRoot, moduleGraph, activeModule.get().projectPath());
+                    // Re-resolve classpath after compilation — include compiled module output dirs
+                    var updatedClasspath = new LinkedHashSet<>(inferForGraph.classPath());
+                    updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath()));
+                    // Also add class outputs for any other modules that are in the workspace roots
+                    for (var root : FileStore.workspaceRoots()) {
+                        var rootModule = moduleGraph.moduleForFile(root);
+                        if (rootModule.isPresent() && !rootModule.get().projectPath().equals(activeModule.get().projectPath())) {
+                            updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(rootModule.get().projectPath()));
+                            updatedClasspath.addAll(moduleGraph.transitiveClasspath(rootModule.get().projectPath()));
+                        }
+                    }
+                    classPath = updatedClasspath;
+                }
+            }
+        }
+
         endWorkDoneProgress(progressToken, "Configured javac");
 
         var shared = CompilerSharedResources.from(classPath, resolvedDocPath, addExports, extraArgs);
@@ -713,6 +789,7 @@ class JavaLanguageServer extends LanguageServer {
 
         var indexStarted = Instant.now();
         indexCompiler = new JavaCompilerService(shared, "index");
+        diagnosticCompiler = new JavaCompilerService(shared, "diagnostics");
 
         LOG.info(String.format(
                 "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms index=%dms total=%dms",
@@ -761,27 +838,38 @@ class JavaLanguageServer extends LanguageServer {
         return List.copyOf(args);
     }
 
-    private InferConfig.MavenCompilerArgs selectCompilerArgs(List<String> userExtraArgs, Set<String> externalDependencies) {
+    private InferConfig.CompilerArgs selectCompilerArgs(List<String> userExtraArgs, Set<String> externalDependencies) {
         if (hasExplicitJavaLevelOverride(userExtraArgs)) {
-            return new InferConfig.MavenCompilerArgs(userExtraArgs, "user", false);
+            return new InferConfig.CompilerArgs(userExtraArgs, "user", false);
+        }
+        // Gradle: use the active module's source compatibility
+        if (moduleGraph != ModuleGraph.EMPTY) {
+            var activeModule = moduleGraph.moduleForFile(workspaceRoot);
+            if (activeModule.isPresent() && activeModule.get().sourceCompatibility() != null
+                    && !activeModule.get().sourceCompatibility().isBlank()) {
+                var merged = new ArrayList<String>(userExtraArgs);
+                merged.add("--release");
+                merged.add(activeModule.get().sourceCompatibility());
+                return new InferConfig.CompilerArgs(merged, "gradle:" + activeModule.get().sourceCompatibility(), false);
+            }
         }
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (!Files.exists(pomXml)) {
-            return new InferConfig.MavenCompilerArgs(userExtraArgs, "none", false);
+            return new InferConfig.CompilerArgs(userExtraArgs, "none", false);
         }
         var inferred = new InferConfig(workspaceRoot, externalDependencies).compilerArgs();
         if (inferred.mixedModules()) {
             warnUserOnce(
                     "maven_mixed_release_fallback",
                     "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.");
-            return new InferConfig.MavenCompilerArgs(userExtraArgs, "fallback_mixed_modules", true);
+            return new InferConfig.CompilerArgs(userExtraArgs, "fallback_mixed_modules", true);
         }
         if (inferred.args().isEmpty()) {
-            return new InferConfig.MavenCompilerArgs(userExtraArgs, "none", false);
+            return new InferConfig.CompilerArgs(userExtraArgs, "none", false);
         }
         var merged = new ArrayList<String>(userExtraArgs);
         merged.addAll(inferred.args());
-        return new InferConfig.MavenCompilerArgs(merged, inferred.source(), false);
+        return new InferConfig.CompilerArgs(merged, inferred.source(), false);
     }
 
     private static boolean hasExplicitJavaLevelOverride(List<String> extraArgs) {
@@ -928,7 +1016,6 @@ class JavaLanguageServer extends LanguageServer {
         c.add("signatureHelpProvider", signatureHelpOptions);
         c.addProperty("referencesProvider", true);
         c.addProperty("definitionProvider", true);
-        c.addProperty("documentHighlightProvider", true);
         c.addProperty("workspaceSymbolProvider", true);
         c.addProperty("documentSymbolProvider", true);
         c.addProperty("documentFormattingProvider", true);
@@ -992,6 +1079,8 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         completionIndexExecutor.shutdownNow();
+        diagnosticExecutor.shutdownNow();
+        GradleTooling.shutdown(workspaceRoot);
         CacheAudit.logSummary(LOG);
     }
 
@@ -1154,7 +1243,6 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
         ensureTypeIndexReady("hoverBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
-        var snapshot = completionSnapshotRef.get();
         var content = new HoverProvider(getOrCreateCompiler()).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
@@ -1171,9 +1259,9 @@ class JavaLanguageServer extends LanguageServer {
         var column = params.position.character + 1;
         ensureTypeIndexReady("signatureBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
-        var help = new SignatureProvider(getOrCreateCompiler(), snapshot.typeIndex()).signatureHelp(file, line, column);
-        if (help == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
-        return Optional.of(help);
+        var signatureProvider = new SignatureProvider(getOrCreateCompiler(), snapshot.typeIndex()).signatureHelp(file, line, column);
+        if (signatureProvider == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
+        return Optional.of(signatureProvider);
     }
 
     @Override
@@ -1201,6 +1289,13 @@ class JavaLanguageServer extends LanguageServer {
                                 file.getFileName(), retryFailure.getMessage()));
                 return Optional.empty();
             }
+        } catch (RuntimeException e) {
+            // javac internal error (NPE in Types.sideCast on complex generics).
+            // Don't crash the server — return empty.
+            LOG.warning(String.format(
+                    "[definition] compiler error file=%s: %s",
+                    file.getFileName(), e.getClass().getSimpleName()));
+            return Optional.empty();
         }
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
@@ -1224,21 +1319,6 @@ class JavaLanguageServer extends LanguageServer {
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
-        return Optional.of(found);
-    }
-
-    @Override
-    public Optional<List<DocumentHighlight>> documentHighlight(TextDocumentPositionParams params) {
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
-        var file = Paths.get(params.textDocument.uri);
-        var line = params.position.line + 1;
-        var column = params.position.character + 1;
-        ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
-        var snapshot = completionSnapshotRef.get();
-        var found = new DocumentHighlightProvider(
-                        getOrCreateCompiler(), snapshot.typeIndex(), file, line, column)
-                .find();
-        if (found.isEmpty()) return Optional.empty();
         return Optional.of(found);
     }
 
@@ -1284,7 +1364,7 @@ class JavaLanguageServer extends LanguageServer {
     public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
-        return Optional.of(new InlayHintProvider(getOrCreateCompiler()).inlayHints(file, params.range));
+        return Optional.of(new InlayHintProvider(getOrCreateCompiler(), completionSnapshotRef.get().typeIndex()).inlayHints(file, params.range));
     }
 
     @Override
@@ -1443,31 +1523,94 @@ class JavaLanguageServer extends LanguageServer {
             return new DocumentDiagnosticReport(List.of());
         }
         var file = Paths.get(params.textDocument.uri);
-        var fileUri = file.toUri();
-        var started = Instant.now();
-        CompileTask task = null;
-        try {
-            task = getOrCreateCompiler().compileDiagnostics(List.of(new SourceFileObject(file)));
-            var requestedUris = Set.of(fileUri);
-            var report = new ErrorProvider(task, completionSnapshotRef.get().wordIndex()).errors(requestedUris);
-            var diagnostics = report.diagnostics().stream()
-                    .filter(p -> fileUri.equals(p.uri))
-                    .flatMap(p -> p.diagnostics.stream())
-                    .collect(java.util.stream.Collectors.toList());
-            LOG.fine(String.format(
-                    "[perf] pull_diagnostics file=%s count=%d took=%dms",
-                    file.getFileName(),
-                    diagnostics.size(),
-                    Duration.between(started, Instant.now()).toMillis()));
-            return new DocumentDiagnosticReport(diagnostics);
-        } catch (ReusableCompiler.TaskCreationException e) {
-            LOG.fine(String.format(
-                    "[perf] pull_diagnostics_skip file=%s reason=%s",
-                    file.getFileName(), e.getMessage()));
-            return new DocumentDiagnosticReport(List.of());
-        } finally {
-            if (task != null) task.close();
-        }
+        scheduleDiagnosticCompile(file);
+        var cached = lastPublishedDiagnostics.get(file);
+        return new DocumentDiagnosticReport(cached != null ? cached : List.of());
+    }
+
+    /**
+     * Schedule a background ATTR compile for type diagnostics.
+     * The compile runs on diagnosticExecutor using the diagnosticCompiler lane.
+     * On completion, diagnostics are published to the client via publishDiagnostics.
+     */
+    private void scheduleDiagnosticCompile(Path file) {
+        var contentHash = FileStore.contentHash(file);
+        if (contentHash == lastDiagnosticContentHash.getOrDefault(file, 0)) return;
+        lastDiagnosticContentHash.put(file, contentHash);
+        diagnosticExecutor.submit(() -> {
+            try {
+                var compiler = diagnosticCompiler;
+                if (compiler == null) return;
+                if (FileStore.contentHash(file) != lastDiagnosticContentHash.getOrDefault(file, 0)) return;
+                LOG.info("[diagnostics] background_compile_start file=" + file.getFileName());
+                var started = System.nanoTime();
+                var sources = List.<JavaFileObject>of(new SourceFileObject(file));
+                try (var task = compiler.compileDiagnostics(sources)) {
+                    var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+                    var errorProvider = new ErrorProvider(task);
+                    var errorReport = errorProvider.errors(Set.of(file.toUri()));
+                    LOG.info(String.format(
+                            "[diagnostics] background_compile_done file=%s duration=%dms errors=%d",
+                            file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
+                    for (var diagParams : errorReport.diagnostics()) {
+                        var diagFile = Paths.get(diagParams.uri);
+                        lastPublishedDiagnostics.put(diagFile, diagParams.diagnostics);
+                    }
+                    client.customNotification("workspace/diagnostic/refresh", null);
+                }
+            } catch (Exception e) {
+                LOG.warning("[diagnostics] background_compile_failed file=" + file.getFileName()
+                        + " reason=" + e.getMessage());
+            }
+        });
+    }
+
+    private final Map<Path, Integer> lastDiagnosticContentHash = new ConcurrentHashMap<>();
+    private final Map<Path, List<org.javacs.lsp.Diagnostic>> lastPublishedDiagnostics = new ConcurrentHashMap<>();
+
+    /** Modules whose deps have already been compiled this session. */
+    private final Set<String> compiledModuleDeps = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Compile a module's transitive deps in background, then extend all compilers' classpath
+     * with the new class output dirs. Re-triggers diagnostics for the file that caused the switch.
+     */
+    private void scheduleModuleDepCompilation(String projectPath, Path triggerFile) {
+        if (!compiledModuleDeps.add(projectPath)) return; // already done
+        diagnosticExecutor.submit(() -> {
+            try {
+                var graph = moduleGraph;
+                if (graph == ModuleGraph.EMPTY) return;
+                var buildRoot = new InferConfig(workspaceRoot).findBuildRoot();
+                var token = beginWorkDoneProgress("Build", "Compiling " + projectPath + " dependencies");
+                LOG.info("[multi-module] background_dep_compile_start module=" + projectPath);
+                var started = System.nanoTime();
+                GradleTooling.compileDependencies(buildRoot, graph, projectPath);
+                var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+                LOG.info("[multi-module] background_dep_compile_done module=" + projectPath + " took=" + durationMs + "ms");
+                endWorkDoneProgress(token, "Built " + projectPath + " deps");
+                // Extend all compilers' classpath with the new class output dirs
+                var newDirs = graph.transitiveClassOutputDirs(projectPath);
+                var existingDirs = new LinkedHashSet<Path>();
+                for (var dir : newDirs) {
+                    if (Files.exists(dir)) existingDirs.add(dir);
+                }
+                if (!existingDirs.isEmpty()) {
+                    var interactive = interactiveCompiler;
+                    if (interactive != null) interactive.addClassPathEntries(existingDirs);
+                    var diag = diagnosticCompiler;
+                    if (diag != null) diag.addClassPathEntries(existingDirs);
+                    var idx = indexCompiler;
+                    if (idx != null) idx.addClassPathEntries(existingDirs);
+                }
+                // Notify client to re-pull diagnostics now that deps are on classpath
+                client.customNotification("workspace/diagnostic/refresh", null);
+            } catch (Exception e) {
+                LOG.warning("[multi-module] background_dep_compile_failed module=" + projectPath
+                        + " reason=" + e.getMessage());
+                compiledModuleDeps.remove(projectPath); // allow retry
+            }
+        });
     }
 
     /** Test helper: trigger diagnostics for a set of files synchronously. */
@@ -1482,9 +1625,68 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
+        // If the file is in a different module of the same project (multi-module),
+        // expand workspace roots to include ALL source dirs of that module BEFORE open().
+        // This ensures test source sets can resolve types from the main source set.
+        if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)
+                && FileStore.isJavaFile(params.textDocument.uri)
+                && moduleGraph != ModuleGraph.EMPTY) {
+            var file = Paths.get(params.textDocument.uri);
+            var moduleOpt = moduleGraph.moduleForFile(file);
+            if (moduleOpt.isPresent()) {
+                var module = moduleOpt.get();
+                var fileInModule = module.sourceDirs().stream().anyMatch(file::startsWith);
+                if (fileInModule) {
+                    var expanded = new HashSet<>(FileStore.workspaceRoots());
+                    var added = new ArrayList<Path>();
+                    for (var srcDir : module.sourceDirs()) {
+                        if (!FileStore.isWorkspaceFile(srcDir) && Files.exists(srcDir)) {
+                            expanded.add(srcDir);
+                            added.add(srcDir);
+                        }
+                    }
+                    if (!added.isEmpty()) {
+                        FileStore.setWorkspaceRoots(expanded);
+                        LOG.info("[multi-module] expanded workspace to include " + added.size()
+                                + " source dirs from " + module.projectPath()
+                                + " (files=" + FileStore.all().size() + ")");
+                        // Merge the new module's files into the existing index
+                        var newFiles = new ArrayList<Path>();
+                        for (var srcDir : added) {
+                            for (var f : FileStore.all()) {
+                                if (f.startsWith(srcDir)) newFiles.add(f);
+                            }
+                        }
+                        if (!newFiles.isEmpty()) {
+                            completionIndexScheduler.scheduleRefresh(
+                                    newFiles, "moduleExpand", 0,
+                                    CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
+                        }
+                        // Compile this module's deps in background so type diagnostics resolve
+                        scheduleModuleDepCompilation(module.projectPath(), file);
+                        // Extend classpath with this module's external JARs
+                        var moduleCp = moduleGraph.transitiveClasspath(module.projectPath());
+                        if (!moduleCp.isEmpty()) {
+                            var interactive = interactiveCompiler;
+                            if (interactive != null) interactive.addClassPathEntries(moduleCp);
+                            var diag = diagnosticCompiler;
+                            if (diag != null) diag.addClassPathEntries(moduleCp);
+                            var idx = indexCompiler;
+                            if (idx != null) idx.addClassPathEntries(moduleCp);
+                        }
+                    }
+                }
+            }
+        }
         FileStore.open(params);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
-        completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
+        // For large workspaces, defer full index — only index the open file initially.
+        // Full workspace index is built lazily on first completion/navigation that needs it.
+        if (FileStore.all().size() > LARGE_WORKSPACE_THRESHOLD) {
+            completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didOpen");
+        } else {
+            completionIndexScheduler.scheduleProjectBootstrapIfNeeded("didOpen");
+        }
     }
 
     @Override
@@ -1557,7 +1759,7 @@ class JavaLanguageServer extends LanguageServer {
                 if (!trimmed.isEmpty()) selectedFields.add(trimmed);
             }
             if (selectedFields.isEmpty() && !"constructor".equals(methodKind)) return null;
-            var rewrite = new org.javacs.rewrite.GenerateMethods(className, methodKind, 0, selectedFields);
+            var rewrite = new GenerateMethods(className, methodKind, 0, selectedFields);
             var edits = rewrite.rewrite(getOrCreateCompiler());
             if (edits != null && !edits.isEmpty()) {
                 var workspaceEdit = new WorkspaceEdit();
@@ -1575,7 +1777,6 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         FileStore.save(file);
-        refreshWordIndex(file);
         if (completionSnapshotRef.get().scope() == CompletionIndexScope.EMPTY
                 && !FileStore.activeDocuments().isEmpty()) {
             completionIndexScheduler.scheduleActiveBootstrapIfNeeded("didSaveBootstrap");
@@ -1585,39 +1786,6 @@ class JavaLanguageServer extends LanguageServer {
                     "didSave",
                     0,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-        }
-    }
-
-    private void refreshWordIndex(Path file) {
-        var currentSnapshot = completionSnapshotRef.get();
-        if (currentSnapshot.wordIndex() == WordIndex.EMPTY) return;
-        try {
-            var parse = Parser.parseJavaFileObject(new SourceFileObject(file));
-            var words = new HashSet<String>();
-            new TreeScanner<Void, Void>() {
-                @Override public Void visitIdentifier(IdentifierTree t, Void v) {
-                    words.add(t.getName().toString()); return null;
-                }
-                @Override public Void visitMemberSelect(MemberSelectTree t, Void v) {
-                    words.add(t.getIdentifier().toString()); return super.visitMemberSelect(t, v);
-                }
-                @Override public Void visitMemberReference(MemberReferenceTree t, Void v) {
-                    words.add(t.getName().toString()); return super.visitMemberReference(t, v);
-                }
-                @Override public Void visitMethod(MethodTree t, Void v) {
-                    words.add(t.getName().toString()); return super.visitMethod(t, v);
-                }
-            }.scan(parse.root, null);
-            var updated = currentSnapshot.wordIndex().replaceFiles(Map.of(file, words));
-            completionSnapshotRef.set(new CompletionSnapshot(
-                    currentSnapshot.workspaceIndex(),
-                    currentSnapshot.externalIndex(),
-                    currentSnapshot.typeIndex(),
-                    updated,
-                    currentSnapshot.version(),
-                    currentSnapshot.scope()));
-        } catch (Exception e) {
-            LOG.fine("[perf] word_index_refresh_failed file=" + file.getFileName() + " reason=" + e.getMessage());
         }
     }
 
@@ -1631,7 +1799,6 @@ class JavaLanguageServer extends LanguageServer {
         /** Publish a rebuilt workspace index snapshot, replacing the previous workspace view. */
         void installTypeMemberIndex(
                 WorkspaceTypeIndex nextIndex,
-                WordIndex wordIndex,
                 long indexVersion,
                 String trigger,
                 Duration took,
@@ -1641,7 +1808,6 @@ class JavaLanguageServer extends LanguageServer {
             publishCompletionSnapshot(
                     rebuilt,
                     currentSnapshot.externalIndex(),
-                    wordIndex != null ? wordIndex : currentSnapshot.wordIndex(),
                     indexVersion,
                     rebuilt == WorkspaceTypeIndex.EMPTY ? CompletionIndexScope.EMPTY : scope);
             LOG.fine(String.format(
@@ -1675,7 +1841,7 @@ class JavaLanguageServer extends LanguageServer {
                             : baseSnapshot.scope() == CompletionIndexScope.EMPTY
                                     ? CompletionIndexScope.ACTIVE
                                     : baseSnapshot.scope();
-            publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), baseSnapshot.wordIndex(), indexVersion, nextScope);
+            publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), indexVersion, nextScope);
             LOG.fine(String.format(
                     "[perf] completion_type_index_merge trigger=%s base_version=%d version=%d types=%d files=%d took=%dms",
                     trigger,
@@ -1709,11 +1875,31 @@ class JavaLanguageServer extends LanguageServer {
                 return;
             }
             synchronized (JavaLanguageServer.this) {
+                // Don't re-schedule if a full rebuild is already pending or running
                 if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
                     return;
                 }
             }
-            scheduleRefresh(FileStore.all(), trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
+            // For Gradle multi-module projects, scope the index to the active module's transitive
+            // source files rather than all workspace files. This avoids parsing 8000+ files when
+            // only the active module and its deps are needed for completion.
+            var files = scopedSourceFiles();
+            scheduleRefresh(files, trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
+        }
+
+        /**
+         * Return the set of source files to index for the current context.
+         * FileStore is already scoped to the active module's source dirs for Gradle projects.
+         * Cap at 1000 files to avoid OOM on very large modules.
+         */
+        private Collection<Path> scopedSourceFiles() {
+            var all = FileStore.all();
+            if (all.size() > LARGE_WORKSPACE_THRESHOLD) {
+                // For large modules, only index active documents to avoid OOM.
+                var active = filterJavaFiles(FileStore.activeDocuments());
+                return active.isEmpty() ? List.of() : active;
+            }
+            return all;
         }
 
         /** Debounce completion-index refreshes and collapse newer schedules onto one pending task. */
@@ -1723,29 +1909,35 @@ class JavaLanguageServer extends LanguageServer {
             if (javaFiles.isEmpty()) {
                 return;
             }
-            var revision = completionIndexRevision.incrementAndGet();
             var filesBatch = List.copyOf(javaFiles);
             synchronized (JavaLanguageServer.this) {
+                // Don't cancel an in-progress full rebuild to schedule another identical one
+                if (pendingCompletionIndex != null
+                        && !pendingCompletionIndex.isDone()
+                        && mode == CompletionIndexRefreshMode.FULL_REBUILD) {
+                    return;
+                }
                 if (pendingCompletionIndex != null) {
                     pendingCompletionIndex.cancel(false);
                 }
+                var revision = completionIndexRevision.incrementAndGet();
                 pendingCompletionIndex =
                         completionIndexExecutor.schedule(
                                 () -> runRefresh(filesBatch, revision, trigger, mode),
                                 delayMs,
                                 TimeUnit.MILLISECONDS);
-            }
-            if (delayMs == 0
-                    || "didSave".equals(trigger)
-                    || mode == CompletionIndexRefreshMode.FULL_REBUILD
-                    || filesBatch.size() > 1) {
-                LOG.fine(String.format(
-                        "[perf] completion_index_debounce trigger=%s files=%d mode=%s delay=%dms revision=%d",
-                        trigger,
-                        filesBatch.size(),
-                        mode.name().toLowerCase(),
-                        delayMs,
-                        revision));
+                if (delayMs == 0
+                        || "didSave".equals(trigger)
+                        || mode == CompletionIndexRefreshMode.FULL_REBUILD
+                        || filesBatch.size() > 1) {
+                    LOG.fine(String.format(
+                            "[perf] completion_index_debounce trigger=%s files=%d mode=%s delay=%dms revision=%d",
+                            trigger,
+                            filesBatch.size(),
+                            mode.name().toLowerCase(),
+                            delayMs,
+                            revision));
+                }
             }
         }
 
@@ -1770,13 +1962,9 @@ class JavaLanguageServer extends LanguageServer {
                     bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
                     var compiler = indexCompiler;
                     WorkspaceTypeIndex nextIndex;
-                    WordIndex nextWordIndex = null;
                     Instant indexStarted;
                     if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
                         // Parse-only path: ~15x faster than compilation for large workspaces.
-                        // Type names in the index are raw parse-tree strings; ParseTypeResolver
-                        // resolves them at query time. Inherited external members are resolved
-                        // lazily by ExternalBinaryTypeIndex.
                         reportWorkDoneProgress(bootstrapProgressToken,
                                 "Parsing " + files.size() + " files");
                         var parseTasks = compiler.parseAll(files);
@@ -1788,15 +1976,13 @@ class JavaLanguageServer extends LanguageServer {
                             return;
                         }
                         indexStarted = Instant.now();
-                        var parseResult = WorkspaceTypeIndex.fromParseTreesWithWordIndex(parseTasks);
-                        nextIndex = parseResult.typeIndex();
-                        nextWordIndex = parseResult.wordIndex();
+                        nextIndex = WorkspaceTypeIndex.fromParseTrees(parseTasks);
                     } else {
-                        // WORKSPACE_DECLARATION_MERGE: single-file compile with AP for accurate
-                        // erased parameter types and Lombok-generated members.
-                        // ACTIVE_DOCUMENT_BOOTSTRAP: compile open files with AP so Lombok
-                        // classes show their generated accessors immediately.
-                        task = compiler.compileFastWithProcessors(files.toArray(Path[]::new));
+                        // WORKSPACE_DECLARATION_MERGE / ACTIVE_DOCUMENT_BOOTSTRAP:
+                        // Use parse-only for index updates — compile (ATTR) hangs on large
+                        // multi-module projects due to javac internal errors.
+                        // Parse captures type declarations and member signatures accurately.
+                        var parseTasks = compiler.parseAll(files);
                         if (revision != completionIndexRevision.get()) {
                             LOG.fine(String.format(
                                     "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
@@ -1806,8 +1992,8 @@ class JavaLanguageServer extends LanguageServer {
                         }
                         indexStarted = Instant.now();
                         reportWorkDoneProgress(bootstrapProgressToken,
-                                "Compiled " + files.size() + " files");
-                        nextIndex = buildIndex(task, mode, compiler);
+                                "Indexed " + files.size() + " files");
+                        nextIndex = WorkspaceTypeIndex.fromParseTrees(parseTasks);
                     }
                     if (revision != completionIndexRevision.get()) {
                         LOG.fine(String.format(
@@ -1829,7 +2015,7 @@ class JavaLanguageServer extends LanguageServer {
                                         ? CompletionIndexScope.WORKSPACE
                                         : CompletionIndexScope.ACTIVE;
                         installTypeMemberIndex(
-                                nextIndex, nextWordIndex, indexVersion, "index:" + trigger, installTook, scope);
+                                nextIndex, indexVersion, "index:" + trigger, installTook, scope);
                         if (scope == CompletionIndexScope.ACTIVE) {
                             completionIndexExecutor.schedule(
                                     () -> scheduleProjectBootstrapIfNeeded("active-bootstrap-upgrade"),
@@ -1838,11 +2024,10 @@ class JavaLanguageServer extends LanguageServer {
                         }
                     }
                     LOG.info(String.format(
-                            "[perf] index installed trigger=%s version=%d types=%d words=%d took=%dms",
+                            "[perf] index installed trigger=%s version=%d types=%d took=%dms",
                             trigger,
                             indexVersion,
                             nextIndex == null ? 0 : nextIndex.size(),
-                            nextWordIndex == null ? 0 : nextWordIndex.size(),
                             Duration.between(started, Instant.now()).toMillis()));
                     endWorkDoneProgress(bootstrapProgressToken, "Index ready");
                     var totalMs = Duration.between(started, Instant.now()).toMillis();
@@ -1869,26 +2054,6 @@ class JavaLanguageServer extends LanguageServer {
                     }
                 }
             }
-        }
-
-        /**
-         * Build the next workspace type snapshot for the requested refresh mode.
-         *
-         * <p>Active bootstrap keeps only types that are declared in the compiled sources or can be
-         * mapped back to a source declaration. Full rebuild and declaration-merge modes index all
-         * workspace declarations from the compile task.
-         */
-        WorkspaceTypeIndex buildIndex(
-                CompileTask task, CompletionIndexRefreshMode mode, JavaCompilerService compiler) {
-            if (mode == CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP) {
-                return WorkspaceTypeIndex.from(task)
-                        .filterTypes(
-                                info ->
-                                        info.sourcePath != null
-                                                || compiler.findTypeDeclaration(info.qualifiedName)
-                                                        != CompilerProvider.NOT_FOUND);
-            }
-            return WorkspaceTypeIndex.workspaceDeclarations(task);
         }
 
         /** Cancel any queued completion-index refresh and bump the revision so stale work is dropped. */

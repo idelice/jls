@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.nio.file.attribute.*;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -27,8 +28,10 @@ public class FileStore {
     private static final AtomicLong contentRevision = new AtomicLong();
 
     /** javaSources[file] is the javaSources time of a .java source file. */
-    // TODO organize by package name for speed of list(...)
     private static final ConcurrentSkipListMap<Path, Info> javaSources = new ConcurrentSkipListMap<>();
+    /** Package-indexed view for O(1) list() lookups instead of scanning all 7938 files. */
+    private static final ConcurrentHashMap<String, CopyOnWriteArrayList<Path>>
+            packageIndex = new ConcurrentHashMap<>();
 
     private static class Info {
         final Instant modified;
@@ -40,11 +43,21 @@ public class FileStore {
         }
     }
 
+    static Set<Path> workspaceRoots() {
+        return Set.copyOf(workspaceRoots);
+    }
+
     static void setWorkspaceRoots(Set<Path> newRoots) {
         newRoots = normalize(newRoots);
         for (var root : workspaceRoots) {
             if (!newRoots.contains(root)) {
-                javaSources.keySet().removeIf(f -> f.startsWith(root));
+                javaSources.keySet().removeIf(f -> {
+                    if (f.startsWith(root)) {
+                        removeFromPackageIndex(f);
+                        return true;
+                    }
+                    return false;
+                });
             }
         }
         for (var root : newRoots) {
@@ -73,11 +86,19 @@ public class FileStore {
         }
     }
 
+    private static final Set<String> EXCLUDED_DIRS = Set.of(
+            "build", "out", "target", ".gradle", ".git", "generated", "generated-sources",
+            "generated-test-sources", "node_modules", ".idea", ".metals");
+
     static class FindJavaSources extends SimpleFileVisitor<Path> {
         @Override
         public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
             if (attrs.isSymbolicLink()) {
                 LOG.warning("Don't check " + dir + " for java sources");
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+            var name = dir.getFileName();
+            if (name != null && EXCLUDED_DIRS.contains(name.toString())) {
                 return FileVisitResult.SKIP_SUBTREE;
             }
             return FileVisitResult.CONTINUE;
@@ -110,17 +131,13 @@ public class FileStore {
         activeDocuments.clear();
         workspaceRoots.clear();
         javaSources.clear();
+        packageIndex.clear();
         bumpContentRevision();
     }
 
     static List<Path> list(String packageName) {
-        var list = new ArrayList<Path>();
-        for (var file : javaSources.keySet()) {
-            if (javaSources.get(file).packageName.equals(packageName)) {
-                list.add(file);
-            }
-        }
-        return list;
+        var files = packageIndex.get(packageName);
+        return files == null ? List.of() : List.copyOf(files);
     }
 
     public static Set<Path> sourceRoots() {
@@ -236,6 +253,7 @@ public class FileStore {
     }
 
     static void externalDelete(Path file) {
+        removeFromPackageIndex(file);
         javaSources.remove(file);
         bumpContentRevision();
     }
@@ -244,12 +262,23 @@ public class FileStore {
         try {
             var time = Files.getLastModifiedTime(file).toInstant();
             var packageName = StringSearch.packageName(file);
+            removeFromPackageIndex(file);
             javaSources.put(file, new Info(time, packageName));
+            packageIndex.computeIfAbsent(packageName, k -> new CopyOnWriteArrayList<>()).addIfAbsent(file);
         } catch (NoSuchFileException | CharacterCodingException e) {
             LOG.warning(e.getMessage());
+            removeFromPackageIndex(file);
             javaSources.remove(file);
         } catch (IOException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private static void removeFromPackageIndex(Path file) {
+        var info = javaSources.get(file);
+        if (info != null) {
+            var files = packageIndex.get(info.packageName);
+            if (files != null) files.remove(file);
         }
     }
 
@@ -271,6 +300,7 @@ public class FileStore {
         var document = params.textDocument;
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
+        if (existing == null) return;
         if (document.version <= existing.version) {
             LOG.warning("Ignored change with version " + document.version + " <= " + existing.version);
             return;
@@ -506,25 +536,6 @@ public class FileStore {
 
     static boolean isWorkspaceJavaFile(URI uri) {
         return uri.getScheme().equals("file") && isWorkspaceJavaFile(Paths.get(uri));
-    }
-
-    static Optional<Path> findDeclaringFile(TypeElement el) {
-        var qualifiedName = el.getQualifiedName().toString();
-        var packageName = StringSearch.mostName(qualifiedName);
-        var className = StringSearch.lastName(qualifiedName);
-        // Fast path: look for text `class Foo` in file Foo.java
-        for (var f : list(packageName)) {
-            if (f.getFileName().toString().equals(className) && StringSearch.containsType(f, el)) {
-                return Optional.of(f);
-            }
-        }
-        // Slow path: look for text `class Foo` in any file in package
-        for (var f : list(packageName)) {
-            if (StringSearch.containsType(f, el)) {
-                return Optional.of(f);
-            }
-        }
-        return Optional.empty();
     }
 
     private static final Logger LOG = Logger.getLogger("main");

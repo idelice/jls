@@ -162,6 +162,32 @@ public final class ExternalBinaryTypeIndex {
         return (int)typeCache.estimatedSize();
     }
 
+    /**
+     * Eagerly load all known class types into the raw type cache on a background thread.
+     * After this completes, all subsequent {@link #members}, {@link #typeInfo}, and
+     * {@link #containsType} calls are pure cache hits — zero reflection on the hot path.
+     *
+     * <p>Call this once after construction. Safe to call from any thread.
+     */
+    public void preScanAll() {
+        if (knownClassNames.isEmpty()) return;
+        var started = java.time.Instant.now();
+        int loaded = 0;
+        int failed = 0;
+        for (var className : knownClassNames) {
+            try {
+                rawTypeInfo(className);
+                loaded++;
+            } catch (Exception e) {
+                failed++;
+            }
+        }
+        LOG.info(String.format(
+                "[perf] external_binary_prescan classes=%d loaded=%d failed=%d took=%dms",
+                knownClassNames.size(), loaded, failed,
+                java.time.Duration.between(started, java.time.Instant.now()).toMillis()));
+    }
+
     public Optional<IndexedType> typeInfo(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();

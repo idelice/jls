@@ -38,21 +38,18 @@ class JavaCompilerService implements CompilerProvider {
             new CompileProfile(CompileBatch.AnalysisMode.ATTR, true, true, false);
     private static final CompileProfile FAST_NO_AP_PROFILE =
             new CompileProfile(CompileBatch.AnalysisMode.ATTR, false, true, false);
-    // Diagnostics: full analysis on the requested file(s) only.
-    // Does NOT widen to FileStore.all() — pull diagnostics are strictly per-file.
-    // expandAdditionalSources=true enables targeted Lombok source expansion: only Lombok-annotated
-    // files directly referenced by the requested file are added to the compilation unit, so AP
-    // generates their members and Lombok method calls resolve correctly. ErrorProvider still filters
-    // emitted diagnostics to the requested URIs, so non-requested expanded roots are silent.
     private static final CompileProfile DIAGNOSTICS_PROFILE =
-            new CompileProfile(CompileBatch.AnalysisMode.FULL, true, true, false);
+            new CompileProfile(CompileBatch.AnalysisMode.ATTR, true, true, false);
 
-    // Not modifiable! If you want to edit these, you need to create a new instance
-    final Set<Path> classPath, docPath;
+    // classPath may grow when new module deps are compiled in the background.
+    // Read via getter; updated atomically via addClassPathEntries().
+    volatile Set<Path> classPath;
+    final Set<Path> docPath;
     final Set<String> addExports;
     final List<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
     private final ReusableCompiler.SlotContext fullSlot = new ReusableCompiler.SlotContext();
+    private final ReusableCompiler.SlotContext diagnosticSlot;
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
     final boolean apEnabled;
@@ -87,6 +84,7 @@ class JavaCompilerService implements CompilerProvider {
                 !"background".equals(this.compilerRole)
                         && !"index".equals(this.compilerRole)
                         && !"diagnostics".equals(this.compilerRole);
+        this.diagnosticSlot = "diagnostics".equals(compilerRole) ? new ReusableCompiler.SlotContext() : null;
         this.fileManager = new SourceFileManager();
         this.docsFileManager = shared.docs().createFileManager();
         LOG.info(String.format(
@@ -105,6 +103,17 @@ class JavaCompilerService implements CompilerProvider {
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Set<String> extraArgs) {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
+    }
+
+    /** Atomically extend the classpath with new entries (e.g. compiled module output dirs). */
+    void addClassPathEntries(Set<Path> entries) {
+        if (entries.isEmpty()) return;
+        var updated = new LinkedHashSet<>(this.classPath);
+        if (updated.addAll(entries)) {
+            this.classPath = Collections.unmodifiableSet(updated);
+            LOG.info(String.format("[compiler] classpath_extended role=%s added=%d total=%d",
+                    compilerRole, entries.size(), updated.size()));
+        }
     }
 
     private CompileBatch workspaceCache;
@@ -337,7 +346,7 @@ class JavaCompilerService implements CompilerProvider {
                             effectiveSources,
                             profile,
                             useAnnotationProcessing,
-                            null);
+                            diagnosticSlot);
             lastCompileTelemetry =
                     compileTelemetry(
                             "javac.none",

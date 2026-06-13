@@ -24,7 +24,6 @@ import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
-    final org.javacs.index.WordIndex wordIndex;
     private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
@@ -47,9 +46,8 @@ public class ErrorProvider {
             long convertMs,
             long warningMs) {}
 
-    public ErrorProvider(CompileTask task, org.javacs.index.WordIndex wordIndex) {
+    public ErrorProvider(CompileTask task) {
         this.task = task;
-        this.wordIndex = wordIndex != null ? wordIndex : org.javacs.index.WordIndex.EMPTY;
     }
 
     public ErrorReport errors(Set<URI> requestedUris) {
@@ -198,19 +196,7 @@ public class ErrorProvider {
         // Non-private members with zero same-file references — confirm with workspace word index
         var declaringFile = Paths.get(root.getSourceFile().toUri());
         var candidates = warnUnused.potentiallyUnusedNonPrivate();
-        if (!candidates.isEmpty() && wordIndex.size() > 0) {
-            var candidateNames = new HashMap<String, Element>();
-            for (var el : candidates) {
-                candidateNames.put(el.getSimpleName().toString(), el);
-            }
-            var referencedNames = wordIndex.referencedNames(candidateNames.keySet(), declaringFile);
-            for (var entry : candidateNames.entrySet()) {
-                if (!referencedNames.contains(entry.getKey())) {
-                    result.add(warnUnused(entry.getValue()));
-                }
-            }
-        } else if (!candidates.isEmpty()) {
-            // Fallback: text search when WordIndex not yet available
+        if (!candidates.isEmpty()) {
             var candidateNames = new HashMap<String, Element>();
             for (var el : candidates) {
                 candidateNames.put(el.getSimpleName().toString(), el);
@@ -226,8 +212,7 @@ public class ErrorProvider {
         return result;
     }
 
-    /** Single pass over workspace files: returns member names that appear in at least one other file. */
-    /** Fallback text search when WordIndex is not available. */
+    /** Text search: returns member names that appear in at least one other file. */
     private Set<String> textSearchReferencedNames(Set<String> memberNames, Path declaringFile) {
         var found = new HashSet<String>();
         var patterns = new HashMap<String, java.util.regex.Pattern>();

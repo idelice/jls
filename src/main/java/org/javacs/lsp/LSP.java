@@ -411,13 +411,6 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
-                    case "textDocument/documentHighlight":
-                        {
-                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
-                            var response = server.documentHighlight(params);
-                            respond(send, r.id, response);
-                            break;
-                        }
                     case "textDocument/documentSymbol":
                         {
                             var params = gson.fromJson(r.params, DocumentSymbolParams.class);

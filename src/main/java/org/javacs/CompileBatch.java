@@ -77,7 +77,21 @@ public class CompileBatch implements AutoCloseable {
             parseNanos = System.nanoTime() - parseStarted;
 
             var analyzeStarted = System.nanoTime();
-            task.analyze();
+            // In ATTR mode, catch and ignore the JDK 25 NPE in Types.sideCast.
+            // This NPE occurs in Check.validate during type-argument bound checking,
+            // which is not needed for definition/hover (only symbol resolution matters).
+            if (analysisMode == AnalysisMode.ATTR) {
+                try {
+                    task.analyze();
+                } catch (Throwable attrError) {
+                    // Attribution may have partially completed — symbols resolved before
+                    // the crash are still usable for definition/hover.
+                    LOG.fine("[compiler] ATTR analyze partial failure (continuing): "
+                            + attrError.getClass().getSimpleName());
+                }
+            } else {
+                task.analyze();
+            }
             analyzeNanos = System.nanoTime() - analyzeStarted;
             if (analysisMode == AnalysisMode.FULL) {
                 ANALYZE_INVOCATIONS.incrementAndGet();

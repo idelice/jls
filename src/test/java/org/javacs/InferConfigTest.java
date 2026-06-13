@@ -94,7 +94,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferMavenCompilerArgs(
+                InferConfig.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_release"));
@@ -130,7 +130,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferMavenCompilerArgs(
+                InferConfig.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_release"));
@@ -160,7 +160,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferMavenCompilerArgs(
+                InferConfig.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_source_target"));
@@ -229,7 +229,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferMavenCompilerArgs(
+                InferConfig.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("fallback_mixed_modules"));
@@ -302,7 +302,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferMavenCompilerArgs(
+                InferConfig.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_release"));
@@ -325,7 +325,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferMavenCompilerArgs(
+                InferConfig.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("none"));
