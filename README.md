@@ -45,7 +45,6 @@ require('lspconfig').jls.setup({
 - **Go-to-definition** — workspace files, dependency JARs (with source), decompiled classes
 - **Find references** — all usages across workspace
 - **Hover** — type information and Javadoc
-- **Document highlight** — occurrences of symbol under cursor
 - **Diagnostics** — pull-based (real-time linting without keystroke lag)
 - **Signature help** — parameter info for method calls
 - **Inlay hints** — parameter name hints at call sites
@@ -54,6 +53,7 @@ require('lspconfig').jls.setup({
 - **Lombok** — @Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.
 - **Private repositories** — Maven authentication inherited from `~/.m2/settings.xml`
 - **JAR navigation** — go-to-definition into dependency source JARs
+- **Multi Module Gradle Support** - natively support multi module gradle projects
 
 ### Code actions
 
