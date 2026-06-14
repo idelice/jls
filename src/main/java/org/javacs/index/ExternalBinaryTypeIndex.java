@@ -65,7 +65,6 @@ public final class ExternalBinaryTypeIndex {
     private final Cache<String, Optional<IndexedType>> typeCache;
     private final Cache<String, Optional<Path>> decompiledSourceCache;
     private final Cache<String, Optional<BinaryClassModel>> classFileCache;
-    private final Cache<String, Boolean> negativeTypeCache;
     private final ExternalBinaryDecompiler decompiler;
 
     /**
@@ -89,7 +88,6 @@ public final class ExternalBinaryTypeIndex {
         this.typeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.decompiledSourceCache = Caffeine.newBuilder().maximumSize(1).build();
         this.classFileCache = Caffeine.newBuilder().maximumSize(1).build();
-        this.negativeTypeCache = Caffeine.newBuilder().maximumSize(1).build();
         this.decompiler = new ExternalBinaryDecompiler(Set.of(), "", classLoader);
     }
 
@@ -150,11 +148,6 @@ public final class ExternalBinaryTypeIndex {
                         .maximumSize(20_000)
                         .expireAfterAccess(Duration.ofMinutes(30))
                         .build();
-        this.negativeTypeCache =
-                Caffeine.newBuilder()
-                        .maximumSize(100_000)
-                        .expireAfterAccess(Duration.ofMinutes(30))
-                        .build();
         this.decompiler = new ExternalBinaryDecompiler(this.classPathRoots, this.classPathFingerprint, this.classLoader);
     }
 
@@ -192,18 +185,20 @@ public final class ExternalBinaryTypeIndex {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
+        if (!knownClassNames.contains(qualifiedName)) return Optional.empty();
         return lookup(typeCache, qualifiedName, this::loadLinkedTypeInfo, "external_binary.type");
     }
 
     public boolean containsType(String qualifiedName) {
-        if (knownClassNames.contains(qualifiedName)) return true;
-        if (negativeTypeCache.getIfPresent(qualifiedName) != null) return false;
-        var present = rawTypeInfo(qualifiedName).isPresent();
-        if (!present) negativeTypeCache.put(qualifiedName, Boolean.TRUE);
-        return present;
+        // knownClassNames is the authoritative set of top-level classes on the classpath.
+        // Names not in this set can never resolve via Class.forName (workspace types aren't on the
+        // classpath; inner classes use $ notation which normalize() converts to dots). Skipping the
+        // expensive reflection/classfile fallback eliminates ~2s of wasted I/O on large projects.
+        return knownClassNames.contains(qualifiedName);
     }
 
     public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
+        if (!knownClassNames.contains(qualifiedName)) return List.of();
         var type = rawTypeInfo(qualifiedName);
         if (type.isEmpty()) {
             return List.of();
@@ -218,6 +213,7 @@ public final class ExternalBinaryTypeIndex {
     }
 
     public List<IndexedMember> constructors(String qualifiedName) {
+        if (!knownClassNames.contains(qualifiedName)) return List.of();
         var type = rawTypeInfo(qualifiedName);
         if (type.isEmpty()) return List.of();
         return type.get().members.stream()
@@ -311,6 +307,7 @@ public final class ExternalBinaryTypeIndex {
         if (qualifiedName == null || qualifiedName.isBlank() || compiler == null) {
             return Optional.empty();
         }
+        if (!knownClassNames.contains(qualifiedName)) return Optional.empty();
         return lookup(
                 decompiledSourceCache,
                 qualifiedName,

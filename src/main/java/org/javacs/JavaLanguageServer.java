@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 import javax.lang.model.element.*;
 import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
@@ -1905,6 +1906,7 @@ class JavaLanguageServer extends LanguageServer {
         /** Debounce completion-index refreshes and collapse newer schedules onto one pending task. */
         void scheduleRefresh(
                 Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
+      files.stream().map(f -> f.getFileName()).filter(f -> f.getName(2).getName(2).getName(2).equals(null)).collect(Collectors.toList());
             var javaFiles = filterJavaFiles(files);
             if (javaFiles.isEmpty()) {
                 return;

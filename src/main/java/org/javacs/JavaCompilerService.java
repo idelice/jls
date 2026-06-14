@@ -266,20 +266,31 @@ class JavaCompilerService implements CompilerProvider {
             String phase) {
         diags.clear();
         var options = buildOptions(profile.analysisMode(), useAnnotationProcessing);
+        var slotWarm = slot != null && slot.compileCount > 0;
         logMemorySnapshot(
                 String.format(
-                        "before_create_compile phase=%s mode=%s sources=%d ap=%s",
-                        phase, profile.analysisMode(), sources.size(), useAnnotationProcessing));
+                        "before_create_compile phase=%s mode=%s sources=%d ap=%s role=%s slot=%s slot_compiles=%d",
+                        phase, profile.analysisMode(), sources.size(), useAnnotationProcessing,
+                        compilerRole, slotWarm ? "warm" : "cold", slot != null ? slot.compileCount : -1));
+        var compileStarted = System.nanoTime();
         var batch = new CompileBatch(
                 this, sources, useAnnotationProcessing, profile.analysisMode(), slot, options);
+        var compileMs = (System.nanoTime() - compileStarted) / 1_000_000;
+        if (slot != null) slot.compileCount++;
+        LOG.fine(String.format(
+                "[perf] persistent_context role=%s slot=%s slot_compiles=%d compile_ms=%d sources=%d roots=%d ap=%s phase=%s",
+                compilerRole, slotWarm ? "warm" : "cold", slot != null ? slot.compileCount : -1,
+                compileMs, sources.size(), batch.roots.size(), batch.annotationProcessingEnabled, phase));
         logMemorySnapshot(
                 String.format(
-                        "after_create_compile phase=%s mode=%s sources=%d roots=%d ap=%s",
+                        "after_create_compile phase=%s mode=%s sources=%d roots=%d ap=%s role=%s slot=%s",
                         phase,
                         profile.analysisMode(),
                         sources.size(),
                         batch.roots.size(),
-                        batch.annotationProcessingEnabled));
+                        batch.annotationProcessingEnabled,
+                        compilerRole,
+                        slotWarm ? "warm" : "cold"));
         return batch;
     }
 
@@ -291,7 +302,12 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private ReusableCompiler.SlotContext slotFor(CompileProfile profile) {
-        return profile.widenToWorkspace() ? fullSlot : null;
+        // persistent compilation context — always reuse the warm slot so javac's
+        // symbol table (resolved imports, type signatures) stays alive between compiles.
+        // First compile pays the full cost; subsequent compiles skip import resolution.
+        // Ceiling: ~200-400MB symbol table memory for large Spring Boot classpaths.
+        // Upgrade: TTL-based slot reset if memory pressure detected.
+        return fullSlot;
     }
 
     private CompileTelemetry compileTelemetry(

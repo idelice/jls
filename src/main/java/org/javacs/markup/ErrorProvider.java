@@ -193,49 +193,9 @@ public class ErrorProvider {
         for (var unusedEl : warnUnused.notUsed()) {
             result.add(warnUnused(unusedEl));
         }
-        // Non-private members with zero same-file references — confirm with workspace word index
-        var declaringFile = Paths.get(root.getSourceFile().toUri());
-        var candidates = warnUnused.potentiallyUnusedNonPrivate();
-        if (!candidates.isEmpty()) {
-            var candidateNames = new HashMap<String, Element>();
-            for (var el : candidates) {
-                candidateNames.put(el.getSimpleName().toString(), el);
-            }
-            var referencedNames = textSearchReferencedNames(candidateNames.keySet(), declaringFile);
-            for (var entry : candidateNames.entrySet()) {
-                if (!referencedNames.contains(entry.getKey())) {
-                    result.add(warnUnused(entry.getValue()));
-                }
-            }
-        }
+
         result.addAll(unusedImportWarnings(root));
         return result;
-    }
-
-    /** Text search: returns member names that appear in at least one other file. */
-    private Set<String> textSearchReferencedNames(Set<String> memberNames, Path declaringFile) {
-        var found = new HashSet<String>();
-        var patterns = new HashMap<String, java.util.regex.Pattern>();
-        for (var name : memberNames) {
-            patterns.put(name, java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(name) + "\\b"));
-        }
-        for (var f : org.javacs.FileStore.all()) {
-            if (f.equals(declaringFile)) continue;
-            if (found.size() == memberNames.size()) break;
-            try {
-                var content = org.javacs.FileStore.contents(f);
-                for (var iter = patterns.entrySet().iterator(); iter.hasNext(); ) {
-                    var entry = iter.next();
-                    if (entry.getValue().matcher(content).find()) {
-                        found.add(entry.getKey());
-                        iter.remove();
-                    }
-                }
-            } catch (Exception e) {
-                // skip unreadable files
-            }
-        }
-        return found;
     }
 
     private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {

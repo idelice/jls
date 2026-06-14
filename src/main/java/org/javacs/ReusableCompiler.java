@@ -90,6 +90,7 @@ class ReusableCompiler {
     static class SlotContext {
         ReusableContext context;
         boolean inUse;
+        int compileCount;
 
         SlotContext() {
             this.context = new ReusableContext();
@@ -98,6 +99,7 @@ class ReusableCompiler {
         void reset() {
             this.context = new ReusableContext();
             this.inUse = false;
+            this.compileCount = 0;
         }
     }
 

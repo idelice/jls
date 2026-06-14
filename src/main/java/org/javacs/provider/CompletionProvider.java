@@ -44,6 +44,9 @@ import java.util.TreeMap;
 import java.util.logging.Logger;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.TypeKind;
+import javax.lang.model.type.TypeVariable;
 
 import org.javacs.CacheAudit;
 import org.javacs.CompilerProvider;
@@ -400,6 +403,15 @@ public class CompletionProvider {
         var resolved = resolver.resolve(expression, memberAccess.receiver());
         var resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
         if (resolved.isEmpty()) {
+            // TODO: ParseTypeResolver cannot infer types for lambda parameters, var with generic
+            // inference, or complex method chains. Fall back to the compile cache which has full
+            // javac attribution from the last successful ATTR compile.
+            var cacheFallback = tryResolveMemberFromCompileCache(parseTask, cursor, memberAccess);
+            if (cacheFallback != null) {
+                LOG.fine(String.format("[completion] compile_cache_fallback receiver='%s' items=%d",
+                        memberAccess.receiver(), cacheFallback.items.size()));
+                return new IndexedCompletionResult(cacheFallback, resolveMs, "compile_cache_fallback");
+            }
             LOG.fine(String.format("[completion] unresolved_type receiver='%s' expression=%s",
                     memberAccess.receiver(), expression != null ? expression.getClass().getSimpleName() : "null"));
             return new IndexedCompletionResult(EMPTY, resolveMs, "unresolved_type");
@@ -1519,6 +1531,80 @@ public class CompletionProvider {
         }
         return false;
     }
+
+    /**
+     * Fallback: use the interactive compiler's cached ATTR result to resolve a member access
+     * when ParseTypeResolver can't infer the receiver type (lambdas, var, generics).
+     *
+     * <p>This is read-only from the cache — never triggers a new compile. Returns null on cache miss.
+     */
+    private CompletionList tryResolveMemberFromCompileCache(ParseTask parseTask, long cursor, MemberAccessContext memberAccess) {
+        var file = Paths.get(parseTask.root().getSourceFile().toUri());
+        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+            var trees = Trees.instance(task.task);
+            var pos = trees.getSourcePositions();
+            var root = task.root(file);
+            // Find the identifier at the cursor position in the attributed tree
+            var found = new Object() { TreePath result; };
+            new TreePathScanner<Void, Void>() {
+                @Override
+                public Void visitIdentifier(IdentifierTree id, Void unused) {
+                    if (id.getName().contentEquals(memberAccess.receiver())) {
+                        long start = pos.getStartPosition(root, id);
+                        long end = pos.getEndPosition(root, id);
+                        // Match by proximity to cursor (receiver is just before the dot)
+                        if (start >= 0 && end >= 0 && end <= cursor && cursor - end <= 2) {
+                            found.result = getCurrentPath();
+                        }
+                    }
+                    return super.visitIdentifier(id, unused);
+                }
+            }.scan(root, null);
+            if (found.result == null) return null;
+            var element = trees.getElement(found.result);
+            if (element == null) return null;
+            var typeMirror = element.asType();
+            if (typeMirror == null || typeMirror.getKind() == TypeKind.ERROR) return null;
+            var qualifiedType = switch (typeMirror.getKind()) {
+                case DECLARED -> ((DeclaredType) typeMirror).asElement().toString();
+                case TYPEVAR -> {
+                    var bound = ((TypeVariable) typeMirror).getUpperBound();
+                    yield bound instanceof DeclaredType dt
+                            ? dt.asElement().toString()
+                            : "java.lang.Object";
+                }
+                default -> null;
+            };
+            if (qualifiedType == null || qualifiedType.isBlank()) return null;
+            // Use the type index to get members (consistent with the normal path)
+            var members = typeIndexRouter.members(qualifiedType, false);
+            if (members.isEmpty()) return null;
+            var list = new ArrayList<CompletionItem>();
+            var methods = new TreeMap<String, List<IndexedMember>>();
+            var methodPriority = new HashMap<String, Integer>();
+            for (var member : members) {
+                if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
+                if (member.kind == CompletionItemKind.Method) {
+                    methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
+                    methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
+                } else {
+                    var item = indexedMember(member);
+                    item.sortText = sortKey(indexMemberPriority(member), item.label);
+                    list.add(item);
+                }
+            }
+            for (var entry : methods.entrySet()) {
+                var method = indexedMethod(entry.getValue(), true);
+                method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
+                list.add(method);
+            }
+            return list.isEmpty() ? null : new CompletionList(false, list);
+        } catch (Exception e) {
+            LOG.fine(String.format("[completion] compile_cache_fallback_failed reason=%s", e.getMessage()));
+            return null;
+        }
+    }
+
 
     private CompletionList completeArrayMemberSelect(boolean isStatic) {
         if (isStatic) {
