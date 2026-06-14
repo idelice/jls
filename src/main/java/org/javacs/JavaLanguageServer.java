@@ -1906,7 +1906,6 @@ class JavaLanguageServer extends LanguageServer {
         /** Debounce completion-index refreshes and collapse newer schedules onto one pending task. */
         void scheduleRefresh(
                 Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
-      files.stream().map(f -> f.getFileName()).filter(f -> f.getName(2).getName(2).getName(2).equals(null)).collect(Collectors.toList());
             var javaFiles = filterJavaFiles(files);
             if (javaFiles.isEmpty()) {
                 return;
