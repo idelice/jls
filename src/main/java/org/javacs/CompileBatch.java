@@ -259,6 +259,12 @@ public class CompileBatch implements AutoCloseable {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
+        // Source path allows javac to resolve workspace types from source rather than
+        // stale .class files, enabling cross-file error detection without full recompilation.
+        var sourceRoots = FileStore.workspaceRoots();
+        if (!sourceRoots.isEmpty()) {
+            Collections.addAll(list, "-sourcepath", joinPath(sourceRoots));
+        }
         if (!targetsJava8OrEarlier(extraArgs)) {
             Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         }
@@ -330,6 +336,10 @@ public class CompileBatch implements AutoCloseable {
     static List<String> optionsWithoutAP(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();
         Collections.addAll(list, "-classpath", joinPath(classPath));
+        var sourceRoots = FileStore.workspaceRoots();
+        if (!sourceRoots.isEmpty()) {
+            Collections.addAll(list, "-sourcepath", joinPath(sourceRoots));
+        }
         if (!targetsJava8OrEarlier(extraArgs)) {
             Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         }

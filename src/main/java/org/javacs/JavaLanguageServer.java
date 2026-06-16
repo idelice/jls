@@ -1066,7 +1066,6 @@ class JavaLanguageServer extends LanguageServer {
         }
         completionIndexExecutor.shutdownNow();
         diagnosticExecutor.shutdownNow();
-        GradleTooling.shutdown(workspaceRoot);
         CacheAudit.logSummary(LOG);
     }
 

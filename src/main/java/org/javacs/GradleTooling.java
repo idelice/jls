@@ -129,10 +129,6 @@ public final class GradleTooling {
         }
     }
 
-    /** No-op — no persistent daemon to shut down with the subprocess approach. */
-    public static synchronized void shutdown(Path workspaceRoot) {
-        // ponytail: nothing to do, --no-daemon means no persistent process
-    }
 
     // -------------------------------------------------------------------------
     // Subprocess invocation
