@@ -459,6 +459,43 @@ public final class ExternalBinaryTypeIndex {
                             ex.getClass().getSimpleName()));
                 }
             }
+            // Index constructors via reflection
+            for (var ctor : binaryClass.getDeclaredConstructors()) {
+                try {
+                    if (ctor.isSynthetic()) continue;
+                    if (java.lang.reflect.Modifier.isPrivate(ctor.getModifiers())) continue;
+                    var parameterNames = new String[ctor.getParameterCount()];
+                    var erasedParameterTypes = new String[ctor.getParameterCount()];
+                    var parameters = new StringJoiner(", ");
+                    for (int i = 0; i < ctor.getParameterCount(); i++) {
+                        var parameter = ctor.getParameters()[i];
+                        parameterNames[i] = parameter.isNamePresent() ? parameter.getName() : "arg" + i;
+                        erasedParameterTypes[i] = ctor.getParameterTypes()[i].getTypeName();
+                        parameters.add(canonicalTypeName(ctor.getParameterTypes()[i]) + " " + parameterNames[i]);
+                    }
+                    var simpleName = binaryClass.getSimpleName();
+                    var detail = simpleName + "(" + parameters + ")";
+                    var member = new IndexedMember(
+                            qualifiedName,
+                            "<init>",
+                            CompletionItemKind.Constructor,
+                            false,
+                            false,
+                            0,
+                            detail,
+                            "void",
+                            parameterNames,
+                            erasedParameterTypes,
+                            IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Constructor, "<init>", erasedParameterTypes),
+                            IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Constructor, "<init>", erasedParameterTypes),
+                            null,
+                            false,
+                            IndexedMember.Provenance.EXTERNAL_BINARY);
+                    seen.putIfAbsent(memberKey(member), member);
+                } catch (TypeNotPresentException | LinkageError ex) {
+                    // skip
+                }
+            }
             var members = new ArrayList<>(seen.values());
             IndexedMember.sort(members);
             var superclass =
@@ -612,6 +649,26 @@ public final class ExternalBinaryTypeIndex {
             var parameterTypes = parseBinaryParameterTypes(methodType);
             var parameterNames = syntheticParameterNames(parameterTypes.length);
             if ("<init>".equals(name)) {
+                // Index constructor
+                var privateMember = method.flags().has(AccessFlag.PRIVATE);
+                var ctorDetail = TypeNames.simpleName(qualifiedName) + "(" + renderParameters(parameterTypes, parameterNames) + ")";
+                var member = new IndexedMember(
+                        qualifiedName,
+                        name,
+                        CompletionItemKind.Constructor,
+                        false,
+                        privateMember,
+                        0,
+                        ctorDetail,
+                        "void",
+                        parameterNames,
+                        parameterTypes,
+                        IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Constructor, name, parameterTypes),
+                        IndexedMember.canonicalKey(qualifiedName, CompletionItemKind.Constructor, name, parameterTypes),
+                        null,
+                        false,
+                        IndexedMember.Provenance.EXTERNAL_BINARY);
+                seenMembers.putIfAbsent(memberKey(member), member);
                 continue;
             }
             var returnType = normalizeBinaryType(methodType.returnType());

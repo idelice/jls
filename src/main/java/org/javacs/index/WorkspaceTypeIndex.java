@@ -448,6 +448,9 @@ public class WorkspaceTypeIndex {
                 if (staticContext != member.isStatic || member.isPrivate) {
                     continue;
                 }
+                if (member.kind == CompletionItemKind.Constructor) {
+                    continue; // constructors are not inherited
+                }
                 var storageKey = memberStorageKey(member);
                 if (!seenStorageKeys.add(storageKey)) {
                     continue;
@@ -712,6 +715,7 @@ public class WorkspaceTypeIndex {
             // Synthesize record component accessors without attribution
             if (classTree.getKind() == Tree.Kind.RECORD) {
                 addRecordComponentAccessorsFromParseTree(qualifiedName, classTree, seen);
+                addRecordCanonicalConstructorFromParseTree(qualifiedName, classTree, seen);
             }
         }
 
@@ -928,8 +932,9 @@ public class WorkspaceTypeIndex {
     private static void addParseTreeMethod(
             String ownerQualifiedName, MethodTree method, Map<String, IndexedMember> seen) {
         var name = method.getName() == null ? null : method.getName().toString();
-        if (name == null || name.isBlank() || "<init>".equals(name)) return;
+        if (name == null || name.isBlank()) return;
 
+        var isConstructor = "<init>".equals(name);
         var flags = method.getModifiers().getFlags();
         var isStatic = flags.contains(Modifier.STATIC);
         var isPrivate = flags.contains(Modifier.PRIVATE);
@@ -937,6 +942,7 @@ public class WorkspaceTypeIndex {
         var isPublic = flags.contains(Modifier.PUBLIC);
         var isAbstract = flags.contains(Modifier.ABSTRACT);
 
+        var kind = isConstructor ? CompletionItemKind.Constructor : CompletionItemKind.Method;
         var returnTypeStr = method.getReturnType() == null ? "void" : method.getReturnType().toString();
 
         var params = method.getParameters();
@@ -952,11 +958,13 @@ public class WorkspaceTypeIndex {
         }
 
         var canonicalKey = IndexedMember.canonicalKey(
-                ownerQualifiedName, CompletionItemKind.Method, name, erasedParamTypes);
-        var detail = returnTypeStr + " " + name + "(" + String.join(", ", declaredParamTypes) + ")";
+                ownerQualifiedName, kind, name, erasedParamTypes);
+        var detail = isConstructor
+                ? TypeNames.simpleName(ownerQualifiedName) + "(" + String.join(", ", declaredParamTypes) + ")"
+                : returnTypeStr + " " + name + "(" + String.join(", ", declaredParamTypes) + ")";
 
         var next = new IndexedMember(
-                ownerQualifiedName, name, CompletionItemKind.Method,
+                ownerQualifiedName, name, kind,
                 isStatic, isPrivate, isProtected, isPublic, isAbstract,
                 0, detail, returnTypeStr, returnTypeStr,
                 paramNames, erasedParamTypes, declaredParamTypes,
@@ -1053,6 +1061,43 @@ public class WorkspaceTypeIndex {
     }
 
     /**
+     * Synthesize the canonical constructor for a record from its components.
+     * Only adds one if no explicit constructor with matching arity was already indexed.
+     */
+    private static void addRecordCanonicalConstructorFromParseTree(
+            String ownerQualifiedName, ClassTree classTree, Map<String, IndexedMember> seen) {
+        var paramNames = new java.util.ArrayList<String>();
+        var erasedParamTypes = new java.util.ArrayList<String>();
+        var declaredParamTypes = new java.util.ArrayList<String>();
+        for (var member : classTree.getMembers()) {
+            if (!(member instanceof VariableTree vt)) continue;
+            if (!(vt instanceof JCVariableDecl jcVar)) continue;
+            if ((jcVar.mods.flags & Flags.RECORD) == 0) continue;
+            var name = jcVar.getName() == null ? null : jcVar.getName().toString();
+            if (name == null || name.isBlank()) continue;
+            paramNames.add(name);
+            var typeStr = jcVar.vartype == null ? "Object" : jcVar.vartype.toString();
+            declaredParamTypes.add(typeStr);
+            erasedParamTypes.add(TypeNames.normalize(typeStr));
+        }
+        var pNames = paramNames.toArray(String[]::new);
+        var ePTypes = erasedParamTypes.toArray(String[]::new);
+        var dPTypes = declaredParamTypes.toArray(String[]::new);
+        var canonicalKey = IndexedMember.canonicalKey(
+                ownerQualifiedName, CompletionItemKind.Constructor, "<init>", ePTypes);
+        if (seen.containsKey(canonicalKey)) return; // explicit constructor already indexed
+        var simpleName = TypeNames.simpleName(ownerQualifiedName);
+        var detail = simpleName + "(" + String.join(", ", dPTypes) + ")";
+        seen.put(canonicalKey, new IndexedMember(
+                ownerQualifiedName, "<init>", CompletionItemKind.Constructor,
+                false, false, false, true, false,
+                0, detail, "void", "void",
+                pNames, ePTypes, dPTypes,
+                canonicalKey, canonicalKey, null, true,
+                IndexedMember.Origin.RECORD_COMPONENT, Set.of(Modifier.PUBLIC), null, null));
+    }
+
+    /**
      * Walk the workspace superclass and interface chains to add inherited members.
      *
      * <p>Only workspace-declared types are walked here. External inherited members are resolved
@@ -1099,6 +1144,7 @@ public class WorkspaceTypeIndex {
         for (var entry : parentMembers.entrySet()) {
             var parentMember = entry.getValue();
             if (parentMember.isPrivate) continue;
+            if (parentMember.kind == CompletionItemKind.Constructor) continue; // constructors are not inherited
             childSeen.putIfAbsent(entry.getKey(), withInheritedPriority(parentMember));
         }
     }
@@ -1318,7 +1364,12 @@ public class WorkspaceTypeIndex {
 
             var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
             for (var member : elements.getAllMembers(type)) {
-                if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
+                if (member.getKind() == ElementKind.CONSTRUCTOR) {
+                    // Only index constructors declared in this type, never inherited
+                    var ownerElement = member.getEnclosingElement();
+                    if (!(ownerElement instanceof TypeElement ownerType)) continue;
+                    if (!qualifiedName.equals(ownerType.getQualifiedName().toString())) continue;
+                } 
                 var kind = memberKind(member);
                 if (kind == null) continue;
 
@@ -1507,6 +1558,9 @@ public class WorkspaceTypeIndex {
     private static Integer memberKind(Element member) {
         if (member.getKind() == ElementKind.METHOD) {
             return CompletionItemKind.Method;
+        }
+        if (member.getKind() == ElementKind.CONSTRUCTOR) {
+            return CompletionItemKind.Constructor;
         }
         if (member.getKind() == ElementKind.FIELD || member.getKind() == ElementKind.ENUM_CONSTANT) {
             return CompletionItemKind.Field;

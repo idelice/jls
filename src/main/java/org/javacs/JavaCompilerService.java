@@ -457,8 +457,10 @@ class JavaCompilerService implements CompilerProvider {
                             slotFor(profile));
             workspaceCache = loaded;
             workspaceCacheRevision = currentContentRevision;
-            // Release the slot so it's available for the next compile.
+            // Clear context keys so the next compile won't hit "duplicate context value".
+            // The warm symbol table (Enter, Types, Check, Modules) persists after clear().
             if (loaded.slot != null && !loaded.closed) {
+                loaded.slot.context.clear();
                 loaded.slot.inUse = false;
             }
             CacheAudit.load(cacheName);
@@ -541,9 +543,10 @@ class JavaCompilerService implements CompilerProvider {
                         useAnnotationProcessing,
                         slotFor(profile));
         fileCache.load(file, null, loaded);
-        // Release the slot so it's available for the next compile.
-        // The cached batch retains the AST/type info but doesn't need the slot locked.
+        // Clear context keys so the next compile won't hit "duplicate context value".
+        // The warm symbol table (Enter, Types, Check, Modules) persists after clear().
         if (loaded.slot != null && !loaded.closed) {
+            loaded.slot.context.clear();
             loaded.slot.inUse = false;
         }
         var compilerPath =
