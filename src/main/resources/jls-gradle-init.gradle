@@ -1,0 +1,79 @@
+// JLS Gradle init script — extracts module graph as JSON for the Java Language Server.
+// Invoked via: ./gradlew --no-daemon --init-script <this-file> jlsProjectInfo
+
+rootProject {
+    task jlsProjectInfo {
+        doLast {
+            def modules = []
+            rootProject.allprojects { proj ->
+                def info = [:]
+                info.projectPath = proj.path
+                info.projectDir = proj.projectDir.absolutePath
+
+                // Source directories
+                def srcDirs = []
+                if (proj.plugins.hasPlugin('java') || proj.plugins.hasPlugin('java-library')) {
+                    proj.sourceSets.each { ss ->
+                        ss.java.srcDirs.each { dir ->
+                            if (dir.exists()) {
+                                srcDirs.add(dir.absolutePath)
+                            }
+                        }
+                    }
+                }
+                info.sourceDirs = srcDirs
+
+                // External classpath (resolved compile dependencies from all source sets)
+                def classpath = [] as Set
+                try {
+                    proj.configurations.each { config ->
+                        if (config.name.endsWith('CompileClasspath') && config.isCanBeResolved()) {
+                            config.resolve().each { file ->
+                                classpath.add(file.absolutePath)
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // Configuration may not be resolvable
+                }
+                info.externalClasspath = classpath.toList()
+
+                // Inter-module (project) dependencies
+                def moduleDeps = []
+                try {
+                    def config = proj.configurations.findByName('compileClasspath')
+                    if (config != null) {
+                        config.dependencies.each { dep ->
+                            if (dep instanceof org.gradle.api.artifacts.ProjectDependency) {
+                                moduleDeps.add(dep.dependencyProject.path)
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    // Ignore
+                }
+                info.moduleDeps = moduleDeps
+
+                // Source compatibility
+                info.sourceCompatibility = null
+                if (proj.plugins.hasPlugin('java')) {
+                    try {
+                        def javaExt = proj.extensions.findByName('java')
+                        if (javaExt != null && javaExt.sourceCompatibility != null) {
+                            info.sourceCompatibility = javaExt.sourceCompatibility.toString()
+                        }
+                    } catch (Exception e) {
+                        // Ignore
+                    }
+                }
+
+                modules.add(info)
+            }
+
+            def json = groovy.json.JsonOutput.toJson([modules: modules])
+            println "___JLS_MODULE_GRAPH_START___"
+            println json
+            println "___JLS_MODULE_GRAPH_END___"
+        }
+    }
+}

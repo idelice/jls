@@ -497,21 +497,6 @@ class JavaLanguageServer extends LanguageServer {
         return true;
     }
 
-    private Collection<Path> otherActiveDocuments(Path file) {
-        var activeJavaFiles = filterJavaFiles(FileStore.activeDocuments());
-        if (activeJavaFiles.isEmpty() || !activeJavaFiles.contains(file)) {
-            return List.of();
-        }
-        var others = new LinkedHashSet<Path>();
-        for (var active : activeJavaFiles) {
-            if (active.equals(file)) {
-                continue;
-            }
-            others.add(active);
-        }
-        return List.copyOf(others);
-    }
-
     private List<DeclaredTypeShape> declaredTypeShapes(ParseTask parse) {
         var packageName = parse.root().getPackageName() == null ? "" : parse.root().getPackageName().toString();
         var result = new ArrayList<DeclaredTypeShape>();
@@ -1658,7 +1643,7 @@ class JavaLanguageServer extends LanguageServer {
                                 if (f.startsWith(srcDir)) newFiles.add(f);
                             }
                         }
-                        if (!newFiles.isEmpty()) {
+                        if (!newFiles.isEmpty() && newFiles.size() <= LARGE_WORKSPACE_THRESHOLD) {
                             completionIndexScheduler.scheduleRefresh(
                                     newFiles, "moduleExpand", 0,
                                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);

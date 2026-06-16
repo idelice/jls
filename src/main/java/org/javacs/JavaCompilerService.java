@@ -20,7 +20,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.tools.*;
+import org.javacs.completion.ExternalBinaryDecompiler;
 
 class JavaCompilerService implements CompilerProvider {
     private static final Logger LOG = Logger.getLogger("main");
@@ -455,6 +457,10 @@ class JavaCompilerService implements CompilerProvider {
                             slotFor(profile));
             workspaceCache = loaded;
             workspaceCacheRevision = currentContentRevision;
+            // Release the slot so it's available for the next compile.
+            if (loaded.slot != null && !loaded.closed) {
+                loaded.slot.inUse = false;
+            }
             CacheAudit.load(cacheName);
             CacheAudit.store(cacheName);
             var compilerPath =
@@ -535,6 +541,11 @@ class JavaCompilerService implements CompilerProvider {
                         useAnnotationProcessing,
                         slotFor(profile));
         fileCache.load(file, null, loaded);
+        // Release the slot so it's available for the next compile.
+        // The cached batch retains the AST/type info but doesn't need the slot locked.
+        if (loaded.slot != null && !loaded.closed) {
+            loaded.slot.inUse = false;
+        }
         var compilerPath =
                 useAnnotationProcessing && !loaded.annotationProcessingEnabled
                         ? "ap_fallback_no_cache"
@@ -995,9 +1006,9 @@ class JavaCompilerService implements CompilerProvider {
         return classPath;
     }
 
-    private volatile org.javacs.completion.ExternalBinaryDecompiler decompiler;
+    private volatile ExternalBinaryDecompiler decompiler;
 
-    private org.javacs.completion.ExternalBinaryDecompiler decompiler() {
+    private ExternalBinaryDecompiler decompiler() {
         if (decompiler == null) {
             synchronized (this) {
                 if (decompiler == null) {
@@ -1006,9 +1017,9 @@ class JavaCompilerService implements CompilerProvider {
                                     classPath.stream()
                                             .map(p -> p.toAbsolutePath().normalize().toString())
                                             .sorted()
-                                            .collect(java.util.stream.Collectors.joining("|"))
+                                            .collect(Collectors.joining("|"))
                                             .hashCode());
-                    decompiler = new org.javacs.completion.ExternalBinaryDecompiler(
+                    decompiler = new ExternalBinaryDecompiler(
                             classPath, fingerprint, getClass().getClassLoader());
                 }
             }
