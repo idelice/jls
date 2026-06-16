@@ -1,14 +1,10 @@
 package org.javacs;
 
-import com.sun.source.doctree.DocCommentTree;
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import java.io.IOException;
 import java.nio.file.*;
-import java.time.Instant;
 import java.util.*;
-import java.util.logging.Logger;
-import java.util.regex.Pattern;
 import javax.lang.model.element.*;
 import javax.tools.JavaCompiler;
 import javax.tools.JavaFileObject;

@@ -434,7 +434,7 @@ public class WorkspaceTypeIndex {
     private void addInheritedMembers(
             String qualifiedName, boolean staticContext, List<IndexedMember> members, Set<String> seenStorageKeys) {
         var visited = new ObjectLinkedOpenHashSet<String>();
-        var pending = new java.util.ArrayDeque<>(directSupertypes(qualifiedName));
+        var pending = new ArrayDeque<>(directSupertypes(qualifiedName));
         while (!pending.isEmpty()) {
             var superType = pending.removeFirst();
             if (!visited.add(superType)) {
@@ -489,7 +489,7 @@ public class WorkspaceTypeIndex {
     private Optional<IndexedMember> inheritedMember(
             String qualifiedName, String name, boolean staticContext, String[] erasedParameterTypes) {
         var visited = new ObjectLinkedOpenHashSet<String>();
-        var pending = new java.util.ArrayDeque<>(directSupertypes(qualifiedName));
+        var pending = new ArrayDeque<>(directSupertypes(qualifiedName));
         while (!pending.isEmpty()) {
             var superType = pending.removeFirst();
             if (!visited.add(superType)) {

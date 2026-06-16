@@ -3,11 +3,13 @@ package org.javacs.completion;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.time.Instant;
 import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import org.jetbrains.java.decompiler.api.Decompiler;
@@ -37,7 +39,7 @@ public final class ExternalBinaryDecompiler {
      */
     private void pruneStaleCache() {
         var tmp = Path.of(System.getProperty("java.io.tmpdir"));
-        var cutoff = java.time.Instant.now().minus(STALE_CACHE_DAYS, java.time.temporal.ChronoUnit.DAYS);
+        var cutoff = Instant.now().minus(STALE_CACHE_DAYS, ChronoUnit.DAYS);
         for (var cacheRoot : List.of(tmp.resolve("jls-binary-decompiled"), tmp.resolve("jls-binary-inputs"))) {
             if (!Files.isDirectory(cacheRoot)) continue;
             try (var stream = Files.list(cacheRoot)) {

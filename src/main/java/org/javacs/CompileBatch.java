@@ -208,7 +208,7 @@ public class CompileBatch implements AutoCloseable {
         return addFiles;
     }
 
-    private String errorText(javax.tools.Diagnostic<? extends javax.tools.JavaFileObject> err) {
+    private String errorText(Diagnostic<? extends JavaFileObject> err) {
         var file = Paths.get(err.getSource().toUri());
         var contents = FileStore.contents(file);
         var begin = (int) err.getStartPosition();
@@ -216,7 +216,7 @@ public class CompileBatch implements AutoCloseable {
         return contents.substring(begin, end);
     }
 
-    private String packageName(javax.tools.Diagnostic<? extends javax.tools.JavaFileObject> err) {
+    private String packageName(Diagnostic<? extends JavaFileObject> err) {
         var file = Paths.get(err.getSource().toUri());
         return FileStore.packageName(file);
     }
@@ -384,7 +384,7 @@ public class CompileBatch implements AutoCloseable {
         }
     }
 
-    private boolean isValidFileRange(javax.tools.Diagnostic<? extends JavaFileObject> d) {
+    private boolean isValidFileRange(Diagnostic<? extends JavaFileObject> d) {
         return d.getSource().toUri().getScheme().equals("file") && d.getStartPosition() >= 0 && d.getEndPosition() >= 0;
     }
 }

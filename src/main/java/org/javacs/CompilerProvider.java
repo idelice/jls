@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import javax.tools.JavaFileObject;
+import java.util.ArrayList;
 
 public interface CompilerProvider {
     Set<String> imports();
@@ -60,7 +61,7 @@ public interface CompilerProvider {
      * is called, so this is typically ~15x faster than any compile path for large workspaces.
      */
     default List<ParseTask> parseAll(Collection<Path> files) {
-        var result = new java.util.ArrayList<ParseTask>(files.size());
+        var result = new ArrayList<ParseTask>(files.size());
         for (var file : files) {
             result.add(parse(file));
         }
@@ -79,7 +80,7 @@ public interface CompilerProvider {
      * <p>The result is cached on disk by fingerprint so repeated calls are cheap. Returns empty
      * when the type cannot be located on the classpath or decompilation fails.
      */
-    default Optional<java.nio.file.Path> decompileClass(String qualifiedName) {
+    default Optional<Path> decompileClass(String qualifiedName) {
         return Optional.empty();
     }
 

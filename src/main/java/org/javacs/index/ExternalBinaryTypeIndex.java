@@ -6,6 +6,7 @@ import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.VariableTree;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Modifier;
 import java.lang.classfile.ClassFile;
 import java.lang.classfile.constantpool.ConstantPoolException;
 import java.lang.constant.ClassDesc;
@@ -347,8 +348,8 @@ public final class ExternalBinaryTypeIndex {
                                     declaring,
                                     field.getName(),
                                     CompletionItemKind.Field,
-                                    java.lang.reflect.Modifier.isStatic(field.getModifiers()),
-                                    java.lang.reflect.Modifier.isPrivate(field.getModifiers()),
+                                    Modifier.isStatic(field.getModifiers()),
+                                    Modifier.isPrivate(field.getModifiers()),
                                     priority,
                                     field.getType().getTypeName() + " " + field.getName(),
                                     canonicalTypeName(field.getType()),
@@ -415,8 +416,8 @@ public final class ExternalBinaryTypeIndex {
                                         declaring,
                                         method.getName(),
                                         CompletionItemKind.Method,
-                                        java.lang.reflect.Modifier.isStatic(method.getModifiers()),
-                                        java.lang.reflect.Modifier.isPrivate(method.getModifiers()),
+                                        Modifier.isStatic(method.getModifiers()),
+                                        Modifier.isPrivate(method.getModifiers()),
                                         priority,
                                         detail,
                                         canonicalTypeName(method.getReturnType()),
@@ -673,7 +674,7 @@ public final class ExternalBinaryTypeIndex {
             return;
         }
         for (var field : type.getDeclaredFields()) {
-            if (!java.lang.reflect.Modifier.isPublic(field.getModifiers()) || field.isSynthetic()) {
+            if (!Modifier.isPublic(field.getModifiers()) || field.isSynthetic()) {
                 continue;
             }
             ordered.putIfAbsent(field.getName(), field);
@@ -695,7 +696,7 @@ public final class ExternalBinaryTypeIndex {
             return;
         }
         for (var method : type.getDeclaredMethods()) {
-            if (!java.lang.reflect.Modifier.isPublic(method.getModifiers())
+            if (!Modifier.isPublic(method.getModifiers())
                     || method.isSynthetic()
                     || method.isBridge()) {
                 continue;

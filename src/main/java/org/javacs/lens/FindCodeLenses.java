@@ -10,7 +10,6 @@ import java.util.Objects;
 import org.javacs.FileStore;
 import org.javacs.lsp.CodeLens;
 import org.javacs.lsp.Command;
-import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 
 class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
@@ -115,7 +114,7 @@ class FindCodeLenses extends TreeScanner<Void, List<CodeLens>> {
         var start = pos.getStartPosition(root, t);
         var end = pos.getEndPosition(root, t);
         try {
-            return org.javacs.FileStore.range(root.getSourceFile().getCharContent(true).toString(), start, end);
+            return FileStore.range(root.getSourceFile().getCharContent(true).toString(), start, end);
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }

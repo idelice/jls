@@ -133,7 +133,7 @@ public class CodeActionProvider {
                     for (var member : classTree.getMembers()) {
                         if (member instanceof VariableTree) {
                             var field = (VariableTree) member;
-                            if (!field.getModifiers().getFlags().contains(javax.lang.model.element.Modifier.STATIC)) {
+                            if (!field.getModifiers().getFlags().contains(Modifier.STATIC)) {
                                 fields.add(field);
                             }
                         }
