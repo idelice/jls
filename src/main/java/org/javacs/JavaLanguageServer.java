@@ -1508,50 +1508,34 @@ class JavaLanguageServer extends LanguageServer {
             return new DocumentDiagnosticReport(List.of());
         }
         var file = Paths.get(params.textDocument.uri);
-        scheduleDiagnosticCompile(file);
-        var cached = lastPublishedDiagnostics.get(file);
-        return new DocumentDiagnosticReport(cached != null ? cached : List.of());
-    }
-
-    /**
-     * Schedule a background ATTR compile for type diagnostics.
-     * The compile runs on diagnosticExecutor using the diagnosticCompiler lane.
-     * On completion, diagnostics are published to the client via publishDiagnostics.
-     */
-    private void scheduleDiagnosticCompile(Path file) {
-        var contentHash = FileStore.contentHash(file);
-        if (contentHash == lastDiagnosticContentHash.getOrDefault(file, 0)) return;
-        lastDiagnosticContentHash.put(file, contentHash);
-        diagnosticExecutor.submit(() -> {
-            try {
-                var compiler = diagnosticCompiler;
-                if (compiler == null) return;
-                if (FileStore.contentHash(file) != lastDiagnosticContentHash.getOrDefault(file, 0)) return;
-                LOG.info("[diagnostics] background_compile_start file=" + file.getFileName());
-                var started = System.nanoTime();
-                var sources = List.<JavaFileObject>of(new SourceFileObject(file));
-                try (var task = compiler.compileDiagnostics(sources)) {
-                    var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
-                    var errorProvider = new ErrorProvider(task);
-                    var errorReport = errorProvider.errors(Set.of(file.toUri()));
-                    LOG.info(String.format(
-                            "[diagnostics] background_compile_done file=%s duration=%dms errors=%d",
-                            file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
-                    for (var diagParams : errorReport.diagnostics()) {
-                        var diagFile = Paths.get(diagParams.uri);
-                        lastPublishedDiagnostics.put(diagFile, diagParams.diagnostics);
-                    }
-                    client.customNotification("workspace/diagnostic/refresh", null);
-                }
-            } catch (Exception e) {
-                LOG.warning("[diagnostics] background_compile_failed file=" + file.getFileName()
-                        + " reason=" + e.getMessage());
+        try {
+            var compiler = diagnosticCompiler;
+            if (compiler == null) {
+                return new DocumentDiagnosticReport(List.of());
             }
-        });
+            LOG.info("[diagnostics] pull_compile_start file=" + file.getFileName());
+            var started = System.nanoTime();
+            var sources = List.<JavaFileObject>of(new SourceFileObject(file));
+            try (var task = compiler.compileDiagnostics(sources)) {
+                var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+                var errorProvider = new ErrorProvider(task);
+                var errorReport = errorProvider.errors(Set.of(file.toUri()));
+                LOG.info(String.format(
+                        "[diagnostics] pull_compile_done file=%s duration=%dms errors=%d",
+                        file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
+                for (var diagParams : errorReport.diagnostics()) {
+                    if (file.toUri().equals(diagParams.uri)) {
+                        return new DocumentDiagnosticReport(diagParams.diagnostics);
+                    }
+                }
+                return new DocumentDiagnosticReport(List.of());
+            }
+        } catch (Exception e) {
+            LOG.warning("[diagnostics] pull_compile_failed file=" + file.getFileName()
+                    + " reason=" + e.getMessage());
+            return new DocumentDiagnosticReport(List.of());
+        }
     }
-
-    private final Map<Path, Integer> lastDiagnosticContentHash = new ConcurrentHashMap<>();
-    private final Map<Path, List<org.javacs.lsp.Diagnostic>> lastPublishedDiagnostics = new ConcurrentHashMap<>();
 
     /** Modules whose deps have already been compiled this session. */
     private final Set<String> compiledModuleDeps = ConcurrentHashMap.newKeySet();

@@ -50,7 +50,6 @@ class JavaCompilerService implements CompilerProvider {
     final Set<String> addExports;
     final List<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
-    private final ReusableCompiler.SlotContext fullSlot = new ReusableCompiler.SlotContext();
     private final ReusableCompiler.SlotContext diagnosticSlot;
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
@@ -303,15 +302,6 @@ class JavaCompilerService implements CompilerProvider {
         return CompileBatch.options(classPath, addExports, extraArgs, lombokPresentOnClasspath);
     }
 
-    private ReusableCompiler.SlotContext slotFor(CompileProfile profile) {
-        // persistent compilation context — always reuse the warm slot so javac's
-        // symbol table (resolved imports, type signatures) stays alive between compiles.
-        // First compile pays the full cost; subsequent compiles skip import resolution.
-        // Ceiling: ~200-400MB symbol table memory for large Spring Boot classpaths.
-        // Upgrade: TTL-based slot reset if memory pressure detected.
-        return fullSlot;
-    }
-
     private CompileTelemetry compileTelemetry(
             String cacheName,
             String path,
@@ -404,6 +394,8 @@ class JavaCompilerService implements CompilerProvider {
                             effectiveSources,
                             profile,
                             useAnnotationProcessing,
+                            // Retained cache snapshots are read-only and can outlive the request.
+                            // Keep them off reusable slots so local/parameter TreePath mappings remain valid.
                             null);
             var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
             LOG.fine(
@@ -454,15 +446,11 @@ class JavaCompilerService implements CompilerProvider {
                             effectiveSources,
                             profile,
                             useAnnotationProcessing,
-                            slotFor(profile));
+                            // Same rule as workspace cache refresh: retained snapshots are single-use tasks,
+                            // reusable slots are reserved for transient compile work.
+                            null);
             workspaceCache = loaded;
             workspaceCacheRevision = currentContentRevision;
-            // Clear context keys so the next compile won't hit "duplicate context value".
-            // The warm symbol table (Enter, Types, Check, Modules) persists after clear().
-            if (loaded.slot != null && !loaded.closed) {
-                loaded.slot.context.clear();
-                loaded.slot.inUse = false;
-            }
             CacheAudit.load(cacheName);
             CacheAudit.store(cacheName);
             var compilerPath =
@@ -541,14 +529,8 @@ class JavaCompilerService implements CompilerProvider {
                         effectiveSources,
                         profile,
                         useAnnotationProcessing,
-                        slotFor(profile));
+                        null);
         fileCache.load(file, null, loaded);
-        // Clear context keys so the next compile won't hit "duplicate context value".
-        // The warm symbol table (Enter, Types, Check, Modules) persists after clear().
-        if (loaded.slot != null && !loaded.closed) {
-            loaded.slot.context.clear();
-            loaded.slot.inUse = false;
-        }
         var compilerPath =
                 useAnnotationProcessing && !loaded.annotationProcessingEnabled
                         ? "ap_fallback_no_cache"

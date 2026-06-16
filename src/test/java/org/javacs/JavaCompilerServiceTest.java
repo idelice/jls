@@ -3,6 +3,8 @@ package org.javacs;
 import static org.hamcrest.Matchers.*;
 import static org.junit.Assert.*;
 
+import com.sun.source.util.TreePath;
+import com.sun.source.util.Trees;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -12,6 +14,7 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.util.*;
+import javax.lang.model.element.ElementKind;
 import javax.tools.JavaFileObject;
 import org.junit.*;
 
@@ -409,6 +412,56 @@ public class JavaCompilerServiceTest {
             }
 
             assertThat("cached batch should remain open after cache hit", firstBatch.closed, is(false));
+        }
+    }
+
+    @Test
+    public void cachedFastCompileRetainsLocalVariableDeclarationPaths() throws Exception {
+        var workspace = Files.createTempDirectory("compile-fast-local-paths");
+        var file = workspace.resolve("LocalPaths.java");
+        Files.writeString(
+                file,
+                """
+                class LocalPaths {
+                    void test() {
+                        int local = 1;
+                        int other = local + 1;
+                    }
+                }
+                """);
+        FileStore.reset();
+        FileStore.setWorkspaceRoots(Set.of(workspace));
+        var service =
+                new JavaCompilerService(
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet(),
+                        Collections.emptySet());
+
+        try {
+            try (var first = service.compileFast(file)) {
+                assertThat(first.root(file), notNullValue());
+                assertThat(service.lastCompileTelemetry().path(), is("cache_refresh"));
+            }
+
+            try (var second = service.compileFast(file)) {
+                assertThat(service.lastCompileTelemetry().path(), is("cache_hit"));
+                var root = second.root(file);
+                var trees = Trees.instance(second.task);
+                var source = root.getSourceFile().getCharContent(true).toString();
+                var cursor = (long) source.indexOf("local +");
+                assertThat("expected usage marker in source", cursor, greaterThanOrEqualTo(0L));
+                var usage = new FindNameAt(second).scan(root, cursor);
+                assertThat("expected local variable usage path", usage, notNullValue());
+                var element = trees.getElement(usage);
+                assertThat("expected local variable element", element.getKind(), is(ElementKind.LOCAL_VARIABLE));
+                assertThat(
+                        "cache hit task should keep local element TreePath mapping",
+                        trees.getPath(element),
+                        notNullValue());
+            }
+        } finally {
+            deleteTree(workspace);
         }
     }
 
