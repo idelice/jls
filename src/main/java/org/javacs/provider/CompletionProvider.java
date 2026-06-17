@@ -1540,8 +1540,8 @@ public class CompletionProvider {
      */
     private CompletionList tryResolveMemberFromCompileCache(ParseTask parseTask, long cursor, MemberAccessContext memberAccess) {
         var file = Paths.get(parseTask.root().getSourceFile().toUri());
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
-            var trees = Trees.instance(task.task);
+        try (var task = compiler.compile(file)) {
+            var trees = task.trees;
             var pos = trees.getSourcePositions();
             var root = task.root(file);
             // Find the identifier at the cursor position in the attributed tree

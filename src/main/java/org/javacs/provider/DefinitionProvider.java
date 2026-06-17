@@ -78,14 +78,13 @@ public class DefinitionProvider {
     }
 
     public ResolvedSymbol resolveSymbol() {
-        var lombokUsed = compiler.lombokPresentOnClasspath();
         // Use an ATTR compile of the current file only. javac resolves cross-file types
         // automatically via SOURCE_PATH during attribution, so Trees.getElement(path) is
         // still fully typed. For cross-file declarations, Trees.getPath(element) either
         // succeeds (SOURCE_PATH files are entered into javac's compiledTopLevels) or returns
         // null and the fallback resolveElementCrossFile() handles it via the type index.
         // This reuses the completion ATTR cache — definition is always a cache hit.
-        try (var compile = lombokUsed ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+        try (var compile = compiler.compile(file)) {
             var root = compile.root(file);
             long cursor;
             try {
@@ -106,7 +105,7 @@ public class DefinitionProvider {
                 path = path.getParentPath();
             }
             var selectedName = selectedName(path);
-            var trees = Trees.instance(compile.task);
+            var trees = compile.trees;
             var element = trees.getElement(path);
             // Handle case where local variable name shadows a method name
             // e.g. var packageName = packageName(className);
@@ -147,7 +146,7 @@ public class DefinitionProvider {
                 }
             }
             if (element == null) {
-                if (lombokUsed) {
+                if (compiler.lombokPresentOnClasspath()) {
                     var builderField =
                             lombokBuilderFieldFromReceiver(compile, trees, path, selectedName);
                     if (builderField.isPresent()) {
@@ -173,8 +172,8 @@ public class DefinitionProvider {
                 var enclosingClass =
                         (TypeElement) method.getEnclosingElement();
                 var enclosingType = enclosingClass.asType();
-                var types = compile.task.getTypes();
-                var elements = compile.task.getElements();
+                var types = compile.types;
+                var elements = compile.elements;
                 for (var superClass : types.directSupertypes(enclosingType)) {
                     var e = (TypeElement) types.asElement(superClass);
                     for (var other : e.getEnclosedElements()) {
@@ -239,7 +238,7 @@ public class DefinitionProvider {
                     declarationName = element.getEnclosingElement().getSimpleName();
                 }
                 var location = FindHelper.location(compile, declarationPath, declarationName);
-                if (lombokUsed) {
+                if (compiler.lombokPresentOnClasspath()) {
                     var lombokField =
                             lombokGeneratedField(
                                     compile,
@@ -285,7 +284,7 @@ public class DefinitionProvider {
             // declarationPath is null: element is in another file or is Lombok-generated.
             // Try Lombok same-file field navigation first (Lombok-generated method with field in
             // batch).
-            if (lombokUsed) {
+            if (compiler.lombokPresentOnClasspath()) {
                 var lombokField =
                         lombokGeneratedField(compile, trees, element, selectedName, null, null);
                 if (lombokField.isPresent()) {
@@ -302,12 +301,12 @@ public class DefinitionProvider {
                     }
                 }
             }
-            return resolveElementCrossFile(element, lombokUsed);
+            return resolveElementCrossFile(element);
         }
     }
 
     private ResolvedSymbol resolveElementCrossFile(
-            Element element, boolean lombokUsed) {
+            Element element) {
         var kind = element.getKind();
         if (kind == ElementKind.CLASS
                 || kind == ElementKind.INTERFACE
@@ -365,7 +364,7 @@ public class DefinitionProvider {
                 }
             }
 
-            if (lombokUsed) {
+            if (compiler.lombokPresentOnClasspath()) {
                 // Builder chain: method on a generated Builder class (e.g. .field1(v).build()).
                 var builderOwner = LombokAnnotations.builderOwner(owner);
                 if (builderOwner.isPresent()) {
@@ -415,7 +414,7 @@ public class DefinitionProvider {
             }
 
             // 2. workspace - lombok — Lombok heuristics on workspace source.
-            if (lombokUsed && workspaceSource.isPresent()) {
+            if (compiler.lombokPresentOnClasspath() && workspaceSource.isPresent()) {
                 var fieldName = LombokAnnotations.accessorFieldName(memberName);
                 if (fieldName.isPresent()) {
                     var fieldLocations =
@@ -454,7 +453,7 @@ public class DefinitionProvider {
             }
 
             // 4. external - lombok — Lombok heuristics on decompiled source.
-            if (lombokUsed && externalSource.isPresent()) {
+            if (compiler.lombokPresentOnClasspath() && externalSource.isPresent()) {
                 var fieldName = LombokAnnotations.accessorFieldName(memberName);
                 if (fieldName.isPresent()) {
                     var fieldLocations =
@@ -505,7 +504,7 @@ public class DefinitionProvider {
                     return new ResolvedSymbol(
                             results, ownerQualified, constructorName, true, null, constructorName);
                 }
-                if (lombokUsed) {
+                if (compiler.lombokPresentOnClasspath()) {
                     // Lombok-generated constructor (e.g. @AllArgsConstructor) → class declaration.
                     var classLocations = locateType(s, constructorName);
                     return new ResolvedSymbol(
@@ -621,7 +620,7 @@ public class DefinitionProvider {
         if (receiverType == null) {
             return Optional.empty();
         }
-        var receiverElement = compile.task.getTypes().asElement(receiverType);
+        var receiverElement = compile.types.asElement(receiverType);
         if (!(receiverElement instanceof TypeElement receiver)) {
             return Optional.empty();
         }
@@ -648,7 +647,7 @@ public class DefinitionProvider {
 
         @Override
         public TreePath visitMemberSelect(MemberSelectTree tree, Long cursor) {
-            var positions = Trees.instance(compile.task).getSourcePositions();
+            var positions = compile.trees.getSourcePositions();
             var end = (int) positions.getEndPosition(root, tree);
             // Only match cursor on the right-hand identifier (method name),
             // never on the expression (variable name) which may share the same name.
@@ -692,7 +691,7 @@ public class DefinitionProvider {
         if (superclass == null || superclass.getKind() == TypeKind.NONE) {
             return Optional.empty();
         }
-        var superElement = compile.task.getTypes().asElement(superclass);
+        var superElement = compile.types.asElement(superclass);
         if (superElement instanceof TypeElement superType) {
             return findFieldInType(compile, trees, superType, fieldName);
         }

@@ -10,7 +10,6 @@ import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.util.TreePath;
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.StringJoiner;
@@ -32,8 +31,8 @@ public class CreateMissingMethod implements Rewrite {
 
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
-        try (var task = compiler.compileFast(file)) {
-            var trees = Trees.instance(task.task);
+        try (var task = compiler.compile(file)) {
+            var trees = task.trees;
             var root = task.root(file);
             var call = new FindMethodCallAt(task.task).scan(root, position);
             if (call == null) return CANCELLED;
@@ -80,7 +79,7 @@ public class CreateMissingMethod implements Rewrite {
     }
 
     private String printParameters(CompileTask task, CompilationUnitTree root, MethodInvocationTree call) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var join = new StringJoiner(", ");
         for (var i = 0; i < call.getArguments().size(); i++) {
             var type = trees.getTypeMirror(trees.getPath(root, call.getArguments().get(i)));

@@ -35,7 +35,7 @@ public class FindHelper {
     private static Path jarCacheDir;
 
     public static String[] erasedParameterTypes(CompileTask task, ExecutableElement method) {
-        var types = task.task.getTypes();
+        var types = task.types;
         var erasedParameterTypes = new String[method.getParameters().size()];
         for (var i = 0; i < erasedParameterTypes.length; i++) {
             var p = method.getParameters().get(i).asType();
@@ -74,7 +74,7 @@ public class FindHelper {
 
     public static ExecutableElement findMethod(
             CompileTask task, String className, String methodName, String[] erasedParameterTypes) {
-        var type = task.task.getElements().getTypeElement(className);
+        var type = task.elements.getTypeElement(className);
         for (var member : type.getEnclosedElements()) {
             if (member.getKind() != ElementKind.METHOD) continue;
             var method = (ExecutableElement) member;
@@ -91,7 +91,7 @@ public class FindHelper {
             String className,
             String methodName,
             String[] erasedParameterTypes) {
-        var types = task.task.getTypes();
+        var types = task.types;
         var parent = (TypeElement) method.getEnclosingElement();
         if (!parent.getQualifiedName().contentEquals(className)) return false;
         if (!method.getSimpleName().contentEquals(methodName)) return false;

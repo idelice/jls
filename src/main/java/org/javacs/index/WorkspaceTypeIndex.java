@@ -1162,9 +1162,9 @@ public class WorkspaceTypeIndex {
     }
 
     private static WorkspaceTypeIndex from(CompileTask task, boolean includeReferencedTypes) {
-        var trees = Trees.instance(task.task);
-        var elements = task.task.getElements();
-        var types = task.task.getTypes();
+        var trees = task.trees;
+        var elements = task.elements;
+        var types = task.types;
 
         var rootDeclaredTypeSources = new Object2ObjectOpenHashMap<String, Path>();
         var rootDeclaredTypeTrees = new Object2ObjectOpenHashMap<String, ClassTree>();

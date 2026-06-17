@@ -18,7 +18,7 @@ public class HoverProvider {
     }
 
     public MarkupContent hover(Path file, int line, int column) {
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var root = task.root(file);
             long cursor;
             try {
@@ -29,7 +29,7 @@ public class HoverProvider {
             var path = new FindNameAt(task).scan(root, cursor);
             if (path == null) return null;
 
-            var element = Trees.instance(task.task).getElement(path);
+            var element = task.trees.getElement(path);
             if (element == null) return null;
 
             var markdown = new StringBuilder();
@@ -208,7 +208,7 @@ public class HoverProvider {
     }
 
     private String getDocComment(Element element, CompileTask task) {
-        var elements = task.task.getElements();
+        var elements = task.elements;
         var doc = elements.getDocComment(element);
         if (doc != null && !doc.isEmpty()) return MarkdownHelper.asMarkdown(doc.trim());
 

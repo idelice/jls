@@ -108,27 +108,18 @@ class JavaLanguageServer extends LanguageServer {
     private final LanguageClient client;
     private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
 
-    // Three compilers, each owned by exactly one thread/task:
-    //   interactiveCompiler  — LSP main thread (definition, hover, completion, references …)
-    //   indexCompiler        — background completion-index builds (runRefresh / CompletionIndexScheduler)
-    //   diagnosticCompiler   — background ATTR compiles for type diagnostics (diagnosticExecutor thread)
-    // No two threads share a compiler. JavaCompilerService is not thread-safe.
-    private JavaCompilerService interactiveCompiler;
-    private JavaCompilerService indexCompiler;
-    private JavaCompilerService diagnosticCompiler;
+    // Single compiler — all requests (interactive + diagnostics) run on the main LSP thread.
+    // parse() is thread-safe (standalone javac tasks), so background index builds share the instance.
+    private JavaCompilerService compiler;
 
-    // Background thread for ATTR diagnostic compiles.
-    private final ExecutorService diagnosticExecutor =
+    // Background thread for Gradle module dep compilation only.
+    private final ExecutorService backgroundExecutor =
             Executors.newSingleThreadExecutor(
-                    Thread.ofPlatform().daemon().name("javacs-diagnostics").factory());
+                    Thread.ofPlatform().daemon().name("javacs-background").factory());
 
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
     private ModuleGraph moduleGraph = ModuleGraph.EMPTY;
-
-    // Per-module interactive compilers, lazily created by getOrCreateCompiler(Path).
-    // Keyed by Gradle project path (e.g. ":server"). Cleared and rebuilt on createCompilers().
-    private final Map<String, JavaCompilerService> moduleCompilers = new LinkedHashMap<>();
 
     private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
@@ -173,10 +164,10 @@ class JavaLanguageServer extends LanguageServer {
         WORKSPACE
     }
 
-    /** Return the current interactive compiler. Compiler recreation happens at explicit event boundaries. */
+    /** Return the current compiler. Compiler recreation happens at explicit event boundaries. */
     synchronized JavaCompilerService getOrCreateCompiler() {
-        Objects.requireNonNull(interactiveCompiler, "Compiler has not been initialized");
-        return interactiveCompiler;
+        Objects.requireNonNull(compiler, "Compiler has not been initialized");
+        return compiler;
     }
 
 
@@ -215,8 +206,8 @@ class JavaLanguageServer extends LanguageServer {
         // Use the module-scoped compiler when available — scanning 107k classes from
         // the union classpath is too slow. The active module's ~15k classes is sufficient.
         var activeFile = FileStore.activeDocuments().stream().findFirst().orElse(null);
-        var compiler = activeFile != null ? getOrCreateCompiler() : getOrCreateCompiler();
-        var externalIndex = new ExternalBinaryTypeIndex(compiler);
+        var c = getOrCreateCompiler();
+        var externalIndex = new ExternalBinaryTypeIndex(c);
         publishCompletionSnapshot(
                 currentSnapshot.workspaceIndex(),
                 externalIndex,
@@ -725,7 +716,6 @@ class JavaLanguageServer extends LanguageServer {
         // Populate module graph and compile inter-module deps before creating compilers.
         var inferForGraph = new InferConfig(workspaceRoot, externalDependencies());
         moduleGraph = inferForGraph.moduleGraph();
-        moduleCompilers.clear();
         if (moduleGraph != ModuleGraph.EMPTY) {
             var buildRoot = inferForGraph.findBuildRoot();
             var isGradleProject = Files.exists(buildRoot.resolve("settings.gradle"))
@@ -770,23 +760,16 @@ class JavaLanguageServer extends LanguageServer {
 
         endWorkDoneProgress(progressToken, "Configured javac");
 
-        var shared = CompilerSharedResources.from(classPath, resolvedDocPath, addExports, extraArgs);
-        interactiveCompiler = new JavaCompilerService(shared, "interactive");
-
-        var indexStarted = Instant.now();
-        indexCompiler = new JavaCompilerService(shared, "index");
-        diagnosticCompiler = new JavaCompilerService(shared, "diagnostics");
+        compiler = new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs);
 
         LOG.info(String.format(
-                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms interactive=%dms index=%dms total=%dms",
+                "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms total=%dms",
                 classPath.size(),
                 resolvedDocPath.size(),
                 extraArgs.size(),
                 addExports.size(),
                 Duration.between(started, settingsLoaded).toMillis(),
                 Duration.between(settingsLoaded, inferenceFinished).toMillis(),
-                Duration.between(inferenceFinished, indexStarted).toMillis(),
-                Duration.between(indexStarted, Instant.now()).toMillis(),
                 Duration.between(started, Instant.now()).toMillis()));
     }
 
@@ -1065,7 +1048,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         completionIndexExecutor.shutdownNow();
-        diagnosticExecutor.shutdownNow();
+        backgroundExecutor.shutdownNow();
         CacheAudit.logSummary(LOG);
     }
 
@@ -1260,20 +1243,6 @@ class JavaLanguageServer extends LanguageServer {
         List<Location> found;
         try {
             found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
-        } catch (ReusableCompiler.TaskCreationException e) {
-            LOG.warning(
-                    String.format(
-                            "[compiler] definition_retry_after_task_create_failure file=%s reason=%s",
-                            file.getFileName(), e.getMessage()));
-            try {
-                found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
-            } catch (ReusableCompiler.TaskCreationException retryFailure) {
-                LOG.warning(
-                        String.format(
-                                "[compiler] definition_failed_after_task_create_retry file=%s reason=%s",
-                                file.getFileName(), retryFailure.getMessage()));
-                return Optional.empty();
-            }
         } catch (RuntimeException e) {
             // javac internal error (NPE in Types.sideCast on complex generics).
             // Don't crash the server — return empty.
@@ -1357,7 +1326,7 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         LOG.info("Try to rename...");
         var file = Paths.get(params.textDocument.uri);
-        try (var task = getOrCreateCompiler().compileFast(file)) {
+        try (var task = getOrCreateCompiler().compile(file)) {
             long cursor;
             try {
                 cursor =
@@ -1373,7 +1342,7 @@ class JavaLanguageServer extends LanguageServer {
                 LOG.info("...no element under cursor");
                 return Optional.empty();
             }
-            var el = Trees.instance(task.task).getElement(path);
+            var el = task.trees.getElement(path);
             if (el == null) {
                 LOG.info("...couldn't resolve element");
                 return Optional.empty();
@@ -1447,7 +1416,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private Rewrite createRewrite(RenameParams params) {
         var file = Paths.get(params.textDocument.uri);
-        try (var task = getOrCreateCompiler().compileFast(file)) {
+        try (var task = getOrCreateCompiler().compile(file)) {
             long position;
             try {
                 position =
@@ -1460,7 +1429,7 @@ class JavaLanguageServer extends LanguageServer {
             }
             var path = new FindNameAt(task).scan(task.root(file), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
-            var el = Trees.instance(task.task).getElement(path);
+            var el = task.trees.getElement(path);
             return switch (el.getKind()) {
                 case METHOD -> renameMethod(task, (ExecutableElement) el, params.newName);
                 case FIELD -> renameField(task, (VariableElement) el, params.newName);
@@ -1482,7 +1451,7 @@ class JavaLanguageServer extends LanguageServer {
         var erasedParameterTypes = new String[method.getParameters().size()];
         for (var i = 0; i < erasedParameterTypes.length; i++) {
             var type = method.getParameters().get(i).asType();
-            erasedParameterTypes[i] = task.task.getTypes().erasure(type).toString();
+            erasedParameterTypes[i] = task.types.erasure(type).toString();
         }
         return new RenameMethod(className, methodName, erasedParameterTypes, newName);
     }
@@ -1495,7 +1464,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private RenameVariable renameVariable(CompileTask task, VariableElement variable, String newName) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var path = trees.getPath(variable);
         var file = Paths.get(path.getCompilationUnit().getSourceFile().toUri());
         var position = trees.getSourcePositions().getStartPosition(path.getCompilationUnit(), path.getLeaf());
@@ -1509,14 +1478,13 @@ class JavaLanguageServer extends LanguageServer {
         }
         var file = Paths.get(params.textDocument.uri);
         try {
-            var compiler = diagnosticCompiler;
             if (compiler == null) {
                 return new DocumentDiagnosticReport(List.of());
             }
             LOG.info("[diagnostics] pull_compile_start file=" + file.getFileName());
             var started = System.nanoTime();
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));
-            try (var task = compiler.compileDiagnostics(sources)) {
+            try (var task = compiler.compile(sources)) {
                 var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
                 var errorProvider = new ErrorProvider(task);
                 var errorReport = errorProvider.errors(Set.of(file.toUri()));
@@ -1546,7 +1514,7 @@ class JavaLanguageServer extends LanguageServer {
      */
     private void scheduleModuleDepCompilation(String projectPath, Path triggerFile) {
         if (!compiledModuleDeps.add(projectPath)) return; // already done
-        diagnosticExecutor.submit(() -> {
+        backgroundExecutor.submit(() -> {
             try {
                 var graph = moduleGraph;
                 if (graph == ModuleGraph.EMPTY) return;
@@ -1558,19 +1526,15 @@ class JavaLanguageServer extends LanguageServer {
                 var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
                 LOG.info("[multi-module] background_dep_compile_done module=" + projectPath + " took=" + durationMs + "ms");
                 endWorkDoneProgress(token, "Built " + projectPath + " deps");
-                // Extend all compilers' classpath with the new class output dirs
+                // Extend compiler's classpath with the new class output dirs
                 var newDirs = graph.transitiveClassOutputDirs(projectPath);
                 var existingDirs = new LinkedHashSet<Path>();
                 for (var dir : newDirs) {
                     if (Files.exists(dir)) existingDirs.add(dir);
                 }
                 if (!existingDirs.isEmpty()) {
-                    var interactive = interactiveCompiler;
-                    if (interactive != null) interactive.addClassPathEntries(existingDirs);
-                    var diag = diagnosticCompiler;
-                    if (diag != null) diag.addClassPathEntries(existingDirs);
-                    var idx = indexCompiler;
-                    if (idx != null) idx.addClassPathEntries(existingDirs);
+                    var c = compiler;
+                    if (c != null) c.addClassPathEntries(existingDirs);
                 }
                 // Notify client to re-pull diagnostics now that deps are on classpath
                 client.customNotification("workspace/diagnostic/refresh", null);
@@ -1636,12 +1600,8 @@ class JavaLanguageServer extends LanguageServer {
                         // Extend classpath with this module's external JARs
                         var moduleCp = moduleGraph.transitiveClasspath(module.projectPath());
                         if (!moduleCp.isEmpty()) {
-                            var interactive = interactiveCompiler;
-                            if (interactive != null) interactive.addClassPathEntries(moduleCp);
-                            var diag = diagnosticCompiler;
-                            if (diag != null) diag.addClassPathEntries(moduleCp);
-                            var idx = indexCompiler;
-                            if (idx != null) idx.addClassPathEntries(moduleCp);
+                            var c = compiler;
+                            if (c != null) c.addClassPathEntries(moduleCp);
                         }
                     }
                 }
@@ -1929,7 +1889,7 @@ class JavaLanguageServer extends LanguageServer {
                         case WORKSPACE_DECLARATION_MERGE -> "Updating index";
                     };
                     bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
-                    var compiler = indexCompiler;
+                    var compiler = JavaLanguageServer.this.compiler;
                     WorkspaceTypeIndex nextIndex;
                     Instant indexStarted;
                     if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
@@ -2008,7 +1968,7 @@ class JavaLanguageServer extends LanguageServer {
                             mode.name().toLowerCase(),
                             Duration.between(started, indexStarted).toMillis(),
                             totalMs));
-                } catch (ReusableCompiler.TaskCreationException e) {
+                } catch (RuntimeException e) {
                     endWorkDoneProgress(bootstrapProgressToken, "Index failed");
                     LOG.warning(
                             String.format(

@@ -39,8 +39,8 @@ public class RenameClass implements Rewrite {
         Collections.addAll(allPaths, referenceFiles);
 
         try (var compile = compiler.compile(allPaths.toArray(new Path[0]))) {
-            var trees = Trees.instance(compile.task);
-            var oldType = compile.task.getElements().getTypeElement(oldQualifiedName);
+            var trees = compile.trees;
+            var oldType = compile.elements.getTypeElement(oldQualifiedName);
             if (oldType == null) {
                 return CANCELLED;
             }

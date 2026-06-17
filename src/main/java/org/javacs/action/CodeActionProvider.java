@@ -45,7 +45,7 @@ public class CodeActionProvider {
         var rewrites = new TreeMap<String, Rewrite>();
         var variedActions = new ArrayList<VariedAction>();
         var actions = new ArrayList<CodeAction>();
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var elapsed = Duration.between(started, Instant.now()).toMillis();
             LOG.info(String.format("...compiled in %d ms", elapsed));
             var root = task.root(file);
@@ -228,7 +228,7 @@ public class CodeActionProvider {
     }
 
     private JavaType inferType(CompileTask task, CompilationUnitTree root, int pos) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var sourcePos = trees.getSourcePositions();
         var finder = new TreeAtFinder(sourcePos, root);
         var treeAt = finder.scan(root, (long) pos);
@@ -263,11 +263,11 @@ public class CodeActionProvider {
         var methodTree = new FindMethodDeclarationAt(task.task).scan(root, cursor);
         if (methodTree != null) return Map.of();
         var actions = new TreeMap<String, Rewrite>();
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
         if (classTree == null) return Map.of();
         var classPath = trees.getPath(root, classTree);
-        var elements = task.task.getElements();
+        var elements = task.elements;
         var classElement = (TypeElement) trees.getElement(classPath);
         for (var member : elements.getAllMembers(classElement)) {
             if (member.getModifiers().contains(Modifier.FINAL)) continue;
@@ -313,7 +313,7 @@ public class CodeActionProvider {
         LOG.info(String.format("Check %d diagnostics for quick fixes...", params.context.diagnostics.size()));
         var started = Instant.now();
         var file = Paths.get(params.textDocument.uri);
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var actions = new ArrayList<CodeAction>();
             for (var d : params.context.diagnostics) {
                 var newActions = codeActionForDiagnostic(task, file, d);
@@ -423,7 +423,7 @@ public class CodeActionProvider {
     }
 
     private String qualifiedName(CompileTask task, CompilationUnitTree root, ClassTree tree) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var path = trees.getPath(root, tree);
         var type = (TypeElement) trees.getElement(path);
         return type.getQualifiedName().toString();
@@ -446,11 +446,11 @@ public class CodeActionProvider {
     }
 
     private boolean synthentic(CompileTask task, CompilationUnitTree root, MethodTree method) {
-        return Trees.instance(task.task).getSourcePositions().getStartPosition(root, method) != -1;
+        return task.trees.getSourcePositions().getStartPosition(root, method) != -1;
     }
 
     private MethodPtr findMethod(CompileTask task, CompilationUnitTree root, Range range) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
         var tree = new FindMethodDeclarationAt(task.task).scan(root, position);
         var path = trees.getPath(root, tree);

@@ -39,10 +39,10 @@ public class OverrideInheritedMethod implements Rewrite {
     }
 
     private String insertText(CompilerProvider compiler) {
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var root = task.root(file);
-            var types = task.task.getTypes();
-            var trees = Trees.instance(task.task);
+            var types = task.types;
+            var trees = task.trees;
             var superMethod = FindHelper.findMethod(task, superClassName, methodName, erasedParameterTypes);
             var thisTree = new FindTypeDeclarationAt(task.task).scan(root, (long) insertPosition);
             var thisPath = trees.getPath(root, thisTree);

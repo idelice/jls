@@ -156,7 +156,7 @@ public class ConstructorIndexAndContextReuseTest {
         var file = workspaceRoot.resolve("pkg/MyClass.java");
 
         // First compile — populates cache and releases slot
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             assertThat(task.root(), notNullValue());
         }
 
@@ -173,7 +173,7 @@ public class ConstructorIndexAndContextReuseTest {
         FileStore.externalChange(file);
 
         // Second compile — reuses the slot context; should NOT throw
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             assertThat(task.root(), notNullValue());
         }
 
@@ -189,7 +189,7 @@ public class ConstructorIndexAndContextReuseTest {
         }
         FileStore.externalChange(file);
 
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             assertThat(task.root(), notNullValue());
         }
     }

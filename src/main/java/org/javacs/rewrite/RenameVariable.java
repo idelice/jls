@@ -1,6 +1,5 @@
 package org.javacs.rewrite;
 
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.Map;
 import org.javacs.CompilerProvider;
@@ -19,8 +18,8 @@ public class RenameVariable implements Rewrite {
 
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
-        try (var compile = compiler.compileFast(file)) {
-            var trees = Trees.instance(compile.task);
+        try (var compile = compiler.compile(file)) {
+            var trees = compile.trees;
             var root = compile.root(file);
             var found = new FindVariableAt(compile.task).scan(root, position);
             if (found == null) {

@@ -30,9 +30,9 @@ public class CatchException implements Rewrite {
         if (file == CompilerProvider.NOT_FOUND) {
             return CANCELLED;
         }
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var root = task.root(file);
-            var trees = Trees.instance(task.task);
+            var trees = task.trees;
             var pos = trees.getSourcePositions();
             var lines = root.getLineMap();
 

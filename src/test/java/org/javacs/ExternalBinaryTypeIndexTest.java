@@ -503,7 +503,7 @@ public class ExternalBinaryTypeIndexTest {
             Path binaryJar,
             Path sourceJar) implements AutoCloseable {
         TypeIndexRouter index() {
-            try (var task = compileCompiler.compileFast(consumerFile)) {
+            try (var task = compileCompiler.compile(consumerFile)) {
                 return new TypeIndexRouter(
                         WorkspaceTypeIndex.workspaceDeclarations(task),
                         new ExternalBinaryTypeIndex(definitionCompiler));

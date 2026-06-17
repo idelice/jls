@@ -29,10 +29,10 @@ public class ImplementAbstractMethods implements Rewrite {
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var file = compiler.findTypeDeclaration(className);
         var insertText = new StringJoiner("\n");
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
-            var elements = task.task.getElements();
-            var types = task.task.getTypes();
-            var trees = Trees.instance(task.task);
+        try (var task = compiler.compile(file)) {
+            var elements = task.elements;
+            var types = task.types;
+            var trees = task.trees;
             var thisClass = elements.getTypeElement(className);
             var thisType = (DeclaredType) thisClass.asType();
             var thisTree = trees.getTree(thisClass);

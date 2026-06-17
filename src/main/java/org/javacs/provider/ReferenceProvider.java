@@ -33,8 +33,6 @@ public class ReferenceProvider {
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
-    private static final java.util.logging.Logger LOG = java.util.logging.Logger.getLogger("main");
-
     public ReferenceProvider(
             CompilerProvider compiler,
             TypeIndexRouter typeIndexRouter,
