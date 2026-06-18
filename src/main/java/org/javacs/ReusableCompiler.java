@@ -26,6 +26,7 @@
 
 package org.javacs;
 
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.JavacTask;
 import com.sun.source.util.TaskEvent;
 import com.sun.source.util.TaskListener;
@@ -43,8 +44,11 @@ import com.sun.tools.javac.util.Context;
 import com.sun.tools.javac.util.DefinedBy;
 import com.sun.tools.javac.util.DefinedBy.Api;
 import com.sun.tools.javac.util.Log;
+import com.sun.tools.javac.util.Options;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.tools.DiagnosticListener;
@@ -64,6 +68,12 @@ class ReusableCompiler {
 
     private ReusableContext currentContext = new ReusableContext();
     private boolean dirty; // true if context was used and needs clearing before reuse
+
+    /** Mark the context as corrupted — next compile will use a fresh context. */
+    void resetContext() {
+        currentContext = new ReusableContext();
+        dirty = false;
+    }
 
     /**
      * Execute a compilation inside the pool. The worker receives a valid JavacTask
@@ -92,7 +102,6 @@ class ReusableCompiler {
             dirty = true;
             return worker.apply(task);
         } catch (Throwable e) {
-            // Context may be corrupted — recreate
             currentContext = new ReusableContext();
             dirty = false;
             throw new RuntimeException("Compilation failed: " + e.getMessage(), e);
@@ -100,6 +109,8 @@ class ReusableCompiler {
     }
 
     static class ReusableContext extends Context implements TaskListener {
+
+        Set<CompilationUnitTree> roots = new HashSet<>();
 
         ReusableContext() {
             super();
@@ -116,7 +127,10 @@ class ReusableCompiler {
             drop(JavacTask.class);
             drop(JavacTrees.class);
             drop(JavacElements.class);
+            drop(Options.optionsKey);
             dropByClassName("com.sun.tools.javac.platform.PlatformDescription");
+            drop(javax.annotation.processing.Processor.class);
+            dropByClassName("com.sun.tools.javac.processing.JavacProcessingEnvironment");
 
             if (ht.get(Log.logKey) instanceof ReusableLog) {
                 Log.instance(this).clear();
@@ -129,7 +143,43 @@ class ReusableCompiler {
                 Annotate.instance(this).newRound();
                 CompileStates.instance(this).clear();
                 MultiTaskListener.instance(this).clear();
+                // Remove compiled class symbols from Symtab (critical for Lombok AP reuse)
+                removeCompiledClassSymbols();
+                roots.clear();
             }
+        }
+
+        private void removeCompiledClassSymbols() {
+            try {
+                var symtabClass = Class.forName("com.sun.tools.javac.code.Symtab");
+                var instanceMethod = symtabClass.getMethod("instance", Context.class);
+                var symtab = instanceMethod.invoke(null, this);
+                var removeClassMethod = symtabClass.getMethod("removeClass",
+                        Class.forName("com.sun.tools.javac.code.Symbol$ModuleSymbol"),
+                        Class.forName("com.sun.tools.javac.util.Name"));
+                for (var root : roots) {
+                    var cu = (com.sun.source.tree.CompilationUnitTree) root;
+                    for (var decl : cu.getTypeDecls()) {
+                        if (decl instanceof com.sun.source.tree.ClassTree classTree) {
+                            removeClassFromSymtab(symtab, removeClassMethod, classTree);
+                        }
+                    }
+                }
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // Symtab API may differ between JDK versions
+            }
+        }
+
+        private void removeClassFromSymtab(Object symtab, java.lang.reflect.Method removeClassMethod,
+                com.sun.source.tree.ClassTree classTree) {
+            try {
+                // Access the JCClassDecl.sym field to get the ClassSymbol
+                var jcClass = (com.sun.tools.javac.tree.JCTree.JCClassDecl) classTree;
+                var sym = jcClass.sym;
+                if (sym != null) {
+                    removeClassMethod.invoke(symtab, sym.packge().modle, sym.flatname);
+                }
+            } catch (ReflectiveOperationException | RuntimeException ignored) {}
         }
 
         private void clearLintMapper() {
@@ -152,7 +202,11 @@ class ReusableCompiler {
 
         @Override
         @DefinedBy(Api.COMPILER_TREE)
-        public void finished(TaskEvent e) {}
+        public void finished(TaskEvent e) {
+            if (e.getKind() == TaskEvent.Kind.PARSE) {
+                roots.add(e.getCompilationUnit());
+            }
+        }
 
         @Override
         @DefinedBy(Api.COMPILER_TREE)
@@ -169,7 +223,17 @@ class ReusableCompiler {
             @Override
             public void close() {}
 
-            void clear() { newRound(); }
+            void clear() {
+                newRound();
+                // Lombok's processor cannot be reused across compiles - its internal
+                // handlers reference AST nodes from the previous compilation.
+                // Null procEnvImpl to force fresh AP initialization each time.
+                try {
+                    var f = JavaCompiler.class.getDeclaredField("procEnvImpl");
+                    f.setAccessible(true);
+                    f.set(this, null);
+                } catch (ReflectiveOperationException ignored) {}
+            }
 
             @Override
             protected void checkReusable() {}

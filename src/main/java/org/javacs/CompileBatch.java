@@ -59,6 +59,7 @@ public class CompileBatch implements AutoCloseable {
                         } catch (Throwable e) {
                             LOG.warning("[compiler] analyze failed: "
                                     + e.getClass().getName() + ": " + e.getMessage());
+                            parent.compiler.resetContext();
                         }
                     } catch (IOException e) {
                         throw new RuntimeException(e);
