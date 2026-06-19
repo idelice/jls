@@ -466,6 +466,7 @@ public class CompletionProvider {
             if (!isIndexMemberVisible(member, target.qualifiedType(), currentType)) continue;
             if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
             if (memberAccess.methodReference() && member.kind != CompletionItemKind.Method) continue;
+            if (member.kind == CompletionItemKind.Constructor) continue;
             if (member.kind == CompletionItemKind.Method) {
                 methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
                 methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
