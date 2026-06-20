@@ -1,6 +1,7 @@
 package org.javacs;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -127,7 +128,19 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
-        if (needsCompile() || (isBuildOutputAvailable() && lombokPresentOnClasspath)) {
+        var needsFresh = needsCompile() || (isBuildOutputAvailable() && lombokPresentOnClasspath);
+        if (!needsFresh && cachedCompile != null) {
+            // Verify cache covers requested sources — cached roots may be from a different file
+            var cachedUris = new HashSet<URI>();
+            for (var r : cachedCompile.roots) cachedUris.add(r.getSourceFile().toUri());
+            for (var s : sources) {
+                if (!cachedUris.contains(s.toUri())) {
+                    needsFresh = true;
+                    break;
+                }
+            }
+        }
+        if (needsFresh) {
             loadCompile(sources);
         } else {
             LOG.fine("...using cached compile");
@@ -147,7 +160,7 @@ class JavaCompilerService implements CompilerProvider {
         Collection<? extends JavaFileObject> effectiveSources;
         if (lombokPresentOnClasspath && sources.size() <= 1) {
             if (isBuildOutputAvailable()) {
-          // Include dirty documents so cross-file errors from edited files are visible
+                // Include dirty documents so cross-file errors from edited files are visible
                 var allSources = new LinkedHashSet<JavaFileObject>(sources);
                 LOG.info("[dirty] compile() has " + FileStore.dirtyDocuments().size() + " dirty documents");
                 for (var dirty : FileStore.dirtyDocuments()) {
