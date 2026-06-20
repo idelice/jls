@@ -23,7 +23,6 @@ class JavaCompilerService implements CompilerProvider {
     final ReusableCompiler compiler = new ReusableCompiler();
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
-    boolean targetNeedsLombok;
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
     final SourceFileManager fileManager;
     final SourceFileManager docsFileManager;

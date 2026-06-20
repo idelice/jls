@@ -104,9 +104,6 @@ class ReusableCompiler {
         @DefinedBy(Api.COMPILER_TREE)
         public void started(TaskEvent e) {}
 
-        <T> void drop(Key<T> k) { ht.remove(k); }
-        <T> void drop(Class<T> c) { ht.remove(key(c)); }
-
         static class ReusableJavaCompiler extends JavaCompiler {
             static final Factory<JavaCompiler> factory = ReusableJavaCompiler::new;
 

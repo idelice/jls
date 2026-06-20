@@ -31,7 +31,7 @@ public class CompileBatch implements AutoCloseable {
         this.parent = parent;
         LOG.info("[compile] CompileBatch — starting compile of " + files.size() + " file(s)");
         parent.diags.clear();
-        var options = options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath, parent.isBuildOutputAvailable(), parent.targetNeedsLombok);
+        var options = options(parent.classPath, parent.addExports, parent.extraArgs);
 
         // single mutable holder to extract result from worker lambda
         var holder = new Object() {
@@ -53,8 +53,6 @@ public class CompileBatch implements AutoCloseable {
                     holder.elements = task.getElements();
                     holder.types = task.getTypes();
                     holder.roots = new ArrayList<>();
-                    if (parent.targetNeedsLombok) {
-                    }
                     try {
                         for (var t : task.parse()) {
                             holder.roots.add(t);
@@ -185,7 +183,7 @@ public class CompileBatch implements AutoCloseable {
         closed = true;
     }
 
-    static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent, boolean useBuildOutput, boolean targetNeedsLombok) {
+    static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
