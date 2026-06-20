@@ -107,7 +107,8 @@ class InferConfig {
         var buildRoot = findBuildRoot();
         var pomXml = buildRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            var classPath = new HashSet<>(mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars));
+            var modulePath = mavenModulePath(buildRoot, workspaceRoot);
+            var classPath = new HashSet<>(mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars, modulePath));
             var targetClasses = buildRoot.resolve("target/classes");
             if (Files.isDirectory(targetClasses)) {
                 LOG.info("[classpath] Adding Maven build output: " + targetClasses);
@@ -187,6 +188,34 @@ class InferConfig {
         }
     }
 
+    /**
+     * Returns {@code -pl} argument for multi-module Maven projects, or null for single-module.
+     */
+    static String mavenModulePath(Path buildRoot, Path workspaceRoot) {
+        var normalizedBuild = buildRoot.toAbsolutePath().normalize();
+        var normalizedWork = workspaceRoot.toAbsolutePath().normalize();
+        if (!hasModules(normalizedBuild.resolve("pom.xml"))) {
+            return null;
+        }
+        if (!normalizedWork.equals(normalizedBuild)) {
+            return normalizedBuild.relativize(normalizedWork).toString();
+        }
+        // workspaceRoot IS the build root — extract module names from pom
+        return parseDeclaredModules(normalizedBuild.resolve("pom.xml"));
+    }
+
+    private static String parseDeclaredModules(Path pomXml) {
+        try {
+            var content = Files.readString(pomXml);
+            var matcher = Pattern.compile("<module>([^<]+)</module>").matcher(content);
+            var modules = new ArrayList<String>();
+            while (matcher.find()) modules.add(matcher.group(1).trim());
+            return modules.isEmpty() ? null : String.join(",", modules);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private Path bazelWorkspaceRoot() {
         for (var current = workspaceRoot; current != null; current = current.getParent()) {
             if (Files.exists(current.resolve("WORKSPACE"))) {
@@ -214,9 +243,11 @@ class InferConfig {
         }
 
         // Maven
-        var pomXml = workspaceRoot.resolve("pom.xml");
+        var buildRoot = findBuildRoot();
+        var pomXml = buildRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:sources", mavenHome, this.envVars);
+            var modulePath = mavenModulePath(buildRoot, workspaceRoot);
+            return mvnDependencies(pomXml, "dependency:sources", mavenHome, this.envVars, modulePath);
         }
 
         // Bazel
@@ -288,6 +319,10 @@ class InferConfig {
     }
 
     static Set<Path> mvnDependencies(Path pomXml, String goal, Path mavenHome, Map<String, String> envVars) {
+        return mvnDependencies(pomXml, goal, mavenHome, envVars, null);
+    }
+
+    static Set<Path> mvnDependencies(Path pomXml, String goal, Path mavenHome, Map<String, String> envVars, String modulePath) {
         Objects.requireNonNull(pomXml, "pom.xml path is null");
         Objects.requireNonNull(mavenHome, "mavenHome is null");
         var started = Instant.now();
@@ -304,23 +339,28 @@ class InferConfig {
             }
             CacheAudit.miss("infer_config.maven_dependencies");
 
-            // TODO consider using mvn valide dependency:copy-dependencies -DoutputDirectory=??? instead
             // Run maven as a subprocess
-            String[] command = {
+            var cmd = new ArrayList<>(List.of(
                 getMvnCommand(envVars),
-                "--batch-mode", // Turns off ANSI control sequences
-                "validate",
+                "--batch-mode",
+                modulePath != null ? "package" : "validate",
                 goal,
                 "-DincludeScope=test",
-                "-DoutputAbsoluteArtifactFilename=true",
-            };
+                "-DoutputAbsoluteArtifactFilename=true"
+            ));
+            if (modulePath != null) {
+                cmd.add("-pl");
+                cmd.add(modulePath);
+                cmd.add("-am");
+                cmd.add("-DskipTests");
+            }
             var output = Files.createTempFile("jls-maven-output", ".txt");
-            LOG.info("Running " + String.join(" ", command) + " ...");
+            LOG.info("Running " + String.join(" ", cmd) + " ...");
             var workingDirectory = pomXml.toAbsolutePath().getParent().toFile();
             var processStarted = Instant.now();
             var process =
                     new ProcessBuilder()
-                            .command(command)
+                            .command(cmd)
                             .directory(workingDirectory)
                             .redirectError(ProcessBuilder.Redirect.INHERIT)
                             .redirectOutput(output.toFile())
