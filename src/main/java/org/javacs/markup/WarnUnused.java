@@ -61,16 +61,6 @@ class WarnUnused extends TreeScanner<Void, Void> {
         return unused;
     }
 
-    /** Non-private members not referenced within the same file. Needs workspace confirmation. */
-    Set<Element> potentiallyUnusedNonPrivate() {
-        var unused = new HashSet<Element>();
-        unused.addAll(nonPrivateDeclarations.keySet());
-        unused.removeAll(used);
-        unused.removeIf(Objects::isNull);
-        unused.removeIf(i -> i.toString().equals("<error>"));
-        return unused;
-    }
-
     private void foundPrivateDeclaration() {
         privateDeclarations.put(trees.getElement(path), path);
     }

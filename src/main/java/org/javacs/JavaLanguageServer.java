@@ -1490,7 +1490,7 @@ class JavaLanguageServer extends LanguageServer {
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));
             try (var task = compiler.compile(sources)) {
                 var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
-                var errorProvider = new ErrorProvider(task);
+                var errorProvider = new ErrorProvider(task, compiler);
                 var errorReport = errorProvider.errors(Set.of(file.toUri()));
                 LOG.info(String.format(
                         "[diagnostics] pull_compile_done file=%s duration=%dms errors=%d",
