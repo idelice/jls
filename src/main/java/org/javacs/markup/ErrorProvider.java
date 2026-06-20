@@ -200,7 +200,7 @@ public class ErrorProvider {
 
     private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
-        var trees = task.trees;
+        var trees = Trees.instance(task.task);
         var pos = trees.getSourcePositions();
         var importTrees = new ArrayList<ImportTree>();
         var importNames = new ArrayList<String>();
@@ -302,7 +302,7 @@ public class ErrorProvider {
     }
 
     private Diagnostic warnNotThrown(String name, TreePath path) {
-        var trees = task.trees;
+        var trees = Trees.instance(task.task);
         var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = pos.getStartPosition(root, path.getLeaf());
@@ -317,7 +317,7 @@ public class ErrorProvider {
     }
 
     private Diagnostic warnUnused(Element unusedEl) {
-        var trees = task.trees;
+        var trees = Trees.instance(task.task);
         var path = trees.getPath(unusedEl);
         if (path == null) {
             throw new RuntimeException(unusedEl + " has no path");
