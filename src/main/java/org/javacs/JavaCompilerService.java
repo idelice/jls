@@ -23,6 +23,7 @@ class JavaCompilerService implements CompilerProvider {
     final ReusableCompiler compiler = new ReusableCompiler();
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
+    boolean targetNeedsLombok;
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
     final SourceFileManager fileManager;
     final SourceFileManager docsFileManager;
@@ -59,6 +60,19 @@ class JavaCompilerService implements CompilerProvider {
                     if (line.contains("class ") || line.contains("interface ") || line.contains("enum ")) break;
                 }
             } catch (Exception ignored) {}
+        }
+        return false;
+    }
+
+    boolean isBuildOutputAvailable() {
+        for (var path : classPath) {
+            if (Files.isDirectory(path) && !path.getFileName().toString().endsWith(".jar")) {
+                try (var entries = java.nio.file.Files.list(path)) {
+                    if (entries.anyMatch(Files::isDirectory)) {
+                        return true;
+                    }
+                } catch (IOException ignored) {}
+            }
         }
         return false;
     }
@@ -114,7 +128,7 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
-        if (needsCompile()) {
+        if (needsCompile() || (isBuildOutputAvailable() && lombokPresentOnClasspath)) {
             loadCompile(sources);
         } else {
             LOG.fine("...using cached compile");
@@ -131,13 +145,23 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
-        // Lombok AP only generates members for files explicitly in the compilation unit.
-        // Without Lombok, single-file compile works (SourceFileManager resolves types via SOURCE_PATH).
         Collection<? extends JavaFileObject> effectiveSources;
         if (lombokPresentOnClasspath && sources.size() <= 1) {
-            effectiveSources = FileStore.all().stream()
-                    .<JavaFileObject>map(SourceFileObject::new)
-                    .toList();
+            if (isBuildOutputAvailable()) {
+          // Include dirty documents so cross-file errors from edited files are visible
+                var allSources = new LinkedHashSet<JavaFileObject>(sources);
+                LOG.info("[dirty] compile() has " + FileStore.dirtyDocuments().size() + " dirty documents");
+                for (var dirty : FileStore.dirtyDocuments()) {
+                    allSources.add(new SourceFileObject(dirty));
+                }
+                effectiveSources = allSources;
+                LOG.info("[compile] fast-path enabled: types from build output, compiling " + allSources.size() + " file(s)");
+            } else {
+                effectiveSources = FileStore.all().stream()
+                        .<JavaFileObject>map(SourceFileObject::new)
+                        .toList();
+                LOG.info("[compile] fallback: build output unavailable, compiling all " + effectiveSources.size() + " files");
+            }
         } else {
             effectiveSources = sources;
         }

@@ -110,7 +110,7 @@ class JavaLanguageServer extends LanguageServer {
 
     // Single compiler — all requests (interactive + diagnostics) run on the main LSP thread.
     // parse() is thread-safe (standalone javac tasks), so background index builds share the instance.
-    private JavaCompilerService compiler;
+    private volatile JavaCompilerService compiler;
 
     // Background thread for Gradle module dep compilation only.
     private final ExecutorService backgroundExecutor =
@@ -166,7 +166,10 @@ class JavaLanguageServer extends LanguageServer {
 
     /** Return the current compiler. Compiler recreation happens at explicit event boundaries. */
     synchronized JavaCompilerService getOrCreateCompiler() {
-        Objects.requireNonNull(compiler, "Compiler has not been initialized");
+        if (compiler == null) {
+            LOG.warning("Compiler has not been initialized");
+            return null;
+        }
         return compiler;
     }
 
@@ -1238,7 +1241,6 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        ensureTypeIndexReady("definitionBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var snapshot = completionSnapshotRef.get();
         List<Location> found;
         try {
@@ -1279,6 +1281,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
+        if (compiler == null) return List.of();
         var file = Paths.get(params.textDocument.uri);
         return new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
     }
@@ -1317,6 +1320,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
+        if (compiler == null) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
         return Optional.of(new InlayHintProvider(getOrCreateCompiler(), completionSnapshotRef.get().typeIndex()).inlayHints(file, params.range));
     }
@@ -1890,6 +1894,10 @@ class JavaLanguageServer extends LanguageServer {
                     };
                     bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
                     var compiler = JavaLanguageServer.this.compiler;
+                    if (compiler == null) {
+                        LOG.warning("[completion] index refresh skipped — compiler not yet initialized (trigger=" + trigger + ")");
+                        return;
+                    }
                     WorkspaceTypeIndex nextIndex;
                     Instant indexStarted;
                     if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {

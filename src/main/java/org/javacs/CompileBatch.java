@@ -2,6 +2,9 @@ package org.javacs;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
+import com.sun.tools.javac.api.BasicJavacTask;
+import com.sun.tools.javac.api.JavacTaskImpl;
+import com.sun.tools.javac.main.JavaCompiler;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -24,11 +27,11 @@ public class CompileBatch implements AutoCloseable {
     final Elements elements;
     final Types types;
     final List<CompilationUnitTree> roots;
-
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
         this.parent = parent;
+        LOG.info("[compile] CompileBatch — starting compile of " + files.size() + " file(s)");
         parent.diags.clear();
-        var options = options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath);
+        var options = options(parent.classPath, parent.addExports, parent.extraArgs, parent.lombokPresentOnClasspath, parent.isBuildOutputAvailable(), parent.targetNeedsLombok);
 
         // single mutable holder to extract result from worker lambda
         var holder = new Object() {
@@ -50,16 +53,20 @@ public class CompileBatch implements AutoCloseable {
                     holder.elements = task.getElements();
                     holder.types = task.getTypes();
                     holder.roots = new ArrayList<>();
+                    if (parent.targetNeedsLombok) {
+                    }
                     try {
                         for (var t : task.parse()) {
                             holder.roots.add(t);
                         }
                         try {
-                            task.analyze();
+                            var impl = (JavacTaskImpl) task;
+                            impl.enter();
+                            var compiler = JavaCompiler.instance(impl.getContext());
+                            compiler.attribute(compiler.todo);
                         } catch (Throwable e) {
                             LOG.warning("[compiler] analyze failed: "
                                     + e.getClass().getName() + ": " + e.getMessage());
-                            parent.compiler.resetContext();
                         }
                     } catch (IOException e) {
                         throw new RuntimeException(e);
@@ -77,14 +84,27 @@ public class CompileBatch implements AutoCloseable {
     Set<Path> needsAdditionalSources() {
         var addFiles = new HashSet<Path>();
         for (var err : parent.diags) {
-            if (!err.getCode().equals("compiler.err.cant.resolve.location")) continue;
-            if (!isValidFileRange(err)) continue;
-            var className = errorText(err);
-            var packageName = packageName(err);
-            if (packageName != null) {
-                var location = findPackagePrivateClass(packageName, className);
-                if (location != FILE_NOT_FOUND) {
-                    addFiles.add(location);
+            var code = err.getCode();
+            if (code.equals("compiler.err.cant.resolve.location")) {
+                if (!isValidFileRange(err)) continue;
+                var className = errorText(err);
+                var pkg = packageName(err);
+                if (pkg != null) {
+                    var location = findPackagePrivateClass(pkg, className);
+                    if (location != FILE_NOT_FOUND) {
+                        addFiles.add(location);
+                    }
+                }
+            }
+            // Handle general missing symbols (stale .class files from edited dependencies)
+            if (code.equals("compiler.err.cant.resolve")) {
+                var symbolName = extractSymbolName(err);
+                if (symbolName != null && !symbolName.isEmpty()) {
+                    var location = findSourceFile(symbolName);
+                    if (location != FILE_NOT_FOUND) {
+                        LOG.info("[compile] stale-classfile: adding source for " + symbolName + " at " + location);
+                        addFiles.add(location);
+                    }
                 }
             }
         }
@@ -120,12 +140,52 @@ public class CompileBatch implements AutoCloseable {
         return FILE_NOT_FOUND;
     }
 
+    /** Extract the missing symbol name from a "cannot resolve symbol" diagnostic.
+     *  The error message format is: "cannot find symbol\n  symbol:   method foo()\n  location: class Bar"
+     *  We extract the symbol name (without trailing () for methods). */
+    private String extractSymbolName(Diagnostic<? extends JavaFileObject> err) {
+        var msg = err.getMessage(java.util.Locale.US);
+        if (msg == null) return null;
+        var symbolPattern = java.util.regex.Pattern.compile("symbol:\\s+\\w+\\s+(\\S+)");
+        var matcher = symbolPattern.matcher(msg);
+        if (matcher.find()) {
+            var name = matcher.group(1);
+            if (name.endsWith("()")) name = name.substring(0, name.length() - 2);
+            return name;
+        }
+        return null;
+    }
+
+    /** Find a workspace source file that defines a type with the given simple name.
+     *  Searches all packages. Returns FILE_NOT_FOUND if nothing matches. */
+    private Path findSourceFile(String simpleName) {
+        for (var file : FileStore.all()) {
+            var fileName = file.getFileName().toString();
+            if (!fileName.endsWith(".java")) continue;
+            var fileBaseName = fileName.substring(0, fileName.length() - ".java".length());
+            if (!fileBaseName.equals(simpleName)) continue;
+            try {
+                var source = new SourceFileObject(file);
+                var parser = Parser.parseJavaFileObject(source);
+                for (var decl : parser.root.getTypeDecls()) {
+                    if (decl instanceof com.sun.source.tree.ClassTree cls) {
+                        if (cls.getSimpleName().toString().equals(simpleName)) {
+                            return file;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return FILE_NOT_FOUND;
+    }
+
     @Override
     public void close() {
         closed = true;
     }
 
-    static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent) {
+    static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs, boolean lombokPresent, boolean useBuildOutput, boolean targetNeedsLombok) {
         var list = new ArrayList<String>();
 
         Collections.addAll(list, "-classpath", joinPath(classPath));
@@ -133,16 +193,8 @@ public class CompileBatch implements AutoCloseable {
             Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         }
 
-        if (lombokPresent) {
-            Collections.addAll(list, "-proc:full");
-            Collections.addAll(list, "-processor", "lombok.launch.AnnotationProcessorHider$AnnotationProcessor");
-            var processorPath = lombokProcessorPath(classPath);
-            if (!processorPath.isEmpty()) {
-                Collections.addAll(list, "-processorpath", processorPath);
-            }
-        } else {
-            Collections.addAll(list, "-proc:none");
-        }
+        // Lombok AP intentionally disabled — types resolve from .class build output on classpath
+        Collections.addAll(list, "-proc:none");
 
         Collections.addAll(list, "-g");
         Collections.addAll(list, "-Xmaxerrs", "9999");
@@ -174,18 +226,6 @@ public class CompileBatch implements AutoCloseable {
                 .map(Path::toString)
                 .sorted()
                 .collect(Collectors.joining(File.pathSeparator));
-    }
-
-    private static String lombokProcessorPath(Set<Path> classPath) {
-        return classPath.stream()
-                .filter(CompileBatch::isLombokJar)
-                .map(Path::toString)
-                .collect(Collectors.joining(File.pathSeparator));
-    }
-
-    private static boolean isLombokJar(Path path) {
-        var name = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
     }
 
     private static boolean targetsJava8OrEarlier(List<String> extraArgs) {

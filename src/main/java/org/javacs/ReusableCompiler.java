@@ -26,29 +26,17 @@
 
 package org.javacs;
 
-import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.JavacTask;
 import com.sun.source.util.TaskEvent;
 import com.sun.source.util.TaskListener;
 import com.sun.tools.javac.api.*;
-import com.sun.tools.javac.code.Types;
-import com.sun.tools.javac.comp.Annotate;
-import com.sun.tools.javac.comp.Check;
-import com.sun.tools.javac.comp.CompileStates;
-import com.sun.tools.javac.comp.Enter;
-import com.sun.tools.javac.comp.Modules;
-import com.sun.tools.javac.main.Arguments;
 import com.sun.tools.javac.main.JavaCompiler;
-import com.sun.tools.javac.model.JavacElements;
 import com.sun.tools.javac.util.Context;
 import com.sun.tools.javac.util.DefinedBy;
 import com.sun.tools.javac.util.DefinedBy.Api;
 import com.sun.tools.javac.util.Log;
-import com.sun.tools.javac.util.Options;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.tools.DiagnosticListener;
@@ -56,10 +44,10 @@ import javax.tools.JavaFileManager;
 import javax.tools.JavaFileObject;
 
 /**
- * Single-slot reusable javac context pool (worker pattern).
- * The worker function receives a live JavacTask, does all compilation work,
- * and returns a result. The context is cleared at the START of the next compilation,
- * so the previous task's Trees/Elements/Types remain valid between compiles.
+ * Fresh-context-per-compile wrapper. Each compile() call creates a new
+ * ReusableContext, guaranteeing zero state leakage between compilations.
+ * The ReusableLog and ReusableJavaCompiler factories are registered in the
+ * context so javac uses our custom implementations for diagnostic capture.
  */
 class ReusableCompiler {
 
@@ -67,13 +55,6 @@ class ReusableCompiler {
     private static final JavacTool systemProvider = JavacTool.create();
 
     private ReusableContext currentContext = new ReusableContext();
-    private boolean dirty; // true if context was used and needs clearing before reuse
-
-    /** Mark the context as corrupted — next compile will use a fresh context. */
-    void resetContext() {
-        currentContext = new ReusableContext();
-        dirty = false;
-    }
 
     /**
      * Execute a compilation inside the pool. The worker receives a valid JavacTask
@@ -86,11 +67,9 @@ class ReusableCompiler {
             List<String> options,
             Collection<? extends JavaFileObject> compilationUnits,
             Function<JavacTask, T> worker) {
-        // Clear previous compilation's state before reuse
-        if (dirty) {
-            currentContext.clear();
-            dirty = false;
-        }
+        // Fresh context every compile — zero state leakage between compilations
+        currentContext = new ReusableContext();
+        LOG.info("[context] compile() — fresh context, calling getTask()");
         try {
             var task = (JavacTaskImpl) systemProvider.getTask(
                     null, fileManager, diagnosticListener, options, List.of(), compilationUnits, currentContext);
@@ -99,18 +78,15 @@ class ReusableCompiler {
             if (log instanceof ReusableContext.ReusableLog rl) {
                 rl.setDiagListener(diagnosticListener);
             }
-            dirty = true;
+            LOG.info("[context] compile() — getTask() succeeded, worker starting");
             return worker.apply(task);
         } catch (Throwable e) {
-            currentContext = new ReusableContext();
-            dirty = false;
+            LOG.warning("[context] compile() — failed: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
             throw new RuntimeException("Compilation failed: " + e.getMessage(), e);
         }
     }
 
     static class ReusableContext extends Context implements TaskListener {
-
-        Set<CompilationUnitTree> roots = new HashSet<>();
 
         ReusableContext() {
             super();
@@ -118,94 +94,10 @@ class ReusableCompiler {
             put(JavaCompiler.compilerKey, ReusableJavaCompiler.factory);
         }
 
-        void clear() {
-            drop(Arguments.argsKey);
-            drop(DiagnosticListener.class);
-            drop(Log.outKey);
-            drop(Log.errKey);
-            drop(JavaFileManager.class);
-            drop(JavacTask.class);
-            drop(JavacTrees.class);
-            drop(JavacElements.class);
-            drop(Options.optionsKey);
-            dropByClassName("com.sun.tools.javac.platform.PlatformDescription");
-            drop(javax.annotation.processing.Processor.class);
-            dropByClassName("com.sun.tools.javac.processing.JavacProcessingEnvironment");
-
-            if (ht.get(Log.logKey) instanceof ReusableLog) {
-                Log.instance(this).clear();
-                clearLintMapper();
-                Enter.instance(this).newRound();
-                ((ReusableJavaCompiler) ReusableJavaCompiler.instance(this)).clear();
-                Types.instance(this).newRound();
-                Check.instance(this).newRound();
-                Modules.instance(this).newRound();
-                Annotate.instance(this).newRound();
-                CompileStates.instance(this).clear();
-                MultiTaskListener.instance(this).clear();
-                // Remove compiled class symbols from Symtab (critical for Lombok AP reuse)
-                removeCompiledClassSymbols();
-                roots.clear();
-            }
-        }
-
-        private void removeCompiledClassSymbols() {
-            try {
-                var symtabClass = Class.forName("com.sun.tools.javac.code.Symtab");
-                var instanceMethod = symtabClass.getMethod("instance", Context.class);
-                var symtab = instanceMethod.invoke(null, this);
-                var removeClassMethod = symtabClass.getMethod("removeClass",
-                        Class.forName("com.sun.tools.javac.code.Symbol$ModuleSymbol"),
-                        Class.forName("com.sun.tools.javac.util.Name"));
-                for (var root : roots) {
-                    var cu = (com.sun.source.tree.CompilationUnitTree) root;
-                    for (var decl : cu.getTypeDecls()) {
-                        if (decl instanceof com.sun.source.tree.ClassTree classTree) {
-                            removeClassFromSymtab(symtab, removeClassMethod, classTree);
-                        }
-                    }
-                }
-            } catch (ReflectiveOperationException | RuntimeException ignored) {
-                // Symtab API may differ between JDK versions
-            }
-        }
-
-        private void removeClassFromSymtab(Object symtab, java.lang.reflect.Method removeClassMethod,
-                com.sun.source.tree.ClassTree classTree) {
-            try {
-                // Access the JCClassDecl.sym field to get the ClassSymbol
-                var jcClass = (com.sun.tools.javac.tree.JCTree.JCClassDecl) classTree;
-                var sym = jcClass.sym;
-                if (sym != null) {
-                    removeClassMethod.invoke(symtab, sym.packge().modle, sym.flatname);
-                }
-            } catch (ReflectiveOperationException | RuntimeException ignored) {}
-        }
-
-        private void clearLintMapper() {
-            try {
-                var cls = Class.forName("com.sun.tools.javac.code.LintMapper");
-                var instance = cls.getMethod("instance", Context.class);
-                var obj = instance.invoke(null, this);
-                var clear = cls.getMethod("clear");
-                clear.invoke(obj);
-            } catch (ReflectiveOperationException ignored) {
-            }
-        }
-
-        @SuppressWarnings("unchecked")
-        private void dropByClassName(String className) {
-            try {
-                drop((Class<Object>) Class.forName(className));
-            } catch (ClassNotFoundException ignored) {}
-        }
-
         @Override
         @DefinedBy(Api.COMPILER_TREE)
         public void finished(TaskEvent e) {
-            if (e.getKind() == TaskEvent.Kind.PARSE) {
-                roots.add(e.getCompilationUnit());
-            }
+            // do nothing
         }
 
         @Override
@@ -225,14 +117,17 @@ class ReusableCompiler {
 
             void clear() {
                 newRound();
-                // Lombok's processor cannot be reused across compiles - its internal
-                // handlers reference AST nodes from the previous compilation.
                 // Null procEnvImpl to force fresh AP initialization each time.
+                // Without a JDK-level reset() method, this is the safest approach:
+                // annotation processors are rediscovered, but incremental Lombok
+                // compilation (fewer files) keeps overall compile time low.
                 try {
                     var f = JavaCompiler.class.getDeclaredField("procEnvImpl");
                     f.setAccessible(true);
                     f.set(this, null);
-                } catch (ReflectiveOperationException ignored) {}
+                } catch (ReflectiveOperationException e) {
+                    LOG.warning("[compiler] Failed to null procEnvImpl: " + e.getMessage());
+                }
             }
 
             @Override

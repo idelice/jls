@@ -852,6 +852,13 @@ public class DefinitionProvider {
                         // and its getCharContent() throws UnsupportedOperationException.
                         return openParsedSource(compiler.parse(sym.sourcefile), key);
                     }
+                    // Check workspace before decompiling — fast path resolves types from classpath .class
+                    // files, so ClassSymbol.sourcefile has a relative URI. The workspace .java source
+                    // should be preferred when available.
+                    var workspaceFile = compiler.findAnywhere(key);
+                    if (workspaceFile.isPresent() && workspaceFile.get().toUri().getScheme().equals("file")) {
+                        return openParsedSource(compiler.parse(workspaceFile.get()), key);
+                    }
                     // Binary-only (JDK platform types, jars without attached sources, or external
                     // types whose ClassSymbol.sourcefile is a ClassReader$SourceFileObject):
                     // decompile with Vineflower.

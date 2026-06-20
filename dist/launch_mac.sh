@@ -26,6 +26,5 @@ JLINK_VM_OPTIONS="\
 DIR=`dirname $0`
 JAVA_BIN="$DIR/mac/bin/java"
 LOGGING_CONFIG="$DIR/mac/conf/logging.properties"
-JLS_JVM_DEFAULT_MEM="-Xmx6g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication"
-PATCH_MODULE="--patch-module jdk.compiler=$DIR/patches/jdk.compiler"
-exec "$JAVA_BIN" $JLINK_VM_OPTIONS $PATCH_MODULE ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} -Djava.util.logging.config.file="$LOGGING_CONFIG" -classpath "$DIR/classpath/*" "$@"
+JLS_JVM_DEFAULT_MEM="-Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication"
+exec "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} -Djava.util.logging.config.file="$LOGGING_CONFIG" -classpath "$DIR/classpath/*" "$@"

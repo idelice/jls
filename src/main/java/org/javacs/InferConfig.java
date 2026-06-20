@@ -107,7 +107,13 @@ class InferConfig {
         var buildRoot = findBuildRoot();
         var pomXml = buildRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars);
+            var classPath = new HashSet<>(mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars));
+            var targetClasses = buildRoot.resolve("target/classes");
+            if (Files.isDirectory(targetClasses)) {
+                LOG.info("[classpath] Adding Maven build output: " + targetClasses);
+                classPath.add(targetClasses);
+            }
+            return classPath;
         }
 
         // Bazel

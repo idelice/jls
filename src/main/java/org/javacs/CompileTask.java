@@ -34,14 +34,14 @@ public class CompileTask implements AutoCloseable {
         for (var root : roots) {
             if (root.getSourceFile().toUri().equals(file.toUri())) return root;
         }
-        throw new RuntimeException("not found");
+        return null;
     }
 
     public CompilationUnitTree root(JavaFileObject file) {
         for (var root : roots) {
             if (root.getSourceFile().toUri().equals(file.toUri())) return root;
         }
-        throw new RuntimeException("not found");
+        return null;
     }
 
     public CompileTask(
