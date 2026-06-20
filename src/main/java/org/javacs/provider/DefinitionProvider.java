@@ -441,7 +441,30 @@ public class DefinitionProvider {
                 }
             }
 
-            // 3. external — look up method in decompiled source.
+            // 3. external — redirect Lombok getter/setter to source field before decompiling
+            if (compiler.lombokPresentOnClasspath()) {
+                var lombokFieldName = LombokAnnotations.accessorFieldName(memberName);
+                if (lombokFieldName.isPresent()) {
+                    var source = openSourceForElement(owner);
+                    if (source.isPresent()) {
+                        var fieldLocations =
+                                source
+                                        .map(s -> locateField(s, lombokFieldName.get()))
+                                        .orElseGet(List::of);
+                        if (!fieldLocations.isEmpty()) {
+                            return new ResolvedSymbol(
+                                    fieldLocations,
+                                    ownerQualified,
+                                    lombokFieldName.get(),
+                                    false,
+                                    null,
+                                    lombokFieldName.get());
+                        }
+                    }
+                }
+            }
+
+            // 4. external — look up method in decompiled source.
             var externalSource = openExternalSourceForElement(owner);
             var extLocations =
                     externalSource
@@ -452,7 +475,7 @@ public class DefinitionProvider {
                         extLocations, ownerQualified, memberName, true, null, memberName);
             }
 
-            // 4. external - lombok — Lombok heuristics on decompiled source.
+            // 5. external - lombok — Lombok heuristics on decompiled source.
             if (compiler.lombokPresentOnClasspath() && externalSource.isPresent()) {
                 var fieldName = LombokAnnotations.accessorFieldName(memberName);
                 if (fieldName.isPresent()) {
