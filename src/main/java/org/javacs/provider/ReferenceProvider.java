@@ -226,7 +226,11 @@ public class ReferenceProvider {
                     null, name, false, null, name, localLoc);
         }
 
+        // Method declaration — leaf is the method name identifier, parent is MethodTree
         var parent = path.getParentPath() != null ? path.getParentPath().getLeaf() : null;
+        if (id != null && parent instanceof MethodTree mt) {
+            return resolveMethodDeclaration(parse, path.getParentPath(), mt);
+        }
         if (id != null
                 && parent instanceof NewClassTree nc
                 && nc.getIdentifier() == id
