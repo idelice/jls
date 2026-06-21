@@ -2,7 +2,6 @@ package org.javacs;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
-import com.sun.tools.javac.api.BasicJavacTask;
 import com.sun.tools.javac.api.JavacTaskImpl;
 import com.sun.tools.javac.main.JavaCompiler;
 import java.io.File;
