@@ -429,7 +429,8 @@ class JavaCompilerService implements CompilerProvider {
 
     private volatile ExternalBinaryDecompiler decompiler;
 
-    private ExternalBinaryDecompiler decompiler() {
+    @Override
+    public Optional<Path> decompileClass(String qualifiedName) {
         if (decompiler == null) {
             synchronized (this) {
                 if (decompiler == null) {
@@ -443,11 +444,6 @@ class JavaCompilerService implements CompilerProvider {
                 }
             }
         }
-        return decompiler;
-    }
-
-    @Override
-    public Optional<Path> decompileClass(String qualifiedName) {
-        return decompiler().decompileSourcePath(qualifiedName);
+        return decompiler.decompileSourcePath(qualifiedName);
     }
 }
