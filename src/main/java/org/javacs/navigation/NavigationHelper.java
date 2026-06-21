@@ -37,7 +37,7 @@ public class NavigationHelper {
         }
     }
 
-    static boolean isMember(Element element) {
+    public static boolean isMember(Element element) {
         switch (element.getKind()) {
             case ENUM_CONSTANT:
             case FIELD:
@@ -49,7 +49,7 @@ public class NavigationHelper {
         }
     }
 
-    static boolean isType(Element element) {
+    public static boolean isType(Element element) {
         switch (element.getKind()) {
             case ANNOTATION_TYPE:
             case CLASS:

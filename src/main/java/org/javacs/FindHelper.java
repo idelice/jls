@@ -27,6 +27,7 @@ import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import org.javacs.CacheAudit;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.Range;
 
@@ -140,6 +141,10 @@ public class FindHelper {
 
     public static Location location(ParseTask task, TreePath path) {
         return location(task.task(), path, "", false);
+    }
+
+    public static Location location(CompileTask task, TreePath path) {
+        return location(task, path, "");
     }
 
     public static Location location(CompileTask task, TreePath path, CharSequence name) {

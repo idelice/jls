@@ -142,7 +142,7 @@ class JavaLanguageServer extends LanguageServer {
             Collections.synchronizedMap(
                     new LinkedHashMap<>(REWRITE_REGISTRY_MAX, 0.75f, true) {
                         @Override
-                        protected boolean removeEldestEntry(Map.Entry<String, org.javacs.rewrite.Rewrite> eldest) {
+                        protected boolean removeEldestEntry(Map.Entry<String, Rewrite> eldest) {
                             return size() > REWRITE_REGISTRY_MAX;
                         }
                     });
@@ -1264,7 +1264,7 @@ class JavaLanguageServer extends LanguageServer {
         var includeDeclaration = position.context != null && position.context.includeDeclaration;
         var found =
                 new ReferenceProvider(
-                                getOrCreateCompiler(), snapshot.typeIndex(), file, line, column, includeDeclaration)
+                                getOrCreateCompiler(), file, line, column)
                         .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
