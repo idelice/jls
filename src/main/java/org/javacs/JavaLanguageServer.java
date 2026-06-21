@@ -1035,6 +1035,7 @@ class JavaLanguageServer extends LanguageServer {
         client.registerCapability("workspace/didChangeWatchedFiles", options);
         LOG.info(String.format("[perf] client_attached workspace=%s watchers=%d", workspaceRoot, watchFiles.length));
         initializeCompilers();
+        getOrCreateCompiler().fullCompileWithAP();
     }
 
     @Override
@@ -1714,6 +1715,7 @@ class JavaLanguageServer extends LanguageServer {
                     0,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
         }
+        getOrCreateCompiler().refreshBuildOutput(file);
     }
 
     /**

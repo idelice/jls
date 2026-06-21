@@ -1,5 +1,6 @@
 package org.javacs;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.*;
@@ -284,6 +285,87 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public boolean lombokPresentOnClasspath() {
         return lombokPresentOnClasspath;
+    }
+
+    // find build output dir from classpath, fallback to workspace convention
+    Path findBuildOutputDir() {
+        for (var p : classPath) {
+            if (Files.isDirectory(p) && !p.getFileName().toString().endsWith(".jar")) {
+                return p;
+            }
+        }
+        var roots = FileStore.workspaceRoots();
+        if (roots.isEmpty()) return null;
+        var root = roots.iterator().next();
+        var dir = root.resolve("target").resolve("classes");
+        try {
+            Files.createDirectories(dir);
+            addClassPathEntries(Set.of(dir));
+            return dir;
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    // startup full compile with AP — populates build output once
+    void fullCompileWithAP() {
+        if (!lombokPresentOnClasspath) return;
+        var outputDir = findBuildOutputDir();
+        if (outputDir == null) return;
+        var sources = FileStore.all().stream()
+                .filter(FileStore::isJavaFile)
+                .map(SourceFileObject::new)
+                .toList();
+        if (sources.isEmpty()) return;
+        var options = CompileBatch.options(classPath, addExports, extraArgs);
+        options.remove("-proc:none");
+        options.addAll(List.of("-d", outputDir.toString()));
+        var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
+        options.addAll(List.of("-processorpath", cp));
+        compiler.compile(
+                fileManager,
+                diags::add,
+                options,
+                sources,
+                task -> {
+                    try {
+                        task.analyze();
+                        task.generate();
+                    } catch (java.io.IOException e) {
+                        LOG.warning("[build] fullCompileWithAP failed: " + e.getMessage());
+                    }
+                    return null;
+                });
+        cachedCompile = null;
+        LOG.info("[build] fullCompileWithAP complete");
+    }
+
+    // single-file compile with AP — updates .class in build output on didSave
+    void refreshBuildOutput(Path file) {
+        if (!lombokPresentOnClasspath) return;
+        var outputDir = findBuildOutputDir();
+        if (outputDir == null) return;
+        var options = CompileBatch.options(classPath, addExports, extraArgs);
+        options.remove("-proc:none");
+        options.addAll(List.of("-d", outputDir.toString()));
+        var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
+        options.addAll(List.of("-processorpath", cp));
+        compiler.compile(
+                fileManager,
+                diags::add,
+                options,
+                List.of(new SourceFileObject(file)),
+                task -> {
+                    try {
+                        task.analyze();
+                        task.generate();
+                    } catch (java.io.IOException e) {
+                        LOG.warning(String.format("[build] refreshBuildOutput failed for %s: %s",
+                                file.getFileName(), e.getMessage()));
+                    }
+                    return null;
+                });
+        LOG.info(String.format("[build] refreshBuildOutput compiled %s", file.getFileName()));
     }
 
     @Override

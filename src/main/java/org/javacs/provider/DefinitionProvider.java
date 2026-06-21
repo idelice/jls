@@ -338,6 +338,11 @@ public class DefinitionProvider {
                 if (hasLombokAnnotation(rawClassName, task.task.getElements())) {
                     return resolveLombokField(element, element.getSimpleName().toString(), task.task.getElements());
                 }
+                // .class files strip SOURCE annotations. Try accessor pattern fallback.
+                var memberName = element.getSimpleName().toString();
+                if (LombokAnnotations.accessorFieldName(memberName).isPresent()) {
+                    return resolveLombokField(element, memberName, task.task.getElements());
+                }
             }
             var decl = tryDeclarationNavigation(task, element);
             if (!decl.isEmpty()) return decl;

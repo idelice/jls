@@ -9,6 +9,7 @@ import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.util.Elements;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
@@ -111,7 +112,7 @@ public class ReferenceProvider {
             LOG.info("[ref] parent is not TypeElement, returning empty");
             return Set.of();
         }
-        var hasLombok = hasLombokAnnotation(parentType);
+        var hasLombok = hasLombokAnnotation(parentType.getQualifiedName().toString(), task.task.getElements());
         LOG.info(String.format("[ref] hasLombokAnnotation=%s", hasLombok));
         if (!hasLombok) return Set.of();
         var fieldName = element.getKind() == ElementKind.FIELD
@@ -128,7 +129,10 @@ public class ReferenceProvider {
         return names;
     }
 
-    private boolean hasLombokAnnotation(TypeElement type) {
+    // check source TypeElement via task Elements. .class files strip SOURCE annotations.
+    private boolean hasLombokAnnotation(String className, Elements elements) {
+        var type = elements.getTypeElement(className);
+        if (type == null) return false;
         for (var mirror : type.getAnnotationMirrors()) {
             var annType = mirror.getAnnotationType().asElement();
             if (annType instanceof TypeElement te
