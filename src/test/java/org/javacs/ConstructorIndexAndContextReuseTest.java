@@ -9,7 +9,6 @@ import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.CompletionItemKind;
-import org.javacs.lsp.InlayHint;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.provider.InlayHintProvider;

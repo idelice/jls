@@ -53,6 +53,7 @@ public class LanguageServerFixture {
     }
 
     static JavaLanguageServer getJavaLanguageServer(Path workspaceRoot, LanguageClient client) {
+        System.setProperty("jls.test", "true");
         FileStore.reset();
 
         var server = new JavaLanguageServer(client);

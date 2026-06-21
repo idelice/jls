@@ -7,13 +7,9 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
-import com.sun.source.tree.IdentifierTree;
-import com.sun.source.tree.MemberReferenceTree;
-import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePathScanner;
-import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,7 +26,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
-import java.util.stream.Collectors;
 import javax.lang.model.element.*;
 import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
@@ -1241,10 +1236,9 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var snapshot = completionSnapshotRef.get();
         List<Location> found;
         try {
-            found = new DefinitionProvider(getOrCreateCompiler(), snapshot.typeIndex(), file, line, column).find();
+            found = new DefinitionProvider(getOrCreateCompiler(),file, line, column).find();
         } catch (RuntimeException e) {
             // javac internal error (NPE in Types.sideCast on complex generics).
             // Don't crash the server — return empty.

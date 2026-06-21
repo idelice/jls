@@ -52,8 +52,11 @@ class JavaCompilerService implements CompilerProvider {
         for (var file : FileStore.all()) {
             // Skip test fixtures/resources/examples (not actual project source)
             var path = file.toString();
-            if (path.contains("/test/resources/") || path.contains("/test/examples/")
-                    || path.contains("/test-resources/")) continue;
+            // TODO: jls.test is temporary — needs proper multi-workspace support
+            // to separate test fixtures from main workspace without breaking Lombok detection
+            if (System.getProperty("jls.test") == null
+                    && (path.contains("/test/resources/") || path.contains("/test/examples/")
+                    || path.contains("/test-resources/"))) continue;
             try (var reader = FileStore.lines(file)) {
                 for (var line = reader.readLine(); line != null; line = reader.readLine()) {
                     if (line.startsWith("import lombok")) return true;
