@@ -165,17 +165,17 @@ class JavaCompilerService implements CompilerProvider {
             if (isBuildOutputAvailable()) {
                 // Include dirty documents so cross-file errors from edited files are visible
                 var allSources = new LinkedHashSet<JavaFileObject>(sources);
-                LOG.info("[dirty] compile() has " + FileStore.dirtyDocuments().size() + " dirty documents");
+                LOG.fine("[dirty] compile() has " + FileStore.dirtyDocuments().size() + " dirty documents");
                 for (var dirty : FileStore.dirtyDocuments()) {
                     allSources.add(new SourceFileObject(dirty));
                 }
                 effectiveSources = allSources;
-                LOG.info("[compile] fast-path enabled: types from build output, compiling " + allSources.size() + " file(s)");
+                LOG.fine("[compile] fast-path enabled: types from build output, compiling " + allSources.size() + " file(s)");
             } else {
                 effectiveSources = FileStore.all().stream()
                         .<JavaFileObject>map(SourceFileObject::new)
                         .toList();
-                LOG.info("[compile] fallback: build output unavailable, compiling all " + effectiveSources.size() + " files");
+                LOG.fine("[compile] fallback: build output unavailable, compiling all " + effectiveSources.size() + " files");
             }
         } else {
             effectiveSources = sources;
