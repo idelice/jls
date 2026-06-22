@@ -1,6 +1,8 @@
 package org.javacs;
 
 import com.sun.source.tree.AnnotationTree;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ModifiersTree;
 import com.sun.source.util.TreePath;
 import java.io.BufferedReader;
@@ -22,7 +24,7 @@ import org.javacs.lsp.Location;
  * change the source model, and how generated accessor names should map back to source fields.
  */
 public final class LombokAnnotations {
-    private static final Set<String> LOGGING_ONLY = Set.of("Slf4j");
+    private static final Set<String> LOGGING_ONLY = Set.of("Slf4j", "Log", "Log4j", "Log4j2", "CommonsLog", "Flogger", "JBossLog", "XSlf4j", "CustomLog");
     private static final Set<String> ACCESSOR_RELATED = Set.of("Data", "Getter", "Setter", "Value");
     public static final Set<String> KNOWN =
             Set.of(
@@ -325,5 +327,37 @@ public final class LombokAnnotations {
         } catch (RuntimeException | java.io.IOException e) {
             return false;
         }
+    }
+
+    // reads lombok.config for custom log field name. Default is "log".
+    public static String logFieldName(Path workspaceRoot) {
+        if (workspaceRoot == null) return "log";
+        var configFile = workspaceRoot.resolve("lombok.config");
+        if (!Files.exists(configFile)) return "log";
+        try {
+            for (var line : Files.readAllLines(configFile)) {
+                var trimmed = line.trim();
+                if (trimmed.startsWith("#") || trimmed.isEmpty()) continue;
+                if (!trimmed.startsWith("lombok.log.fieldName")) continue;
+                var eq = trimmed.indexOf('=');
+                if (eq < 0) continue;
+                var value = trimmed.substring(eq + 1).trim();
+                if (!value.isEmpty()) return value;
+            }
+        } catch (IOException e) {
+            // silently fall back to default
+        }
+        return "log";
+    }
+
+    // uses parsed CST — annotations already resolved, no file I/O
+    public static boolean hasLogAnnotation(CompilationUnitTree root) {
+        for (var decl : root.getTypeDecls()) {
+            if (decl instanceof ClassTree cls
+                    && hasAnnotation(cls.getModifiers(), LOGGING_ONLY)) {
+                return true;
+            }
+        }
+        return false;
     }
 }
