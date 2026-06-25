@@ -212,14 +212,17 @@ public class DefinitionProvider {
             }
         }
         if (className.isEmpty()) return NOT_SUPPORTED;
-        return navigateToField(className, fieldName, elements);
+        var declaringClass = findDeclaringClass(className, fieldName, elements);
+        if (declaringClass.isEmpty()) return List.of();
+        var sourceFile = compiler.findAnywhere(declaringClass);
+        if (sourceFile.isEmpty()) return List.of();
+        var parse = compiler.parse(sourceFile.get());
+        var fieldTree = FindHelper.findField(parse, declaringClass, fieldName);
+        var path = TreePath.getPath(parse.root(), fieldTree);
+        return List.of(FindHelper.location(parse, path, fieldName));
     }
 
-    private List<Location> navigateToField(String startClassName, String fieldName, Elements elements) {
-        var declaringClass = findDeclaringClass(startClassName, fieldName, elements);
-        if (declaringClass.isEmpty()) return List.of();
-        return parseAndNavigate(declaringClass, fieldName);
-    }
+
 
     private List<Location> navigateToDeclaration(CompileTask task, ExecutableElement method) {
         var enclosing = (TypeElement) method.getEnclosingElement();
@@ -289,15 +292,6 @@ public class DefinitionProvider {
             current = (TypeElement) ((DeclaredType) superMirror).asElement();
         }
         return "";
-    }
-
-    private List<Location> parseAndNavigate(String className, String fieldName) {
-        var sourceFile = compiler.findAnywhere(className);
-        if (sourceFile.isEmpty()) return List.of();
-        var parse = compiler.parse(sourceFile.get());
-        var fieldTree = FindHelper.findField(parse, className, fieldName);
-        var path = TreePath.getPath(parse.root(), fieldTree);
-        return List.of(FindHelper.location(parse, path, fieldName));
     }
 
     private boolean hasLombokAnnotation(String className, Elements elements) {
