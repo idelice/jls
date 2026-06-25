@@ -222,8 +222,6 @@ public class DefinitionProvider {
         return List.of(FindHelper.location(parse, path, fieldName));
     }
 
-
-
     private List<Location> navigateToDeclaration(CompileTask task, ExecutableElement method) {
         var enclosing = (TypeElement) method.getEnclosingElement();
         var types = task.task.getTypes();
