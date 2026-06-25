@@ -60,7 +60,8 @@ public class CompileBatch implements AutoCloseable {
                             var impl = (JavacTaskImpl) task;
                             impl.enter();
                             var compiler = JavaCompiler.instance(impl.getContext());
-                            compiler.attribute(compiler.todo);
+                            var attr = compiler.attribute(compiler.todo);
+                            compiler.flow(attr);
                         } catch (Throwable e) {
                             LOG.warning("[compiler] analyze failed: "
                                     + e.getClass().getName() + ": " + e.getMessage());
