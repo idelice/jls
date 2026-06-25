@@ -775,7 +775,7 @@ public final class ParseTypeResolver {
         if (resolved.isEmpty()) {
             return Optional.empty();
         }
-        var array = normalized.endsWith("[]");
+        var array = typeName.endsWith("[]");
         var qualified = resolved.get();
         if (array && qualified.endsWith("[]")) {
             qualified = qualified.substring(0, qualified.length() - 2);
@@ -1335,7 +1335,7 @@ public final class ParseTypeResolver {
         if (resolved.isEmpty()) {
             return Optional.empty();
         }
-        var array = normalized.endsWith("[]");
+        var array = typeName.endsWith("[]");
         var qualified = resolved.get();
         if (array && qualified.endsWith("[]")) {
             qualified = qualified.substring(0, qualified.length() - 2);
