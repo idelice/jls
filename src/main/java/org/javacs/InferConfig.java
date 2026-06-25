@@ -51,9 +51,6 @@ class InferConfig {
         this(workspaceRoot, externalDependencies, defaultMavenHome(), defaultGradleHome(), null);
     }
 
-    Path mavenHome() { return mavenHome; }
-    Map<String, String> envVars() { return envVars; }
-
     private static Path defaultMavenHome() {
         return Paths.get(System.getProperty("user.home")).resolve(".m2");
     }
