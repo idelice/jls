@@ -219,7 +219,16 @@ class JavaLanguageServer extends LanguageServer {
         publishExternalBinaryIndexSnapshot();
     }
 
+    private volatile long lastCompilerRecreateMs = 0;
+    private static final long COMPILER_RECREATE_DEBOUNCE_MS = 10_000; // 10 seconds
+
     private synchronized void recreateCompilersAndRefreshState(String trigger) {
+        var now = System.currentTimeMillis();
+        if (trigger.equals("didChangeWatchedFiles") && (now - lastCompilerRecreateMs) < COMPILER_RECREATE_DEBOUNCE_MS) {
+            LOG.info(String.format("[perf] compiler_recreate_debounced trigger=%s elapsed=%dms", trigger, now - lastCompilerRecreateMs));
+            return;
+        }
+        lastCompilerRecreateMs = now;
         LOG.info(String.format("[perf] compiler_recreate trigger=%s", trigger));
         completionIndexScheduler.cancel(trigger);
         createCompilers();
@@ -671,6 +680,7 @@ class JavaLanguageServer extends LanguageServer {
         var extraArgs = compilerArgs.args();
         var settingsLoaded = Instant.now();
         Set<Path> resolvedDocPath;
+        InferConfig infer = null;
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
             resolvedDocPath = docPath();
@@ -682,11 +692,9 @@ class JavaLanguageServer extends LanguageServer {
         }
         // Otherwise, combine inference with user-specified external dependencies
         else {
-            var infer = new InferConfig(workspaceRoot, externalDependencies);
-            var buildRoot = infer.findBuildRoot();
-            var isGradle = Files.exists(buildRoot.resolve("settings.gradle"))
-                    || Files.exists(buildRoot.resolve("settings.gradle.kts"));
-            var isMaven = !isGradle && Files.exists(buildRoot.resolve("pom.xml"));
+            infer = new InferConfig(workspaceRoot, externalDependencies);
+            var isGradle = infer.buildSystem() == InferConfig.BuildSystem.GRADLE;
+            var isMaven = infer.buildSystem() == InferConfig.BuildSystem.MAVEN;
 
             reportWorkDoneProgress(progressToken,
                     isGradle ? "Resolving Gradle dependencies (may take a minute on first run)"
@@ -712,14 +720,25 @@ class JavaLanguageServer extends LanguageServer {
         var inferenceFinished = Instant.now();
 
         // Populate module graph and compile inter-module deps before creating compilers.
-        var inferForGraph = new InferConfig(workspaceRoot, externalDependencies());
+        var inferForGraph = infer != null ? infer : new InferConfig(workspaceRoot, externalDependencies());
         moduleGraph = inferForGraph.moduleGraph();
         if (moduleGraph != ModuleGraph.EMPTY) {
-            var buildRoot = inferForGraph.findBuildRoot();
-            var isGradleProject = Files.exists(buildRoot.resolve("settings.gradle"))
-                    || Files.exists(buildRoot.resolve("settings.gradle.kts"));
+            var buildRoot = inferForGraph.buildRoot();
+            var isGradleProject = inferForGraph.buildSystem() == InferConfig.BuildSystem.GRADLE;
             LOG.info(String.format("[module-graph] loaded %d modules (build_system=%s)",
                     moduleGraph.modules().size(), isGradleProject ? "gradle" : "maven"));
+            // Warn once if Maven sibling modules lack build output
+            if (!isGradleProject) {
+                int total = 0, missing = 0;
+                for (var info : moduleGraph.modules().values()) {
+                    total++;
+                    if (!Files.isDirectory(MavenTooling.outputDirectory(info.projectDir()))) missing++;
+                }
+                if (missing > 0) {
+                    warnUserOnce("maven_missing_build_output",
+                            String.format("%d of %d modules lack target/classes. Run your project build for full cross-module resolution.", missing, total));
+                }
+            }
             // Compile transitive inter-module deps — only supported for Gradle via Tooling API.
             // Maven projects compile via `mvn compile` which the user runs manually.
             if (isGradleProject) {
@@ -737,11 +756,19 @@ class JavaLanguageServer extends LanguageServer {
                         LOG.info(String.format("[multi-module] scoped workspace to %d source dirs for %s (files=%d)",
                                 scopedRoots.size(), activeModule.get().projectPath(), FileStore.all().size()));
                     }
-                    reportWorkDoneProgress(progressToken,
-                            "Building Gradle module dependencies (" + activeModule.get().projectPath() + ")");
-                    GradleTooling.compileDependencies(buildRoot, moduleGraph, activeModule.get().projectPath());
-                    // Re-resolve classpath after compilation — include compiled module output dirs
-                    var updatedClasspath = new LinkedHashSet<>(inferForGraph.classPath());
+                    // don't compile deps on startup (blocks for minutes on large projects).
+                    // Use existing build/classes/java/main if present. Warn if missing.
+                    var depDirs = moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath());
+                    int missingDeps = 0;
+                    for (var dir : depDirs) {
+                        if (!Files.isDirectory(dir)) missingDeps++;
+                    }
+                    if (missingDeps > 0) {
+                        warnUserOnce("gradle_missing_build_output",
+                                String.format("%d module dependencies lack build/classes/java/main. Run './gradlew compileJava' for full cross-module resolution.", missingDeps));
+                    }
+                    // Re-resolve classpath — include compiled module output dirs that exist
+                    var updatedClasspath = new LinkedHashSet<>(classPath);
                     updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath()));
                     // Also add class outputs for any other modules that are in the workspace roots
                     for (var root : FileStore.workspaceRoots()) {
@@ -1508,8 +1535,9 @@ class JavaLanguageServer extends LanguageServer {
     private final Set<String> compiledModuleDeps = ConcurrentHashMap.newKeySet();
 
     /**
-     * Compile a module's transitive deps in background, then extend all compilers' classpath
-     * with the new class output dirs. Re-triggers diagnostics for the file that caused the switch.
+     * When a new module is opened, extend the compiler's classpath with its
+     * transitive dep class output dirs (if they exist on disk).
+     * No compilation is performed — the user is responsible for building.
      */
     private void scheduleModuleDepCompilation(String projectPath, Path triggerFile) {
         if (!compiledModuleDeps.add(projectPath)) return; // already done
@@ -1517,15 +1545,7 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 var graph = moduleGraph;
                 if (graph == ModuleGraph.EMPTY) return;
-                var buildRoot = new InferConfig(workspaceRoot, Collections.emptySet()).findBuildRoot();
-                var token = beginWorkDoneProgress("Build", "Compiling " + projectPath + " dependencies");
-                LOG.info("[multi-module] background_dep_compile_start module=" + projectPath);
-                var started = System.nanoTime();
-                GradleTooling.compileDependencies(buildRoot, graph, projectPath);
-                var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
-                LOG.info("[multi-module] background_dep_compile_done module=" + projectPath + " took=" + durationMs + "ms");
-                endWorkDoneProgress(token, "Built " + projectPath + " deps");
-                // Extend compiler's classpath with the new class output dirs
+                // Just add existing class output dirs — don't run gradlew
                 var newDirs = graph.transitiveClassOutputDirs(projectPath);
                 var existingDirs = new LinkedHashSet<Path>();
                 for (var dir : newDirs) {

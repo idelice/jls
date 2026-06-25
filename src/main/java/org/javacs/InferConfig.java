@@ -18,6 +18,8 @@ import java.util.stream.Stream;
 class InferConfig {
     private static final Logger LOG = Logger.getLogger("main");
 
+    enum BuildSystem { MAVEN, GRADLE, BAZEL, UNKNOWN }
+
     /** Root of the workspace that is currently open in VSCode */
     private final Path workspaceRoot;
     /** External dependencies specified manually by the user */
@@ -28,6 +30,14 @@ class InferConfig {
     private final Path gradleHome;
     /** Environment variables, primarily for testing */
     private final Map<String, String> envVars;
+    /** Cached build root (lazily initialized) */
+    private Path buildRoot;
+    /** Cached build system detection (lazily initialized) */
+    private BuildSystem buildSystem;
+    /** Cached module graph (lazily initialized) */
+    private ModuleGraph cachedModuleGraph;
+    /** Cached maven deps (lazily initialized) */
+    private MavenTooling.MavenDependencies cachedMavenDeps;
 
     InferConfig(
             Path workspaceRoot,
@@ -59,6 +69,27 @@ class InferConfig {
         return Paths.get(System.getProperty("user.home")).resolve(".gradle");
     }
 
+    Path buildRoot() {
+        if (buildRoot == null) buildRoot = findBuildRoot();
+        return buildRoot;
+    }
+
+    BuildSystem buildSystem() {
+        if (buildSystem == null) buildSystem = detectBuildSystem();
+        return buildSystem;
+    }
+
+    private BuildSystem detectBuildSystem() {
+        var root = buildRoot();
+        if (Files.exists(root.resolve("settings.gradle")) || Files.exists(root.resolve("settings.gradle.kts")))
+            return BuildSystem.GRADLE;
+        if (Files.exists(root.resolve("pom.xml")))
+            return BuildSystem.MAVEN;
+        if (Files.exists(root.resolve("WORKSPACE")))
+            return BuildSystem.BAZEL;
+        return BuildSystem.UNKNOWN;
+    }
+
     /** Find .jar files for external dependencies, for examples maven dependencies in ~/.m2 or jars in bazel-genfiles */
     Set<Path> classPath() {
         // Check for CLASSPATH environment variable first
@@ -71,83 +102,89 @@ class InferConfig {
         }
         // externalDependencies
         if (!externalDependencies.isEmpty()) {
-            var result = new HashSet<Path>();
-            for (var id : externalDependencies) {
-                var a = Artifact.parse(id);
-                var found = findAnyJar(a, false);
-                if (found == NOT_FOUND) {
-                    LOG.warning(String.format("Couldn't find jar for %s in %s or %s", a, mavenHome, gradleHome));
-                    continue;
-                }
-                result.add(found);
-            }
-            return result;
+            return resolveExternalDependencies(false);
         }
 
-        // Maven
-        var buildRoot = findBuildRoot();
-        var pomXml = buildRoot.resolve("pom.xml");
-        if (Files.exists(pomXml)) {
-            var modulePath = mavenModulePath(buildRoot, workspaceRoot);
-            var deps = MavenSupport.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath);
-            var classPath = new HashSet<>(deps.classpath());
-            var moduleOut = MavenSupport.outputDirectory(workspaceRoot);
-            if (Files.isDirectory(moduleOut)) {
-                LOG.info("[classpath] Adding module build output: " + moduleOut);
-                classPath.add(moduleOut);
-            }
-            var graph = MavenTooling.resolveModuleGraph(buildRoot);
-            if (graph != ModuleGraph.EMPTY) {
-                for (var info : graph.modules().values()) {
-                    var siblingOut = MavenSupport.outputDirectory(info.projectDir());
-                    if (Files.isDirectory(siblingOut) && !siblingOut.equals(moduleOut)) {
-                        LOG.info("[classpath] Adding sibling build output: " + siblingOut);
-                        classPath.add(siblingOut);
-                    }
-                }
-            }
-            return classPath;
-        }
+        return switch (buildSystem()) {
+            case MAVEN -> mavenClasspath();
+            case GRADLE -> gradleClasspath();
+            case BAZEL -> bazelClasspath(bazelWorkspaceRoot());
+            case UNKNOWN -> Collections.emptySet();
+        };
+    }
 
-        // Bazel
-        var bazelWorkspaceRoot = bazelWorkspaceRoot();
-        if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
-            return bazelClasspath(bazelWorkspaceRoot);
+    private Set<Path> mavenClasspath() {
+        var pomXml = buildRoot().resolve("pom.xml");
+        var modulePath = mavenModulePath(buildRoot(), workspaceRoot);
+        cachedMavenDeps = MavenTooling.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath);
+        var classPath = new HashSet<>(cachedMavenDeps.classpath());
+        var moduleOut = MavenTooling.outputDirectory(workspaceRoot);
+        if (Files.isDirectory(moduleOut)) {
+            LOG.info("[classpath] Adding module build output: " + moduleOut);
+            classPath.add(moduleOut);
         }
-
-        // Gradle
-        LOG.info("[gradle] Resolving classpath via Gradle Tooling API — this may take a minute for large projects.");
-        var graph = GradleTooling.resolveModuleGraph(buildRoot, cacheHome(this.envVars));
+        var graph = MavenTooling.resolveModuleGraph(buildRoot());
         if (graph != ModuleGraph.EMPTY) {
-            // Scope to the active module's own external classpath only.
-            // Inter-module deps are resolved via compiled .class files (added by compileDependencies).
+            for (var info : graph.modules().values()) {
+                var siblingOut = MavenTooling.outputDirectory(info.projectDir());
+                if (Files.isDirectory(siblingOut) && !siblingOut.equals(moduleOut)) {
+                    LOG.info("[classpath] Adding sibling build output: " + siblingOut);
+                    classPath.add(siblingOut);
+                }
+            }
+        }
+        return classPath;
+    }
+
+    private Set<Path> gradleClasspath() {
+        LOG.info("[gradle] Resolving classpath via Gradle Tooling API — this may take a minute for large projects.");
+        var graph = moduleGraph();
+        if (graph != ModuleGraph.EMPTY) {
             var activeModule = graph.moduleForFile(workspaceRoot);
             if (activeModule.isPresent()) {
-                return new HashSet<>(activeModule.get().externalClasspath());
+                var classPath = new HashSet<>(activeModule.get().externalClasspath());
+                for (var dir : graph.transitiveClassOutputDirs(activeModule.get().projectPath())) {
+                    if (Files.isDirectory(dir)) classPath.add(dir);
+                }
+                return classPath;
             }
-            // Fallback: root module
             var rootModule = graph.modules().get(":");
             if (rootModule != null) {
-                return new HashSet<>(rootModule.externalClasspath());
+                var classPath = new HashSet<>(rootModule.externalClasspath());
+                for (var dir : graph.transitiveClassOutputDirs(rootModule.projectPath())) {
+                    if (Files.isDirectory(dir)) classPath.add(dir);
+                }
+                return classPath;
             }
-            return Collections.emptySet();
         }
-
         return Collections.emptySet();
     }
 
+    private Set<Path> resolveExternalDependencies(boolean source) {
+        var result = new HashSet<Path>();
+        for (var id : externalDependencies) {
+            var a = Artifact.parse(id);
+            var found = findAnyJar(a, source);
+            if (found == NOT_FOUND) {
+                LOG.warning(String.format("Couldn't find %sjar for %s in %s or %s",
+                        source ? "doc " : "", a, mavenHome, gradleHome));
+                continue;
+            }
+            result.add(found);
+        }
+        return result;
+    }
+
+    /** Resolve the module graph for this workspace (cached). Returns EMPTY for single-module projects. */
     /** Resolve the module graph for this workspace (cached). Returns EMPTY for single-module projects. */
     ModuleGraph moduleGraph() {
-        var buildRoot = findBuildRoot();
-        // Determine build system at the root — don't cross-contaminate
-        if (Files.exists(buildRoot.resolve("settings.gradle"))
-                || Files.exists(buildRoot.resolve("settings.gradle.kts"))) {
-            return GradleTooling.resolveModuleGraph(buildRoot, cacheHome(this.envVars));
-        }
-        if (Files.exists(buildRoot.resolve("pom.xml"))) {
-            return MavenTooling.resolveModuleGraph(buildRoot);
-        }
-        return ModuleGraph.EMPTY;
+        if (cachedModuleGraph != null) return cachedModuleGraph;
+        cachedModuleGraph = switch (buildSystem()) {
+            case GRADLE -> GradleTooling.resolveModuleGraph(buildRoot(), cacheHome(this.envVars));
+            case MAVEN -> MavenTooling.resolveModuleGraph(buildRoot());
+            default -> ModuleGraph.EMPTY;
+        };
+        return cachedModuleGraph;
     }
 
     /**
@@ -186,20 +223,8 @@ class InferConfig {
         if (!normalizedWork.equals(normalizedBuild)) {
             return normalizedBuild.relativize(normalizedWork).toString();
         }
-        // workspaceRoot IS the build root — extract module names from pom
-        return parseDeclaredModules(normalizedBuild.resolve("pom.xml"));
-    }
-
-    private static String parseDeclaredModules(Path pomXml) {
-        try {
-            var content = Files.readString(pomXml);
-            var matcher = Pattern.compile("<module>([^<]+)</module>").matcher(content);
-            var modules = new ArrayList<String>();
-            while (matcher.find()) modules.add(matcher.group(1).trim());
-            return modules.isEmpty() ? null : String.join(",", modules);
-        } catch (IOException e) {
-            return null;
-        }
+        // workspaceRoot IS the build root — resolve everything at root (no -pl needed)
+        return null;
     }
 
     private Path bazelWorkspaceRoot() {
@@ -213,36 +238,22 @@ class InferConfig {
 
     /** Find source .jar files in local maven repository. */
     Set<Path> buildDocPath() {
-        // externalDependencies
         if (!externalDependencies.isEmpty()) {
-            var result = new HashSet<Path>();
-            for (var id : externalDependencies) {
-                var a = Artifact.parse(id);
-                var found = findAnyJar(a, true);
-                if (found == NOT_FOUND) {
-                    LOG.warning(String.format("Couldn't find doc jar for %s in %s or %s", a, mavenHome, gradleHome));
-                    continue;
+            return resolveExternalDependencies(true);
+        }
+        return switch (buildSystem()) {
+            case MAVEN -> {
+                // Reuse cached result from classPath() call — no second mvn invocation
+                if (cachedMavenDeps != null) {
+                    yield cachedMavenDeps.sources();
                 }
-                result.add(found);
+                var pomXml = buildRoot().resolve("pom.xml");
+                var modulePath = mavenModulePath(buildRoot(), workspaceRoot);
+                yield MavenTooling.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath).sources();
             }
-            return result;
-        }
-
-        // Maven
-        var buildRoot = findBuildRoot();
-        var pomXml = buildRoot.resolve("pom.xml");
-        if (Files.exists(pomXml)) {
-            var modulePath = mavenModulePath(buildRoot, workspaceRoot);
-            return MavenSupport.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath).sources();
-        }
-
-        // Bazel
-        var bazelWorkspaceRoot = bazelWorkspaceRoot();
-        if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
-            return bazelSourcepath(bazelWorkspaceRoot);
-        }
-
-        return Collections.emptySet();
+            case BAZEL -> bazelSourcepath(bazelWorkspaceRoot());
+            default -> Collections.emptySet();
+        };
     }
 
     CompilerArgs compilerArgs() {
@@ -250,7 +261,7 @@ class InferConfig {
         if (!Files.exists(pomXml)) {
             return CompilerArgs.none();
         }
-        var result = MavenSupport.inferCompilerArgs(pomXml, mavenHome, envVars);
+        var result = MavenTooling.inferCompilerArgs(pomXml, mavenHome, envVars);
         return new CompilerArgs(result.args(), result.source(), result.mixedModules());
     }
 
