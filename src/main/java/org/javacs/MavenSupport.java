@@ -75,6 +75,95 @@ class MavenSupport {
     private record MavenCacheInputs(List<FileFingerprint> pomInputs, FileFingerprint settings) {
     }
 
+    // ponytail: single mvn invocation for both dependency:list + dependency:sources,
+    // split by filename (-sources.jar → docpath, else → classpath)
+    static final record MavenDependencies(Set<Path> classpath, Set<Path> sources) {}
+
+    private static final String DEPENDENCY_LIST = "dependency:list";
+    private static final String DEPENDENCY_SOURCES = "dependency:sources";
+
+    static MavenDependencies resolveDependencies(Path pomXml, Path mavenHome, Map<String, String> envVars, String modulePath) {
+        Objects.requireNonNull(pomXml, "pom.xml path is null");
+        Objects.requireNonNull(mavenHome, "mavenHome is null");
+        var started = Instant.now();
+        var cacheHome = cacheHome(envVars);
+
+        var cachedClasspath = loadCachedMavenDependencies(pomXml, DEPENDENCY_LIST, mavenHome, cacheHome);
+        var cachedSources = loadCachedMavenDependencies(pomXml, DEPENDENCY_SOURCES, mavenHome, cacheHome);
+        if (!cachedClasspath.isEmpty() && !cachedSources.isEmpty()) {
+            CacheAudit.hit("infer_config.maven_dependencies");
+            CacheAudit.load("infer_config.maven_dependencies");
+            LOG.info(String.format(
+                    "[perf] infer_config_maven goal=combined source=cache_disk classpath=%d sources=%d took=%dms",
+                    cachedClasspath.size(), cachedSources.size(),
+                    Duration.between(started, Instant.now()).toMillis()));
+            return new MavenDependencies(cachedClasspath, cachedSources);
+        }
+        CacheAudit.miss("infer_config.maven_dependencies");
+
+        try {
+            var cmd = new ArrayList<>(List.of(
+                findMvnCommand(normalizePath(pomXml).getParent(), envVars),
+                "--batch-mode",
+                modulePath != null ? "package" : "validate",
+                DEPENDENCY_LIST, DEPENDENCY_SOURCES,
+                "-DincludeScope=test",
+                "-DoutputAbsoluteArtifactFilename=true"
+            ));
+            if (modulePath != null) {
+                cmd.add("-pl");
+                cmd.add(modulePath);
+                cmd.add("-am");
+                cmd.add("-DskipTests");
+            }
+            var output = Files.createTempFile("jls-maven-output", ".txt");
+            LOG.info("Running " + String.join(" ", cmd) + " ...");
+            var workingDirectory = pomXml.toAbsolutePath().getParent().toFile();
+            var processStarted = Instant.now();
+            var process =
+                    new ProcessBuilder()
+                            .command(cmd)
+                            .directory(workingDirectory)
+                            .redirectError(ProcessBuilder.Redirect.INHERIT)
+                            .redirectOutput(output.toFile())
+                            .start();
+
+            var result = process.waitFor();
+            if (result != 0) {
+                LOG.warning(String.format(
+                        "[perf] infer_config_maven goal=combined source=fresh exit=%d took=%dms",
+                        result, Duration.between(started, Instant.now()).toMillis()));
+                return new MavenDependencies(Set.of(), Set.of());
+            }
+
+            var classpath = new HashSet<Path>();
+            var sources = new HashSet<Path>();
+            for (var line : Files.readAllLines(output)) {
+                var jar = readDependency(line);
+                if (jar == NOT_FOUND) continue;
+                // ponytail: source jars have -sources in filename
+                if (jar.getFileName().toString().contains("-sources")) {
+                    sources.add(jar);
+                } else {
+                    classpath.add(jar);
+                }
+            }
+            LOG.info(String.format(
+                    "[perf] infer_config_maven goal=combined source=fresh classpath=%d sources=%d process=%dms total=%dms",
+                    classpath.size(), sources.size(),
+                    Duration.between(processStarted, Instant.now()).toMillis(),
+                    Duration.between(started, Instant.now()).toMillis()));
+            var immutableClasspath = Set.copyOf(classpath);
+            var immutableSources = Set.copyOf(sources);
+            storeCachedMavenDependencies(pomXml, DEPENDENCY_LIST, mavenHome, cacheHome, immutableClasspath);
+            storeCachedMavenDependencies(pomXml, DEPENDENCY_SOURCES, mavenHome, cacheHome, immutableSources);
+            CacheAudit.store("infer_config.maven_dependencies");
+            return new MavenDependencies(immutableClasspath, immutableSources);
+        } catch (InterruptedException | IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     static Set<Path> mvnDependencies(Path pomXml, String goal, Path mavenHome, Map<String, String> envVars) {
         return mvnDependencies(pomXml, goal, mavenHome, envVars, null);
     }
@@ -98,7 +187,7 @@ class MavenSupport {
 
             // Run maven as a subprocess
             var cmd = new ArrayList<>(List.of(
-                getMvnCommand(envVars),
+                findMvnCommand(normalizePath(pomXml).getParent(), envVars),
                 "--batch-mode",
                 modulePath != null ? "package" : "validate",
                 goal,
@@ -473,7 +562,7 @@ class MavenSupport {
         try {
             var output = Files.createTempFile("jls-effective-pom", ".xml");
             String[] command = {
-                getMvnCommand(envVars),
+                findMvnCommand(normalizePath(pomXml).getParent(), envVars),
                 "--batch-mode",
                 "help:effective-pom",
                 "-Doutput=" + output.toAbsolutePath(),
@@ -581,6 +670,33 @@ class MavenSupport {
         // If findExecutableOnPath returns null (e.g. PATH is not set), we should still return "mvn"
         // and let the execution fail later if it's not on the (empty) path.
         return mvnCommand == null ? "mvn" : mvnCommand;
+    }
+
+    static String findMvnCommand(Path projectDir, Map<String, String> envVars) {
+        var mvnw = projectDir.resolve(File.separatorChar == '\\' ? "mvnw.cmd" : "mvnw").toString();
+        if (new File(mvnw).isFile()) {
+            return mvnw;
+        }
+        return getMvnCommand(envVars);
+    }
+
+    // ponytail: parse <build><outputDirectory> from pom.xml, fallback target/classes
+    static Path outputDirectory(Path moduleDir) {
+        var pom = moduleDir.resolve("pom.xml");
+        if (!Files.exists(pom)) return moduleDir.resolve("target").resolve("classes");
+        try {
+            var factory = DocumentBuilderFactory.newInstance();
+            factory.setNamespaceAware(true);
+            var doc = factory.newDocumentBuilder().parse(pom.toFile());
+            var build = directChild(doc.getDocumentElement(), "build");
+            if (build != null) {
+                var out = directChildText(build, "outputDirectory");
+                if (out != null) return moduleDir.resolve(out).normalize();
+            }
+        } catch (Exception e) {
+            LOG.fine("Failed to parse outputDirectory from " + pom + ": " + e.getMessage());
+        }
+        return moduleDir.resolve("target").resolve("classes");
     }
 
     private static String findExecutableOnPath(String name, Map<String, String> envVars) {

@@ -51,6 +51,9 @@ class InferConfig {
         this(workspaceRoot, externalDependencies, defaultMavenHome(), defaultGradleHome(), null);
     }
 
+    Path mavenHome() { return mavenHome; }
+    Map<String, String> envVars() { return envVars; }
+
     private static Path defaultMavenHome() {
         return Paths.get(System.getProperty("user.home")).resolve(".m2");
     }
@@ -89,11 +92,22 @@ class InferConfig {
         var pomXml = buildRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
             var modulePath = mavenModulePath(buildRoot, workspaceRoot);
-            var classPath = new HashSet<>(MavenSupport.mvnDependencies(pomXml, "dependency:list", mavenHome, this.envVars, modulePath));
-            var targetClasses = buildRoot.resolve("target/classes");
-            if (Files.isDirectory(targetClasses)) {
-                LOG.info("[classpath] Adding Maven build output: " + targetClasses);
-                classPath.add(targetClasses);
+            var deps = MavenSupport.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath);
+            var classPath = new HashSet<>(deps.classpath());
+            var moduleOut = MavenSupport.outputDirectory(workspaceRoot);
+            if (Files.isDirectory(moduleOut)) {
+                LOG.info("[classpath] Adding module build output: " + moduleOut);
+                classPath.add(moduleOut);
+            }
+            var graph = MavenTooling.resolveModuleGraph(buildRoot);
+            if (graph != ModuleGraph.EMPTY) {
+                for (var info : graph.modules().values()) {
+                    var siblingOut = MavenSupport.outputDirectory(info.projectDir());
+                    if (Files.isDirectory(siblingOut) && !siblingOut.equals(moduleOut)) {
+                        LOG.info("[classpath] Adding sibling build output: " + siblingOut);
+                        classPath.add(siblingOut);
+                    }
+                }
             }
             return classPath;
         }
@@ -222,7 +236,7 @@ class InferConfig {
         var pomXml = buildRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
             var modulePath = mavenModulePath(buildRoot, workspaceRoot);
-            return MavenSupport.mvnDependencies(pomXml, "dependency:sources", mavenHome, this.envVars, modulePath);
+            return MavenSupport.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath).sources();
         }
 
         // Bazel
