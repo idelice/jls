@@ -51,9 +51,7 @@ public class ReferenceProvider {
                 // Lombok gate first — skip all Lombok logic when not on classpath
                 if (compiler.lombokPresentOnClasspath()) {
                     LOG.info("[ref] lombokOnClasspath=true");
-                    LOG.info("[ref] calling lombokSearchNames");
                     var names = lombokSearchNames(element, memberName, task);
-                    LOG.info(String.format("[ref] lombokSearchNames result size=%d", names.size()));
                     if (!names.isEmpty()) {
                         task.close();
                         return findLombokReferences(className, names);
@@ -109,23 +107,18 @@ public class ReferenceProvider {
         var parent = element.getEnclosingElement();
         LOG.info(String.format("[ref] lombokSearchNames element.kind=%s memberName=%s", element.getKind(), memberName));
         if (!(parent instanceof TypeElement parentType)) {
-            LOG.info("[ref] parent is not TypeElement, returning empty");
             return Set.of();
         }
         var hasLombok = hasLombokAnnotation(parentType.getQualifiedName().toString(), task.task.getElements());
-        LOG.info(String.format("[ref] hasLombokAnnotation=%s", hasLombok));
         if (!hasLombok) return Set.of();
         var fieldName = element.getKind() == ElementKind.FIELD
                 ? memberName
                 : LombokAnnotations.accessorFieldName(memberName).orElse(null);
-        LOG.info(String.format("[ref] fieldName=%s", fieldName));
         if (fieldName == null) {
-            LOG.info("[ref] fieldName is null, returning empty");
             return Set.of();
         }
         var names = new LinkedHashSet<>(NavigationSymbolSupport.accessorNames(fieldName));
         names.add(fieldName);
-        LOG.info(String.format("[ref] searchNames=%s", names));
         return names;
     }
 
@@ -144,27 +137,22 @@ public class ReferenceProvider {
     }
 
     private List<Location> findLombokReferences(String className, Set<String> names) {
-        LOG.info(String.format("[ref] findLombokReferences className=%s names=%s", className, names));
         var files = new LinkedHashSet<Path>();
         for (var name : names) {
             for (var f : compiler.findMemberReferences(className, name)) {
                 files.add(f);
             }
         }
-        LOG.info(String.format("[ref] candidate files count=%d", files.size()));
         if (files.isEmpty()) return List.of();
         try (var task = compiler.compile(files.toArray(Path[]::new))) {
-            LOG.info("[ref] batch compile done");
             var paths = new ArrayList<TreePath>();
             for (var root : task.roots) {
                 new FindLombokReferences(task.task, names).scan(root, paths);
             }
-            LOG.info(String.format("[ref] paths found=%d", paths.size()));
             var locations = new ArrayList<Location>();
             for (var p : paths) {
                 locations.add(FindHelper.location(task, p));
             }
-            LOG.info(String.format("[ref] returning %d locations", locations.size()));
             return locations;
         }
     }

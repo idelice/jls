@@ -12,14 +12,15 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import org.javacs.guava.ClassPath;
 
 public class ScanClassPath {
-    private static final java.util.Map<Path, Set<String>> JDK_TOP_LEVEL_CLASSES_CACHE = new ConcurrentHashMap<>();
-    private static final java.util.Map<Set<Path>, Set<String>> CLASS_PATH_TOP_LEVEL_CLASSES_CACHE =
+    private static final Map<Path, Set<String>> JDK_TOP_LEVEL_CLASSES_CACHE = new ConcurrentHashMap<>();
+    private static final Map<Set<Path>, Set<String>> CLASS_PATH_TOP_LEVEL_CLASSES_CACHE =
             new ConcurrentHashMap<>();
 
     // TODO delete this and implement findPublicTypeDeclarationInJdk some other way

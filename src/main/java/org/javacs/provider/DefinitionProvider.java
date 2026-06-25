@@ -4,10 +4,8 @@ import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.logging.Logger;
 import com.sun.source.tree.MemberSelectTree;
-import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
@@ -16,7 +14,6 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.util.Elements;
 import javax.lang.model.type.TypeKind;
-import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
@@ -51,10 +48,7 @@ public class DefinitionProvider {
                 if (compiler.lombokPresentOnClasspath()) {
                     var memberName = element.getSimpleName().toString();
                     var result = resolveLombokField(element, memberName, task.task.getElements());
-                    task.close();
                     if (!result.isEmpty()) return result;
-                } else {
-                    task.close();
                 }
                 return findError(element);
             }
@@ -73,16 +67,47 @@ public class DefinitionProvider {
                 if (compiler.lombokPresentOnClasspath()) {
                     var memberName = element.getSimpleName().toString();
                     var result = resolveLombokField(element, memberName, task.task.getElements());
-                    task.close();
                     if (!result.isEmpty()) return result;
+                }
+                // Last resort: decompile from .class when no source is available
+                var decompiled = compiler.decompileClass(className);
+                if (decompiled.isPresent()) {
+                    LOG.info("[def] decompileClass fallback for " + className + " at " + decompiled.get());
+                    var parse = compiler.parse(new SourceFileObject(decompiled.get()));
+                    var tree = FindHelper.findType(parse, className);
+                    var path = TreePath.getPath(parse.root(), tree);
+                    return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
                 }
                 return List.of();
             }
             if (otherFile.get().toUri().equals(file.toUri())) {
                 return findDefinitions(task, element);
             }
-            task.close();
-            return findRemoteDefinitions(otherFile.get());
+            // parse directly — javac Trees.getPath can't make TreePaths for jar:// sources
+            var parse = compiler.parse(otherFile.get());
+            var tree = FindHelper.findType(parse, className);
+            // Navigate to the specific member if the element is a method
+            if (element instanceof ExecutableElement method) {
+                var erased = FindHelper.erasedParameterTypes(task, method);
+                var memberTree = FindHelper.findMethod(parse, className, method.getSimpleName().toString(), erased);
+                if (memberTree != null) {
+                    var path = TreePath.getPath(parse.root(), memberTree);
+                    return List.of(FindHelper.location(parse, path, method.getSimpleName()));
+                }
+            }
+            // Navigate to the specific field/enum constant
+            if (element.getKind() == ElementKind.FIELD || element.getKind() == ElementKind.ENUM_CONSTANT) {
+                var memberName = element.getSimpleName().toString();
+                try {
+                    var memberTree = FindHelper.findField(parse, className, memberName);
+                    var path = TreePath.getPath(parse.root(), memberTree);
+                    return List.of(FindHelper.location(parse, path, memberName));
+                } catch (RuntimeException e) {
+                    // field not found in parsed source, fall through to class location
+                }
+            }
+            var path = TreePath.getPath(parse.root(), tree);
+            return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
         } finally {
             LOG.info("[def] goto-definition " + file.getFileName() + ":" + line + ":" + column + " completed in " + (System.currentTimeMillis() - start) + "ms");
         }
@@ -171,13 +196,6 @@ public class DefinitionProvider {
         return "";
     }
 
-    private List<Location> findRemoteDefinitions(JavaFileObject otherFile) {
-        try (var task = compiler.compile(List.of(new SourceFileObject(file), otherFile))) {
-            var element = NavigationHelper.findElement(task, file, line, column);
-            return findDefinitions(task, element);
-        }
-    }
-
     private List<Location> resolveLombokField(Element element, String memberName, Elements elements) {
         var fieldName = LombokAnnotations.accessorFieldName(memberName)
                 .orElse(memberName.isEmpty() || !Character.isLowerCase(memberName.charAt(0))
@@ -258,30 +276,6 @@ public class DefinitionProvider {
         return List.of();
     }
 
-    private List<Location> navigateToJdkDeclaration(Element element) {
-        var enclosing = element.getEnclosingElement();
-        if (!(enclosing instanceof TypeElement type)) return List.of();
-        var className = type.getQualifiedName().toString();
-        var sourceFile = compiler.findAnywhere(className);
-        if (sourceFile.isEmpty()) {
-            var decompiled = compiler.decompileClass(className);
-            if (decompiled.isPresent()) {
-                sourceFile = Optional.of(new SourceFileObject(decompiled.get()));
-            }
-        }
-        if (sourceFile.isEmpty()) return List.of();
-        var parse = compiler.parse(sourceFile.get());
-        var methodName = element.getSimpleName().toString();
-        var classTree = FindHelper.findType(parse, className);
-        for (var member : classTree.getMembers()) {
-            if (member instanceof MethodTree mt && mt.getName().contentEquals(methodName)) {
-                var path = TreePath.getPath(parse.root(), mt);
-                return List.of(FindHelper.location(parse, path, methodName));
-            }
-        }
-        return List.of();
-    }
-
     private String findDeclaringClass(String startClass, String fieldName, Elements elements) {
         var current = elements.getTypeElement(startClass);
         while (current != null) {
@@ -324,8 +318,6 @@ public class DefinitionProvider {
             var decl = navigateToDeclaration(task, method);
             if (!decl.isEmpty()) return decl;
         }
-        var jdk = navigateToJdkDeclaration(element);
-        if (!jdk.isEmpty()) return jdk;
         return navigateToRecordComponent(task, element);
     }
 

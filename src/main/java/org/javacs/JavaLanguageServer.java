@@ -1517,7 +1517,7 @@ class JavaLanguageServer extends LanguageServer {
             try {
                 var graph = moduleGraph;
                 if (graph == ModuleGraph.EMPTY) return;
-                var buildRoot = new InferConfig(workspaceRoot).findBuildRoot();
+                var buildRoot = new InferConfig(workspaceRoot, Collections.emptySet()).findBuildRoot();
                 var token = beginWorkDoneProgress("Build", "Compiling " + projectPath + " dependencies");
                 LOG.info("[multi-module] background_dep_compile_start module=" + projectPath);
                 var started = System.nanoTime();
