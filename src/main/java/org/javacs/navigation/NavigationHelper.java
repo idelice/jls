@@ -43,6 +43,7 @@ public class NavigationHelper {
             case FIELD:
             case METHOD:
             case CONSTRUCTOR:
+            case RECORD_COMPONENT:
                 return true;
             default:
                 return false;
