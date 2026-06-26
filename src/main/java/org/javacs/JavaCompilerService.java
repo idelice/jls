@@ -26,6 +26,7 @@ class JavaCompilerService implements CompilerProvider {
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
+    final Map<URI, List<org.javacs.lsp.Diagnostic>> apDiagnosticCache = new ConcurrentHashMap<>();
     final SourceFileManager fileManager;
     final SourceFileManager docsFileManager;
 
@@ -322,9 +323,10 @@ class JavaCompilerService implements CompilerProvider {
         options.addAll(List.of("-d", outputDir.toString()));
         var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
         options.addAll(List.of("-processorpath", cp));
+        var apDiags = new ArrayList<Diagnostic<? extends JavaFileObject>>();
         compiler.compile(
                 fileManager,
-                diags::add,
+                d -> { diags.add(d); apDiags.add(d); },
                 options,
                 sources,
                 task -> {
@@ -336,6 +338,7 @@ class JavaCompilerService implements CompilerProvider {
                     }
                     return null;
                 });
+        cacheApDiagnostics(apDiags);
         cachedCompile = null;
         LOG.info("[build] fullCompileWithAP complete");
     }
@@ -350,9 +353,10 @@ class JavaCompilerService implements CompilerProvider {
         options.addAll(List.of("-d", outputDir.toString()));
         var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
         options.addAll(List.of("-processorpath", cp));
+        var apDiags = new ArrayList<Diagnostic<? extends JavaFileObject>>();
         compiler.compile(
                 fileManager,
-                diags::add,
+                d -> { diags.add(d); apDiags.add(d); },
                 options,
                 List.of(new SourceFileObject(file)),
                 task -> {
@@ -365,7 +369,30 @@ class JavaCompilerService implements CompilerProvider {
                     }
                     return null;
                 });
+        cacheApDiagnostics(apDiags);
         LOG.info(String.format("[build] refreshBuildOutput compiled %s", file.getFileName()));
+    }
+
+    private void cacheApDiagnostics(List<Diagnostic<? extends JavaFileObject>> rawDiags) {
+        for (var d : rawDiags) {
+            if (d.getSource() == null || d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
+            if ("compiler.warn.proc.messager".equals(d.getCode())) continue;
+            var lsp = new org.javacs.lsp.Diagnostic();
+            lsp.severity = d.getKind() == Diagnostic.Kind.ERROR ? org.javacs.lsp.DiagnosticSeverity.Error
+                    : d.getKind() == Diagnostic.Kind.WARNING || d.getKind() == Diagnostic.Kind.MANDATORY_WARNING
+                    ? org.javacs.lsp.DiagnosticSeverity.Warning : org.javacs.lsp.DiagnosticSeverity.Information;
+            lsp.code = d.getCode();
+            lsp.message = d.getMessage(null);
+            try {
+                lsp.range = FileStore.range(d.getSource().getCharContent(true).toString(),
+                        d.getStartPosition(), d.getEndPosition());
+            } catch (Exception ignored) { continue; }
+            apDiagnosticCache.computeIfAbsent(d.getSource().toUri(), k -> new ArrayList<>()).add(lsp);
+        }
+    }
+
+    List<org.javacs.lsp.Diagnostic> getCachedApDiagnostics(URI uri) {
+        return apDiagnosticCache.get(uri);
     }
 
     @Override
