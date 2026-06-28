@@ -4,16 +4,16 @@ import com.sun.source.tree.*;
 import com.sun.source.util.*;
 
 public class FindNameAt extends TreePathScanner<TreePath, Long> {
-    private final JavacTask task;
+    private final Trees trees;
     private CompilationUnitTree root;
     private ClassTree surroundingClass;
 
     public FindNameAt(CompileTask task) {
-        this.task = task.task;
+        this.trees = task.trees;
     }
 
     public FindNameAt(ParseTask task) {
-        this.task = task.task();
+        this.trees = Trees.instance(task.task());
     }
 
     @Override
@@ -43,7 +43,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         }
         // Only match the cursor on the method name token itself, not on same-named
         // identifiers inside the body (e.g. a recursive call or a local variable).
-        var pos = Trees.instance(task).getSourcePositions();
+        var pos = trees.getSourcePositions();
         var start = (int) pos.getStartPosition(root, t);
         var end = t.getBody() != null
                 ? (int) pos.getStartPosition(root, t.getBody())
@@ -77,7 +77,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
 
     @Override
     public TreePath visitMemberSelect(MemberSelectTree t, Long find) {
-        var pos = Trees.instance(task).getSourcePositions();
+        var pos = trees.getSourcePositions();
         var end = (int) pos.getEndPosition(root, t);
         // Only match cursor on the right-hand identifier (method name),
         // never on the expression (variable name) which may share the same name.
@@ -113,7 +113,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     public TreePath visitVariable(VariableTree t, Long find) {
         // Only match the cursor on the variable name itself, not on same-named identifiers
         // in the initializer (e.g. `var canonicalKey = IndexedMember.canonicalKey(...)`).
-        var pos = Trees.instance(task).getSourcePositions();
+        var pos = trees.getSourcePositions();
         var start = (int) pos.getStartPosition(root, t);
         var end = t.getInitializer() != null
                 ? (int) pos.getStartPosition(root, t.getInitializer())
@@ -129,7 +129,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
 
     @Override
     public TreePath visitNewClass(NewClassTree t, Long find) {
-        var start = Trees.instance(task).getSourcePositions().getStartPosition(root, t);
+        var start = trees.getSourcePositions().getStartPosition(root, t);
         var end = start + "new".length();
         if (start <= find && find < end) {
             return getCurrentPath();
@@ -144,7 +144,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     }
 
     private boolean contains(Tree t, CharSequence name, long find) {
-        var pos = Trees.instance(task).getSourcePositions();
+        var pos = trees.getSourcePositions();
         var start = (int) pos.getStartPosition(root, t);
         var end = (int) pos.getEndPosition(root, t);
         if (start == -1 || end == -1) return false;

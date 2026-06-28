@@ -7,11 +7,11 @@ import java.util.Set;
 import javax.tools.Diagnostic;
 
 public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> {
-    private final JavacTask task;
+    private final Trees trees;
     private final Set<String> names;
 
-    public FindLombokReferences(JavacTask task, Set<String> names) {
-        this.task = task;
+    public FindLombokReferences(Trees trees, Set<String> names) {
+        this.trees = trees;
         this.names = names;
     }
 
@@ -36,7 +36,6 @@ public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> 
     private boolean check(String name) {
         if (!names.contains(name)) return false;
         var path = getCurrentPath();
-        var trees = Trees.instance(task);
         var pos = trees.getSourcePositions();
         return pos.getStartPosition(path.getCompilationUnit(), path.getLeaf()) != Diagnostic.NOPOS
                 && pos.getEndPosition(path.getCompilationUnit(), path.getLeaf()) != Diagnostic.NOPOS;

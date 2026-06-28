@@ -37,6 +37,10 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
+    default CompileTask compileFresh(Path... files) {
+        return compile(files);
+    }
+
     default List<ParseTask> parseAll(Collection<Path> files) {
         var result = new java.util.ArrayList<ParseTask>(files.size());
         for (var file : files) {
@@ -50,6 +54,10 @@ public interface CompilerProvider {
     }
 
     default Optional<Path> decompileClass(String qualifiedName) {
+        return Optional.empty();
+    }
+
+    default Optional<Path> findClassFile(String qualifiedName) {
         return Optional.empty();
     }
 

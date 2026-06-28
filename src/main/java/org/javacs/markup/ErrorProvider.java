@@ -89,6 +89,7 @@ public class ErrorProvider {
             convertNanos += System.nanoTime() - convertStarted;
             var filteredDiagnostics = filtered.compilerDiagnostics();
             filteredDiagnostics = suppressLogErrors(filteredDiagnostics, root);
+            filteredDiagnostics = suppressLombokBytecodeErrors(filteredDiagnostics, root);
             params.diagnostics.addAll(filteredDiagnostics);
             compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
@@ -202,7 +203,7 @@ public class ErrorProvider {
 
     private List<Diagnostic> unusedWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
-        var warnUnused = new WarnUnused(task.task);
+        var warnUnused = new WarnUnused(task.trees);
         warnUnused.scan(root, null);
         var allUnused = warnUnused.notUsed();
 
@@ -227,7 +228,7 @@ public class ErrorProvider {
             return Set.of();
         }
 
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var suppressed = new HashSet<Element>();
 
         // Collect Lombok field info
@@ -304,7 +305,7 @@ public class ErrorProvider {
 
     private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var pos = trees.getSourcePositions();
         var importTrees = new ArrayList<ImportTree>();
         var importNames = new ArrayList<String>();
@@ -350,7 +351,7 @@ public class ErrorProvider {
     private List<Diagnostic> notThrownWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
         var notThrown = new HashMap<TreePath, String>();
-        new WarnNotThrown(task.task).scan(root, notThrown);
+        new WarnNotThrown(task.trees).scan(root, notThrown);
         for (var location : notThrown.keySet()) {
             result.add(warnNotThrown(notThrown.get(location), location));
         }
@@ -406,7 +407,7 @@ public class ErrorProvider {
     }
 
     private Diagnostic warnNotThrown(String name, TreePath path) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = pos.getStartPosition(root, path.getLeaf());
@@ -421,7 +422,7 @@ public class ErrorProvider {
     }
 
     private Diagnostic warnUnused(Element unusedEl) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var path = trees.getPath(unusedEl);
         if (path == null) {
             throw new RuntimeException(unusedEl + " has no path");
@@ -510,5 +511,67 @@ public class ErrorProvider {
             result.add(d);
         }
         return result;
+    }
+
+    // For Lombok-annotated files, check .class bytecode before reporting cant.resolve / cant.apply.symbol.
+    // If the symbol exists in bytecode, Lombok generated it — suppress the false positive.
+    private List<Diagnostic> suppressLombokBytecodeErrors(List<Diagnostic> diagnostics, CompilationUnitTree root) {
+        if (compiler == null || !compiler.lombokPresentOnClasspath()) return diagnostics;
+        var file = Paths.get(root.getSourceFile().toUri());
+        if (!LombokAnnotations.sourceMayRequireLombokExpansion(file, 50)) return diagnostics;
+        var className = qualifiedClassName(root);
+        var classFile = compiler.findClassFile(className);
+        if (classFile.isEmpty()) return diagnostics;
+        java.lang.classfile.ClassModel model;
+        try {
+            model = java.lang.classfile.ClassFile.of().parse(java.nio.file.Files.readAllBytes(classFile.get()));
+        } catch (java.io.IOException e) {
+            return diagnostics;
+        }
+        var result = new ArrayList<Diagnostic>();
+        for (var d : diagnostics) {
+            if (d.code == null) { result.add(d); continue; }
+            if (d.code.contains("cant.resolve")) {
+                var name = extractSymbolName(d.message);
+                if (name != null && hasMember(model, name)) {
+                    LOG.info("[lombok-filter] suppressed cant.resolve '" + name + "' in " + className);
+                    continue;
+                }
+            }
+            if (d.code.contains("cant.apply.symbol")) {
+                if (hasConstructor(model)) {
+                    LOG.info("[lombok-filter] suppressed cant.apply.symbol in " + className);
+                    continue;
+                }
+            }
+            result.add(d);
+        }
+        return result;
+    }
+
+    private static String qualifiedClassName(CompilationUnitTree root) {
+        var pkg = root.getPackageName();
+        var decls = root.getTypeDecls();
+        if (decls.isEmpty()) return null;
+        var name = ((ClassTree) decls.getFirst()).getSimpleName().toString();
+        return pkg != null ? pkg + "." + name : name;
+    }
+
+    private static String extractSymbolName(String message) {
+        if (message == null) return null;
+        var m = Pattern.compile("'([^']+)'").matcher(message);
+        if (!m.find()) return null;
+        var name = m.group(1);
+        var paren = name.indexOf('(');
+        return paren >= 0 ? name.substring(0, paren) : name;
+    }
+
+    private static boolean hasMember(java.lang.classfile.ClassModel model, String name) {
+        return model.methods().stream().anyMatch(m -> m.methodName().equalsString(name))
+                || model.fields().stream().anyMatch(f -> f.fieldName().equalsString(name));
+    }
+
+    private static boolean hasConstructor(java.lang.classfile.ClassModel model) {
+        return model.methods().stream().anyMatch(m -> m.methodName().equalsString("<init>"));
     }
 }

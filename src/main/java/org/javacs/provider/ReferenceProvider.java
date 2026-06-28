@@ -37,9 +37,10 @@ public class ReferenceProvider {
     }
 
     public List<Location> find() {
+        var start = System.currentTimeMillis();
         try (var task = compiler.compile(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
-            if (element == null) return NOT_SUPPORTED;
+            if (element == null) { LOG.info(String.format("[cache] references:total %dms", System.currentTimeMillis() - start)); return NOT_SUPPORTED; }
             if (NavigationHelper.isMember(element)) {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
@@ -54,22 +55,27 @@ public class ReferenceProvider {
                     var names = lombokSearchNames(element, memberName, task);
                     if (!names.isEmpty()) {
                         task.close();
+                        LOG.info(String.format("[cache] references:total %dms", System.currentTimeMillis() - start));
                         return findLombokReferences(className, names);
                     }
                     LOG.info("[ref] names empty, falling back to findMemberReferences");
                 }
                 task.close();
+                LOG.info(String.format("[cache] references:total %dms", System.currentTimeMillis() - start));
                 return findMemberReferences(className, memberName);
             }
             if (NavigationHelper.isLocal(element)) {
+                LOG.info(String.format("[cache] references:total %dms", System.currentTimeMillis() - start));
                 return findReferences(task);
             }
             if (NavigationHelper.isType(element)) {
                 var type = (TypeElement) element;
                 var className = type.getQualifiedName().toString();
                 task.close();
+                LOG.info(String.format("[cache] references:total %dms", System.currentTimeMillis() - start));
                 return findTypeReferences(className);
             }
+            LOG.info(String.format("[cache] references:total %dms", System.currentTimeMillis() - start));
             return NOT_SUPPORTED;
         }
     }
@@ -77,7 +83,7 @@ public class ReferenceProvider {
     private List<Location> findTypeReferences(String className) {
         var files = compiler.findTypeReferences(className);
         if (files.length == 0) return List.of();
-        try (var task = compiler.compile(files)) {
+        try (var task = compiler.compileFresh(files)) {
             return findReferences(task);
         }
     }
@@ -85,7 +91,7 @@ public class ReferenceProvider {
     private List<Location> findMemberReferences(String className, String memberName) {
         var files = compiler.findMemberReferences(className, memberName);
         if (files.length == 0) return List.of();
-        try (var task = compiler.compile(files)) {
+        try (var task = compiler.compileFresh(files)) {
             return findReferences(task);
         }
     }
@@ -94,7 +100,7 @@ public class ReferenceProvider {
         var element = NavigationHelper.findElement(task, file, line, column);
         var paths = new ArrayList<TreePath>();
         for (var root : task.roots) {
-            new FindReferences(task.task, element).scan(root, paths);
+                new FindReferences(task.trees, element).scan(root, paths);
         }
         var locations = new ArrayList<Location>();
         for (var p : paths) {
@@ -109,7 +115,7 @@ public class ReferenceProvider {
         if (!(parent instanceof TypeElement parentType)) {
             return Set.of();
         }
-        var hasLombok = hasLombokAnnotation(parentType.getQualifiedName().toString(), task.task.getElements());
+        var hasLombok = hasLombokAnnotation(parentType.getQualifiedName().toString(), task.elements);
         if (!hasLombok) return Set.of();
         var fieldName = element.getKind() == ElementKind.FIELD
                 ? memberName
@@ -144,10 +150,10 @@ public class ReferenceProvider {
             }
         }
         if (files.isEmpty()) return List.of();
-        try (var task = compiler.compile(files.toArray(Path[]::new))) {
+        try (var task = compiler.compileFresh(files.toArray(Path[]::new))) {
             var paths = new ArrayList<TreePath>();
             for (var root : task.roots) {
-                new FindLombokReferences(task.task, names).scan(root, paths);
+                new FindLombokReferences(task.trees, names).scan(root, paths);
             }
             var locations = new ArrayList<Location>();
             for (var p : paths) {

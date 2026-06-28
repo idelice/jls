@@ -10,8 +10,8 @@ public class FindTypeDeclarationAt extends TreeScanner<ClassTree, Long> {
     private final SourcePositions pos;
     private CompilationUnitTree root;
 
-    public FindTypeDeclarationAt(JavacTask task) {
-        pos = Trees.instance(task).getSourcePositions();
+    public FindTypeDeclarationAt(Trees trees) {
+        pos = trees.getSourcePositions();
     }
 
     @Override

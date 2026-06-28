@@ -1507,16 +1507,6 @@ class JavaLanguageServer extends LanguageServer {
             if (compiler == null) {
                 return new DocumentDiagnosticReport(List.of());
             }
-            // For Lombok files, return cached AP diagnostics (updated on save)
-            if (compiler.lombokPresentOnClasspath()
-                    && LombokAnnotations.sourceMayRequireLombokExpansion(file, 50)) {
-                var cached = compiler.getCachedApDiagnostics(file.toUri());
-                if (cached != null) {
-                    LOG.info(String.format("[diagnostics] ap_cache_hit file=%s diags=%d",
-                            file.getFileName(), cached.size()));
-                    return new DocumentDiagnosticReport(cached);
-                }
-            }
             LOG.info("[diagnostics] pull_compile_start file=" + file.getFileName());
             var started = System.nanoTime();
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));

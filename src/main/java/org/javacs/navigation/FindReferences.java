@@ -7,11 +7,11 @@ import javax.lang.model.element.Element;
 import javax.tools.Diagnostic;
 
 public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
-    final JavacTask task;
+    final Trees trees;
     final Element find;
 
-    public FindReferences(JavacTask task, Element find) {
-        this.task = task;
+    public FindReferences(Trees trees, Element find) {
+        this.trees = trees;
         this.find = find;
     }
 
@@ -49,7 +49,6 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
 
     private boolean check() {
         var path = getCurrentPath();
-        var trees = Trees.instance(task);
         var candidate = trees.getElement(path);
         if (!find.equals(candidate)) {
             return false;

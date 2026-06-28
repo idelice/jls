@@ -43,69 +43,109 @@ public class DefinitionProvider {
         var start = System.currentTimeMillis();
         try (var task = compiler.compile(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
-            if (element == null) return NOT_SUPPORTED;
+            if (element == null) { LOG.info("[def] element=null"); return NOT_SUPPORTED; }
+            LOG.info("[def] element=" + element.getKind() + " " + element + " type=" + element.asType().getKind());
             if (element.asType().getKind() == TypeKind.ERROR) {
+                LOG.info("[def] branch=ERROR kind=" + element.getKind() + " name=" + element.getSimpleName());
                 if (compiler.lombokPresentOnClasspath()) {
                     var memberName = element.getSimpleName().toString();
-                    var result = resolveLombokField(element, memberName, task.task.getElements());
-                    if (!result.isEmpty()) return result;
+                    var result = resolveLombokField(element, memberName, task.elements);
+                    if (!result.isEmpty()) { LOG.info("[def] return=lombok-error-field"); return result; }
                 }
+                LOG.info("[def] branch=findError");
                 return findError(element);
             }
-            // TODO instead of checking isLocal, just try to resolve the location, fall back to searching
             if (NavigationHelper.isLocal(element)) {
-                return findDefinitions(task, element);
+                LOG.info("[def] branch=isLocal kind=" + element.getKind() + " name=" + element.getSimpleName());
+                var result = findDefinitions(task, element);
+                LOG.info("[def] return=findDefinitions size=" + result.size());
+                return result;
             }
             var className = className(element);
-            if (className.isEmpty()) return NOT_SUPPORTED;
+            LOG.info("[def] branch=not-local className=" + className + " kind=" + element.getKind());
+            if (className.isEmpty()) { LOG.info("[def] return=NOT_SUPPORTED className=empty"); return NOT_SUPPORTED; }
             var otherFile = compiler.findAnywhere(className);
+            LOG.info("[def] findAnywhere(" + className + ")=" + (otherFile.isPresent() ? otherFile.get() : "empty"));
             if (otherFile.isEmpty()) {
-                // Try navigating within current compilation (JDK, records, declarations)
                 var localDefs = findDefinitions(task, element);
-                if (!localDefs.isEmpty()) return localDefs;
-                // Lombok builder inner class has no source → resolve via Lombok
+                if (!localDefs.isEmpty()) { LOG.info("[def] return=findDefinitions-in-file"); return localDefs; }
                 if (compiler.lombokPresentOnClasspath()) {
+                    LOG.info("[def] branch=lombok-fallback classname=" + className);
                     var memberName = element.getSimpleName().toString();
-                    var result = resolveLombokField(element, memberName, task.task.getElements());
-                    if (!result.isEmpty()) return result;
+                    var result = resolveLombokField(element, memberName, task.elements);
+                    if (!result.isEmpty()) { LOG.info("[def] return=lombok-fallback"); return result; }
                 }
-                // Last resort: decompile from .class when no source is available
+                LOG.info("[def] branch=decompile-fallback");
                 var decompiled = compiler.decompileClass(className);
                 if (decompiled.isPresent()) {
-                    LOG.info("[def] decompileClass fallback for " + className + " at " + decompiled.get());
+                    LOG.info("[def] return=decompiled " + decompiled.get());
                     var parse = compiler.parse(new SourceFileObject(decompiled.get()));
                     var tree = FindHelper.findType(parse, className);
                     var path = TreePath.getPath(parse.root(), tree);
                     return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
                 }
+                LOG.info("[def] return=empty");
                 return List.of();
             }
             if (otherFile.get().toUri().equals(file.toUri())) {
-                return findDefinitions(task, element);
+                LOG.info("[def] branch=same-file");
+                var result = findDefinitions(task, element);
+                LOG.info("[def] return=findDefinitions-same-file size=" + result.size());
+                return result;
             }
-            // parse directly — javac Trees.getPath can't make TreePaths for jar:// sources
+            LOG.info("[def] branch=other-file " + otherFile.get());
             var parse = compiler.parse(otherFile.get());
             var tree = FindHelper.findType(parse, className);
-            // Navigate to the specific member if the element is a method
             if (element instanceof ExecutableElement method) {
                 var erased = FindHelper.erasedParameterTypes(task, method);
-                var memberTree = FindHelper.findMethod(parse, className, method.getSimpleName().toString(), erased);
-                if (memberTree != null) {
-                    var path = TreePath.getPath(parse.root(), memberTree);
-                    return List.of(FindHelper.location(parse, path, method.getSimpleName()));
+                try {
+                    var memberTree = FindHelper.findMethod(parse, className, method.getSimpleName().toString(), erased);
+                    if (memberTree != null) {
+                        LOG.info("[def] return=method-in-other-file");
+                        var path = TreePath.getPath(parse.root(), memberTree);
+                        return List.of(FindHelper.location(parse, path, method.getSimpleName()));
+                    }
+                } catch (RuntimeException notInSource) {
+                    // Method not in source tree (Lombok-generated) — check .class bytecode
+                    var classFile = compiler.findClassFile(className);
+                    var methodName = method.getSimpleName().toString();
+                    if (classFile.isPresent() && classHasMethod(classFile.get(), methodName)) {
+                        // Map getter/setter to field name, navigate to field if found
+                        var fieldName = compiler.lombokPresentOnClasspath()
+                                ? LombokAnnotations.accessorFieldName(methodName) : java.util.Optional.<String>empty();
+                        if (fieldName.isPresent()) {
+                            try {
+                                var fieldTree = FindHelper.findField(parse, className, fieldName.get());
+                                LOG.info("[def] return=field-in-other-file (via bytecode+accessor)");
+                                var path = TreePath.getPath(parse.root(), fieldTree);
+                                return List.of(FindHelper.location(parse, path, fieldName.get()));
+                            } catch (RuntimeException e) {
+                                // field not in source, fall through to class
+                            }
+                        }
+                        LOG.info("[def] return=class-in-other-file (via .class bytecode for " + methodName + ")");
+                        var path = TreePath.getPath(parse.root(), tree);
+                        return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+                    }
                 }
             }
-            // Navigate to the specific field/enum constant
             if (element.getKind() == ElementKind.FIELD || element.getKind() == ElementKind.ENUM_CONSTANT) {
                 var memberName = element.getSimpleName().toString();
                 try {
                     var memberTree = FindHelper.findField(parse, className, memberName);
+                    LOG.info("[def] return=field-in-other-file");
                     var path = TreePath.getPath(parse.root(), memberTree);
                     return List.of(FindHelper.location(parse, path, memberName));
-                } catch (RuntimeException e) {
-                    // field not found in parsed source, fall through to class location
+                } catch (RuntimeException notInSource) {
+                    var classFile = compiler.findClassFile(className);
+                    if (classFile.isPresent() && classHasMethod(classFile.get(), memberName)) {
+                        LOG.info("[def] return=class-in-other-file (via .class bytecode for " + memberName + ")");
+                        var path = TreePath.getPath(parse.root(), tree);
+                        return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+                    }
                 }
             }
+            LOG.info("[def] return=class-in-other-file");
             var path = TreePath.getPath(parse.root(), tree);
             return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
         } finally {
@@ -171,8 +211,8 @@ public class DefinitionProvider {
         }
         var locations = new ArrayList<Location>();
         try (var task = compiler.compile(sources)) {
-            var trees = Trees.instance(task.task);
-            var elements = task.task.getElements();
+            var trees = task.trees;
+            var elements = task.elements;
             var parentClass = elements.getTypeElement(className);
             for (var member : elements.getAllMembers(parentClass)) {
                 if (!member.getSimpleName().contentEquals(memberName)) continue;
@@ -224,8 +264,8 @@ public class DefinitionProvider {
 
     private List<Location> navigateToDeclaration(CompileTask task, ExecutableElement method) {
         var enclosing = (TypeElement) method.getEnclosingElement();
-        var types = task.task.getTypes();
-        var elements = task.task.getElements();
+        var types = task.types;
+        var elements = task.elements;
         for (var superMirror : types.directSupertypes(enclosing.asType())) {
             var superType = (TypeElement) types.asElement(superMirror);
             for (var other : superType.getEnclosedElements()) {
@@ -254,7 +294,7 @@ public class DefinitionProvider {
         for (var member : type.getEnclosedElements()) {
             if (member.getKind() == ElementKind.RECORD_COMPONENT
                     && member.getSimpleName().contentEquals(accessorName)) {
-                var trees = Trees.instance(task.task);
+                var trees = task.trees;
                 var path = trees.getPath(member);
                 if (path != null) {
                     return List.of(FindHelper.location(task, path, accessorName));
@@ -314,18 +354,18 @@ public class DefinitionProvider {
     }
 
     private List<Location> findDefinitions(CompileTask task, Element element) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var path = trees.getPath(element);
+        LOG.info("[def] findDefinitions kind=" + element.getKind() + " name=" + element.getSimpleName() + " getPath=" + (path != null ? "found" : "null"));
         if (path == null) {
             if (compiler.lombokPresentOnClasspath()) {
                 var rawClassName = className(element);
-                if (hasLombokAnnotation(rawClassName, task.task.getElements())) {
-                    return resolveLombokField(element, element.getSimpleName().toString(), task.task.getElements());
+                if (hasLombokAnnotation(rawClassName, task.elements)) {
+                    return resolveLombokField(element, element.getSimpleName().toString(), task.elements);
                 }
-                // .class files strip SOURCE annotations. Try accessor pattern fallback.
                 var memberName = element.getSimpleName().toString();
                 if (LombokAnnotations.accessorFieldName(memberName).isPresent()) {
-                    return resolveLombokField(element, memberName, task.task.getElements());
+                    return resolveLombokField(element, memberName, task.elements);
                 }
             }
             var decl = tryDeclarationNavigation(task, element);
@@ -341,5 +381,17 @@ public class DefinitionProvider {
         var name = element.getSimpleName();
         if (name.contentEquals("<init>")) name = element.getEnclosingElement().getSimpleName();
         return List.of(FindHelper.location(task, path, name));
+    }
+
+    private static boolean classHasMethod(java.nio.file.Path classFile, String methodName) {
+        try {
+            var bytes = java.nio.file.Files.readAllBytes(classFile);
+            var model = java.lang.classfile.ClassFile.of().parse(bytes);
+            for (var m : model.methods()) {
+                if (m.methodName().equalsString(methodName)) return true;
+            }
+        } catch (java.io.IOException e) {
+        }
+        return false;
     }
 }

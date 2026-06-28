@@ -140,27 +140,27 @@ public class FindHelper {
     }
 
     public static Location location(ParseTask task, TreePath path) {
-        return location(task.task(), path, "", false);
+        return location(Trees.instance(task.task()), path, "", false);
     }
 
     public static Location location(CompileTask task, TreePath path) {
-        return location(task, path, "");
+        return location(task.trees, path, "", false);
     }
 
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
-        return location(task.task, path, name, false);
+        return location(task.trees, path, name, false);
     }
 
     public static Location location(ParseTask task, TreePath path, CharSequence name) {
-        return location(task.task(), path, name, false);
+        return location(Trees.instance(task.task()), path, name, false);
     }
 
     public static Location locationStrict(ParseTask task, TreePath path, CharSequence name) {
-        return location(task.task(), path, name, true);
+        return location(Trees.instance(task.task()), path, name, true);
     }
 
-    public static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
-        var pos = Trees.instance(task).getSourcePositions();
+    public static Location location(Trees trees, TreePath path, CharSequence name, boolean strictNameMatch) {
+        var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = -1;
         var end = -1;

@@ -44,7 +44,7 @@ public class OverrideInheritedMethod implements Rewrite {
             var types = task.types;
             var trees = task.trees;
             var superMethod = FindHelper.findMethod(task, superClassName, methodName, erasedParameterTypes);
-            var thisTree = new FindTypeDeclarationAt(task.task).scan(root, (long) insertPosition);
+            var thisTree = new FindTypeDeclarationAt(task.trees).scan(root, (long) insertPosition);
             var thisPath = trees.getPath(root, thisTree);
             var thisClass = (TypeElement) trees.getElement(thisPath);
             var parameterizedType = (ExecutableType) types.asMemberOf((DeclaredType) thisClass.asType(), superMethod);
@@ -62,7 +62,7 @@ public class OverrideInheritedMethod implements Rewrite {
 
     private Position insertNearCursor(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var parent = new FindTypeDeclarationAt(task.task()).scan(task.root(), (long) insertPosition);
+        var parent = new FindTypeDeclarationAt(Trees.instance(task.task())).scan(task.root(), (long) insertPosition);
         var next = nextMember(task, parent);
         if (next != Position.NONE) {
             return next;

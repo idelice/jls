@@ -36,7 +36,7 @@ public class CatchException implements Rewrite {
             var pos = trees.getSourcePositions();
             var lines = root.getLineMap();
 
-            var method = new FindMethodDeclarationAt(task.task).scan(root, (long) startPosition);
+            var method = new FindMethodDeclarationAt(task.trees).scan(root, (long) startPosition);
             if (method == null) {
                 return CANCELLED;
             }

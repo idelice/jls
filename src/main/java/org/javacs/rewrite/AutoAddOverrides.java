@@ -22,7 +22,7 @@ public class AutoAddOverrides implements Rewrite {
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         try (var task = compiler.compile(file)) {
             var missing = new ArrayList<TreePath>();
-            new FindMissingOverride(task.task).scan(task.root(), missing);
+            new FindMissingOverride(task.trees, task.elements, task.types).scan(task.root(), missing);
             var list = addOverrides(task, missing);
             return Map.of(file, list.toArray(new TextEdit[list.size()]));
         }

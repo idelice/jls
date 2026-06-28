@@ -14,6 +14,7 @@ import java.util.UUID;
 import com.google.gson.JsonPrimitive;
 import javax.lang.model.element.*;
 import javax.lang.model.type.*;
+import javax.lang.model.util.Types;
 import org.javacs.*;
 import org.javacs.FindTypeDeclarationAt;
 import org.javacs.lsp.*;
@@ -58,12 +59,12 @@ public class CodeActionProvider {
                     || params.range.start.character != params.range.end.character;
             if (hasSelection) {
                 var selectionEnd = lines.getPosition(params.range.end.line + 1, params.range.end.character + 1);
-                var methodAtEnd = new FindMethodDeclarationAt(task.task).scan(root, selectionEnd);
-                var methodAtStart = new FindMethodDeclarationAt(task.task).scan(root, cursor);
+                var methodAtEnd = new FindMethodDeclarationAt(task.trees).scan(root, selectionEnd);
+                var methodAtStart = new FindMethodDeclarationAt(task.trees).scan(root, cursor);
                 var insideMethod = (methodAtEnd != null || methodAtStart != null);
                 if (insideMethod) {
                     var methodDetectPos = (methodAtEnd != null) ? selectionEnd : cursor;
-                    var classTree = new FindTypeDeclarationAt(task.task).scan(root, methodDetectPos);
+                    var classTree = new FindTypeDeclarationAt(task.trees).scan(root, methodDetectPos);
                     if (classTree != null) {
                         var className = qualifiedName(task, root, classTree);
                         var rangeStart =
@@ -105,7 +106,7 @@ public class CodeActionProvider {
             }
 
             if (!hasSelection) {
-                var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
+                var classTree = new FindTypeDeclarationAt(task.trees).scan(root, cursor);
                 if (classTree != null) {
                     var className = qualifiedName(task, root, classTree);
                     for (var kind :
@@ -260,11 +261,11 @@ public class CodeActionProvider {
         var root = task.root(file);
         if (!isBlankLine(root, cursor)) return Map.of();
         if (isInMethod(task, root, cursor)) return Map.of();
-        var methodTree = new FindMethodDeclarationAt(task.task).scan(root, cursor);
+        var methodTree = new FindMethodDeclarationAt(task.trees).scan(root, cursor);
         if (methodTree != null) return Map.of();
         var actions = new TreeMap<String, Rewrite>();
         var trees = task.trees;
-        var classTree = new FindTypeDeclarationAt(task.task).scan(root, cursor);
+        var classTree = new FindTypeDeclarationAt(task.trees).scan(root, cursor);
         if (classTree == null) return Map.of();
         var classPath = trees.getPath(root, classTree);
         var elements = task.elements;
@@ -276,7 +277,7 @@ public class CodeActionProvider {
             var methodSource = (TypeElement) member.getEnclosingElement();
             if (methodSource.getQualifiedName().contentEquals("java.lang.Object")) continue;
             if (methodSource.equals(classElement)) continue;
-            var ptr = new MethodPtr(task.task, method);
+            var ptr = new MethodPtr(task.types, method);
             var rewrite =
                     new OverrideInheritedMethod(
                             ptr.className, ptr.methodName, ptr.erasedParameterTypes, file, (int) cursor);
@@ -287,7 +288,7 @@ public class CodeActionProvider {
     }
 
     private boolean isInMethod(CompileTask task, CompilationUnitTree root, long cursor) {
-        var method = new FindMethodDeclarationAt(task.task).scan(root, cursor);
+        var method = new FindMethodDeclarationAt(task.trees).scan(root, cursor);
         return method != null;
     }
 
@@ -419,7 +420,7 @@ public class CodeActionProvider {
 
     private ClassTree findClassTree(CompileTask task, CompilationUnitTree root, Range range) {
         var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
-        return new FindTypeDeclarationAt(task.task).scan(root, position);
+        return new FindTypeDeclarationAt(task.trees).scan(root, position);
     }
 
     private String qualifiedName(CompileTask task, CompilationUnitTree root, ClassTree tree) {
@@ -452,18 +453,17 @@ public class CodeActionProvider {
     private MethodPtr findMethod(CompileTask task, CompilationUnitTree root, Range range) {
         var trees = task.trees;
         var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
-        var tree = new FindMethodDeclarationAt(task.task).scan(root, position);
+        var tree = new FindMethodDeclarationAt(task.trees).scan(root, position);
         var path = trees.getPath(root, tree);
         var method = (ExecutableElement) trees.getElement(path);
-        return new MethodPtr(task.task, method);
+        return new MethodPtr(task.types, method);
     }
 
     class MethodPtr {
         String className, methodName;
         String[] erasedParameterTypes;
 
-        MethodPtr(JavacTask task, ExecutableElement method) {
-            var types = task.getTypes();
+        MethodPtr(Types types, ExecutableElement method) {
             var parent = (TypeElement) method.getEnclosingElement();
             className = parent.getQualifiedName().toString();
             methodName = method.getSimpleName().toString();

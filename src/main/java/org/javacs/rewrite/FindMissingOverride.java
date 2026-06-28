@@ -12,10 +12,10 @@ class FindMissingOverride extends TreePathScanner<Void, List<TreePath>> {
     private final Elements elements;
     private final Types types;
 
-    FindMissingOverride(JavacTask task) {
-        this.trees = Trees.instance(task);
-        this.elements = task.getElements();
-        this.types = task.getTypes();
+    FindMissingOverride(Trees trees, Elements elements, Types types) {
+        this.trees = trees;
+        this.elements = elements;
+        this.types = types;
     }
 
     @Override

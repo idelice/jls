@@ -19,13 +19,13 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 
 class WarnNotThrown extends TreePathScanner<Void, Map<TreePath, String>> {
-    private final JavacTask task;
+    private final Trees trees;
     private CompilationUnitTree root;
     private Map<String, TreePath> declaredExceptions = new HashMap<>();
     private Set<String> observedExceptions = new HashSet<>();
 
-    WarnNotThrown(JavacTask task) {
-        this.task = task;
+    WarnNotThrown(Trees trees) {
+        this.trees = trees;
     }
 
     @Override
@@ -55,7 +55,6 @@ class WarnNotThrown extends TreePathScanner<Void, Map<TreePath, String>> {
     }
 
     private Map<String, TreePath> declared(MethodTree t) {
-        var trees = Trees.instance(task);
         var names = new HashMap<String, TreePath>();
         for (var e : t.getThrows()) {
             var path = new TreePath(getCurrentPath(), e);
@@ -71,14 +70,13 @@ class WarnNotThrown extends TreePathScanner<Void, Map<TreePath, String>> {
     @Override
     public Void visitThrow(ThrowTree t, Map<TreePath, String> notThrown) {
         var path = new TreePath(getCurrentPath(), t.getExpression());
-        var type = Trees.instance(task).getTypeMirror(path);
+        var type = trees.getTypeMirror(path);
         addThrown(type);
         return super.visitThrow(t, notThrown);
     }
 
     @Override
     public Void visitNewClass(NewClassTree t, Map<TreePath, String> notThrown) {
-        var trees = Trees.instance(task);
         var target = trees.getElement(getCurrentPath());
         if (target instanceof ExecutableElement) {
             var method = (ExecutableElement) target;
@@ -91,7 +89,6 @@ class WarnNotThrown extends TreePathScanner<Void, Map<TreePath, String>> {
 
     @Override
     public Void visitMethodInvocation(MethodInvocationTree t, Map<TreePath, String> notThrown) {
-        var trees = Trees.instance(task);
         var target = trees.getElement(getCurrentPath());
         if (target instanceof ExecutableElement) {
             var method = (ExecutableElement) target;

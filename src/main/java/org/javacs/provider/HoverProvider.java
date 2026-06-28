@@ -7,10 +7,12 @@ import java.util.StringJoiner;
 import java.util.stream.Collectors;
 import javax.lang.model.element.*;
 import javax.lang.model.type.*;
+import java.util.logging.Logger;
 import org.javacs.*;
 import org.javacs.lsp.*;
 
 public class HoverProvider {
+    private static final Logger LOG = Logger.getLogger("main");
     final CompilerProvider compiler;
 
     public HoverProvider(CompilerProvider compiler) {
@@ -18,6 +20,7 @@ public class HoverProvider {
     }
 
     public MarkupContent hover(Path file, int line, int column) {
+        var start = System.currentTimeMillis();
         try (var task = compiler.compile(file)) {
             var root = task.root(file);
             long cursor;
@@ -59,6 +62,8 @@ public class HoverProvider {
             return new MarkupContent(MarkupKind.Markdown, markdown.toString());
         } catch (Exception e) {
             return null;
+        } finally {
+            LOG.info(String.format("[cache] hover:compile %dms", System.currentTimeMillis() - start));
         }
     }
 

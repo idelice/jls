@@ -659,7 +659,6 @@ public final class MavenTooling {
         var match = DEPENDENCY.matcher(line);
         if (!match.matches()) return NOT_FOUND;
         var path = match.group(2);
-        LOG.fine(String.format("...%s => %s", match.group(1), path));
         return Paths.get(path);
     }
 

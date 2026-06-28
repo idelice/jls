@@ -26,7 +26,6 @@ class JavaCompilerService implements CompilerProvider {
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
-    final Map<URI, List<org.javacs.lsp.Diagnostic>> apDiagnosticCache = new ConcurrentHashMap<>();
     final SourceFileManager fileManager;
     final SourceFileManager docsFileManager;
 
@@ -69,19 +68,6 @@ class JavaCompilerService implements CompilerProvider {
         return false;
     }
 
-    boolean isBuildOutputAvailable() {
-        for (var path : classPath) {
-            if (Files.isDirectory(path) && !path.getFileName().toString().endsWith(".jar")) {
-                try (var entries = java.nio.file.Files.list(path)) {
-                    if (entries.anyMatch(Files::isDirectory)) {
-                        return true;
-                    }
-                } catch (IOException ignored) {}
-            }
-        }
-        return false;
-    }
-
     /** Atomically extend the classpath with new entries (e.g. compiled module output dirs). */
     void addClassPathEntries(Set<Path> entries) {
         if (entries.isEmpty()) return;
@@ -92,18 +78,23 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
-    // --- Single-cache model ---
-    // Invalidated by FileStore.contentRevision() which bumps on every didChange/didSave.
-    private CompileBatch cachedCompile;
+    // --- Small LRU compile cache ---
+    // Invalidation: global contentRevision (bumps on any edit/save).
+    // Eviction: LRU, max 4 entries. No cross-file tracking needed.
+    private final Map<URI, CompileBatch> compileCache = new LinkedHashMap<>(4, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<URI, CompileBatch> eldest) {
+            return size() > 4;
+        }
+    };
     private long cachedRevision = -1;
 
     private boolean needsCompile() {
-        if (cachedCompile == null) return true;
         return FileStore.contentRevision() != cachedRevision;
     }
 
-    private void loadCompile(Collection<? extends JavaFileObject> sources) {
-        cachedCompile = doCompile(sources);
+    private void loadCompile(URI key, Collection<? extends JavaFileObject> sources) {
+        compileCache.put(key, doCompile(sources));
         cachedRevision = FileStore.contentRevision();
     }
 
@@ -133,24 +124,16 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
-        var needsFresh = needsCompile() || (isBuildOutputAvailable() && lombokPresentOnClasspath);
-        if (!needsFresh && cachedCompile != null) {
-            // Verify cache covers requested sources — cached roots may be from a different file
-            var cachedUris = new HashSet<URI>();
-            for (var r : cachedCompile.roots) cachedUris.add(r.getSourceFile().toUri());
-            for (var s : sources) {
-                if (!cachedUris.contains(s.toUri())) {
-                    needsFresh = true;
-                    break;
-                }
-            }
+        LOG.info("[cache] compileBatch " + sources.size() + " source(s)");
+        var key = sources.iterator().next().toUri();
+        var needsFresh = needsCompile() || !compileCache.containsKey(key);
+        if (!needsFresh) {
+            LOG.info("[cache] HIT");
+            return compileCache.get(key);
         }
-        if (needsFresh) {
-            loadCompile(sources);
-        } else {
-            LOG.fine("...using cached compile");
-        }
-        return cachedCompile;
+        LOG.info("[cache] MISS revision=" + FileStore.contentRevision() + " prev=" + cachedRevision);
+        loadCompile(key, sources);
+        return compileCache.get(key);
     }
 
     @Override
@@ -162,34 +145,22 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
-        Collection<? extends JavaFileObject> effectiveSources;
-        if (lombokPresentOnClasspath && sources.size() <= 1) {
-            if (isBuildOutputAvailable()) {
-                // Include dirty documents so cross-file errors from edited files are visible
-                var allSources = new LinkedHashSet<JavaFileObject>(sources);
-                LOG.fine("[dirty] compile() has " + FileStore.dirtyDocuments().size() + " dirty documents");
-                for (var dirty : FileStore.dirtyDocuments()) {
-                    allSources.add(new SourceFileObject(dirty));
-                }
-                effectiveSources = allSources;
-                LOG.fine("[compile] fast-path enabled: types from build output, compiling " + allSources.size() + " file(s)");
-            } else {
-                effectiveSources = FileStore.all().stream()
-                        .<JavaFileObject>map(SourceFileObject::new)
-                        .toList();
-                LOG.fine("[compile] fallback: build output unavailable, compiling all " + effectiveSources.size() + " files");
-            }
-        } else {
-            effectiveSources = sources;
-        }
-        var batch = compileBatch(effectiveSources);
-        return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, diags, batch::close);
+        var batch = compileBatch(sources);
+        return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, batch.diagnostics, batch::close);
     }
 
     @Override
     public ParseTask parse(Path file) {
         var parser = Parser.parseJavaFileObject(new SourceFileObject(file));
         return new ParseTask(parser.task, parser.root);
+    }
+
+    @Override
+    public CompileTask compileFresh(Path... files) {
+        var sources = new ArrayList<JavaFileObject>(files.length);
+        for (var f : files) sources.add(new SourceFileObject(f));
+        var batch = new CompileBatch(this, sources);
+        return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, batch.diagnostics, batch::close);
     }
 
     @Override
@@ -323,10 +294,9 @@ class JavaCompilerService implements CompilerProvider {
         options.addAll(List.of("-d", outputDir.toString()));
         var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
         options.addAll(List.of("-processorpath", cp));
-        var apDiags = new ArrayList<Diagnostic<? extends JavaFileObject>>();
         compiler.compile(
                 fileManager,
-                d -> { diags.add(d); apDiags.add(d); },
+                diags::add,
                 options,
                 sources,
                 task -> {
@@ -338,25 +308,23 @@ class JavaCompilerService implements CompilerProvider {
                     }
                     return null;
                 });
-        cacheApDiagnostics(apDiags);
-        cachedCompile = null;
         LOG.info("[build] fullCompileWithAP complete");
     }
 
-    // single-file compile with AP — updates .class in build output on didSave
+    // recompile on save — updates .class in build output for cross-file resolution
     void refreshBuildOutput(Path file) {
-        if (!lombokPresentOnClasspath) return;
         var outputDir = findBuildOutputDir();
         if (outputDir == null) return;
         var options = CompileBatch.options(classPath, addExports, extraArgs);
-        options.remove("-proc:none");
         options.addAll(List.of("-d", outputDir.toString()));
-        var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
-        options.addAll(List.of("-processorpath", cp));
-        var apDiags = new ArrayList<Diagnostic<? extends JavaFileObject>>();
+        if (lombokPresentOnClasspath) {
+            options.remove("-proc:none");
+            var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
+            options.addAll(List.of("-processorpath", cp));
+        }
         compiler.compile(
                 fileManager,
-                d -> { diags.add(d); apDiags.add(d); },
+                diags::add,
                 options,
                 List.of(new SourceFileObject(file)),
                 task -> {
@@ -369,30 +337,7 @@ class JavaCompilerService implements CompilerProvider {
                     }
                     return null;
                 });
-        cacheApDiagnostics(apDiags);
         LOG.info(String.format("[build] refreshBuildOutput compiled %s", file.getFileName()));
-    }
-
-    private void cacheApDiagnostics(List<Diagnostic<? extends JavaFileObject>> rawDiags) {
-        for (var d : rawDiags) {
-            if (d.getSource() == null || d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
-            if ("compiler.warn.proc.messager".equals(d.getCode())) continue;
-            var lsp = new org.javacs.lsp.Diagnostic();
-            lsp.severity = d.getKind() == Diagnostic.Kind.ERROR ? org.javacs.lsp.DiagnosticSeverity.Error
-                    : d.getKind() == Diagnostic.Kind.WARNING || d.getKind() == Diagnostic.Kind.MANDATORY_WARNING
-                    ? org.javacs.lsp.DiagnosticSeverity.Warning : org.javacs.lsp.DiagnosticSeverity.Information;
-            lsp.code = d.getCode();
-            lsp.message = d.getMessage(null);
-            try {
-                lsp.range = FileStore.range(d.getSource().getCharContent(true).toString(),
-                        d.getStartPosition(), d.getEndPosition());
-            } catch (Exception ignored) { continue; }
-            apDiagnosticCache.computeIfAbsent(d.getSource().toUri(), k -> new ArrayList<>()).add(lsp);
-        }
-    }
-
-    List<org.javacs.lsp.Diagnostic> getCachedApDiagnostics(URI uri) {
-        return apDiagnosticCache.get(uri);
     }
 
     @Override
@@ -554,5 +499,15 @@ class JavaCompilerService implements CompilerProvider {
             }
         }
         return decompiler.decompileSourcePath(qualifiedName);
+    }
+
+    @Override
+    public Optional<Path> findClassFile(String qualifiedName) {
+        var relative = qualifiedName.replace('.', '/') + ".class";
+        for (var root : classPath) {
+            var classFile = root.resolve(relative);
+            if (Files.exists(classFile)) return Optional.of(classFile);
+        }
+        return Optional.empty();
     }
 }

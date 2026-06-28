@@ -26,6 +26,7 @@ public class CompileBatch implements AutoCloseable {
     final Elements elements;
     final Types types;
     final List<CompilationUnitTree> roots;
+    final List<Diagnostic<? extends JavaFileObject>> diagnostics;
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
         this.parent = parent;
         LOG.info("[compile] CompileBatch — starting compile of " + files.size() + " file(s)");
@@ -77,6 +78,7 @@ public class CompileBatch implements AutoCloseable {
         this.elements = holder.elements;
         this.types = holder.types;
         this.roots = holder.roots;
+        this.diagnostics = new ArrayList<>(parent.diags);
     }
 
     Set<Path> needsAdditionalSources() {
