@@ -259,7 +259,7 @@ class JavaCompilerService implements CompilerProvider {
         return lombokPresentOnClasspath;
     }
 
-    // find build output dir from classpath, fallback to workspace convention
+    // find build output dir from classpath, fallback to Maven/Gradle convention
     Path findBuildOutputDir() {
         for (var p : classPath) {
             if (Files.isDirectory(p) && !p.getFileName().toString().endsWith(".jar")) {
@@ -267,17 +267,19 @@ class JavaCompilerService implements CompilerProvider {
             }
         }
         for (var root : FileStore.workspaceRoots()) {
-            if (Files.exists(root.resolve("pom.xml"))
-                    || Files.exists(root.resolve("build.gradle"))
-                    || Files.exists(root.resolve("build.gradle.kts"))) {
-                var dir = root.resolve("target").resolve("classes");
-                try {
-                    Files.createDirectories(dir);
-                    addClassPathEntries(Set.of(dir));
-                    return dir;
-                } catch (java.io.IOException e) {
-                    return null;
+            if (Files.exists(root.resolve("pom.xml"))) {
+                var dir = MavenTooling.outputDirectory(root);
+                if (!Files.exists(dir)) {
+                    try { Files.createDirectories(dir); } catch (IOException e) { return null; }
                 }
+                addClassPathEntries(Set.of(dir));
+                return dir;
+            }
+            if (Files.exists(root.resolve("build.gradle"))
+                    || Files.exists(root.resolve("build.gradle.kts"))) {
+                // Gradle default. Override when per-module buildDir detection is added.
+                var dir = root.resolve("build").resolve("classes").resolve("java").resolve("main");
+                return Files.isDirectory(dir) ? dir : null;
             }
         }
         return null;
