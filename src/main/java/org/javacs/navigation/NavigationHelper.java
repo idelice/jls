@@ -16,14 +16,14 @@ public class NavigationHelper {
             if (root.getSourceFile().toUri().equals(file.toUri())) {
                 var trees = task.trees;
                 var cursor = root.getLineMap().getPosition(line, column);
-                LOG.info("[nav] findElement " + file.getFileName() + ":" + line + ":" + column + " cursor=" + cursor + " roots=" + task.roots.size());
+                LOG.fine("[nav] findElement " + file.getFileName() + ":" + line + ":" + column + " cursor=" + cursor + " roots=" + task.roots.size());
                 var path = new FindNameAt(task).scan(root, cursor);
                 if (path == null) {
-                    LOG.info("[nav] findElement -> null (no path found at cursor=" + cursor + ")");
+                    LOG.fine("[nav] findElement -> null (no path found at cursor=" + cursor + ")");
                     return null;
                 }
                 var element = trees.getElement(path);
-                LOG.info("[nav] findElement -> " + (element != null ? element.getKind() + " " + element : "null"));
+                LOG.fine("[nav] findElement -> " + (element != null ? element.getKind() + " " + element : "null"));
                 return element;
             }
         }

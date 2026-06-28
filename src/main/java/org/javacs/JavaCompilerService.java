@@ -266,17 +266,21 @@ class JavaCompilerService implements CompilerProvider {
                 return p;
             }
         }
-        var roots = FileStore.workspaceRoots();
-        if (roots.isEmpty()) return null;
-        var root = roots.iterator().next();
-        var dir = root.resolve("target").resolve("classes");
-        try {
-            Files.createDirectories(dir);
-            addClassPathEntries(Set.of(dir));
-            return dir;
-        } catch (java.io.IOException e) {
-            return null;
+        for (var root : FileStore.workspaceRoots()) {
+            if (Files.exists(root.resolve("pom.xml"))
+                    || Files.exists(root.resolve("build.gradle"))
+                    || Files.exists(root.resolve("build.gradle.kts"))) {
+                var dir = root.resolve("target").resolve("classes");
+                try {
+                    Files.createDirectories(dir);
+                    addClassPathEntries(Set.of(dir));
+                    return dir;
+                } catch (java.io.IOException e) {
+                    return null;
+                }
+            }
         }
+        return null;
     }
 
     // startup full compile with AP — populates build output once

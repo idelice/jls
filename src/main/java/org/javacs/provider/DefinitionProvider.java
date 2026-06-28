@@ -43,57 +43,57 @@ public class DefinitionProvider {
         var start = System.currentTimeMillis();
         try (var task = compiler.compile(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
-            if (element == null) { LOG.info("[def] element=null"); return NOT_SUPPORTED; }
-            LOG.info("[def] element=" + element.getKind() + " " + element + " type=" + element.asType().getKind());
+            if (element == null) { LOG.fine("[def] element=null"); return NOT_SUPPORTED; }
+            LOG.fine("[def] element=" + element.getKind() + " " + element + " type=" + element.asType().getKind());
             if (element.asType().getKind() == TypeKind.ERROR) {
-                LOG.info("[def] branch=ERROR kind=" + element.getKind() + " name=" + element.getSimpleName());
+                LOG.fine("[def] branch=ERROR kind=" + element.getKind() + " name=" + element.getSimpleName());
                 if (compiler.lombokPresentOnClasspath()) {
                     var memberName = element.getSimpleName().toString();
                     var result = resolveLombokField(element, memberName, task.elements);
-                    if (!result.isEmpty()) { LOG.info("[def] return=lombok-error-field"); return result; }
+                    if (!result.isEmpty()) { LOG.fine("[def] return=lombok-error-field"); return result; }
                 }
-                LOG.info("[def] branch=findError");
+                LOG.fine("[def] branch=findError");
                 return findError(element);
             }
             if (NavigationHelper.isLocal(element)) {
-                LOG.info("[def] branch=isLocal kind=" + element.getKind() + " name=" + element.getSimpleName());
+                LOG.fine("[def] branch=isLocal kind=" + element.getKind() + " name=" + element.getSimpleName());
                 var result = findDefinitions(task, element);
-                LOG.info("[def] return=findDefinitions size=" + result.size());
+                LOG.fine("[def] return=findDefinitions size=" + result.size());
                 return result;
             }
             var className = className(element);
-            LOG.info("[def] branch=not-local className=" + className + " kind=" + element.getKind());
-            if (className.isEmpty()) { LOG.info("[def] return=NOT_SUPPORTED className=empty"); return NOT_SUPPORTED; }
+            LOG.fine("[def] branch=not-local className=" + className + " kind=" + element.getKind());
+            if (className.isEmpty()) { LOG.fine("[def] return=NOT_SUPPORTED className=empty"); return NOT_SUPPORTED; }
             var otherFile = compiler.findAnywhere(className);
-            LOG.info("[def] findAnywhere(" + className + ")=" + (otherFile.isPresent() ? otherFile.get() : "empty"));
+            LOG.fine("[def] findAnywhere(" + className + ")=" + (otherFile.isPresent() ? otherFile.get() : "empty"));
             if (otherFile.isEmpty()) {
                 var localDefs = findDefinitions(task, element);
-                if (!localDefs.isEmpty()) { LOG.info("[def] return=findDefinitions-in-file"); return localDefs; }
+                if (!localDefs.isEmpty()) { LOG.fine("[def] return=findDefinitions-in-file"); return localDefs; }
                 if (compiler.lombokPresentOnClasspath()) {
-                    LOG.info("[def] branch=lombok-fallback classname=" + className);
+                    LOG.fine("[def] branch=lombok-fallback classname=" + className);
                     var memberName = element.getSimpleName().toString();
                     var result = resolveLombokField(element, memberName, task.elements);
-                    if (!result.isEmpty()) { LOG.info("[def] return=lombok-fallback"); return result; }
+                    if (!result.isEmpty()) { LOG.fine("[def] return=lombok-fallback"); return result; }
                 }
-                LOG.info("[def] branch=decompile-fallback");
+                LOG.fine("[def] branch=decompile-fallback");
                 var decompiled = compiler.decompileClass(className);
                 if (decompiled.isPresent()) {
-                    LOG.info("[def] return=decompiled " + decompiled.get());
+                    LOG.fine("[def] return=decompiled " + decompiled.get());
                     var parse = compiler.parse(new SourceFileObject(decompiled.get()));
                     var tree = FindHelper.findType(parse, className);
                     var path = TreePath.getPath(parse.root(), tree);
                     return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
                 }
-                LOG.info("[def] return=empty");
+                LOG.fine("[def] return=empty");
                 return List.of();
             }
             if (otherFile.get().toUri().equals(file.toUri())) {
-                LOG.info("[def] branch=same-file");
+                LOG.fine("[def] branch=same-file");
                 var result = findDefinitions(task, element);
-                LOG.info("[def] return=findDefinitions-same-file size=" + result.size());
+                LOG.fine("[def] return=findDefinitions-same-file size=" + result.size());
                 return result;
             }
-            LOG.info("[def] branch=other-file " + otherFile.get());
+            LOG.fine("[def] branch=other-file " + otherFile.get());
             var parse = compiler.parse(otherFile.get());
             var tree = FindHelper.findType(parse, className);
             if (element instanceof ExecutableElement method) {
@@ -101,7 +101,7 @@ public class DefinitionProvider {
                 try {
                     var memberTree = FindHelper.findMethod(parse, className, method.getSimpleName().toString(), erased);
                     if (memberTree != null) {
-                        LOG.info("[def] return=method-in-other-file");
+                        LOG.fine("[def] return=method-in-other-file");
                         var path = TreePath.getPath(parse.root(), memberTree);
                         return List.of(FindHelper.location(parse, path, method.getSimpleName()));
                     }
@@ -116,14 +116,14 @@ public class DefinitionProvider {
                         if (fieldName.isPresent()) {
                             try {
                                 var fieldTree = FindHelper.findField(parse, className, fieldName.get());
-                                LOG.info("[def] return=field-in-other-file (via bytecode+accessor)");
+                                LOG.fine("[def] return=field-in-other-file (via bytecode+accessor)");
                                 var path = TreePath.getPath(parse.root(), fieldTree);
                                 return List.of(FindHelper.location(parse, path, fieldName.get()));
                             } catch (RuntimeException e) {
                                 // field not in source, fall through to class
                             }
                         }
-                        LOG.info("[def] return=class-in-other-file (via .class bytecode for " + methodName + ")");
+                        LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + methodName + ")");
                         var path = TreePath.getPath(parse.root(), tree);
                         return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
                     }
@@ -133,23 +133,23 @@ public class DefinitionProvider {
                 var memberName = element.getSimpleName().toString();
                 try {
                     var memberTree = FindHelper.findField(parse, className, memberName);
-                    LOG.info("[def] return=field-in-other-file");
+                    LOG.fine("[def] return=field-in-other-file");
                     var path = TreePath.getPath(parse.root(), memberTree);
                     return List.of(FindHelper.location(parse, path, memberName));
                 } catch (RuntimeException notInSource) {
                     var classFile = compiler.findClassFile(className);
                     if (classFile.isPresent() && classHasMethod(classFile.get(), memberName)) {
-                        LOG.info("[def] return=class-in-other-file (via .class bytecode for " + memberName + ")");
+                        LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + memberName + ")");
                         var path = TreePath.getPath(parse.root(), tree);
                         return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
                     }
                 }
             }
-            LOG.info("[def] return=class-in-other-file");
+            LOG.fine("[def] return=class-in-other-file");
             var path = TreePath.getPath(parse.root(), tree);
             return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
         } finally {
-            LOG.info("[def] goto-definition " + file.getFileName() + ":" + line + ":" + column + " completed in " + (System.currentTimeMillis() - start) + "ms");
+            LOG.fine("[def] goto-definition " + file.getFileName() + ":" + line + ":" + column + " completed in " + (System.currentTimeMillis() - start) + "ms");
         }
     }
 
@@ -356,7 +356,7 @@ public class DefinitionProvider {
     private List<Location> findDefinitions(CompileTask task, Element element) {
         var trees = task.trees;
         var path = trees.getPath(element);
-        LOG.info("[def] findDefinitions kind=" + element.getKind() + " name=" + element.getSimpleName() + " getPath=" + (path != null ? "found" : "null"));
+        LOG.fine("[def] findDefinitions kind=" + element.getKind() + " name=" + element.getSimpleName() + " getPath=" + (path != null ? "found" : "null"));
         if (path == null) {
             if (compiler.lombokPresentOnClasspath()) {
                 var rawClassName = className(element);
