@@ -32,7 +32,7 @@ public final class MavenTooling {
     static final Path NOT_FOUND = Paths.get("");
 
     private static final Pattern DEPENDENCY =
-            Pattern.compile("^\\[INFO\\]\\s+(.*:.*:.*:.*:.*):(/.*?)( -- module .*)?$");
+            Pattern.compile("^\\[INFO\\]\\s+(.*:.*:.*:.*:.*):(/.*?)( \\(optional\\))?( -- module .*)?$");
 
     private static final String DEPENDENCY_LIST = "dependency:list";
     private static final String DEPENDENCY_SOURCES = "dependency:sources";
