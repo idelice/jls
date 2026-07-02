@@ -100,7 +100,7 @@ public class ReferenceProvider {
         var element = NavigationHelper.findElement(task, file, line, column);
         var paths = new ArrayList<TreePath>();
         for (var root : task.roots) {
-                new FindReferences(task.trees, element).scan(root, paths);
+                new FindReferences(task, element).scan(root, paths);
         }
         var locations = new ArrayList<Location>();
         for (var p : paths) {

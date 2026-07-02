@@ -286,6 +286,13 @@ public class DefinitionProvider {
 
     private List<Location> navigateToRecordComponent(CompileTask task, Element element) {
         var enclosing = element.getEnclosingElement();
+        // For PARAMETER elements in compact constructors, walk up one more level
+        if (element.getKind() == ElementKind.PARAMETER
+                && enclosing instanceof ExecutableElement
+                && enclosing.getEnclosingElement() instanceof TypeElement recordType
+                && recordType.getKind() == ElementKind.RECORD) {
+            enclosing = recordType;
+        }
         if (!(enclosing instanceof TypeElement type) || type.getKind() != ElementKind.RECORD) {
             return List.of();
         }
