@@ -203,9 +203,7 @@ class JavaLanguageServer extends LanguageServer {
         var currentSnapshot = completionSnapshotRef.get();
         // Use the module-scoped compiler when available — scanning 107k classes from
         // the union classpath is too slow. The active module's ~15k classes is sufficient.
-        var activeFile = FileStore.activeDocuments().stream().findFirst().orElse(null);
-        var c = getOrCreateCompiler();
-        var externalIndex = new ExternalBinaryTypeIndex(c);
+        var externalIndex = new ExternalBinaryTypeIndex(getOrCreateCompiler());
         publishCompletionSnapshot(
                 currentSnapshot.workspaceIndex(),
                 externalIndex,
@@ -723,7 +721,6 @@ class JavaLanguageServer extends LanguageServer {
         var inferForGraph = infer != null ? infer : new InferConfig(workspaceRoot, externalDependencies());
         moduleGraph = inferForGraph.moduleGraph();
         if (moduleGraph != ModuleGraph.EMPTY) {
-            var buildRoot = inferForGraph.buildRoot();
             var isGradleProject = inferForGraph.buildSystem() == InferConfig.BuildSystem.GRADLE;
             LOG.info(String.format("[module-graph] loaded %d modules (build_system=%s)",
                     moduleGraph.modules().size(), isGradleProject ? "gradle" : "maven"));
@@ -1288,8 +1285,6 @@ class JavaLanguageServer extends LanguageServer {
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         ensureTypeIndexReady("referencesBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
-        var snapshot = completionSnapshotRef.get();
-        var includeDeclaration = position.context != null && position.context.includeDeclaration;
         var found =
                 new ReferenceProvider(
                                 getOrCreateCompiler(), file, line, column)
@@ -1875,18 +1870,6 @@ class JavaLanguageServer extends LanguageServer {
                                 () -> runRefresh(filesBatch, revision, trigger, mode),
                                 delayMs,
                                 TimeUnit.MILLISECONDS);
-                if (delayMs == 0
-                        || "didSave".equals(trigger)
-                        || mode == CompletionIndexRefreshMode.FULL_REBUILD
-                        || filesBatch.size() > 1) {
-                    LOG.fine(String.format(
-                            "[perf] completion_index_debounce trigger=%s files=%d mode=%s delay=%dms revision=%d",
-                            trigger,
-                            filesBatch.size(),
-                            mode.name().toLowerCase(),
-                            delayMs,
-                            revision));
-                }
             }
         }
 
