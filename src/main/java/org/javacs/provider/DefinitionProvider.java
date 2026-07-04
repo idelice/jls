@@ -1,6 +1,8 @@
 package org.javacs.provider;
 import com.sun.source.util.TreePath;
-import com.sun.source.util.Trees;
+import java.io.IOException;
+import java.lang.classfile.ClassFile;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -390,14 +392,14 @@ public class DefinitionProvider {
         return List.of(FindHelper.location(task, path, name));
     }
 
-    private static boolean classHasMethod(java.nio.file.Path classFile, String methodName) {
+    private static boolean classHasMethod(Path classFile, String methodName) {
         try {
-            var bytes = java.nio.file.Files.readAllBytes(classFile);
-            var model = java.lang.classfile.ClassFile.of().parse(bytes);
+            var bytes = Files.readAllBytes(classFile);
+            var model = ClassFile.of().parse(bytes);
             for (var m : model.methods()) {
                 if (m.methodName().equalsString(methodName)) return true;
             }
-        } catch (java.io.IOException e) {
+        } catch (IOException e) {
         }
         return false;
     }

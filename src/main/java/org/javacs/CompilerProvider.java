@@ -2,6 +2,7 @@ package org.javacs;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -42,7 +43,7 @@ public interface CompilerProvider {
     }
 
     default List<ParseTask> parseAll(Collection<Path> files) {
-        var result = new java.util.ArrayList<ParseTask>(files.size());
+        var result = new ArrayList<ParseTask>(files.size());
         for (var file : files) {
             result.add(parse(file));
         }
