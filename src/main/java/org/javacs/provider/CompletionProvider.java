@@ -1407,24 +1407,6 @@ public class CompletionProvider {
                 uniques.add(item.detail);
             }
         }
-        for (var className : compiler.packagePrivateTopLevelTypes(packageName)) {
-            if (!StringSearch.matchesPartialName(className, partial)) continue;
-            if (!uniques.add(className)) {
-                continue;
-            }
-            var item = classItem(className);
-            applyClassSortPriority(root, className, item);
-            if (hasImportConflict(root, className)) {
-                item.insertText = className;
-                item.insertTextFormat = InsertTextFormat.PlainText;
-            } else {
-                var edits = autoImportEdits(className, root, sourcePositions);
-                if (!edits.isEmpty()) {
-                    item.additionalTextEdits = edits;
-                }
-            }
-            list.items.add(item);
-        }
         for (var className : compiler.publicTopLevelTypes()) {
             if (!StringSearch.matchesPartialName(TypeNames.simpleName(className), partial)) continue;
             if (!uniques.add(className)) {
