@@ -376,6 +376,10 @@ public class InferConfigTest {
                 "[INFO]    org.openjdk.jmh:jmh-generator-annprocess:jar:1.21:provided:/Users/georgefraser/.m2/repository/org/openjdk/jmh/jmh-generator-annprocess/1.21/jmh-generator-annprocess-1.21.jar -- module jmh.generator.annprocess (auto)",
                 "/Users/georgefraser/.m2/repository/org/openjdk/jmh/jmh-generator-annprocess/1.21/jmh-generator-annprocess-1.21.jar",
             },
+            {
+                "[INFO]    org.openjdk.jmh:jmh-generator-annprocess:jar:1.21:provided:C:\\Users\\georgefraser\\.m2\\repository\\org\\openjdk\\jmh\\jmh-generator-annprocess\\1.21\\jmh-generator-annprocess-1.21.jar -- module jmh.generator.annprocess (auto)",
+                "C:\\Users\\georgefraser\\.m2\\repository\\org\\openjdk\\jmh\\jmh-generator-annprocess\\1.21\\jmh-generator-annprocess-1.21.jar",
+            },
         };
         for (var pair : testCases) {
             assert pair.length == 2;
