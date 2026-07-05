@@ -309,7 +309,7 @@ class JavaCompilerService implements CompilerProvider {
                     try {
                         task.analyze();
                         task.generate();
-                    } catch (java.io.IOException e) {
+                    } catch (IOException e) {
                         LOG.warning("[build] fullCompileWithAP failed: " + e.getMessage());
                     }
                     return null;
@@ -337,7 +337,7 @@ class JavaCompilerService implements CompilerProvider {
                     try {
                         task.analyze();
                         task.generate();
-                    } catch (java.io.IOException e) {
+                    } catch (IOException e) {
                         LOG.warning(String.format("[build] refreshBuildOutput failed for %s: %s",
                                 file.getFileName(), e.getMessage()));
                     }
@@ -508,11 +508,30 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     @Override
-    public Optional<Path> findClassFile(String qualifiedName) {
+    public Optional<byte[]> findClassFile(String qualifiedName) {
         var relative = qualifiedName.replace('.', '/') + ".class";
         for (var root : classPath) {
-            var classFile = root.resolve(relative);
-            if (Files.exists(classFile)) return Optional.of(classFile);
+            if (Files.isDirectory(root)) {
+                var classFile = root.resolve(relative);
+                if (Files.exists(classFile)) {
+                    try {
+                        return Optional.of(Files.readAllBytes(classFile));
+                    } catch (IOException e) {
+                        LOG.fine("[classfile] failed to read " + classFile + ": " + e.getMessage());
+                    }
+                }
+            } else if (root.toString().endsWith(".jar") && Files.exists(root)) {
+                try (var jar = new java.util.jar.JarFile(root.toFile())) {
+                    var entry = jar.getEntry(relative);
+                    if (entry != null) {
+                        try (var in = jar.getInputStream(entry)) {
+                            return Optional.of(in.readAllBytes());
+                        }
+                    }
+                } catch (IOException e) {
+                    LOG.fine("[classfile] failed to read " + relative + " from " + root.getFileName() + ": " + e.getMessage());
+                }
+            }
         }
         return Optional.empty();
     }

@@ -249,4 +249,5 @@ public class CompileBatch implements AutoCloseable {
                 && d.getStartPosition() >= 0
                 && d.getEndPosition() >= 0;
     }
+
 }

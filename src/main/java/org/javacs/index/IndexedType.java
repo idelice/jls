@@ -22,7 +22,6 @@ public final class IndexedType {
     public final String qualifiedName;
     public final String simpleName;
     public final List<IndexedMember> members;
-    public final boolean fromCompiledRoot;
     public final Path sourcePath;
     public final URI sourceUri;
     public final String superclass;
@@ -40,7 +39,6 @@ public final class IndexedType {
             String qualifiedName,
             String simpleName,
             List<IndexedMember> members,
-            boolean fromCompiledRoot,
             Path sourcePath,
             String superclass,
             List<String> interfaces,
@@ -49,7 +47,6 @@ public final class IndexedType {
                 qualifiedName,
                 simpleName,
                 members,
-                fromCompiledRoot,
                 sourcePath,
                 sourcePath == null ? null : sourcePath.toUri(),
                 superclass,
@@ -65,7 +62,6 @@ public final class IndexedType {
             String qualifiedName,
             String simpleName,
             List<IndexedMember> members,
-            boolean fromCompiledRoot,
             Path sourcePath,
             URI sourceUri,
             String superclass,
@@ -78,7 +74,6 @@ public final class IndexedType {
         this.qualifiedName = qualifiedName;
         this.simpleName = simpleName;
         this.members = Collections.unmodifiableList(new ArrayList<>(members));
-        this.fromCompiledRoot = fromCompiledRoot;
         this.sourcePath = sourcePath;
         this.sourceUri = sourceUri;
         this.superclass = superclass;

@@ -58,7 +58,7 @@ public interface CompilerProvider {
         return Optional.empty();
     }
 
-    default Optional<Path> findClassFile(String qualifiedName) {
+    default Optional<byte[]> findClassFile(String qualifiedName) {
         return Optional.empty();
     }
 
