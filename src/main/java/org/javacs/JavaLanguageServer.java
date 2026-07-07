@@ -735,6 +735,19 @@ class JavaLanguageServer extends LanguageServer {
                     warnUserOnce("maven_missing_build_output",
                             String.format("%d of %d modules lack target/classes. Run your project build for full cross-module resolution.", missing, total));
                 }
+                // Scope workspace to active module + transitive dependency source dirs.
+                var activeModule = moduleGraph.moduleForFile(workspaceRoot);
+                if (activeModule.isPresent()) {
+                    var scopedRoots = new LinkedHashSet<Path>();
+                    for (var dir : moduleGraph.transitiveSourceDirs(activeModule.get().projectPath())) {
+                        if (Files.exists(dir)) scopedRoots.add(dir);
+                    }
+                    if (!scopedRoots.isEmpty()) {
+                        FileStore.setWorkspaceRoots(scopedRoots);
+                        LOG.info(String.format("[multi-module] maven scoped workspace to %d source dirs for %s (files=%d)",
+                                scopedRoots.size(), activeModule.get().projectPath(), FileStore.all().size()));
+                    }
+                }
             }
             // Compile transitive inter-module deps — only supported for Gradle via Tooling API.
             // Maven projects compile via `mvn compile` which the user runs manually.
@@ -1838,11 +1851,31 @@ class JavaLanguageServer extends LanguageServer {
          */
         private Collection<Path> scopedSourceFiles() {
             var all = FileStore.all();
+            // For multi-module projects, workspace roots include transitive deps for resolution.
+            // But indexing should only cover the active module to stay fast.
+            if (moduleGraph != ModuleGraph.EMPTY) {
+                var activeModule = moduleGraph.moduleForFile(workspaceRoot);
+                if (activeModule.isPresent()) {
+                    var activeSourceDirs = activeModule.get().sourceDirs();
+                    var scoped = all.stream()
+                            .filter(f -> activeSourceDirs.stream().anyMatch(f::startsWith))
+                            .toList();
+                    LOG.info(String.format("[perf] index_scope active_module=%s active_files=%d workspace_files=%d",
+                            activeModule.get().projectPath(), scoped.size(), all.size()));
+                    if (scoped.size() > LARGE_WORKSPACE_THRESHOLD) {
+                        var active = filterJavaFiles(FileStore.activeDocuments());
+                        return active.isEmpty() ? List.of() : active;
+                    }
+                    return scoped;
+                }
+            }
             if (all.size() > LARGE_WORKSPACE_THRESHOLD) {
-                // For large modules, only index active documents to avoid OOM.
+                LOG.info(String.format("[perf] index_scope workspace_files=%d exceeds_threshold=%d — indexing active docs only",
+                        all.size(), LARGE_WORKSPACE_THRESHOLD));
                 var active = filterJavaFiles(FileStore.activeDocuments());
                 return active.isEmpty() ? List.of() : active;
             }
+            LOG.info(String.format("[perf] index_scope workspace_files=%d", all.size()));
             return all;
         }
 
@@ -1903,7 +1936,10 @@ class JavaLanguageServer extends LanguageServer {
                         // Parse-only path: ~15x faster than compilation for large workspaces.
                         reportWorkDoneProgress(bootstrapProgressToken,
                                 "Parsing " + files.size() + " files");
+                        var parseStarted = Instant.now();
                         var parseTasks = compiler.parseAll(files);
+                        var parseTook = Duration.between(parseStarted, Instant.now()).toMillis();
+                        LOG.info(String.format("[perf] index_parse files=%d took=%dms", files.size(), parseTook));
                         if (revision != completionIndexRevision.get()) {
                             LOG.fine(String.format(
                                     "[perf] completion_index_refresh_skip trigger=%s phase=post_parse expected=%d current=%d",
@@ -1913,6 +1949,9 @@ class JavaLanguageServer extends LanguageServer {
                         }
                         indexStarted = Instant.now();
                         nextIndex = WorkspaceTypeIndex.fromParseTrees(parseTasks);
+                        LOG.info(String.format("[perf] index_build files=%d types=%d took=%dms",
+                                files.size(), nextIndex.size(),
+                                Duration.between(indexStarted, Instant.now()).toMillis()));
                     } else {
                         // WORKSPACE_DECLARATION_MERGE / ACTIVE_DOCUMENT_BOOTSTRAP:
                         // Use parse-only for index updates — compile (ATTR) hangs on large
