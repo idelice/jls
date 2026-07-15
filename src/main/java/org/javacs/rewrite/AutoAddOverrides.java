@@ -1,7 +1,6 @@
 package org.javacs.rewrite;
 
 import com.sun.source.util.TreePath;
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -21,9 +20,9 @@ public class AutoAddOverrides implements Rewrite {
 
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var missing = new ArrayList<TreePath>();
-            new FindMissingOverride(task.task).scan(task.root(), missing);
+            new FindMissingOverride(task.trees, task.elements, task.types).scan(task.root(), missing);
             var list = addOverrides(task, missing);
             return Map.of(file, list.toArray(new TextEdit[list.size()]));
         }
@@ -31,7 +30,7 @@ public class AutoAddOverrides implements Rewrite {
 
     private List<TextEdit> addOverrides(CompileTask task, List<TreePath> missing) {
         var edits = new ArrayList<TextEdit>();
-        var pos = Trees.instance(task.task).getSourcePositions();
+        var pos = task.trees.getSourcePositions();
         for (var t : missing) {
             var lines = t.getCompilationUnit().getLineMap();
             var methodStart = pos.getStartPosition(t.getCompilationUnit(), t.getLeaf());

@@ -34,7 +34,7 @@ class RenameHelper {
     }
 
     TextEdit[] renameVariable(CompilationUnitTree root, TreePath rename, String newName) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var target = trees.getElement(rename);
         var found = findVariableReferences(root, target);
         return replaceAll(found, newName);
@@ -72,7 +72,7 @@ class RenameHelper {
     }
 
     private List<TreePath> findVariableReferences(CompilationUnitTree root, Element target) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var found = new ArrayList<TreePath>();
         Consumer<TreePath> forEach =
                 path -> {
@@ -98,7 +98,7 @@ class RenameHelper {
     }
 
     private boolean isFieldReference(TreePath path, String className, String fieldName) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var candidate = trees.getElement(path);
         if (!(candidate instanceof VariableElement)) return false;
         var variable = (VariableElement) candidate;
@@ -110,7 +110,7 @@ class RenameHelper {
     }
 
     private List<TreePath> findMethodReferences(CompilationUnitTree root, ExecutableElement find) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var found = new ArrayList<TreePath>();
         Consumer<TreePath> forEach =
                 path -> {
@@ -124,7 +124,7 @@ class RenameHelper {
     }
 
     private TextEdit[] replaceAll(List<TreePath> found, String newName) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var pos = trees.getSourcePositions();
         var edits = new TextEdit[found.size()];
         var i = 0;

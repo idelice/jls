@@ -32,10 +32,10 @@ public class GenerateRecordConstructor implements Rewrite {
         LOG.info("Generate default constructor for " + className + "...");
         // TODO this needs to fall back on looking for inner classes and package-private classes
         var file = compiler.findTypeDeclaration(className);
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var root = task.root(file);
-            var typeElement = task.task.getElements().getTypeElement(className);
-            var typeTree = Trees.instance(task.task).getTree(typeElement);
+            var typeElement = task.elements.getTypeElement(className);
+            var typeTree = task.trees.getTree(typeElement);
             var fields = fieldsNeedingInitialization(typeTree);
             var parameters = generateParameters(task, root, fields);
             var initializers = generateInitializers(task, fields);
@@ -93,7 +93,7 @@ public class GenerateRecordConstructor implements Rewrite {
     private CharSequence extract(CompileTask task, CompilationUnitTree root, Tree typeTree) {
         try {
             var contents = root.getSourceFile().getCharContent(true);
-            var pos = Trees.instance(task.task).getSourcePositions();
+            var pos = task.trees.getSourcePositions();
             var start = (int) pos.getStartPosition(root, typeTree);
             var end = (int) pos.getEndPosition(root, typeTree);
             return contents.subSequence(start, end);

@@ -67,4580 +67,4580 @@ import org.junit.Test;
 
 public class JavaLanguageServerTest {
 
-    @Test
-    public void LintShouldNotCrashOnCodeWithMissingTypeIdentifier() {
-        String filePath = "src/test/examples/missing-type-identifier/Sample.java";
-        TextDocumentItem textDocument = new TextDocumentItem();
-        textDocument.uri = URI.create("file:///" + filePath);
-        try {
-            textDocument.text = Files.readString(Path.of(filePath));
-        } catch (IOException e) {
-            System.out.println(e.toString());
-        }
-        textDocument.version = 1;
-        textDocument.languageId = "java";
-        JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
-        server.didOpenTextDocument(new DidOpenTextDocumentParams(textDocument));
-
-        // Should not fail
-        server.lint(Collections.singleton(Paths.get(textDocument.uri)));
-    }
-
-    @Test
-    public void lintDoesNotRefreshCompletionIndex() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var hello = FindResource.path("org/javacs/example/HelloWorld.java");
-        var before = completionIndexVersion(server);
-        server.lint(List.of(hello));
-        var after = completionIndexVersion(server);
-        Assert.assertEquals("diagnostics lint should not rebuild completion index", before, after);
-    }
-
-    @Test
-    public void didSaveRefreshesCompletionIndexWithoutDiagnosticsCoupling() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var initial = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = initial;
-        server.didOpenTextDocument(open);
-
-        var before = completionIndexVersion(server);
-        var save = new DidSaveTextDocumentParams();
-        save.textDocument = new TextDocumentIdentifier(file.toUri());
-        server.didSaveTextDocument(save);
-        var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
-        Assert.assertTrue("didSave should trigger completion index refresh", updated);
-    }
-
-    @Test
-    public void didChangeRefreshesCompletionIndexIncrementallyForLombokModel() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var model = FindResource.path("org/javacs/example/LombokCrossTypeModel.java");
-        var original = FileStore.contents(model);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = model.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = original;
-        server.didOpenTextDocument(open);
-        Assert.assertTrue(
-                "expected completion index to initialize before didChange check",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var before = completionIndexVersion(server);
-        var change = new DidChangeTextDocumentParams();
-        change.textDocument.uri = model.toUri();
-        change.textDocument.version = 2;
-        var delta = new TextDocumentContentChangeEvent();
-        delta.text = original.replace("private String name;", "private String title;");
-        change.contentChanges.add(delta);
-        server.didChangeTextDocument(change);
-
-        Assert.assertTrue(
-                "didChange should refresh completion index for Lombok model updates",
-                awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-    }
-
-    @Test
-    public void completionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/LombokCrossTypeCompletion.java");
-
-            Assert.assertEquals("expected empty completion index before bootstrap", 0L, completionIndexVersion(server));
-
-            var position =
-                    new TextDocumentPositionParams(
-                            new TextDocumentIdentifier(file.toUri()), new Position(5, 14));
-            Optional<CompletionList> initialCompletion = server.completion(position);
-
-            Assert.assertTrue("expected completion result while bootstrap is pending", initialCompletion.isPresent());
-            Assert.assertTrue(
-                    "completion should schedule async workspace bootstrap when the index is empty",
-                    capture.countContaining("completion_index_debounce trigger=completionBootstrap") > 0);
-            Assert.assertEquals(
-                    "completion should not do synchronous index rebuilds on cold start",
-                    0,
-                    capture.countContaining("completion_index_refresh_sync trigger=completionBootstrap"));
-            Assert.assertEquals(
-                    "completion should not perform a full workspace compile directly",
-                    0,
-                    capture.countContaining("compile request=completion mode=full"));
-
-            Assert.assertTrue(
-                    "completion bootstrap should initialize the completion index asynchronously",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "completion bootstrap should log workspace bootstrap start",
-                    capture.countContaining("completion_index_debounce trigger=completionBootstrap") > 0);
-            Assert.assertTrue(
-                    "completion bootstrap should log workspace index install",
-                    capture.countContaining("index installed trigger=completionBootstrap") > 0);
-
-            Optional<CompletionList> completion = server.completion(position);
-            Assert.assertTrue("expected completion result after bootstrap", completion.isPresent());
-            var labels =
-                    completion.get().items.stream()
-                            .map(item -> item.label)
-                            .collect(java.util.stream.Collectors.toSet());
-            Assert.assertTrue("expected getter completion after bootstrap", labels.contains("getName"));
-            Assert.assertTrue("expected setter completion after bootstrap", labels.contains("setName"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void definitionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/LombokFieldReferences.java");
-
-        Assert.assertEquals("expected empty completion index before definition bootstrap", 0L, completionIndexVersion(server));
-
-        var result =
-                server.gotoDefinition(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()),
-                                new Position(9, 12)));
-
-        Assert.assertTrue("expected definition result after bootstrap", result.isPresent());
-        Assert.assertTrue("expected definition bootstrap to initialize completion index", completionIndexVersion(server) > 0);
-    }
-
-    @Test
-    public void referencesBootstrapInitialCompletionIndexWhenStillEmpty() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/GotoImplementation.java");
-
-        Assert.assertEquals("expected empty completion index before references bootstrap", 0L, completionIndexVersion(server));
-
-        var params = new ReferenceParams();
-        params.textDocument = new TextDocumentIdentifier(file.toUri());
-        params.position = new Position(8, 20);
-        var result = server.findReferences(params);
-
-        Assert.assertTrue("expected references result after bootstrap", result.isPresent());
-        Assert.assertTrue("expected references bootstrap to initialize completion index", completionIndexVersion(server) > 0);
-    }
-
-    @Test
-    public void didOpenBootstrapPreservesLombokAccessorBackingFieldMetadata() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        configureLombokClasspath(server);
-        var file = FindResource.path("org/javacs/example/LombokFieldReferences.java");
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = Files.readString(file);
-        server.didOpenTextDocument(open);
-
-        Assert.assertTrue(
-                "expected completion index bootstrap before Lombok accessor metadata check",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var member =
-                workspaceIndex(server)
-                        .member("org.javacs.example.LombokFieldReferences", "getBar", false, new String[0]);
-        Assert.assertTrue("expected indexed Lombok accessor after didOpen bootstrap", member.isPresent());
-        Assert.assertEquals("bar", member.get().backingFieldName);
-    }
-
-    @Test
-    public void didOpenBootstrapPublishesSourceSnapshotsAndDeclarationRanges() throws Exception {
-        FileStore.reset();
-        var workspace = Files.createTempDirectory("jls-index-source-snapshot");
-        try {
-            var pkg = workspace.resolve("src/com/example");
-            Files.createDirectories(pkg);
-            var file = pkg.resolve("SnapshotExample.java");
-            Files.writeString(
-                    file,
-                    "package com.example;\n"
-                            + "import java.util.List;\n"
-                            + "import static java.util.Collections.emptyList;\n"
-                            + "class SnapshotExample {\n"
-                            + "  static class Nested {\n"
-                            + "    static final String VALUE = \"x\";\n"
-                            + "    List<String> values() { return emptyList(); }\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
-            openJavaFile(server, file);
-
-            Assert.assertTrue(
-                    "expected completion index bootstrap before snapshot assertion",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            var index = workspaceIndex(server);
-            var source = index.sourceFile(file);
-            Assert.assertTrue("expected indexed source snapshot", source.isPresent());
-            Assert.assertEquals(List.of("java.util.List"), source.get().imports);
-            Assert.assertEquals(List.of("java.util.Collections.emptyList"), source.get().staticImports);
-            Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample"));
-            Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample.Nested"));
-
-            var nestedType = index.typeInfo("com.example.SnapshotExample.Nested");
-            Assert.assertTrue("expected nested type in workspace snapshot", nestedType.isPresent());
-
-            var field = index.member("com.example.SnapshotExample.Nested", "VALUE", true);
-            Assert.assertTrue("expected nested field in workspace snapshot", field.isPresent());
-
-            var method = index.member("com.example.SnapshotExample.Nested", "values", false, new String[0]);
-            Assert.assertTrue("expected nested method in workspace snapshot", method.isPresent());
-            Assert.assertEquals("List<String>", method.get().declaredReturnType);
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didOpenSchedulesWorkspaceCompletionBootstrapInsteadOfSharedDiagnosticsIndex() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-
-            Assert.assertEquals("expected empty completion index before didOpen", 0L, completionIndexVersion(server));
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "didOpen should initialize the completion index from workspace bootstrap",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertTrue(
-                    "didOpen should log workspace bootstrap start",
-                    capture.countContaining("completion_index_debounce trigger=didOpen") > 0);
-            Assert.assertTrue(
-                    "didOpen should log workspace index install",
-                    capture.countContaining("index installed trigger=didOpen") > 0);
-            Assert.assertEquals(
-                    "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
-                    0,
-                    capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
-            Assert.assertEquals(
-                    "full bootstrap should not immediately schedule a redundant activeDeclarations refresh",
-                    0,
-                    capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void didOpenSynchronouslyBootstrapsWorkspaceDiagnosticsAndIndex() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-
-            Assert.assertEquals("expected empty completion index before didOpen bootstrap", 0L, completionIndexVersion(server));
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = FileStore.contents(file);
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "didOpen should install the workspace index asynchronously",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "didOpen bootstrap should not schedule a separate completion bootstrap",
-                    0,
-                    capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap"));
-            Assert.assertTrue(
-                    "didOpen bootstrap should log workspace bootstrap start",
-                    capture.countContaining("completion_index_debounce trigger=didOpen") > 0);
-            Assert.assertTrue(
-                    "didOpen bootstrap should log workspace index installation",
-                    capture.countContaining("index installed trigger=didOpen") > 0);
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void configurationChangeKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var beforeVersion = completionIndexVersion(server);
-        var initialExternal = externalBinaryIndex(server);
-
-        Assert.assertNotSame("compiler initialization should create a non-empty external index", ExternalBinaryTypeIndex.EMPTY, initialExternal);
-
-        var settings = new JsonObject();
-        var java = new JsonObject();
-        var extraCompilerArgs = new com.google.gson.JsonArray();
-        extraCompilerArgs.add("-Xlint:deprecation");
-        java.add("extraCompilerArgs", extraCompilerArgs);
-        settings.add("java", java);
-        var change = new DidChangeConfigurationParams();
-        change.settings = settings;
-        server.didChangeConfiguration(change);
-
-        var refreshedExternal = externalBinaryIndex(server);
-        Assert.assertNotSame("compiler recreation should refresh the external binary index", initialExternal, refreshedExternal);
-        Assert.assertNotSame("refreshed external index should remain usable", ExternalBinaryTypeIndex.EMPTY, refreshedExternal);
-        Assert.assertEquals(
-                "compiler recreation without opened files should not reset workspace index version",
-                beforeVersion,
-                completionIndexVersion(server));
-    }
-
-    @Test
-    public void didOpenBootstrapIndexIncludesReferencedTypesForMemberCompletion() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var fieldFile = FindResource.path("org/javacs/example/CompletionBootstrapFieldMembers.java");
-        var fieldText = FileStore.contents(fieldFile);
-
-        var openField = new DidOpenTextDocumentParams();
-        openField.textDocument.uri = fieldFile.toUri();
-        openField.textDocument.version = 1;
-        openField.textDocument.languageId = "java";
-        openField.textDocument.text = fieldText;
-        server.didOpenTextDocument(openField);
-
-        Assert.assertTrue(
-                "didOpen should initialize the completion index",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var fieldCompletion =
-                server.completion(
-                                new TextDocumentPositionParams(
-                                        new TextDocumentIdentifier(fieldFile.toUri()),
-                                        new Position(6, 19)))
-                        .orElseThrow();
-        var fieldLabels =
-                fieldCompletion.items.stream()
-                        .map(item -> item.label)
-                        .collect(java.util.stream.Collectors.toSet());
-        Assert.assertTrue("field receiver should resolve referenced type members", fieldLabels.contains("value"));
-
-        FileStore.reset();
-        server = LanguageServerFixture.getJavaLanguageServer();
-        var localFile = FindResource.path("org/javacs/example/CompletionBootstrapLocalMembers.java");
-        var localText = FileStore.contents(localFile);
-
-        var openLocal = new DidOpenTextDocumentParams();
-        openLocal.textDocument.uri = localFile.toUri();
-        openLocal.textDocument.version = 1;
-        openLocal.textDocument.languageId = "java";
-        openLocal.textDocument.text = localText;
-        server.didOpenTextDocument(openLocal);
-
-        Assert.assertTrue(
-                "didOpen should initialize the completion index for local receiver test",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var localCompletion =
-                server.completion(
-                                new TextDocumentPositionParams(
-                                        new TextDocumentIdentifier(localFile.toUri()),
-                                        new Position(5, 10)))
-                        .orElseThrow();
-        var localLabels =
-                localCompletion.items.stream()
-                        .map(item -> item.label)
-                        .collect(java.util.stream.Collectors.toSet());
-        Assert.assertTrue("local receiver should resolve referenced type members", localLabels.contains("value"));
-    }
-
-    @Test
-    public void didOpenWorkspaceBootstrapIncludesSplitInheritedDotCompletion() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/SplitInheritedFooDot.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        Assert.assertTrue(
-                "didOpen should initialize the completion index",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        CompileBatch.resetPerfCounters();
-        var completion =
-                server.completion(
-                                new TextDocumentPositionParams(
-                                        new TextDocumentIdentifier(file.toUri()),
-                                        new Position(4, 25)))
-                        .orElseThrow();
-        var labels =
-                completion.items.stream()
-                        .map(item -> item.label)
-                        .collect(java.util.stream.Collectors.toSet());
-        Assert.assertTrue(
-                "split-file inherited dot completion should work without opening the superclass first",
-                labels.contains("perform"));
-        Assert.assertEquals(
-                "completion should not use full compile after workspace bootstrap",
-                0L,
-                CompileBatch.perfCounters().fullBatches);
-        Assert.assertEquals(
-                "completion should not analyze after workspace bootstrap",
-                0L,
-                CompileBatch.perfCounters().analyzeInvocations);
-        Assert.assertEquals(
-                "completion should not run annotation processing after workspace bootstrap",
-                0L,
-                CompileBatch.perfCounters().apEnabledBatches);
-    }
-
-    @Test
-    public void didChangedDoesNotPushDiagnostics() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        var change = new DidChangeTextDocumentParams();
-        change.textDocument.uri = file.toUri();
-        change.textDocument.version = 2;
-        var delta = new TextDocumentContentChangeEvent();
-        delta.text = text + "\n// clear-stale";
-        change.contentChanges.add(delta);
-        server.didChangeTextDocument(change);
-
-        // Pull diagnostics should reflect the updated content
-        var report = pullDiagnostics(server, file.toUri());
-        Assert.assertNotNull("pull diagnostics should return a report", report);
-    }
-
-    @Test
-    public void didSaveRefreshesIndexAndDiagnosticsArePullable() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/HelloWorld.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        Thread.sleep(900);
-
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var before = completionIndexVersion(server);
-
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = file.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = text + "\n// force-save-compile";
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            Thread.sleep(80);
-            var save = new DidSaveTextDocumentParams();
-            save.textDocument = new TextDocumentIdentifier(file.toUri());
-            server.didSaveTextDocument(save);
-            var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
-            Assert.assertTrue("didSave should refresh completion index", updated);
-
-            Assert.assertTrue(
-                    "didSave should schedule a dedicated completion-index refresh",
-                    capture.countContaining("[perf] completion_index_debounce trigger=didSave") > 0);
-
-            var report = pullDiagnostics(server, file.toUri());
-            Assert.assertNotNull("pull diagnostics should return a report after save", report);
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void lombokAnnotationTypeDetectionHandlesQualifiedAndSimpleNames() {
-        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("lombok.Data"));
-        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("lombok.experimental.SuperBuilder"));
-        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("Data"));
-        Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("Getter"));
-
-        Assert.assertFalse(LombokAnnotations.isLombokAnnotationType(null));
-        Assert.assertFalse(LombokAnnotations.isLombokAnnotationType(""));
-        Assert.assertFalse(LombokAnnotations.isLombokAnnotationType("org.example.Custom"));
-    }
-
-
-
-    @Test
-    public void lombokStructuralAnnotationDetectionExcludesSlf4j() {
-        Assert.assertTrue(LombokAnnotations.isStructuralLombokAnnotationType("lombok.Data"));
-        Assert.assertTrue(LombokAnnotations.isStructuralLombokAnnotationType("Getter"));
-        Assert.assertFalse(LombokAnnotations.isStructuralLombokAnnotationType("lombok.extern.slf4j.Slf4j"));
-        Assert.assertFalse(LombokAnnotations.isStructuralLombokAnnotationType("Slf4j"));
-    }
-
-    @Test
-    public void didChangeDoesNotPushDiagnosticsForOtherOpenFiles() throws Exception {
-        var workspace = Files.createTempDirectory("jls-diagnostics-open-batch");
-        try {
-            var pkg = workspace.resolve("src/p");
-            Files.createDirectories(pkg);
-            var serviceFile = pkg.resolve("ServiceTwo.java");
-            var otherFile = pkg.resolve("Other.java");
-            Files.writeString(
-                    serviceFile,
-                    "package p;\n"
-                            + "class ServiceTwo {\n"
-                            + "  void test() {}\n"
-                            + "}\n");
-            Files.writeString(
-                    otherFile,
-                    "package p;\n"
-                            + "class Other {\n"
-                            + "  void test(ServiceTwo service) {\n"
-                            + "    service.toString();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            var otherOpen = new DidOpenTextDocumentParams();
-            otherOpen.textDocument.uri = otherFile.toUri();
-            otherOpen.textDocument.version = 1;
-            otherOpen.textDocument.languageId = "java";
-            otherOpen.textDocument.text = Files.readString(otherFile);
-            server.didOpenTextDocument(otherOpen);
-
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = serviceFile.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = serviceOpen.textDocument.text + "\n// updated";
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            // Each file can be pulled independently after a change
-            var serviceReport = pullDiagnostics(server, serviceFile.toUri());
-            var otherReport = pullDiagnostics(server, otherFile.toUri());
-            Assert.assertNotNull("pull diagnostics should work for changed file", serviceReport);
-            Assert.assertNotNull("pull diagnostics should work for other open file", otherReport);
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didOpenConsumerIncludesUnsavedActiveEnumDependencyInDiagnosticsCompile() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enum-related-open");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var models = workspace.resolve("src/com/example/demo/models");
-            var service = workspace.resolve("src/com/example/demo/service");
-            Files.createDirectories(models);
-            Files.createDirectories(service);
-
-            var enumFile = models.resolve("MyEnum.java");
-            var serviceFile = service.resolve("ServiceTwo.java");
-            Files.writeString(
-                    enumFile,
-                    "package com.example.demo.models;\n"
-                            + "public enum MyEnum {\n"
-                            + "  FIRST;\n"
-                            + "}\n");
-            Files.writeString(
-                    serviceFile,
-                    "package com.example.demo.service;\n"
-                            + "import com.example.demo.models.MyEnum;\n"
-                            + "class ServiceTwo {\n"
-                            + "  String test() {\n"
-                            + "    return MyEnum.FIRST.getType();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-
-            var enumOpen = new DidOpenTextDocumentParams();
-            enumOpen.textDocument.uri = enumFile.toUri();
-            enumOpen.textDocument.version = 1;
-            enumOpen.textDocument.languageId = "java";
-            enumOpen.textDocument.text =
-                    "package com.example.demo.models;\n"
-                            + "public enum MyEnum {\n"
-                            + "  FIRST;\n"
-                            + "  public String getType() {\n"
-                            + "    return name();\n"
-                            + "  }\n"
-                            + "}\n";
-            server.didOpenTextDocument(enumOpen);
-
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            var report = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertFalse(
-                    "consumer diagnostics should include the active unsaved enum dependency on open",
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getType()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didOpenPublishesDiagnosticsOnlyForRequestedFileUri() throws Exception {
-        var workspace = Files.createTempDirectory("jls-diagnostics-requested-uri");
-        try {
-            var pkg = workspace.resolve("src/p");
-            Files.createDirectories(pkg);
-
-            var fooFile = pkg.resolve("Foo.java");
-            var serviceFile = pkg.resolve("Service.java");
-            Files.writeString(
-                    fooFile,
-                    "package p;\n"
-                            + "class Foo {\n"
-                            + "  private String unused = \"x\";\n"
-                            + "}\n");
-            Files.writeString(
-                    serviceFile,
-                    "package p;\n"
-                            + "class Service {\n"
-                            + "  Foo test() {\n"
-                            + "    return new Foo();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = serviceFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(open);
-
-            var serviceReport = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertEquals(
-                    "pull diagnostics should report zero errors for the clean service file",
-                    0,
-                    serviceReport.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .count());
-            var fooReport = pullDiagnostics(server, fooFile.toUri());
-            Assert.assertEquals(
-                    "pull diagnostics for Foo should not be triggered by opening Service",
-                    0,
-                    fooReport.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .count());
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didOpenConsumerIncludesReferencedLombokEnumDependencyWithoutOpeningEnum() throws Exception {
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-        var serviceFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproEnumService.java");
-        try {
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            var report = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertFalse(
-                    "consumer diagnostics should include the referenced Lombok enum dependency on first open",
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getType()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void openingDependencyAfterConsumerDoesNotChangeConsumerDiagnosticsOutcome() throws Exception {
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-        var serviceFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproService.java");
-        var modelFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/model/ReproTxn.java");
-
-        var serviceOpen = new DidOpenTextDocumentParams();
-        serviceOpen.textDocument.uri = serviceFile.toUri();
-        serviceOpen.textDocument.version = 1;
-        serviceOpen.textDocument.languageId = "java";
-        serviceOpen.textDocument.text = Files.readString(serviceFile);
-        server.didOpenTextDocument(serviceOpen);
-
-        var beforeReport = pullDiagnostics(server, serviceFile.toUri());
-        Assert.assertFalse(
-                "expected clean consumer diagnostics before dependency is opened",
-                beforeReport.items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-
-        var modelOpen = new DidOpenTextDocumentParams();
-        modelOpen.textDocument.uri = modelFile.toUri();
-        modelOpen.textDocument.version = 1;
-        modelOpen.textDocument.languageId = "java";
-        modelOpen.textDocument.text = Files.readString(modelFile);
-        server.didOpenTextDocument(modelOpen);
-
-        var afterReport = pullDiagnostics(server, serviceFile.toUri());
-        Assert.assertFalse(
-                "opening the dependency should not change the consumer diagnostics outcome",
-                afterReport.items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-    }
-
-    @Test
-    public void completionOnDependencyDoesNotWarmDiagnosticsParseCache() throws Exception {
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-
-        var consumerFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproService.java");
-        var dependencyFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/model/ReproTxn.java");
-        server.completion(
-                new TextDocumentPositionParams(
-                        new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
-
-        var consumerOpen = new DidOpenTextDocumentParams();
-        consumerOpen.textDocument.uri = consumerFile.toUri();
-        consumerOpen.textDocument.version = 1;
-        consumerOpen.textDocument.languageId = "java";
-        consumerOpen.textDocument.text = Files.readString(consumerFile);
-        server.didOpenTextDocument(consumerOpen);
-
-        var report = pullDiagnostics(server, consumerFile.toUri());
-        Assert.assertFalse(
-                "expected clean consumer diagnostics after dependency completion warmup",
-                report.items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-    }
-
-    @Test
-    public void didOpenConsumerLogsLombokDiagnosticsExpansionDetails() throws Exception {
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-
-        var serviceFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproService.java");
-        var serviceOpen = new DidOpenTextDocumentParams();
-        serviceOpen.textDocument.uri = serviceFile.toUri();
-        serviceOpen.textDocument.version = 1;
-        serviceOpen.textDocument.languageId = "java";
-        serviceOpen.textDocument.text = Files.readString(serviceFile);
-        server.didOpenTextDocument(serviceOpen);
-
-        var report = pullDiagnostics(server, serviceFile.toUri());
-        Assert.assertFalse(
-                "expected clean consumer diagnostics for the Lombok repro service",
-                report.items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-    }
-
-    @Test
-    public void didOpenConsumerIncludesActiveUnsavedTransitiveLombokDependency() throws Exception {
-        var workspace = Files.createTempDirectory("jls-lombok-transitive-active");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var model = workspace.resolve("src/p/model");
-            var service = workspace.resolve("src/p/service");
-            Files.createDirectories(model);
-            Files.createDirectories(service);
-
-            var fooFile = model.resolve("Foo.java");
-            var barFile = model.resolve("Bar.java");
-            var serviceFile = service.resolve("Service.java");
-            Files.writeString(
-                    fooFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  private Bar bar;\n"
-                            + "}\n");
-            Files.writeString(
-                    barFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Bar {\n"
-                            + "  private String biz;\n"
-                            + "}\n");
-            Files.writeString(
-                    serviceFile,
-                    "package p.service;\n"
-                            + "import p.model.Foo;\n"
-                            + "public class Service {\n"
-                            + "  void run(Foo foo) {\n"
-                            + "    var bar = foo.getBar();\n"
-                            + "    var biz = bar.getBiz();\n"
-                            + "    biz.length();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-
-            var settings = new JsonObject();
-            var java = new JsonObject();
-            var classPath = new com.google.gson.JsonArray();
-            classPath.add(TestRuntimeJars.lombokJar().toString());
-            java.add("classPath", classPath);
-            settings.add("java", java);
-            var change = new DidChangeConfigurationParams();
-            change.settings = settings;
-            server.didChangeConfiguration(change);
-
-            var fooOpen = new DidOpenTextDocumentParams();
-            fooOpen.textDocument.uri = fooFile.toUri();
-            fooOpen.textDocument.version = 1;
-            fooOpen.textDocument.languageId = "java";
-            fooOpen.textDocument.text =
-                    Files.readString(fooFile)
-                            + "\n// keep Foo active and unsaved so diagnostics must use in-memory dependency content\n";
-            server.didOpenTextDocument(fooOpen);
-
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            var report = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertFalse(
-                    "consumer diagnostics should include active unsaved Lombok dependencies transitively",
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void repeatedDidOpenAcrossDifferentLombokConsumersKeepsDiagnosticsResolved() throws Exception {
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-
-        var firstFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproService.java");
-        var secondFile = FindResource.path("org/javacs/example/LombokNestedDiagnostics.java");
-        try {
-            var firstOpen = new DidOpenTextDocumentParams();
-            firstOpen.textDocument.uri = firstFile.toUri();
-            firstOpen.textDocument.version = 1;
-            firstOpen.textDocument.languageId = "java";
-            firstOpen.textDocument.text = Files.readString(firstFile);
-            server.didOpenTextDocument(firstOpen);
-
-            var firstReport = pullDiagnostics(server, firstFile.toUri());
-            Assert.assertFalse(
-                    "first Lombok consumer diagnostics should stay resolved",
-                    firstReport.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-
-            var secondOpen = new DidOpenTextDocumentParams();
-            secondOpen.textDocument.uri = secondFile.toUri();
-            secondOpen.textDocument.version = 1;
-            secondOpen.textDocument.languageId = "java";
-            secondOpen.textDocument.text = Files.readString(secondFile);
-            server.didOpenTextDocument(secondOpen);
-
-            var secondReport = pullDiagnostics(server, secondFile.toUri());
-            Assert.assertFalse(
-                    "second Lombok consumer diagnostics should stay resolved after reusing diagnostics compiler",
-                    secondReport.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getBar()", "getName()")));
-            Assert.assertEquals(
-                    "repeated Lombok diagnostics should not disable annotation processing",
-                    0,
-                    capture.countContaining("[perf] lombok_ap disabled=true"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void lombokSlf4jBridgeBreaksDataClassExpansion() throws Exception {
-        // Reproducer for the @Slf4j LombokTypeIndex exclusion bug.
-        //
-        // BFS expansion from the opened file resolves type references and adds each resolved path
-        // to the explicit diagnostic batch only if that path is in LombokTypeIndex. Because
-        // SOURCE_EXPANSION_PATTERN in LombokAnnotations omits @Slf4j, a class annotated with only
-        // @Slf4j is excluded from LombokTypeIndex. BFS stops at that class and never explores its
-        // own type references. Any @Data class reachable only through the @Slf4j bridge is also
-        // excluded, so it is compiled via source path without AP and its generated getters are never
-        // created. Calls to those getters on the opened file then produce false diagnostics.
-        //
-        // Setup:
-        //   Processor (opened) → calls Dispatcher.process() → returns Route
-        //   Dispatcher has @Slf4j only  → excluded from LombokTypeIndex → BFS stops
-        //   Route has @Data             → never reached by BFS → compiled via source path without AP
-        //   Route.getTarget() is missing → false "cannot find symbol" error on Processor
-        var workspace = Files.createTempDirectory("jls-lombok-slf4j-bridge");
-        try {
-            var modelDir = workspace.resolve("src/main/java/p/model");
-            var dispatchDir = workspace.resolve("src/main/java/p/dispatch");
-            var serviceDir = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(modelDir);
-            Files.createDirectories(dispatchDir);
-            Files.createDirectories(serviceDir);
-
-            // @Data class reachable only through the @Slf4j bridge — must get AP to have getters.
-            Files.writeString(
-                    modelDir.resolve("Route.java"),
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Route {\n"
-                            + "  private String target;\n"
-                            + "}\n");
-
-            // @Slf4j-only bridge — excluded from LombokTypeIndex; BFS stops here.
-            Files.writeString(
-                    dispatchDir.resolve("Dispatcher.java"),
-                    "package p.dispatch;\n"
-                            + "import lombok.extern.slf4j.Slf4j;\n"
-                            + "@Slf4j\n"
-                            + "public class Dispatcher {\n"
-                            + "  public p.model.Route process() {\n"
-                            + "    log.info(\"dispatching\");\n"
-                            + "    return new p.model.Route();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            // Opened file: calls Dispatcher.process().getTarget() — getTarget() is Lombok-generated.
-            var processorFile = serviceDir.resolve("Processor.java");
-            Files.writeString(
-                    processorFile,
-                    "package p.service;\n"
-                            + "import p.dispatch.Dispatcher;\n"
-                            + "public class Processor {\n"
-                            + "  Dispatcher dispatcher = new Dispatcher();\n"
-                            + "  public String run() {\n"
-                            + "    return dispatcher.process().getTarget();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-            configureLombokClasspath(server);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = processorFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(processorFile);
-            server.didOpenTextDocument(open);
-
-            var report = pullDiagnostics(server, processorFile.toUri());
-            Assert.assertFalse(
-                    "@Slf4j bridge should not block @Data getter expansion; errors: "
-                            + report.items.stream()
-                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                                    .map(d -> d.message)
-                                    .toList(),
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> d.message.contains("getTarget")));
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void enterpriseStyleLombokDiagnosticsResolveFieldSetterVariant() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enterprise-lombok-setter-variant");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var model = workspace.resolve("src/main/java/p/model");
-            var service = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(model);
-            Files.createDirectories(service);
-
-            var fooFile = model.resolve("Foo.java");
-            var barFile = model.resolve("Bar.java");
-            var bizFile = model.resolve("Biz.java");
-            var consumerFile = service.resolve("FooService.java");
-            Files.writeString(
-                    fooFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  @lombok.Setter private Bar bar;\n"
-                            + "}\n");
-            Files.writeString(
-                    barFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Bar {\n"
-                            + "  private Biz biz = new Biz();\n"
-                            + "}\n");
-            Files.writeString(
-                    bizFile,
-                    "package p.model;\n"
-                            + "public class Biz {\n"
-                            + "  public String value() {\n"
-                            + "    return \"ok\";\n"
-                            + "  }\n"
-                            + "}\n");
-            Files.writeString(
-                    consumerFile,
-                    "package p.service;\n"
-                            + "import p.model.Foo;\n"
-                            + "public class FooService {\n"
-                            + "  String use(Foo foo) {\n"
-                            + "    var bar = foo.getBar();\n"
-                            + "    var biz = bar.getBiz();\n"
-                            + "    return biz.value();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-            configureLombokClasspath(server);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = consumerFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(consumerFile);
-            server.didOpenTextDocument(open);
-
-            var report = pullDiagnostics(server, consumerFile.toUri());
-            Assert.assertFalse(
-                    "field-level setter variant should still resolve generated getter chain",
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void enterpriseStyleLombokDiagnosticsResolveSplitPackageGetterChain() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enterprise-lombok-split-package");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var model = workspace.resolve("src/main/java/p/model");
-            var nested = workspace.resolve("src/main/java/p/nested");
-            var service = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(model);
-            Files.createDirectories(nested);
-            Files.createDirectories(service);
-
-            var fooFile = model.resolve("Foo.java");
-            var barFile = nested.resolve("Bar.java");
-            var bizFile = nested.resolve("Biz.java");
-            var consumerFile = service.resolve("FooService.java");
-            Files.writeString(
-                    fooFile,
-                    "package p.model;\n"
-                            + "import p.nested.Bar;\n"
-                            + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  private Bar bar;\n"
-                            + "}\n");
-            Files.writeString(
-                    barFile,
-                    "package p.nested;\n"
-                            + "@lombok.Data\n"
-                            + "public class Bar {\n"
-                            + "  private Biz biz = new Biz();\n"
-                            + "}\n");
-            Files.writeString(
-                    bizFile,
-                    "package p.nested;\n"
-                            + "public class Biz {\n"
-                            + "  public String value() {\n"
-                            + "    return \"ok\";\n"
-                            + "  }\n"
-                            + "}\n");
-            Files.writeString(
-                    consumerFile,
-                    "package p.service;\n"
-                            + "import p.model.Foo;\n"
-                            + "public class FooService {\n"
-                            + "  String use(Foo foo) {\n"
-                            + "    var bar = foo.getBar();\n"
-                            + "    var biz = bar.getBiz();\n"
-                            + "    return biz.value();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-            configureLombokClasspath(server);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = consumerFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(consumerFile);
-            server.didOpenTextDocument(open);
-
-            var report = pullDiagnostics(server, consumerFile.toUri());
-            Assert.assertFalse(
-                    "split-package getter chain should not produce diagnostics in consumer",
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void lombokNestedClassNameCollidesWithInterfaceNoFalseDiagnostics() throws Exception {
-        // Reproducer for: interface Foo in package A, outer @Data class in package B with a nested
-        // @Data class also named Foo (same simple name as the interface). Consumer imports both
-        // packages via wildcard and calls a getter chain through the nested Lombok type.
-        // Diagnostics should not falsely report that Lombok-generated methods do not exist.
-        var workspace = Files.createTempDirectory("jls-lombok-nested-name-collision");
-        try {
-            var contractDir = workspace.resolve("src/main/java/p/contract");
-            var modelDir = workspace.resolve("src/main/java/p/model");
-            var serviceDir = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(contractDir);
-            Files.createDirectories(modelDir);
-            Files.createDirectories(serviceDir);
-
-            // Interface named "Response" in p.contract — no Lombok
-            Files.writeString(
-                    contractDir.resolve("Response.java"),
-                    "package p.contract;\n"
-                            + "public interface Response {\n"
-                            + "  String getStatus();\n"
-                            + "}\n");
-
-            // Outer @Data class with two nested @Data classes, one named "Response"
-            // (same simple name as the interface above)
-            Files.writeString(
-                    modelDir.resolve("Request.java"),
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Request {\n"
-                            + "  private Response response;\n"
-                            + "  private Detail detail;\n"
-                            + "  @lombok.Data\n"
-                            + "  public static class Response {\n"
-                            + "    private Detail detail;\n"
-                            + "    private String code;\n"
-                            + "  }\n"
-                            + "  @lombok.Data\n"
-                            + "  public static class Detail {\n"
-                            + "    private String message;\n"
-                            + "  }\n"
-                            + "}\n");
-
-            // Consumer: wildcard imports bring in both the interface and the outer class.
-            // Getter chain goes through nested Lombok types.
-            var consumerFile = serviceDir.resolve("Consumer.java");
-            Files.writeString(
-                    consumerFile,
-                    "package p.service;\n"
-                            + "import p.contract.*;\n"
-                            + "import p.model.*;\n"
-                            + "public class Consumer {\n"
-                            + "  String use(Request req) {\n"
-                            + "    return req.getResponse().getDetail().getMessage();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-            configureLombokClasspath(server);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = consumerFile.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = Files.readString(consumerFile);
-            server.didOpenTextDocument(open);
-
-            var report = pullDiagnostics(server, consumerFile.toUri());
-            Assert.assertFalse(
-                    "nested Lombok class with same name as interface should not produce false getter diagnostics; errors: "
-                            + report.items.stream()
-                                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                                    .map(d -> d.message)
-                                    .toList(),
-                    report.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getResponse()", "getDetail()", "getMessage()")));
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didChangeEnumRefreshesActiveConsumerDiagnostics() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enum-related-change");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var models = workspace.resolve("src/com/example/demo/models");
-            var service = workspace.resolve("src/com/example/demo/service");
-            Files.createDirectories(models);
-            Files.createDirectories(service);
-
-            var enumFile = models.resolve("MyEnum.java");
-            var serviceFile = service.resolve("ServiceTwo.java");
-            Files.writeString(
-                    enumFile,
-                    "package com.example.demo.models;\n"
-                            + "public enum MyEnum {\n"
-                            + "  FIRST;\n"
-                            + "}\n");
-            Files.writeString(
-                    serviceFile,
-                    "package com.example.demo.service;\n"
-                            + "import com.example.demo.models.MyEnum;\n"
-                            + "class ServiceTwo {\n"
-                            + "  String test() {\n"
-                            + "    return MyEnum.FIRST.getType();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-
-            var enumOpen = new DidOpenTextDocumentParams();
-            enumOpen.textDocument.uri = enumFile.toUri();
-            enumOpen.textDocument.version = 1;
-            enumOpen.textDocument.languageId = "java";
-            enumOpen.textDocument.text = Files.readString(enumFile);
-            server.didOpenTextDocument(enumOpen);
-
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            var baseline = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertTrue(
-                    "baseline should show the missing enum member error before the unsaved enum change",
-                    baseline.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getType()")));
-
-            var enumChange = new DidChangeTextDocumentParams();
-            enumChange.textDocument.uri = enumFile.toUri();
-            enumChange.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text =
-                    "package com.example.demo.models;\n"
-                            + "public enum MyEnum {\n"
-                            + "  FIRST;\n"
-                            + "  public String getType() {\n"
-                            + "    return name();\n"
-                            + "  }\n"
-                            + "}\n";
-            enumChange.contentChanges.add(delta);
-            server.didChangeTextDocument(enumChange);
-
-            var after = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertFalse(
-                    "changing the enum should resolve consumer diagnostics on next pull",
-                    after.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getType()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didChangeEnumKeepsClosedConsumerDirtyUntilReopen() throws Exception {
-        var workspace = Files.createTempDirectory("jls-enum-related-reopen");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var models = workspace.resolve("src/com/example/demo/models");
-            var service = workspace.resolve("src/com/example/demo/service");
-            Files.createDirectories(models);
-            Files.createDirectories(service);
-
-            var enumFile = models.resolve("MyEnum.java");
-            var serviceFile = service.resolve("ServiceTwo.java");
-            Files.writeString(
-                    enumFile,
-                    "package com.example.demo.models;\n"
-                            + "public enum MyEnum {\n"
-                            + "  FIRST;\n"
-                            + "}\n");
-            Files.writeString(
-                    serviceFile,
-                    "package com.example.demo.service;\n"
-                            + "import com.example.demo.models.MyEnum;\n"
-                            + "class ServiceTwo {\n"
-                            + "  String test() {\n"
-                            + "    return MyEnum.FIRST.getType();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-
-            var enumOpen = new DidOpenTextDocumentParams();
-            enumOpen.textDocument.uri = enumFile.toUri();
-            enumOpen.textDocument.version = 1;
-            enumOpen.textDocument.languageId = "java";
-            enumOpen.textDocument.text = Files.readString(enumFile);
-            server.didOpenTextDocument(enumOpen);
-
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            var baseline = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertTrue(
-                    "baseline should show the missing enum member error before the unsaved enum change",
-                    baseline.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getType()")));
-
-            var serviceClose = new DidCloseTextDocumentParams();
-            serviceClose.textDocument.uri = serviceFile.toUri();
-            server.didCloseTextDocument(serviceClose);
-
-            var enumChange = new DidChangeTextDocumentParams();
-            enumChange.textDocument.uri = enumFile.toUri();
-            enumChange.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text =
-                    "package com.example.demo.models;\n"
-                            + "public enum MyEnum {\n"
-                            + "  FIRST;\n"
-                            + "  public String getType() {\n"
-                            + "    return name();\n"
-                            + "  }\n"
-                            + "}\n";
-            enumChange.contentChanges.add(delta);
-            server.didChangeTextDocument(enumChange);
-
-            server.didOpenTextDocument(serviceOpen);
-
-            var after = pullDiagnostics(server, serviceFile.toUri());
-            Assert.assertFalse(
-                    "reopening the consumer after dependency change should resolve diagnostics on pull",
-                    after.items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .anyMatch(d -> containsAny(d.message, "getType()")));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void lombokConsumerDiagnosticsRemainResolvedBeforeAndAfterModelSave() throws Exception {
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-
-        var serviceFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproService.java");
-        var modelFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/model/ReproTxn.java");
-
-        var serviceOpen = new DidOpenTextDocumentParams();
-        serviceOpen.textDocument.uri = serviceFile.toUri();
-        serviceOpen.textDocument.version = 1;
-        serviceOpen.textDocument.languageId = "java";
-        serviceOpen.textDocument.text = Files.readString(serviceFile);
-        server.didOpenTextDocument(serviceOpen);
-
-        var baselineDiagnostics =
-                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items);
-        Assert.assertFalse(
-                "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
-                pullDiagnostics(server, serviceFile.toUri()).items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-
-        var modelOpen = new DidOpenTextDocumentParams();
-        modelOpen.textDocument.uri = modelFile.toUri();
-        modelOpen.textDocument.version = 1;
-        modelOpen.textDocument.languageId = "java";
-        modelOpen.textDocument.text = Files.readString(modelFile);
-        server.didOpenTextDocument(modelOpen);
-
-        Assert.assertEquals(
-                "opening an unchanged Lombok dependency should not change consumer diagnostics",
-                baselineDiagnostics,
-                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
-
-        var modelSave = new DidSaveTextDocumentParams();
-        modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
-        server.didSaveTextDocument(modelSave);
-
-        var changed = new FileEvent();
-        changed.uri = modelFile.toUri();
-        changed.type = FileChangeType.Changed;
-        var watched = new DidChangeWatchedFilesParams();
-        watched.changes = List.of(changed);
-        server.didChangeWatchedFiles(watched);
-
-        Assert.assertEquals(
-                "saving an unchanged Lombok dependency should not change consumer diagnostics",
-                baselineDiagnostics,
-                diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
-    }
-
-    @Test
-    public void didChangeLombokModelRefreshesOpenConsumerDiagnostics() throws Exception {
-        var server =
-                LanguageServerFixture.getJavaLanguageServer(
-                        LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
-
-        var serviceFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/service/ReproService.java");
-        var modelFile =
-                LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
-                        "src/org/javacs/repro/model/ReproTxn.java");
-        var originalModel = Files.readString(modelFile);
-
-        var serviceOpen = new DidOpenTextDocumentParams();
-        serviceOpen.textDocument.uri = serviceFile.toUri();
-        serviceOpen.textDocument.version = 1;
-        serviceOpen.textDocument.languageId = "java";
-        serviceOpen.textDocument.text = Files.readString(serviceFile);
-        server.didOpenTextDocument(serviceOpen);
-
-        var modelOpen = new DidOpenTextDocumentParams();
-        modelOpen.textDocument.uri = modelFile.toUri();
-        modelOpen.textDocument.version = 1;
-        modelOpen.textDocument.languageId = "java";
-        modelOpen.textDocument.text = originalModel;
-        server.didOpenTextDocument(modelOpen);
-
-        Assert.assertFalse(
-                "expected baseline Lombok consumer diagnostics to be clean",
-                pullDiagnostics(server, serviceFile.toUri()).items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-
-        var brokenModel = originalModel.replace("msref", "title");
-        var change = new DidChangeTextDocumentParams();
-        change.textDocument.uri = modelFile.toUri();
-        change.textDocument.version = 2;
-        var delta = new TextDocumentContentChangeEvent();
-        delta.text = brokenModel;
-        change.contentChanges.add(delta);
-        server.didChangeTextDocument(change);
-
-        Assert.assertTrue(
-                "changing a Lombok model should surface errors in the consumer on the next pull",
-                pullDiagnostics(server, serviceFile.toUri()).items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-
-        var revert = new DidChangeTextDocumentParams();
-        revert.textDocument.uri = modelFile.toUri();
-        revert.textDocument.version = 3;
-        var revertDelta = new TextDocumentContentChangeEvent();
-        revertDelta.text = originalModel;
-        revert.contentChanges.add(revertDelta);
-        server.didChangeTextDocument(revert);
-
-        Assert.assertFalse(
-                "restoring the Lombok model should clear consumer errors on the next pull",
-                pullDiagnostics(server, serviceFile.toUri()).items.stream()
-                        .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                        .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
-    }
-
-    @Test
-    public void watchedLombokDependencyChangeRefreshesOpenConsumerDiagnosticsWithoutOpeningDependency()
-            throws Exception {
-        var workspace = Files.createTempDirectory("jls-watched-lombok-dependency-refresh");
-        try {
-            var model = workspace.resolve("src/main/java/p/model");
-            var service = workspace.resolve("src/main/java/p/service");
-            Files.createDirectories(model);
-            Files.createDirectories(service);
-
-            var fooFile = model.resolve("Foo.java");
-            var barFile = model.resolve("Bar.java");
-            var bizFile = model.resolve("Biz.java");
-            var serviceFile = service.resolve("Service.java");
-            Files.writeString(
-                    fooFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  private Bar bar = new Bar();\n"
-                            + "}\n");
-            Files.writeString(
-                    barFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Bar {\n"
-                            + "  private Biz biz = new Biz();\n"
-                            + "}\n");
-            Files.writeString(
-                    bizFile,
-                    "package p.model;\n"
-                            + "public class Biz {\n"
-                            + "  public String value() {\n"
-                            + "    return \"ok\";\n"
-                            + "  }\n"
-                            + "}\n");
-            Files.writeString(
-                    serviceFile,
-                    "package p.service;\n"
-                            + "import p.model.Foo;\n"
-                            + "class Service {\n"
-                            + "  String run(Foo foo) {\n"
-                            + "    return foo.getBar().getBiz().value();\n"
-                            + "  }\n"
-                            + "}\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace);
-            configureLombokClasspath(server);
-
-            var serviceOpen = new DidOpenTextDocumentParams();
-            serviceOpen.textDocument.uri = serviceFile.toUri();
-            serviceOpen.textDocument.version = 1;
-            serviceOpen.textDocument.languageId = "java";
-            serviceOpen.textDocument.text = Files.readString(serviceFile);
-            server.didOpenTextDocument(serviceOpen);
-
-            Assert.assertFalse(
-                    "consumer diagnostics should resolve against an unopened Lombok dependency on disk",
-                    pullDiagnostics(server, serviceFile.toUri()).items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .findAny()
-                            .isPresent());
-
-            Files.writeString(
-                    fooFile,
-                    "package p.model;\n"
-                            + "@lombok.Data\n"
-                            + "public class Foo {\n"
-                            + "  private Bar bar = new Bar();\n"
-                            + "  // watched dependency change\n"
-                            + "}\n");
-            var changed = new FileEvent();
-            changed.uri = fooFile.toUri();
-            changed.type = FileChangeType.Changed;
-            var watched = new DidChangeWatchedFilesParams();
-            watched.changes = List.of(changed);
-            server.didChangeWatchedFiles(watched);
-
-            Assert.assertFalse(
-                    "watched Lombok dependency changes should not introduce errors in the consumer",
-                    pullDiagnostics(server, serviceFile.toUri()).items.stream()
-                            .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                            .findAny()
-                            .isPresent());
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void completionUsesCurrentIndexEvenAfterUnsavedVersionChange() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var original = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = original;
-        server.didOpenTextDocument(open);
-        Assert.assertTrue(
-                "expected completion index to initialize before unsaved-change check",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var broken = original.replace("this.", "this.\n");
-        var change = new org.javacs.lsp.DidChangeTextDocumentParams();
-        change.textDocument.uri = file.toUri();
-        change.textDocument.version = 2;
-        var delta = new org.javacs.lsp.TextDocumentContentChangeEvent();
-        delta.text = broken;
-        change.contentChanges.add(delta);
-        server.didChangeTextDocument(change);
-
-        var completion =
-                server.completion(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
-        Assert.assertTrue(completion.isPresent());
-        Assert.assertTrue(
-                "member completion should keep using index after unsaved change",
-                completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
-    }
-
-    @Test
-    public void incompleteBodyEditDoesNotTriggerDeclarationDriftRefresh() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-            var original = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = original;
-            server.didOpenTextDocument(open);
-            Assert.assertTrue(
-                    "expected completion index bootstrap before didChange drift check",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            var before = completionIndexVersion(server);
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = file.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text = original.replace("        return \"foo\";\n", "        if (\n");
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            Thread.sleep(1600);
-
-            Assert.assertEquals(
-                    "incomplete method-body edits should keep the published completion snapshot",
-                    before,
-                    completionIndexVersion(server));
-            Assert.assertNull(
-                    "incomplete source should skip declaration-drift refresh",
-                    capture.lastLineContaining(
-                            "[perf] completion_index_didChange_refresh file=AutocompleteMember.java reason=declaration_drift"));
-            Assert.assertNotNull(
-                    "incomplete source should log the didChange skip reason",
-                    capture.lastLineContaining(
-                            "[perf] completion_index_didChange_skip file=AutocompleteMember.java reason=incomplete_source"));
-            Assert.assertEquals(
-                    "didChange should not schedule a completion-index debounce for incomplete body edits",
-                    0,
-                    capture.countContaining("[perf] completion_index_debounce trigger=didChange"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void hasDeclarationDriftCoversStructuralCompareBranches() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        openAndBootstrap(server, file);
-
-        var indexed = indexedTypeForFile(server, file);
-        var matchingShape = declaredTypeShape(indexed, false);
-
-        Assert.assertFalse(
-                "matching indexed declaration shape should not report drift",
-                hasDeclarationDrift(server, file, List.of(matchingShape)));
-
-        Assert.assertTrue(
-                "missing or extra declared types should report drift",
-                hasDeclarationDrift(server, file, List.of()));
-
-        Assert.assertTrue(
-                "same-size declared type sets with different qualified names should report drift",
-                hasDeclarationDrift(
-                        server,
-                        file,
-                        List.of(
-                                declaredTypeShape(
-                                        indexed.qualifiedName + "Renamed",
-                                        directMemberSignatures(indexed),
-                                        indexed.superclass,
-                                        indexed.interfaces,
-                                        false))));
-
-        Assert.assertTrue(
-                "superclass changes should report drift",
-                hasDeclarationDrift(
-                        server,
-                        file,
-                        List.of(
-                                declaredTypeShape(
-                                        indexed.qualifiedName,
-                                        directMemberSignatures(indexed),
-                                        "java.lang.Number",
-                                        indexed.interfaces,
-                                        false))));
-
-        Assert.assertTrue(
-                "interface changes should report drift",
-                hasDeclarationDrift(
-                        server,
-                        file,
-                        List.of(
-                                declaredTypeShape(
-                                        indexed.qualifiedName,
-                                        directMemberSignatures(indexed),
-                                        indexed.superclass,
-                                        List.of("java.io.Serializable"),
-                                        false))));
-
-        var changedMembers = new java.util.ArrayList<>(directMemberSignatures(indexed));
-        changedMembers.add("M:extra:0:false");
-        Assert.assertTrue(
-                "direct member signature changes should report drift",
-                hasDeclarationDrift(
-                        server,
-                        file,
-                        List.of(
-                                declaredTypeShape(
-                                        indexed.qualifiedName,
-                                        changedMembers,
-                                        indexed.superclass,
-                                        indexed.interfaces,
-                                        false))));
-    }
-
-    @Test
-    public void hasDeclarationDriftDetectsIndexedStructuralLombokMismatch() throws Exception {
-        FileStore.reset();
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = Paths.get("/tmp/DriftCoverage.java");
-        var qualifiedName = "p.DriftCoverage";
-
-        var indexed =
-                new IndexedType(
-                        qualifiedName,
-                        "DriftCoverage",
-                        List.of(
-                                new IndexedMember(
-                                        qualifiedName,
-                                        "plainField",
-                                        CompletionItemKind.Field,
-                                        false,
-                                        false,
-                                        0,
-                                        "String plainField",
-                                        "java.lang.String",
-                                        null,
-                                        null,
-                                        qualifiedName + "#plainField",
-                                        qualifiedName + "#plainField",
-                                        null,
-                                        false),
-                                new IndexedMember(
-                                        qualifiedName,
-                                        "halfSynthetic",
-                                        CompletionItemKind.Method,
-                                        false,
-                                        false,
-                                        0,
-                                        "String halfSynthetic()",
-                                        "java.lang.String",
-                                        new String[0],
-                                        new String[0],
-                                        qualifiedName + "#halfSynthetic()",
-                                        qualifiedName + "#halfSynthetic()",
-                                        null,
-                                        true),
-                                new IndexedMember(
-                                        qualifiedName,
-                                        "getName",
-                                        CompletionItemKind.Method,
-                                        false,
-                                        false,
-                                        0,
-                                        "String getName()",
-                                        "java.lang.String",
-                                        new String[0],
-                                        new String[0],
-                                        qualifiedName + "#getName()",
-                                        qualifiedName + "#getName()",
-                                        "name",
-                                        true)),
-                        false,
-                        file,
-                        null,
-                        List.of(),
-                        IndexedMember.Provenance.WORKSPACE);
-
-        publishWorkspaceSnapshot(server, workspaceIndexOf(indexed), 1);
-
-        Assert.assertFalse(
-                "matching structural Lombok should not report drift",
-                hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, true))));
-        Assert.assertTrue(
-                "structural Lombok mismatch should report drift against the indexed snapshot",
-                hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, false))));
-    }
-
-    @Test
-    public void completionRequestDoesNotInvokeCompileBatch() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-
-        Thread.sleep(1200);
-        CompileBatch.resetPerfCounters();
-
-        var completion =
-                server.completion(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
-        Assert.assertTrue(completion.isPresent());
-        Assert.assertEquals(
-                "completion should not invoke semantic compile",
-                0L,
-                CompileBatch.perfCounters().analyzeInvocations);
-    }
-
-    @Test
-    public void completionUsesPublishedSnapshotWhileIncrementalRefreshBuildsNextVersion() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-            var original = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = original;
-            server.didOpenTextDocument(open);
-            Assert.assertTrue(
-                    "expected completion index bootstrap before snapshot publication check",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            var before = completionIndexVersion(server);
-            var change = new DidChangeTextDocumentParams();
-            change.textDocument.uri = file.toUri();
-            change.textDocument.version = 2;
-            var delta = new TextDocumentContentChangeEvent();
-            delta.text =
-                    original.replace(
-                            "    public String testFields;\n",
-                            "    public String testFields;\n    public String refreshedField;\n");
-            change.contentChanges.add(delta);
-            server.didChangeTextDocument(change);
-
-            var completion =
-                    server.completion(
-                            new TextDocumentPositionParams(
-                                    new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
-            Assert.assertTrue("expected completion result during incremental refresh", completion.isPresent());
-            Assert.assertTrue(
-                    "completion should keep serving published members while refresh builds the next snapshot",
-                    completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
-            Assert.assertEquals(
-                    "completion should return before the refreshed snapshot is published",
-                    before,
-                    completionIndexVersion(server));
-
-            var completionFlow = capture.lastLineContaining("[perf] completion_flow file=AutocompleteMember.java");
-            Assert.assertNotNull("expected completion flow log for snapshot publication check", completionFlow);
-            Assert.assertTrue(
-                    "completion should log the currently published snapshot version",
-                    completionFlow.contains("index_version=" + before));
-            Assert.assertTrue(
-                    "completion flow metrics should stay isolated from compiler phases",
-                    completionFlow.contains("enter=0 analyze=0 ap=0"));
-
-            Assert.assertTrue(
-                    "expected incremental refresh to publish a newer snapshot after completion returns",
-                    awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
-            var mergeLog = capture.lastLineContaining("[perf] completion_type_index_merge trigger=index:didChange");
-            if (mergeLog != null) {
-                Assert.assertTrue(
-                        "incremental refresh should log the published base snapshot version",
-                        mergeLog.contains("base_version=" + before));
-            }
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void parseLifecycleParsesOnOpenAndChangeThenReusesForRequestsAndSave() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        var compiler = server.getOrCreateCompiler();
-        Assert.assertNull("didOpen should not eagerly parse in the interactive compiler", compiler.parsedUnits.get(file));
-
-        var firstCompletion =
-                server.completion(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
-        Assert.assertTrue(firstCompletion.isPresent());
-        server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
-
-        var afterOpenRequests = compiler.parsedUnits.get(file);
-        Assert.assertNotNull("completion/hover should populate the interactive parse cache on demand", afterOpenRequests);
-        var openedRoot = afterOpenRequests.task().root();
-        Assert.assertSame(
-                "completion/hover should reuse the lazily populated parse result when text is unchanged",
-                openedRoot,
-                afterOpenRequests.task().root());
-
-        var save = new DidSaveTextDocumentParams();
-        save.textDocument = new TextDocumentIdentifier(file.toUri());
-        server.didSaveTextDocument(save);
-
-        var afterSave = compiler.parsedUnits.get(file);
-        Assert.assertNotNull(afterSave);
-        Assert.assertSame(
-                "didSave should reuse existing parse result when there is no text change",
-                openedRoot,
-                afterSave.task().root());
-
-        var change = new DidChangeTextDocumentParams();
-        change.textDocument.uri = file.toUri();
-        change.textDocument.version = 2;
-        var delta = new TextDocumentContentChangeEvent();
-        delta.text = text + "\n// parse-lifecycle-change";
-        change.contentChanges.add(delta);
-        server.didChangeTextDocument(change);
-
-        var changed = compiler.parsedUnits.get(file);
-        Assert.assertNotNull("didChange should refresh parsed unit", changed);
-        Assert.assertNotSame(
-                "didChange should reparse when text changes", openedRoot, changed.task().root());
-        var changedRoot = changed.task().root();
-
-        var secondCompletion =
-                server.completion(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
-        Assert.assertTrue(secondCompletion.isPresent());
-        server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
-
-        var afterChangeRequests = compiler.parsedUnits.get(file);
-        Assert.assertNotNull(afterChangeRequests);
-        Assert.assertSame(
-                "completion/hover should reuse didChange parse result until next edit",
-                changedRoot,
-                afterChangeRequests.task().root());
-    }
-
-    @Test
-    public void concurrentCompilerCallsAfterSettingsChangeReuseAlreadyRecreatedCompiler() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var logger = Logger.getLogger("main");
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-
-            var settings = new JsonObject();
-            var java = new JsonObject();
-            var extraCompilerArgs = new com.google.gson.JsonArray();
-            extraCompilerArgs.add("-Xlint:deprecation");
-            java.add("extraCompilerArgs", extraCompilerArgs);
-            settings.add("java", java);
-            var change = new DidChangeConfigurationParams();
-            change.settings = settings;
-            server.didChangeConfiguration(change);
-
-            var workers = 6;
-            var ready = new CountDownLatch(workers);
-            var start = new CountDownLatch(1);
-            var done = new CountDownLatch(workers);
-            var failures = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
-
-            for (int i = 0; i < workers; i++) {
-                var t =
-                        new Thread(
-                                () -> {
-                                    try {
-                                        ready.countDown();
-                                        start.await(5, TimeUnit.SECONDS);
-                                        server.getOrCreateCompiler();
-                                    } catch (Throwable e) {
-                                        failures.add(e);
-                                    } finally {
-                                        done.countDown();
-                                    }
-                                },
-                                "compiler-race-" + i);
-                t.start();
-            }
-
-            Assert.assertTrue("workers were not ready in time", ready.await(5, TimeUnit.SECONDS));
-            start.countDown();
-            Assert.assertTrue("workers did not finish in time", done.await(60, TimeUnit.SECONDS));
-            Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
-
-            Assert.assertEquals(
-                    "settings change should recreate compiler immediately and only once",
-                    1,
-                    capture.countContaining("[perf] compiler_recreate trigger=didChangeConfiguration"));
-        } finally {
-            logger.removeHandler(capture);
-        }
-    }
-
-    @Test
-    public void completionRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var tracking = replaceInteractiveCompilerWithTracking(server);
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var before = completionIndexVersion(server);
-        openJavaFile(server, file);
-        Assert.assertTrue(
-                "completion index should bootstrap before the request-path assertion",
-                awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
-
-        tracking.resetCounters();
-        var result =
-                server.completion(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
-
-        Assert.assertTrue("completion request should succeed", result.isPresent());
-        Assert.assertTrue("completion should parse the active file", tracking.parseCalls.get() > 0);
-        Assert.assertEquals("completion should not use full compile", 0, tracking.compileCalls.get());
-        Assert.assertEquals("completion should not use fast compile", 0, tracking.compileFastCalls.get());
-        Assert.assertEquals(
-                "completion should not use fast compile with processors",
-                0,
-                tracking.compileFastWithProcessorsCalls.get());
-    }
-
-    @Test
-    public void nonCompilerSettingsDoNotRecreateGetOrCreateCompiler() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var before = completionIndexVersion(server);
-
-        var settings = new JsonObject();
-        var java = new JsonObject();
-        java.addProperty("codeLens", true);
-        settings.add("java", java);
-        var change = new DidChangeConfigurationParams();
-        change.settings = settings;
-        server.didChangeConfiguration(change);
-
-        server.getOrCreateCompiler();
-        var after = completionIndexVersion(server);
-        Assert.assertEquals(
-                "non-compiler Java settings should not recreate compiler",
-                before,
-                after);
-    }
-
-    @Test
-    public void userReleaseOverridesInferredMavenRelease() throws Exception {
-        var workspace = Files.createTempDirectory("jls-maven-release-override");
-        try {
-            Files.writeString(
-                    workspace.resolve("pom.xml"),
-                    """
-                    <project xmlns="http://maven.apache.org/POM/4.0.0"
-                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                      <modelVersion>4.0.0</modelVersion>
-                      <groupId>example</groupId>
-                      <artifactId>override</artifactId>
-                      <version>1</version>
-                      <properties>
-                        <maven.compiler.release>21</maven.compiler.release>
-                      </properties>
-                    </project>
-                    """);
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingMessageClient());
-            var settings = new JsonObject();
-            var java = new JsonObject();
-            var extra = new com.google.gson.JsonArray();
-            extra.add("--release 17");
-            java.add("extraCompilerArgs", extra);
-            settings.add("java", java);
-            var change = new DidChangeConfigurationParams();
-            change.settings = settings;
-            server.didChangeConfiguration(change);
-
-            var compiler = interactiveCompiler(server);
-            Assert.assertEquals(List.of("--release", "17"), compiler.extraArgs);
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void didChangeRefreshesCompletionIndexWithInferredMavenRelease() throws Exception {
-        var workspace = Files.createTempDirectory("jls-maven-release-didchange");
-        var sourceRoot = Files.createDirectories(workspace.resolve("src/main/java/example"));
-        var file = sourceRoot.resolve("App.java");
-        try {
-            Files.writeString(
-                    workspace.resolve("pom.xml"),
-                    """
-                    <project xmlns="http://maven.apache.org/POM/4.0.0"
-                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                      <modelVersion>4.0.0</modelVersion>
-                      <groupId>example</groupId>
-                      <artifactId>release-didchange</artifactId>
-                      <version>1</version>
-                      <properties>
-                        <maven.compiler.release>21</maven.compiler.release>
-                      </properties>
-                    </project>
-                    """);
-            var original =
-                    """
-                    package example;
-
-                    class App {
-                        String value() {
-                            return "ok";
-                        }
-                    }
-                    """;
-            Files.writeString(file, original);
-
-            var logger = Logger.getLogger("main");
-            var previousLevel = logger.getLevel();
-            logger.setLevel(Level.FINE);
-            var capture = new TestLogCapture();
-            logger.addHandler(capture);
-            try {
-                var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
-                Assert.assertEquals(List.of("--release", "21"), interactiveCompiler(server).extraArgs);
-
-                var open = new DidOpenTextDocumentParams();
-                open.textDocument.uri = file.toUri();
-                open.textDocument.version = 1;
-                open.textDocument.languageId = "java";
-                open.textDocument.text = original;
-                server.didOpenTextDocument(open);
-
-                Assert.assertTrue(
-                        "expected initial workspace bootstrap before didChange",
-                        awaitCompletionIndexAdvance(server, 0, 15, TimeUnit.SECONDS));
-
-                var before = completionIndexVersion(server);
-                var changed =
-                        """
-                        package example;
-
-                        class App {
-                            String value() {
-                                return "ok";
-                            }
-
-                            String title() {
-                                return value();
-                            }
-                        }
-                        """;
-                var change = new DidChangeTextDocumentParams();
-                change.textDocument.uri = file.toUri();
-                change.textDocument.version = 2;
-                var delta = new TextDocumentContentChangeEvent();
-                delta.text = changed;
-                change.contentChanges.add(delta);
-                server.didChangeTextDocument(change);
-
-                Assert.assertTrue(
-                        "didChange should still refresh the completion index with inferred --release",
-                        awaitCompletionIndexAdvance(server, before, 15, TimeUnit.SECONDS));
-                Assert.assertEquals(
-                        "completion refresh should not combine --source with inferred --release",
-                        0,
-                        capture.countContaining("option --source cannot be used together with --release"));
-                Assert.assertEquals(
-                        "completion refresh should not leave the compiler locked after an option failure",
-                        0,
-                        capture.countContaining("Compiler is already in-use!"));
-            } finally {
-                logger.removeHandler(capture);
-                logger.setLevel(previousLevel);
-            }
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void mixedMavenModulesWarnOnceAndFallBackGracefully() throws Exception {
-        var workspace = Files.createTempDirectory("jls-mixed-maven-warning");
-        try {
-            Files.createDirectories(workspace.resolve("mod17"));
-            Files.createDirectories(workspace.resolve("mod21"));
-            Files.writeString(
-                    workspace.resolve("pom.xml"),
-                    """
-                    <project xmlns="http://maven.apache.org/POM/4.0.0"
-                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                      <modelVersion>4.0.0</modelVersion>
-                      <groupId>example</groupId>
-                      <artifactId>mixed-parent</artifactId>
-                      <version>1</version>
-                      <packaging>pom</packaging>
-                      <modules>
-                        <module>mod17</module>
-                        <module>mod21</module>
-                      </modules>
-                    </project>
-                    """);
-            Files.writeString(
-                    workspace.resolve("mod17/pom.xml"),
-                    """
-                    <project xmlns="http://maven.apache.org/POM/4.0.0"
-                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                      <modelVersion>4.0.0</modelVersion>
-                      <parent>
-                        <groupId>example</groupId>
-                        <artifactId>mixed-parent</artifactId>
-                        <version>1</version>
-                      </parent>
-                      <artifactId>mod17</artifactId>
-                      <properties>
-                        <maven.compiler.release>17</maven.compiler.release>
-                      </properties>
-                    </project>
-                    """);
-            Files.writeString(
-                    workspace.resolve("mod21/pom.xml"),
-                    """
-                    <project xmlns="http://maven.apache.org/POM/4.0.0"
-                             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                             xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                      <modelVersion>4.0.0</modelVersion>
-                      <parent>
-                        <groupId>example</groupId>
-                        <artifactId>mixed-parent</artifactId>
-                        <version>1</version>
-                      </parent>
-                      <artifactId>mod21</artifactId>
-                      <properties>
-                        <maven.compiler.release>21</maven.compiler.release>
-                      </properties>
-                    </project>
-                    """);
-
-            var client = new RecordingMessageClient();
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
-
-            Assert.assertEquals(1, client.messages.size());
-            Assert.assertThat(
-                    client.messages.get(0).message,
-                    org.hamcrest.Matchers.containsString("mixed Maven module Java levels"));
-            Assert.assertEquals(List.of(), interactiveCompiler(server).extraArgs);
-
-            var settings = new JsonObject();
-            var java = new JsonObject();
-            java.addProperty("lombokEnabled", false);
-            settings.add("java", java);
-            var change = new DidChangeConfigurationParams();
-            change.settings = settings;
-            server.didChangeConfiguration(change);
-
-            Assert.assertEquals("warning should be shown only once per workspace session", 1, client.messages.size());
-        } finally {
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void configurationChangeSchedulesWorkspaceRefreshForActiveFiles() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        Assert.assertTrue(
-                "wait for initial completion index before triggering config change",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var settings = new JsonObject();
-            var java = new JsonObject();
-            var extraCompilerArgs = new com.google.gson.JsonArray();
-            extraCompilerArgs.add("-Xlint:deprecation");
-            java.add("extraCompilerArgs", extraCompilerArgs);
-            settings.add("java", java);
-            var change = new DidChangeConfigurationParams();
-            change.settings = settings;
-            server.didChangeConfiguration(change);
-
-            Assert.assertEquals(
-                    "compilerRecreated should not schedule a separate sync completion refresh when active files exist",
-                    0,
-                    capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
-            Assert.assertTrue(
-                    "compilerRecreated should schedule a dedicated workspace completion bootstrap when active files exist",
-                    capture.countContaining("completion_index_debounce trigger=compilerRecreated") > 0);
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void initializedDoesNotScheduleCompilerRecreatedRefreshWithoutActiveDocs() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server =
-                    new JavaLanguageServer(
-                            new org.javacs.lsp.LanguageClient() {
-                                @Override
-                                public void publishDiagnostics(org.javacs.lsp.PublishDiagnosticsParams params) {}
-
-                                @Override
-                                public void showMessage(org.javacs.lsp.ShowMessageParams params) {}
-
-                                @Override
-                                public void registerCapability(
-                                        String method, com.google.gson.JsonElement options) {}
-
-                                @Override
-                                public void customNotification(
-                                        String method, com.google.gson.JsonElement params) {}
-                            });
-            var init = new org.javacs.lsp.InitializeParams();
-            init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
-            server.initialize(init);
-            server.initialized();
-
-            Assert.assertEquals(
-                    "startup should not do synchronous full refresh when no active docs",
-                    0,
-                    capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
-            Assert.assertEquals(
-                    "startup should not schedule compilerRecreated refresh without active docs",
-                    0,
-                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
-            Assert.assertEquals(
-                    "startup should not log a compilerRecreated defer path",
-                    0,
-                    capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated"));
-
-            server.shutdown();
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-    @Test
-    public void didOpenDoesNotOverlapWithCompilerRecreatedProjectIndexCompile() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/HelloWorld.java");
-            var text = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-
-            Assert.assertTrue(
-                    "didOpen should still bootstrap the completion index",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            Assert.assertEquals(
-                    "startup should not run compilerRecreated refresh during first didOpen bootstrap",
-                    0,
-                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
-            Assert.assertEquals(
-                    "didOpen bootstrap should not schedule a second declaration refresh compile",
-                    0,
-                    capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
-        } finally {
-            logger.removeHandler(capture);
-        }
-    }
-
-    @Test
-    public void watchedGradleBuildChangeRecreatesCompilerImmediatelyWithoutActiveDocs() throws Exception {
-        var workspace = Files.createTempDirectory("jls-watched-gradle-recreate");
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var src = workspace.resolve("src/main/java/p");
-            Files.createDirectories(src);
-            Files.writeString(src.resolve("App.java"), "package p;\nclass App {}\n");
-            var buildGradle = workspace.resolve("build.gradle");
-            Files.writeString(buildGradle, "plugins { id 'java' }\n");
-
-            var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
-            var initialExternal = externalBinaryIndex(server);
-
-            var changed = new FileEvent();
-            changed.uri = buildGradle.toUri();
-            changed.type = FileChangeType.Changed;
-            var watched = new DidChangeWatchedFilesParams();
-            watched.changes = List.of(changed);
-            server.didChangeWatchedFiles(watched);
-
-            var refreshedExternal = externalBinaryIndex(server);
-            Assert.assertNotSame(
-                    "watched Gradle build changes should recreate the compiler immediately",
-                    initialExternal,
-                    refreshedExternal);
-            Assert.assertTrue(
-                    "expected explicit compiler recreation log for watched Gradle build change",
-                    capture.countContaining("[perf] compiler_recreate trigger=didChangeWatchedFiles") > 0);
-            Assert.assertEquals(
-                    "watched Gradle build change without active docs should not schedule compilerRecreated refresh",
-                    0,
-                    capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-            deleteRecursively(workspace);
-        }
-    }
-
-    @Test
-    public void reopeningAfterConfigurationChangeWithNoActiveDocsBootstrapsWorkspaceAgain() throws Exception {
-        FileStore.reset();
-        var logger = Logger.getLogger("main");
-        var previousLevel = logger.getLevel();
-        logger.setLevel(Level.FINE);
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var server = LanguageServerFixture.getJavaLanguageServer();
-            var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-            var text = FileStore.contents(file);
-
-            var open = new DidOpenTextDocumentParams();
-            open.textDocument.uri = file.toUri();
-            open.textDocument.version = 1;
-            open.textDocument.languageId = "java";
-            open.textDocument.text = text;
-            server.didOpenTextDocument(open);
-            Assert.assertTrue(
-                    "expected first didOpen bootstrap to publish an index",
-                    awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-
-            var close = new DidCloseTextDocumentParams();
-            close.textDocument.uri = file.toUri();
-            server.didCloseTextDocument(close);
-
-            var settings = new JsonObject();
-            var java = new JsonObject();
-            var extra = new com.google.gson.JsonArray();
-            extra.add("-Xlint:deprecation");
-            java.add("extraCompilerArgs", extra);
-            settings.add("java", java);
-            var change = new DidChangeConfigurationParams();
-            change.settings = settings;
-            server.didChangeConfiguration(change);
-
-            Assert.assertSame(
-                    "compiler recreation without active docs should clear the workspace snapshot",
-                    WorkspaceTypeIndex.EMPTY,
-                    workspaceIndex(server));
-
-            var beforeReopen = completionIndexVersion(server);
-            var reopen = new DidOpenTextDocumentParams();
-            reopen.textDocument.uri = file.toUri();
-            reopen.textDocument.version = 2;
-            reopen.textDocument.languageId = "java";
-            reopen.textDocument.text = text;
-            server.didOpenTextDocument(reopen);
-
-            Assert.assertTrue(
-                    "reopening after config change should bootstrap the workspace again",
-                    awaitCompletionIndexAdvance(server, beforeReopen, 10, TimeUnit.SECONDS));
-            Assert.assertEquals(
-                    "expected didOpen bootstrap to run once before and once after config change",
-                    2,
-                    capture.countContaining("[perf] completion_index_debounce trigger=didOpen"));
-        } finally {
-            logger.removeHandler(capture);
-            logger.setLevel(previousLevel);
-        }
-    }
-
-
-
-    @Test
-    public void watchedCreatedForActiveJavaFileSkipsDuplicateWork() throws Exception {
-        var server = LanguageServerFixture.getJavaLanguageServer();
-        var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
-        var text = FileStore.contents(file);
-
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = text;
-        server.didOpenTextDocument(open);
-
-        Thread.sleep(700);
-
-        var logger = Logger.getLogger("main");
-        var capture = new TestLogCapture();
-        logger.addHandler(capture);
-        try {
-            var created = new FileEvent();
-            created.uri = file.toUri();
-            created.type = FileChangeType.Created;
-            var watched = new DidChangeWatchedFilesParams();
-            watched.changes = List.of(created);
-            server.didChangeWatchedFiles(watched);
-
-            Thread.sleep(250);
-            Assert.assertEquals(
-                    "active-doc watched create should not trigger full-project index refresh",
-                    0,
-                    capture.countContaining(
-                            "[perf] completion_index_debounce trigger=didChangeWatchedFiles:javaCreated "));
-            Assert.assertEquals(
-                    "active-doc watched create should not trigger diagnostics debounce",
-                    0,
-                    capture.countContaining(
-                            "[perf] diagnostics_debounce trigger=didChangeWatchedFiles"));
-        } finally {
-            logger.removeHandler(capture);
-        }
-    }
-
-    private long completionIndexVersion(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
-        field.setAccessible(true);
-        return ((AtomicLong) field.get(server)).get();
-    }
-
-    private void openAndBootstrap(JavaLanguageServer server, Path file) throws Exception {
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = Files.readString(file);
-        server.didOpenTextDocument(open);
-        Assert.assertTrue(
-                "expected completion index bootstrap before drift test",
-                awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
-    }
-
-    private boolean hasDeclarationDrift(JavaLanguageServer server, Path file, List<?> shapes) throws Exception {
-        Method method =
-                JavaLanguageServer.class.getDeclaredMethod("hasDeclarationDrift", Path.class, List.class);
-        method.setAccessible(true);
-        return (boolean) method.invoke(server, file, shapes);
-    }
-
-    private Object declaredTypeShape(IndexedType indexed, boolean structuralLombok) throws Exception {
-        return declaredTypeShape(
-                indexed.qualifiedName,
-                directMemberSignatures(indexed),
-                indexed.superclass,
-                indexed.interfaces,
-                structuralLombok);
-    }
-
-    private Object declaredTypeShape(
-            String qualifiedName,
-            List<String> directMemberSignatures,
-            String superclass,
-            List<String> interfaces,
-            boolean structuralLombok)
-            throws Exception {
-        Class<?> shapeClass = Class.forName("org.javacs.JavaLanguageServer$DeclaredTypeShape");
-        Constructor<?> constructor =
-                shapeClass.getDeclaredConstructor(
-                        String.class, List.class, String.class, List.class, boolean.class);
-        constructor.setAccessible(true);
-        return constructor.newInstance(
-                qualifiedName,
-                List.copyOf(directMemberSignatures),
-                superclass,
-                List.copyOf(interfaces),
-                structuralLombok);
-    }
-
-    private IndexedType indexedTypeForFile(JavaLanguageServer server, Path file) throws Exception {
-        return workspaceIndex(server).types().values().stream()
-                .filter(type -> file.equals(type.sourcePath))
-                .findFirst()
-                .orElseThrow();
-    }
-
-    private WorkspaceTypeIndex workspaceIndexOf(IndexedType... types) throws Exception {
-        var constructor =
-                WorkspaceTypeIndex.class.getDeclaredConstructor(Map.class, Map.class);
-        constructor.setAccessible(true);
-        var byName = new java.util.LinkedHashMap<String, IndexedType>();
-        for (var type : types) {
-            byName.put(type.qualifiedName, type);
-        }
-        return constructor.newInstance(byName, Map.of());
-    }
-
-    private void publishWorkspaceSnapshot(JavaLanguageServer server, WorkspaceTypeIndex index, long version)
-            throws Exception {
-        var method =
-                JavaLanguageServer.class.getDeclaredMethod(
-                        "publishCompletionSnapshot",
-                        WorkspaceTypeIndex.class,
-                        ExternalBinaryTypeIndex.class,
-                        long.class,
-                        Class.forName("org.javacs.JavaLanguageServer$CompletionIndexScope"));
-        method.setAccessible(true);
-        method.invoke(server, index, ExternalBinaryTypeIndex.EMPTY, version, null);
-    }
-
-    private List<String> directMemberSignatures(IndexedType type) {
-        var signatures = new java.util.ArrayList<String>();
-        for (var member : type.members) {
-            if (member.synthetic || member.priority != 0) {
-                continue;
-            }
-            if (member.kind == CompletionItemKind.Field) {
-                signatures.add("F:" + member.name + ":" + member.isStatic);
-            } else if (member.kind == CompletionItemKind.Method) {
-                signatures.add(
-                        "M:"
-                                + member.name
-                                + ":"
-                                + (member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length)
-                                + ":"
-                                + member.isStatic);
-            }
-        }
-        return List.copyOf(signatures);
-    }
-
-    private ExternalBinaryTypeIndex externalBinaryIndex(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
-        field.setAccessible(true);
-        var snapshot = ((AtomicReference<?>) field.get(server)).get();
-        var method = snapshot.getClass().getDeclaredMethod("externalIndex");
-        method.setAccessible(true);
-        return (ExternalBinaryTypeIndex) method.invoke(snapshot);
-    }
-
-    private WorkspaceTypeIndex workspaceIndex(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
-        field.setAccessible(true);
-        var snapshot = ((AtomicReference<?>) field.get(server)).get();
-        var method = snapshot.getClass().getDeclaredMethod("workspaceIndex");
-        method.setAccessible(true);
-        return (WorkspaceTypeIndex) method.invoke(snapshot);
-    }
-
-    private void setCompletionIndexVersion(JavaLanguageServer server, long value) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
-        field.setAccessible(true);
-        ((AtomicLong) field.get(server)).set(value);
-    }
-
-    private JavaCompilerService interactiveCompiler(JavaLanguageServer server) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
-        field.setAccessible(true);
-        return (JavaCompilerService) field.get(server);
-    }
-
-    private void setInteractiveCompiler(JavaLanguageServer server, JavaCompilerService compiler) throws Exception {
-        var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
-        field.setAccessible(true);
-        field.set(server, compiler);
-    }
-
-    private MethodTrackingCompiler replaceInteractiveCompilerWithTracking(JavaLanguageServer server) throws Exception {
-        var original = interactiveCompiler(server);
-        var tracking =
-                new MethodTrackingCompiler(
-                        original.classPath,
-                        original.docPath,
-                        original.addExports,
-                        original.extraArgs,
-                        original.apEnabled,
-                        original.compilerRole);
-        setInteractiveCompiler(server, tracking);
-        return tracking;
-    }
-
-    private static void deleteRecursively(Path root) throws IOException {
-        try (var walk = Files.walk(root)) {
-            walk.sorted(java.util.Comparator.reverseOrder())
-                    .forEach(
-                            path -> {
-                                try {
-                                    Files.deleteIfExists(path);
-                                } catch (IOException ignored) {
-                                }
-                            });
-        }
-    }
-
-    private boolean awaitCompletionIndexAdvance(
-            JavaLanguageServer server, long before, long timeout, TimeUnit unit) throws Exception {
-        var deadline = System.nanoTime() + unit.toNanos(timeout);
-        while (System.nanoTime() < deadline) {
-            if (completionIndexVersion(server) > before) {
-                return true;
-            }
-            Thread.sleep(20);
-        }
-        return false;
-    }
-
-    private static DocumentDiagnosticReport pullDiagnostics(
-            JavaLanguageServer server, java.net.URI uri) {
-        var params = new DocumentDiagnosticParams();
-        params.textDocument = new TextDocumentIdentifier(uri);
-        return server.textDocumentDiagnostic(params);
-    }
-
-    private static List<String> diagnosticFingerprints(List<Diagnostic> diagnostics) {
-        return diagnostics.stream()
-                .map(
-                        d ->
-                                String.format(
-                                        "%s|%s|%s|%d:%d",
-                                        d.severity,
-                                        d.code,
-                                        d.message,
-                                        d.range.start.line,
-                                        d.range.start.character))
-                .toList();
-    }
-
-    private static boolean containsAny(String text, String... needles) {
-        if (text == null) {
-            return false;
-        }
-        for (var needle : needles) {
-            if (text.contains(needle)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static void openJavaFile(JavaLanguageServer server, Path file) throws IOException {
-        var open = new DidOpenTextDocumentParams();
-        open.textDocument.uri = file.toUri();
-        open.textDocument.version = 1;
-        open.textDocument.languageId = "java";
-        open.textDocument.text = Files.readString(file);
-        server.didOpenTextDocument(open);
-    }
-
-    private static CompletionList completionAtMarker(
-            JavaLanguageServer server, Path file, String contents, String marker) {
-        var offset = contents.indexOf(marker);
-        Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
-        offset += marker.length();
-        var line = 0;
-        var character = 0;
-        for (int i = 0; i < offset; i++) {
-            if (contents.charAt(i) == '\n') {
-                line++;
-                character = 0;
-            } else {
-                character++;
-            }
-        }
-        return server.completion(
-                        new TextDocumentPositionParams(
-                                new TextDocumentIdentifier(file.toUri()), new Position(line, character)))
-                .orElseThrow();
-    }
-
-    private static CompletionList isolatedCompletionAtMarker(
-            JavaLanguageServer server, Path file, String contents, int version, String marker, String... allMarkers) {
-        var isolated = contents;
-        for (var candidate : allMarkers) {
-            if (!candidate.equals(marker)) {
-                isolated = isolated.replace(candidate, sanitizeCompletionMarker(candidate));
-            }
-        }
-        var change = new DidChangeTextDocumentParams();
-        change.textDocument.uri = file.toUri();
-        change.textDocument.version = version;
-        var delta = new TextDocumentContentChangeEvent();
-        delta.text = isolated;
-        change.contentChanges.add(delta);
-        server.didChangeTextDocument(change);
-        return completionAtMarker(server, file, isolated, marker);
-    }
-
-    private static Process startLanguageServerProcess() throws IOException {
-        var script = Paths.get("dist/lang_server_mac.sh").toAbsolutePath().toString();
-        return new ProcessBuilder(script).directory(Paths.get("").toAbsolutePath().toFile()).start();
-    }
-
-    private static JsonObject initializeParams(Path workspace) {
-        var params = new JsonObject();
-        params.addProperty("rootUri", workspace.toUri().toString());
-        params.add("capabilities", new JsonObject());
-        return params;
-    }
-
-    private static JsonObject didOpenParams(Path file, String text) {
-        var params = new JsonObject();
-        var textDocument = new JsonObject();
-        textDocument.addProperty("uri", file.toUri().toString());
-        textDocument.addProperty("languageId", "java");
-        textDocument.addProperty("version", 0);
-        textDocument.addProperty("text", text);
-        params.add("textDocument", textDocument);
-        return params;
-    }
-
-    private static JsonObject documentParams(Path file) {
-        var params = new JsonObject();
-        var textDocument = new JsonObject();
-        textDocument.addProperty("uri", file.toUri().toString());
-        params.add("textDocument", textDocument);
-        return params;
-    }
-
-    private static JsonObject textDocumentPositionParams(Path file, int line, int character) {
-        var params = documentParams(file);
-        params.add("position", jsonPosition(line, character));
-        return params;
-    }
-
-    private static JsonObject jsonPosition(int line, int character) {
-        var position = new JsonObject();
-        position.addProperty("line", line);
-        position.addProperty("character", character);
-        return position;
-    }
-
-    private static JsonObject toJson(Position position) {
-        var json = new JsonObject();
-        json.addProperty("line", position.line);
-        json.addProperty("character", position.character);
-        return json;
-    }
-
-    private static void writeSources(Path workspace, Map<String, String> sources) throws IOException {
-        for (var entry : sources.entrySet()) {
-            var file = workspace.resolve(entry.getKey());
-            Files.createDirectories(file.getParent());
-            Files.writeString(file, entry.getValue());
-        }
-    }
-
-    private static Map<String, String> lombokBuilderDefinitionReplaySources() {
-        return Map.ofEntries(
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/AddressInfo.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import lombok.AllArgsConstructor;
-                        import lombok.Builder;
-                        import lombok.Data;
-                        import lombok.NoArgsConstructor;
-
-                        @Data
-                        @Builder
-                        @NoArgsConstructor
-                        @AllArgsConstructor
-                        public class AddressInfo {
-                          private String lineOne;
-                          private String lineTwo;
-                          private String city;
-                          private String region;
-                          private String postalCode;
-                          private String countryCode;
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/ContactWindow.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        public class ContactWindow {
-                          private String preferredZone;
-                          private int startHour;
-                          private int endHour;
-
-                          public ContactWindow() {}
-
-                          public ContactWindow(String preferredZone, int startHour, int endHour) {
-                            this.preferredZone = preferredZone;
-                            this.startHour = startHour;
-                            this.endHour = endHour;
-                          }
-
-                          public String getPreferredZone() {
-                            return preferredZone;
-                          }
-
-                          public void setPreferredZone(String preferredZone) {
-                            this.preferredZone = preferredZone;
-                          }
-
-                          public int getStartHour() {
-                            return startHour;
-                          }
-
-                          public void setStartHour(int startHour) {
-                            this.startHour = startHour;
-                          }
-
-                          public int getEndHour() {
-                            return endHour;
-                          }
-
-                          public void setEndHour(int endHour) {
-                            this.endHour = endHour;
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/AbstractTrackedRecord.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.time.Instant;
-                        import java.util.ArrayList;
-                        import java.util.List;
-
-                        public abstract class AbstractTrackedRecord {
-                          private String externalId;
-                          private Instant createdAt = Instant.now();
-                          private Instant updatedAt = Instant.now();
-                          private final List<String> tags = new ArrayList<>();
-
-                          public String getExternalId() {
-                            return externalId;
-                          }
-
-                          public void setExternalId(String externalId) {
-                            this.externalId = externalId;
-                          }
-
-                          public Instant getCreatedAt() {
-                            return createdAt;
-                          }
-
-                          public void setCreatedAt(Instant createdAt) {
-                            this.createdAt = createdAt;
-                          }
-
-                          public Instant getUpdatedAt() {
-                            return updatedAt;
-                          }
-
-                          public void setUpdatedAt(Instant updatedAt) {
-                            this.updatedAt = updatedAt;
-                          }
-
-                          public List<String> getTags() {
-                            return tags;
-                          }
-
-                          public boolean hasTag(String tag) {
-                            return tags.stream().anyMatch(tag::equalsIgnoreCase);
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/AbstractPartyRecord.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        public abstract class AbstractPartyRecord extends AbstractTrackedRecord {
-                          private String displayName;
-                          private String segment;
-                          private boolean archived;
-
-                          public String getDisplayName() {
-                            return displayName;
-                          }
-
-                          public void setDisplayName(String displayName) {
-                            this.displayName = displayName;
-                          }
-
-                          public String getSegment() {
-                            return segment;
-                          }
-
-                          public void setSegment(String segment) {
-                            this.segment = segment;
-                          }
-
-                          public boolean isArchived() {
-                            return archived;
-                          }
-
-                          public void setArchived(boolean archived) {
-                            this.archived = archived;
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/AbstractCustomerRecord.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.util.LinkedHashMap;
-                        import java.util.Map;
-                        import lombok.Getter;
-                        import lombok.Setter;
-
-                        @Getter
-                        @Setter
-                        public abstract class AbstractCustomerRecord extends AbstractPartyRecord {
-                          private final Map<String, String> attributes = new LinkedHashMap<>();
-                          private AddressInfo primaryAddress;
-                          private ContactWindow contactWindow;
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/CustomerProfile.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.util.ArrayList;
-                        import java.util.List;
-                        import lombok.EqualsAndHashCode;
-                        import lombok.Getter;
-                        import lombok.Setter;
-
-                        @Getter
-                        @Setter
-                        @EqualsAndHashCode(callSuper = true)
-                        public class CustomerProfile extends AbstractCustomerRecord {
-                          private String loyaltyTier;
-                          private boolean vip;
-                          private final List<OrderEnvelope> recentOrders = new ArrayList<>();
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/DeepGraph.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.util.ArrayList;
-                        import java.util.List;
-
-                        public class DeepGraph {
-                          private String graphName;
-                          private final List<DeepNode> nodes = new ArrayList<>();
-
-                          public String getGraphName() {
-                            return graphName;
-                          }
-
-                          public void setGraphName(String graphName) {
-                            this.graphName = graphName;
-                          }
-
-                          public List<DeepNode> getNodes() {
-                            return nodes;
-                          }
-
-                          public static class DeepNode {
-                            private String key;
-                            private OrderEnvelope envelope;
-                            private final List<DeepNode> children = new ArrayList<>();
-
-                            public String getKey() {
-                              return key;
-                            }
-
-                            public void setKey(String key) {
-                              this.key = key;
-                            }
-
-                            public OrderEnvelope getEnvelope() {
-                              return envelope;
-                            }
-
-                            public void setEnvelope(OrderEnvelope envelope) {
-                              this.envelope = envelope;
-                            }
-
-                            public List<DeepNode> getChildren() {
-                              return children;
-                            }
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/LineItem.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.math.BigDecimal;
-                        import java.util.ArrayList;
-                        import java.util.List;
-                        import lombok.AllArgsConstructor;
-                        import lombok.Builder;
-                        import lombok.Data;
-                        import lombok.NoArgsConstructor;
-
-                        @Data
-                        @Builder
-                        @NoArgsConstructor
-                        @AllArgsConstructor
-                        public class LineItem {
-                          private String sku;
-                          private String family;
-                          private int quantity;
-                          private BigDecimal unitPrice;
-                          private List<String> flags = new ArrayList<>();
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/MoneyBucket.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.math.BigDecimal;
-                        import java.util.Currency;
-
-                        public class MoneyBucket {
-                          private Currency currency;
-                          private BigDecimal subtotal;
-                          private BigDecimal taxes;
-                          private BigDecimal discount;
-
-                          public Currency getCurrency() {
-                            return currency;
-                          }
-
-                          public void setCurrency(Currency currency) {
-                            this.currency = currency;
-                          }
-
-                          public BigDecimal getSubtotal() {
-                            return subtotal;
-                          }
-
-                          public void setSubtotal(BigDecimal subtotal) {
-                            this.subtotal = subtotal;
-                          }
-
-                          public BigDecimal getTaxes() {
-                            return taxes;
-                          }
-
-                          public void setTaxes(BigDecimal taxes) {
-                            this.taxes = taxes;
-                          }
-
-                          public BigDecimal getDiscount() {
-                            return discount;
-                          }
-
-                          public void setDiscount(BigDecimal discount) {
-                            this.discount = discount;
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/model/OrderEnvelope.java",
-                        """
-                        package com.example.demo.complex.model;
-
-                        import java.time.LocalDate;
-                        import java.util.ArrayList;
-                        import java.util.List;
-                        import lombok.AllArgsConstructor;
-                        import lombok.Builder;
-                        import lombok.Data;
-                        import lombok.NoArgsConstructor;
-
-                        @Data
-                        @Builder
-                        @NoArgsConstructor
-                        @AllArgsConstructor
-                        public class OrderEnvelope {
-                          private String orderId;
-                          private String regionCode;
-                          private LocalDate requestedShipDate;
-                          private CustomerProfile customer;
-                          private MoneyBucket totals;
-                          private List<LineItem> items = new ArrayList<>();
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/spi/AuditPort.java",
-                        """
-                        package com.example.demo.complex.spi;
-
-                        import com.example.demo.complex.model.OrderEnvelope;
-                        import java.util.List;
-
-                        public interface AuditPort {
-                          List<String> LEVELS = List.of("TRACE", "DEBUG", "INFO", "WARN", "ERROR");
-
-                          String describe(OrderEnvelope envelope, String decision);
-
-                          default boolean isNoisy(String level) {
-                            LEVELS.getFirst();
-                            describe(null, null);
-                            return LEVELS.indexOf(level) >= LEVELS.indexOf("WARN");
-                          }
-
-                          static String hardcodedDecision() {
-                            LEVELS.getFirst();
-                            return "DIRECT_INTERFACE_DECISION";
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/spi/PricingPort.java",
-                        """
-                        package com.example.demo.complex.spi;
-
-                        import com.example.demo.complex.model.LineItem;
-                        import com.example.demo.complex.model.OrderEnvelope;
-                        import java.math.BigDecimal;
-                        import java.util.List;
-                        import java.util.Map;
-
-                        public interface PricingPort {
-                          Map<String, BigDecimal> SEGMENT_MULTIPLIERS =
-                              Map.of(
-                                  "enterprise", new BigDecimal("0.91"),
-                                  "mid-market", new BigDecimal("0.96"),
-                                  "starter", new BigDecimal("1.00"));
-
-                          List<String> HARD_CODED_REGIONS = List.of("EU", "US", "APAC", "INTERNAL");
-
-                          BigDecimal price(OrderEnvelope envelope, LineItem item);
-
-                          default BigDecimal fallbackDiscount(String segment) {
-                            HARD_CODED_REGIONS.add(null);
-                            price(null, null);
-                            price(null, null);
-                            HARD_CODED_REGIONS.getFirst();
-                            SEGMENT_MULTIPLIERS.get(null);
-                            return SEGMENT_MULTIPLIERS.getOrDefault(segment, BigDecimal.ONE);
-                          }
-
-                          static String directLookup(String region) {
-                            SEGMENT_MULTIPLIERS.get(null);
-                            HARD_CODED_REGIONS.getFirst();
-                            return HARD_CODED_REGIONS.stream()
-                                .filter(region::equalsIgnoreCase)
-                                .findFirst()
-                                .orElse("OTHER");
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/util/ComplexStatics.java",
-                        """
-                        package com.example.demo.complex.util;
-
-                        import com.example.demo.complex.model.LineItem;
-                        import com.example.demo.complex.model.OrderEnvelope;
-                        import com.example.demo.complex.spi.PricingPort;
-                        import java.math.BigDecimal;
-                        import java.util.Comparator;
-                        import java.util.List;
-                        import java.util.Locale;
-                        import java.util.concurrent.atomic.AtomicInteger;
-
-                        public final class ComplexStatics {
-                          private ComplexStatics() {}
-
-                          public static String resolveRiskBand(OrderEnvelope envelope) {
-                            var itemCount = envelope.getItems() == null ? 0 : envelope.getItems().size();
-                            return itemCount > 10 ? "HIGH" : itemCount > 5 ? "MEDIUM" : "LOW";
-                          }
-
-                          public static BigDecimal aggregate(List<LineItem> items, PricingPort pricingPort, OrderEnvelope envelope) {
-                            return items.stream()
-                                .map(item -> pricingPort.price(envelope, item))
-                                .reduce(BigDecimal.ZERO, BigDecimal::add);
-                          }
-
-                          public static final class NestedFormatter {
-                            private final AtomicInteger sequence = new AtomicInteger();
-
-                            public String label(LineItem item) {
-                              return item.getSku().toUpperCase(Locale.ROOT) + "-" + sequence.incrementAndGet();
-                            }
-
-                            public Comparator<LineItem> comparator() {
-                              return Comparator.comparing(LineItem::getFamily).thenComparing(LineItem::getSku);
-                            }
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/models/Foo.java",
-                        """
-                        package com.example.demo.models;
-
-                        import lombok.Data;
-
-                        @Data
-                        public class Foo {
-                          private Bar bar;
-                          private Integer dome;
-                          private String iba;
-                          private String adwqzxckqp;
-                          private String wakqll;
-                          private String someField;
-                          private String dfaa;
-                          private String name;
-                          private String hxawqp;
-                          private long zxczx;
-                          private String uws;
-                          private String qpo;
-                          private String halo;
-                          private String hihi;
-                          private String huhu;
-                          private String pipi;
-                          private String poppo;
-                          private int number;
-                          private String asd;
-                          private String koo;
-                          private String kk;
-                          private String xx;
-                          private String uui;
-                          private int oo;
-                          private static final String asdss = "SD";
-
-                          public static String getOne(String a) {
-                            return "asd";
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/models/Bar.java",
-                        """
-                        package com.example.demo.models;
-
-                        import lombok.Data;
-                        import lombok.extern.slf4j.Slf4j;
-
-                        @Data
-                        @Slf4j
-                        public class Bar {
-                          private Biz biz;
-                          private String xkkk;
-                          private String poo;
-                          private String pi;
-                          private String k;
-                          private int asd;
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/models/Biz.java",
-                        """
-                        package com.example.demo.models;
-
-                        public class Biz {
-                          private String bvca;
-                          private long jshq;
-                          private int huh;
-                          private long uuhas;
-                          private long buhk;
-                          private String alpoq;
-                          private long khasd;
-                          private String hzxww;
-
-                          public Biz() {}
-
-                          public Biz(String a) {
-                            this.bvca = a;
-                          }
-
-                          public String getBvca() {
-                            return this.bvca;
-                          }
-
-                          public void setBvca(String bvca) {
-                            this.bvca = bvca;
-                          }
-
-                          public long getJshq() {
-                            return this.jshq;
-                          }
-
-                          public void setJshq(long jshq) {
-                            this.jshq = jshq;
-                          }
-
-                          public String getHzxww() {
-                            return this.hzxww;
-                          }
-
-                          public void setHzxww(String hzxww) {
-                            this.hzxww = hzxww;
-                          }
-
-                          public String getAlpoq() {
-                            return this.alpoq;
-                          }
-
-                          public void setAlpoq(String alpoq) {
-                            this.alpoq = alpoq;
-                          }
-
-                          public long getKhasd() {
-                            return this.khasd;
-                          }
-
-                          public void setKhasd(long khasd) {
-                            this.khasd = khasd;
-                          }
-
-                          public long getBuhk() {
-                            return this.buhk;
-                          }
-
-                          public void setBuhk(long buhk) {
-                            this.buhk = buhk;
-                          }
-
-                          public long getUuhas() {
-                            return this.uuhas;
-                          }
-
-                          public void setUuhas(long uuhas) {
-                            this.uuhas = uuhas;
-                          }
-
-                          public int getHuh() {
-                            return this.huh;
-                          }
-
-                          public void setHuh(int huh) {
-                            this.huh = huh;
-                          }
-
-                          @Override
-                          public boolean equals(Object o) {
-                            if (this == o) return true;
-                            if (o == null || getClass() != o.getClass()) return false;
-                            Biz that = (Biz) o;
-                            if (!java.util.Objects.equals(this.huh, that.huh)) return false;
-                            if (!java.util.Objects.equals(this.uuhas, that.uuhas)) return false;
-                            if (!java.util.Objects.equals(this.buhk, that.buhk)) return false;
-                            if (!java.util.Objects.equals(this.alpoq, that.alpoq)) return false;
-                            if (!java.util.Objects.equals(this.khasd, that.khasd)) return false;
-                            if (!java.util.Objects.equals(this.hzxww, that.hzxww)) return false;
-                            return true;
-                          }
-
-                          @Override
-                          public int hashCode() {
-                            return java.util.Objects.hash(this.huh, this.uuhas, this.buhk, this.alpoq, this.khasd, this.hzxww);
-                          }
-                        }
-                        """),
-                Map.entry(
-                        "src/main/java/com/example/demo/complex/service/ComplexScenarioService.java",
-                        """
-                        package com.example.demo.complex.service;
-
-                        import com.example.demo.complex.model.AddressInfo;
-                        import com.example.demo.complex.model.ContactWindow;
-                        import com.example.demo.complex.model.CustomerProfile;
-                        import com.example.demo.complex.model.DeepGraph;
-                        import com.example.demo.complex.model.LineItem;
-                        import com.example.demo.complex.model.MoneyBucket;
-                        import com.example.demo.complex.model.OrderEnvelope;
-                        import com.example.demo.complex.spi.AuditPort;
-                        import com.example.demo.complex.spi.PricingPort;
-                        import com.example.demo.complex.util.ComplexStatics;
-                        import com.example.demo.models.Bar;
-                        import com.example.demo.models.Biz;
-                        import com.example.demo.models.Foo;
-                        import com.google.common.collect.ImmutableMap;
-                        import java.math.BigDecimal;
-                        import java.time.LocalDate;
-                        import java.util.ArrayList;
-                        import java.util.Comparator;
-                        import java.util.Currency;
-                        import java.util.LinkedHashMap;
-                        import java.util.List;
-                        import java.util.Map;
-                        import java.util.Objects;
-                        import java.util.stream.Collectors;
-                        import lombok.extern.slf4j.Slf4j;
-                        import org.apache.commons.lang3.StringUtils;
-                        import org.springframework.beans.factory.annotation.Autowired;
-                        import org.springframework.cache.annotation.Cacheable;
-                        import org.springframework.stereotype.Service;
-
-                        @Service
-                        @Slf4j
-                        public class ComplexScenarioService implements AuditPort {
-                          @Autowired private PricingPort pricingPort;
-                          @Autowired private AuditPort auditPort;
-
-                          @Cacheable("complex-snapshots")
-                          public Map<String, Object> generateSnapshot(String seed) {
-                            auditPort.isNoisy(null);
-                            auditPort.describe(null, null);
-                            auditPort.isNoisy(null);
-
-                            var envelope = sampleEnvelope(seed);
-                            var kasd = envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());
-                            envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());
-                            envelope.getItems().stream().map(i -> i.getFlags().getFirst()).collect(Collectors.toList());
-                            envelope.getItems().stream().map(LineItem::getFlags).collect(Collectors.toList());
-                            envelope.getItems().stream().map(i -> i.getFlags()).collect(Collectors.toList());
-                            var formatter = new ComplexStatics.NestedFormatter();
-                            formatter.comparator();
-                            var graph = buildGraph(envelope);
-                            graph.getGraphName();
-                            var results = new LinkedHashMap<String, Object>();
-                            results.put(null, null);
-                            results.get(null);
-                            results.get(null);
-                            var region = PricingPort.directLookup(envelope.getRegionCode());
-                            results.get(0);
-                            region.isBlank();
-                            log.info(null);
-                            var riskBand = ComplexStatics.resolveRiskBand(envelope);
-                            ComplexStatics.resolveRiskBand(null);
-                            ComplexStatics.aggregate(null, null, null);
-                            var hardDecision = AuditPort.hardcodedDecision();
-                            hardDecision.isBlank();
-                            hardDecision.isBlank();
-                            AuditPort.LEVELS.getFirst();
-                            AuditPort.LEVELS.getFirst();
-                            AuditPort.LEVELS.getLast();
-                            AuditPort.LEVELS.get(0);
-                            AuditPort.LEVELS.getFirst();
-                            envelope.getCustomer().getLoyaltyTier();
-                            envelope.getCustomer().getContactWindow().getEndHour();
-                            envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());
-                            envelope.getItems().stream().map(i -> i.getFamily()).collect(Collectors.toList());
-
-                            var labels =
-                                envelope.getItems().stream()
-                                    .sorted(formatter.comparator())
-                                    .map(formatter::label)
-                                    .collect(Collectors.toCollection(ArrayList::new));
-
-                            var k = envelope.getItems().stream().sorted(formatter.comparator());
-                            var pk = k.collect(Collectors.toList());
-                            pk.getFirst();
-                            labels.get(0);
-                            labels.getFirst();
-
-                            var xx = envelope.getItems().stream().sorted(formatter.comparator())
-                                .map(formatter::label)
-                                .toList();
-
-                            xx.getFirst();
-                            labels.get(0);
-                            var total = ComplexStatics.aggregate(envelope.getItems(), pricingPort, envelope);
-                            total.add(null);
-                            var flaggedFamilies =
-                                envelope.getItems().stream()
-                                    .filter(item -> item.getFlags().stream().anyMatch(flag -> flag.contains("manual")))
-                                    .collect(Collectors.groupingBy(LineItem::getFamily, Collectors.counting()));
-                            flaggedFamilies.get(null);
-                            flaggedFamilies.get(null);
-
-                            StringUtils.appendIfMissing(null, null, null);
-                            var branch =
-                                switch (region) {
-                                  case "asd" -> null;
-                                  case "EU" -> total.compareTo(new BigDecimal("2000")) > 0 ? "EU-HEAVY" : "EU-LIGHT";
-                                  case "US" -> total.compareTo(new BigDecimal("1000")) > 0 ? "US-HEAVY" : "US-LIGHT";
-                                  case "APAC" -> "APAC-" + riskBand;
-                                  default -> "OTHER-" + riskBand;
-                                };
-
-                            switch (region) {
-                              case "d" -> System.out.print("");
-                              default -> System.out.print("");
-                            }
-                            StringUtils.isBlank(null);
-                            if (StringUtils.isBlank(seed)) {
-                              results.put("seedState", "blank");
-                              results.get(null);
-                            } else if (seed.length() > 12 && envelope.getCustomer().isVip()) {
-                              results.put("seedState", "long-vip");
-                            } else if (seed.length() > 4) {
-                              results.put("seedState", "normal");
-                            } else {
-                              results.put("seedState", "tiny");
-                            }
-
-                            var expensiveItems =
-                                envelope.getItems().stream()
-                                    .map(item -> Map.entry(item.getSku(), pricingPort.price(envelope, item)))
-                                    .filter(entry -> entry.getValue().compareTo(new BigDecimal("150")) > 0)
-                                    .sorted(Map.Entry.comparingByValue(Comparator.reverseOrder()))
-                                    .toList();
-
-                            expensiveItems.getFirst();
-
-                            Foo foo = new Foo();
-                            foo.getAdwqzxckqp();
-                            foo.setBar(new Bar());
-                            foo.getBar().setBiz(new Biz("seed-" + seed));
-                            foo.setAsd(seed);
-                            foo.getAdwqzxckqp();
-
-                            results.put(null, null);
-                            results.put("region", region);
-                            results.put("riskBand", riskBand);
-                            results.put("branch", branch);
-                            results.put("hardDecision", hardDecision);
-                            results.put("labels", labels);
-                            results.put("graphSize", graph.getNodes().size());
-                            results.put("priceTotal", total);
-                            results.put("flaggedFamilies", flaggedFamilies);
-                            results.put("expensiveItems", expensiveItems);
-                            results.put("auditDescription", auditPort.describe(envelope, branch));
-                            results.put("localAuditDescription", describe(envelope, branch));
-                            results.put("fooBarName", foo.getBar().getBiz().getAlpoq());
-                            results.put("fooSeed", foo.getAsd());
-                            results.put("staticMultiplierKeys", ImmutableMap.copyOf(PricingPort.SEGMENT_MULTIPLIERS).keySet());
-                            results.put(null, null);
-
-                            for (var item : envelope.getItems()) {
-                              item.getFamily();
-                              var perItem = pricingPort.price(envelope, item);
-                              if (perItem.compareTo(new BigDecimal("600")) > 0 && item.getQuantity() > 5) {
-                                results.put(item.getSku(), "priority-" + item.getFamily());
-                              } else if (item.getQuantity() == 1) {
-                                results.put(item.getSku(), "single-" + formatter.label(item));
-                              } else {
-                                results.put(item.getSku(), item.getFlags().isEmpty() ? "plain" : item.getFlags().get(0));
-                              }
-                            }
-
-                            return results;
-                          }
-
-                          @Override
-                          public String describe(OrderEnvelope envelope, String decision) {
-                            envelope.getCustomer().getContactWindow().getEndHour();
-                            var summary =
-                                envelope.getItems().stream()
-                                    .map(item -> item.getSku() + ":" + item.getQuantity())
-                                    .collect(Collectors.joining("|"));
-                            envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.joining("|"));
-                            envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());
-                            var asd = envelope.getItems().stream().map(i -> i.getUnitPrice().toBigInteger()).collect(Collectors.toList());
-                            asd.remove(null);
-                            return envelope.getOrderId() + "::" + decision + "::" + summary;
-                          }
-
-                          private OrderEnvelope sampleEnvelope(String seed) {
-                            var customer = new CustomerProfile();
-                            customer.getLoyaltyTier().isBlank();
-                            customer.setContactWindow(new ContactWindow());
-                            customer.getLoyaltyTier();
-                            customer.getLoyaltyTier().isBlank();
-                            customer.setExternalId("customer-" + seed);
-                            customer.setDisplayName("Customer " + seed);
-                            customer.setSegment(seed.length() % 2 == 0 ? "enterprise" : "mid-market");
-                            customer.setVip(seed.length() % 3 == 0);
-                            customer.setLoyaltyTier(seed.length() > 8 ? "PLATINUM" : "GOLD");
-                            customer.setPrimaryAddress(
-                                AddressInfo.builder()
-                                    .lineOne("Infinite Loop " + seed)
-                                    .city("Copenhagen")
-                                    .region("Capital")
-                                    .postalCode("2100")
-                                    .countryCode("DK")
-                                    .build());
-                            customer.setContactWindow(new ContactWindow("Europe/Copenhagen", 8, 18));
-                            customer.getAttributes().put("seed", seed);
-                            customer.getAttributes().put("staticDecision", AuditPort.hardcodedDecision());
-
-                            var totals = new MoneyBucket();
-                            totals.getCurrency();
-                            totals.setCurrency(Currency.getInstance("USD"));
-                            totals.setSubtotal(new BigDecimal("1234.56"));
-                            totals.setTaxes(new BigDecimal("321.11"));
-                            totals.setDiscount(new BigDecimal("87.20"));
-                            LineItem.builder().family("asd").flags(List.of("asd")).sku("21");
-                            var b = LineItem.builder().family(null).quantity(0).sku(null).build();
-                            b.getFlags();
-
-                            var items = new ArrayList<LineItem>();
-                            items.add(null);
-                            LineItem.builder().family(null).flags(null).quantity(2).build();
-                            items.add(
-                                LineItem.builder()
-                                    .sku("CPU-" + seed)
-                                    .family("compute")
-                                    .quantity(3)
-                                    .unitPrice(new BigDecimal("122.10"))
-                                    .flags(List.of("manual-review", "fragile"))
-                                    .build());
-                            items.add(
-                                LineItem.builder()
-                                    .sku("MEM-" + seed)
-                                    .family("memory")
-                                    .quantity(9)
-                                    .unitPrice(new BigDecimal("55.00"))
-                                    .flags(List.of("warehouse-b"))
-                                    .build());
-                            items.add(null);
-                            items.add(
-                                LineItem.builder()
-                                    .sku("STO-" + seed)
-                                    .family("storage")
-                                    .quantity(1)
-                                    .unitPrice(new BigDecimal("899.99"))
-                                    .flags(List.of())
-                                    .build());
-
-                            var envelope = new OrderEnvelope();
-                            envelope.setCustomer(new CustomerProfile());
-                            var cs = new CustomerProfile();
-                            cs.setPrimaryAddress(null);
-                            envelope.setOrderId("order-" + seed);
-                            envelope.setRegionCode(seed.length() % 2 == 0 ? "EU" : "US");
-                            envelope.setRequestedShipDate(LocalDate.now().plusDays(seed.length()));
-                            envelope.setCustomer(customer);
-                            envelope.setTotals(totals);
-                            envelope.setTotals(null);
-                            envelope.setItems(items);
-                            customer.getRecentOrders().add(envelope);
-                            customer.getLoyaltyTier();
-                            customer.getContactWindow().getEndHour();
-                            return envelope;
-                          }
-
-                          private DeepGraph buildGraph(OrderEnvelope envelope) {
-                            var graph = new DeepGraph();
-                            graph.setGraphName("graph-" + envelope.getOrderId());
-
-                            var root = new DeepGraph.DeepNode();
-                            root.setKey(envelope.getOrderId());
-                            root.setEnvelope(envelope);
-
-                            for (var item : envelope.getItems()) {
-                              var child = new DeepGraph.DeepNode();
-                              child.setKey(item.getSku());
-                              child.setEnvelope(envelope);
-
-                              if (Objects.equals(item.getFamily(), "compute")) {
-                                child.getChildren().add(createLeaf(item.getSku() + "-policy", envelope));
-                                child.getChildren().add(createLeaf(item.getSku() + "-sla", envelope));
-                              } else {
-                                child.getChildren().add(createLeaf(item.getSku() + "-generic", envelope));
-                              }
-                              root.getChildren().add(child);
-                            }
-
-                            graph.getNodes().add(root);
-                            graph.getNodes().addAll(root.getChildren());
-                            graph.getGraphName();
-                            return graph;
-                          }
-
-                          private DeepGraph.DeepNode createLeaf(String key, OrderEnvelope envelope) {
-                            var leaf = new DeepGraph.DeepNode();
-                            leaf.getChildren();
-                            leaf.setKey(key);
-                            leaf.setEnvelope(envelope);
-                            return leaf;
-                          }
-                        }
-                        """));
-    }
-
-    private static Position positionAtMarker(String contents, String marker) {
-        var offset = contents.indexOf(marker);
-//        Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
-        var line = 0;
-        var character = 0;
-        for (int i = 0; i < offset; i++) {
-            if (contents.charAt(i) == '\n') {
-                line++;
-                character = 0;
-            } else {
-                character++;
-            }
-        }
-        return new Position(line, character);
-    }
-
-    private static String sanitizeCompletionMarker(String marker) {
-        Assert.assertTrue("expected dangling completion marker ending with '.'", marker.endsWith("."));
-        return marker + "toString();";
-    }
-
-    private static void assertDefinitionAtMarker(
-            JavaLanguageServer server,
-            Path file,
-            String contents,
-            String marker,
-            URI expectedUri,
-            int expectedLineZeroBased) {
-        var result =
-                server.gotoDefinition(
-                                new TextDocumentPositionParams(
-                                        new TextDocumentIdentifier(file.toUri()),
-                                        positionAtMarker(contents, marker)))
-                        .orElseThrow();
-        Assert.assertFalse("expected definition result for marker: " + marker, result.isEmpty());
-        Assert.assertEquals(expectedUri, result.get(0).uri);
-        Assert.assertEquals(expectedLineZeroBased, result.get(0).range.start.line);
-    }
-
-    private static void assertProcessDefinitionAtMarker(
-            ProcessLspClient rpc,
-            int id,
-            Path file,
-            String contents,
-            String marker,
-            URI expectedUri,
-            int expectedLineZeroBased)
-            throws Exception {
-        var position = positionAtMarker(contents, marker);
-        rpc.request(id, "textDocument/definition", textDocumentPositionParams(file, position.line, position.character));
-        var response = rpc.awaitResponse(id, 15, TimeUnit.SECONDS);
-        Assert.assertTrue("expected definition response payload", response.has("result"));
-        var result = response.get("result");
-        Assert.assertTrue("expected definition result array for marker: " + marker + ", got: " + response, result.isJsonArray());
-        Assert.assertFalse("expected non-empty definition result for marker: " + marker, result.getAsJsonArray().isEmpty());
-        var location = result.getAsJsonArray().get(0).getAsJsonObject();
-        Assert.assertEquals(expectedUri.toString(), location.get("uri").getAsString());
-        Assert.assertEquals(expectedLineZeroBased, location.getAsJsonObject("range").getAsJsonObject("start").get("line").getAsInt());
-    }
-
-    private static void assertProcessDefinitionPresentAtMarker(
-            ProcessLspClient rpc, int id, Path file, String contents, String marker) throws Exception {
-        assertProcessDefinitionPresentAtMarker(rpc, id, file, contents, marker, 0);
-    }
-
-    private static void assertProcessDefinitionPresentAtMarker(
-            ProcessLspClient rpc, int id, Path file, String contents, String marker, int markerOffset) throws Exception {
-        var position = requiredPositionAtMarker(contents, marker, markerOffset);
-        rpc.request(id, "textDocument/definition", textDocumentPositionParams(file, position.line, position.character));
-        var response = rpc.awaitResponse(id, 15, TimeUnit.SECONDS);
-        Assert.assertTrue("expected definition response payload", response.has("result"));
-        var result = response.get("result");
-        Assert.assertTrue("expected definition result array for marker: " + marker + ", got: " + response, result.isJsonArray());
-        Assert.assertFalse("expected non-empty definition result for marker: " + marker, result.getAsJsonArray().isEmpty());
-    }
-
-    private static void writeInferredDemoPom(Path workspace) throws IOException {
-        Files.writeString(
-                workspace.resolve("pom.xml"),
-                """
-                <?xml version="1.0" encoding="UTF-8"?>
-                <project xmlns="http://maven.apache.org/POM/4.0.0"
-                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-                  <modelVersion>4.0.0</modelVersion>
-                  <parent>
-                    <groupId>org.springframework.boot</groupId>
-                    <artifactId>spring-boot-starter-parent</artifactId>
-                    <version>4.0.1</version>
-                    <relativePath/>
-                  </parent>
-                  <groupId>com.example</groupId>
-                  <artifactId>demo-repro</artifactId>
-                  <version>0.0.1-SNAPSHOT</version>
-                  <properties>
-                    <java.version>21</java.version>
-                  </properties>
-                  <dependencies>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-webmvc</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-data-jpa</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-validation</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-cache</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-actuator</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-security</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.apache.commons</groupId>
-                      <artifactId>commons-lang3</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>com.google.guava</groupId>
-                      <artifactId>guava</artifactId>
-                      <version>33.3.1-jre</version>
-                    </dependency>
-                    <dependency>
-                      <groupId>com.github.ben-manes.caffeine</groupId>
-                      <artifactId>caffeine</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.projectlombok</groupId>
-                      <artifactId>lombok</artifactId>
-                    </dependency>
-                    <dependency>
-                      <groupId>org.springframework.boot</groupId>
-                      <artifactId>spring-boot-starter-webmvc-test</artifactId>
-                      <scope>test</scope>
-                    </dependency>
-                  </dependencies>
-                  <build>
-                    <plugins>
-                      <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-compiler-plugin</artifactId>
-                        <configuration>
-                          <annotationProcessorPaths>
-                            <path>
-                              <groupId>org.projectlombok</groupId>
-                              <artifactId>lombok</artifactId>
-                            </path>
-                          </annotationProcessorPaths>
-                        </configuration>
-                      </plugin>
-                    </plugins>
-                  </build>
-                </project>
-                """);
-    }
-
-    private static Position requiredPositionAtMarker(String contents, String marker, int offset) {
-        var index = contents.indexOf(marker);
-        Assert.assertTrue("expected marker in file contents: " + marker, index >= 0);
-        return positionAtOffset(contents, index + offset);
-    }
-
-    private static Position positionAtOffset(String contents, int offset) {
-        var line = 0;
-        var character = 0;
-        for (int i = 0; i < offset; i++) {
-            if (contents.charAt(i) == '\n') {
-                line++;
-                character = 0;
-            } else {
-                character++;
-            }
-        }
-        return new Position(line, character);
-    }
-
-    private static Set<String> completionLabels(CompletionList completion) {
-        return completion.items.stream()
-                .map(item -> item.label)
-                .collect(java.util.stream.Collectors.toSet());
-    }
-
-    private static final class ProcessLspClient implements AutoCloseable {
-        private final Process process;
-        private final OutputStream input;
-        private final BlockingQueue<JsonObject> messages = new LinkedBlockingQueue<>();
-        private final BlockingQueue<String> logs = new LinkedBlockingQueue<>();
-        private final Thread stdoutReader;
-        private final Thread stderrReader;
-
-        private ProcessLspClient(Process process) {
-            this.process = process;
-            this.input = process.getOutputStream();
-            this.stdoutReader =
-                    new Thread(
-                            () -> {
-                                try {
-                                    while (true) {
-                                        messages.add(JsonParser.parseString(nextLspToken(process.getInputStream())).getAsJsonObject());
-                                    }
-                                } catch (EOFException ignored) {
-                                } catch (IOException e) {
-                                    throw new RuntimeException(e);
-                                }
-                            },
-                            "lsp-stdout-reader");
-            this.stderrReader =
-                    new Thread(
-                            () -> {
-                                try (var reader =
-                                        new BufferedReader(
-                                                new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
-                                    for (String line; (line = reader.readLine()) != null; ) {
-                                        logs.add(line);
-                                    }
-                                } catch (IOException e) {
-                                    throw new RuntimeException(e);
-                                }
-                            },
-                            "lsp-stderr-reader");
-            stdoutReader.setDaemon(true);
-            stderrReader.setDaemon(true);
-            stdoutReader.start();
-            stderrReader.start();
-        }
-
-        void request(int id, String method, JsonObject params) throws IOException {
-            var message = new JsonObject();
-            message.addProperty("jsonrpc", "2.0");
-            message.addProperty("id", id);
-            message.addProperty("method", method);
-            message.add("params", params);
-            send(message);
-        }
-
-        void notify(String method, JsonObject params) throws IOException {
-            var message = new JsonObject();
-            message.addProperty("jsonrpc", "2.0");
-            message.addProperty("method", method);
-            message.add("params", params);
-            send(message);
-        }
-
-        JsonObject awaitResponse(int id, long timeout, TimeUnit unit) throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (true) {
-                var remaining = deadline - System.nanoTime();
-                if (remaining <= 0) {
-                    Assert.fail("timed out waiting for LSP response id=" + id);
-                }
-                var next = messages.poll(remaining, TimeUnit.NANOSECONDS);
-                if (next == null) {
-                    continue;
-                }
-                if (next.has("id") && next.get("id").getAsInt() == id) {
-                    return next;
-                }
-            }
-        }
-
-        String awaitLog(String needle, long timeout, TimeUnit unit) throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (true) {
-                var remaining = deadline - System.nanoTime();
-                if (remaining <= 0) {
-                    Assert.fail("timed out waiting for process log containing: " + needle);
-                }
-                var next = logs.poll(remaining, TimeUnit.NANOSECONDS);
-                if (next == null) {
-                    continue;
-                }
-                if (next.contains(needle)) {
-                    return next;
-                }
-            }
-        }
-
-        private void send(JsonObject message) throws IOException {
-            var json = message.toString();
-            var bytes = json.getBytes(StandardCharsets.UTF_8);
-            var header = String.format("Content-Length: %d\r\n\r\n", bytes.length).getBytes(StandardCharsets.UTF_8);
-            input.write(header);
-            input.write(bytes);
-            input.flush();
-        }
-
-        @Override
-        public void close() {
-            process.destroyForcibly();
-        }
-
-        private static String nextLspToken(InputStream stream) throws IOException {
-            int contentLength = -1;
-            while (true) {
-                var header = readHeader(stream);
-                if (header.isEmpty()) {
-                    if (contentLength < 0) {
-                        throw new EOFException("missing content length");
-                    }
-                    return readBody(stream, contentLength);
-                }
-                if (header.startsWith("Content-Length: ")) {
-                    contentLength = Integer.parseInt(header.substring("Content-Length: ".length()));
-                }
-            }
-        }
-
-        private static String readHeader(InputStream stream) throws IOException {
-            var line = new StringBuilder();
-            while (true) {
-                var next = stream.read();
-                if (next == -1) {
-                    throw new EOFException("stream closed");
-                }
-                if (next == '\r') {
-                    var newline = stream.read();
-                    if (newline == -1) {
-                        throw new EOFException("stream closed");
-                    }
-                    return line.toString();
-                }
-                line.append((char) next);
-            }
-        }
-
-        private static String readBody(InputStream stream, int contentLength) throws IOException {
-            var bytes = stream.readNBytes(contentLength);
-            if (bytes.length != contentLength) {
-                throw new EOFException("expected " + contentLength + " bytes, got " + bytes.length);
-            }
-            return new String(bytes, StandardCharsets.UTF_8);
-        }
-    }
-
-    private static boolean isSyntaxBlockingDiagnostic(Diagnostic diagnostic) {
-        if (diagnostic == null || diagnostic.code == null) {
-            return false;
-        }
-        return switch (diagnostic.code) {
-            case "compiler.err.expected",
-                    "compiler.err.expected2",
-                    "compiler.err.not.stmt",
-                    "compiler.err.illegal.start.of.expr",
-                    "compiler.err.illegal.start.of.stmt" -> true;
-            default -> false;
-        };
-    }
-
-    private static void configureLombokClasspath(JavaLanguageServer server) {
-        var settings = new JsonObject();
-        var java = new JsonObject();
-        var classPath = new com.google.gson.JsonArray();
-        classPath.add(TestRuntimeJars.lombokJar().toString());
-        java.add("classPath", classPath);
-        settings.add("java", java);
-        var change = new DidChangeConfigurationParams();
-        change.settings = settings;
-        server.didChangeConfiguration(change);
-    }
-
-    private static class RecordingDiagnosticsClient implements LanguageClient {
-        private final Map<java.net.URI, List<Diagnostic>> diagnosticsByUri = new ConcurrentHashMap<>();
-        private final AtomicInteger diagnosticsPublishCount = new AtomicInteger();
-
-        @Override
-        public void publishDiagnostics(PublishDiagnosticsParams params) {
-            diagnosticsByUri.put(params.uri, List.copyOf(params.diagnostics));
-            diagnosticsPublishCount.incrementAndGet();
-        }
-
-        @Override
-        public void showMessage(ShowMessageParams params) {}
-
-        @Override
-        public void registerCapability(String method, com.google.gson.JsonElement options) {}
-
-        @Override
-        public void customNotification(String method, com.google.gson.JsonElement params) {}
-
-        boolean awaitErrorMatching(
-                java.net.URI uri,
-                Predicate<Diagnostic> predicate,
-                long timeout,
-                TimeUnit unit)
-                throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (System.nanoTime() < deadline) {
-                if (hasErrorMatching(uri, predicate)) {
-                    return true;
-                }
-                Thread.sleep(25);
-            }
-            return false;
-        }
-
-        boolean awaitNoErrorMatching(
-                java.net.URI uri,
-                Predicate<Diagnostic> predicate,
-                long timeout,
-                TimeUnit unit)
-                throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (System.nanoTime() < deadline) {
-                if (diagnosticsPublishCount.get() > 0 && !hasErrorMatching(uri, predicate)) {
-                    return true;
-                }
-                Thread.sleep(25);
-            }
-            return false;
-        }
-
-        boolean hasErrorMatching(java.net.URI uri, Predicate<Diagnostic> predicate) {
-            var diagnostics = diagnosticsByUri.get(uri);
-            if (diagnostics == null) {
-                return false;
-            }
-            return diagnostics.stream()
-                    .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
-                    .anyMatch(predicate);
-        }
-
-        int diagnosticsPublishCount() {
-            return diagnosticsPublishCount.get();
-        }
-
-        Set<java.net.URI> publishedUris() {
-            return Set.copyOf(diagnosticsByUri.keySet());
-        }
-
-        boolean awaitDiagnosticsCount(java.net.URI uri, int count, long timeout, TimeUnit unit)
-                throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (System.nanoTime() < deadline) {
-                var diagnostics = diagnosticsByUri.get(uri);
-                if (diagnostics != null && diagnostics.size() == count) {
-                    return true;
-                }
-                Thread.sleep(25);
-            }
-            return false;
-        }
-
-        boolean awaitDiagnosticsMatching(
-                java.net.URI uri, Predicate<List<Diagnostic>> predicate, long timeout, TimeUnit unit)
-                throws InterruptedException {
-            var deadline = System.nanoTime() + unit.toNanos(timeout);
-            while (System.nanoTime() < deadline) {
-                var diagnostics = diagnosticsByUri.get(uri);
-                if (diagnostics != null && predicate.test(diagnostics)) {
-                    return true;
-                }
-                Thread.sleep(25);
-            }
-            return false;
-        }
-
-        List<Diagnostic> diagnostics(java.net.URI uri) {
-            return diagnosticsByUri.getOrDefault(uri, List.of());
-        }
-    }
-
-    private static final class RecordingMessageClient implements LanguageClient {
-        private final List<ShowMessageParams> messages = new java.util.concurrent.CopyOnWriteArrayList<>();
-
-        @Override
-        public void publishDiagnostics(PublishDiagnosticsParams params) {}
-
-        @Override
-        public void showMessage(ShowMessageParams params) {
-            messages.add(params);
-        }
-
-        @Override
-        public void registerCapability(String method, com.google.gson.JsonElement options) {}
-
-        @Override
-        public void customNotification(String method, com.google.gson.JsonElement params) {}
-    }
-
-    private static class TestLogCapture extends Handler {
-        private final java.util.concurrent.CopyOnWriteArrayList<String> lines =
-                new java.util.concurrent.CopyOnWriteArrayList<>();
-
-        @Override
-        public void publish(LogRecord record) {
-            if (record == null || record.getLevel().intValue() < Level.FINE.intValue()) {
-                return;
-            }
-            lines.add(record.getMessage());
-        }
-
-        @Override
-        public void flush() {}
-
-        @Override
-        public void close() {}
-
-        String lastLineContaining(String needle) {
-            for (int i = lines.size() - 1; i >= 0; i--) {
-                var line = lines.get(i);
-                if (line != null && line.contains(needle)) {
-                    return line;
-                }
-            }
-            return null;
-        }
-
-        int countContaining(String needle) {
-            var count = 0;
-            for (var line : lines) {
-                if (line != null && line.contains(needle)) {
-                    count++;
-                }
-            }
-            return count;
-        }
-
-        int countMatching(String pattern) {
-            var count = 0;
-            for (var line : lines) {
-                if (line != null && line.matches(pattern)) {
-                    count++;
-                }
-            }
-            return count;
-        }
-
-        List<String> linesMatching(String pattern) {
-            var result = new java.util.ArrayList<String>();
-            for (var line : lines) {
-                if (line != null && line.matches(pattern)) {
-                    result.add(line);
-                }
-            }
-            return result;
-        }
-
-        void clear() {
-            lines.clear();
-        }
-    }
-
-    private static class MethodTrackingCompiler extends JavaCompilerService {
-        final AtomicInteger parseCalls = new AtomicInteger();
-        final AtomicInteger compileCalls = new AtomicInteger();
-        final AtomicInteger compileFastCalls = new AtomicInteger();
-        final AtomicInteger compileFastWithProcessorsCalls = new AtomicInteger();
-
-        MethodTrackingCompiler(
-                Set<Path> classPath,
-                Set<Path> docPath,
-                Set<String> addExports,
-                List<String> extraArgs,
-                boolean lombokConfiguredEnabled,
-                String compilerRole) {
-            super(classPath, docPath, addExports, extraArgs);
-        }
-
-        void resetCounters() {
-            parseCalls.set(0);
-            compileCalls.set(0);
-            compileFastCalls.set(0);
-            compileFastWithProcessorsCalls.set(0);
-        }
-
-        @Override
-        public ParseTask parse(Path file) {
-            parseCalls.incrementAndGet();
-            return super.parse(file);
-        }
-
-        @Override
-        public ParseTask parse(javax.tools.JavaFileObject file) {
-            parseCalls.incrementAndGet();
-            return super.parse(file);
-        }
-
-        @Override
-        public CompileTask compile(Path... files) {
-            compileCalls.incrementAndGet();
-            return super.compile(files);
-        }
-
-        @Override
-        public CompileTask compile(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
-            compileCalls.incrementAndGet();
-            return super.compile(sources);
-        }
-
-        @Override
-        public CompileTask compileFast(Path... files) {
-            compileFastCalls.incrementAndGet();
-            return super.compileFast(files);
-        }
-
-        @Override
-        public CompileTask compileFast(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
-            compileFastCalls.incrementAndGet();
-            return super.compileFast(sources);
-        }
-
-        @Override
-        public CompileTask compileFastWithProcessors(Path... files) {
-            compileFastWithProcessorsCalls.incrementAndGet();
-            return super.compileFastWithProcessors(files);
-        }
-
-        @Override
-        public CompileTask compileFastWithProcessors(
-                java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
-            compileFastWithProcessorsCalls.incrementAndGet();
-            return super.compileFastWithProcessors(sources);
-        }
-    }
+//     @Test
+//     public void LintShouldNotCrashOnCodeWithMissingTypeIdentifier() {
+//         String filePath = "src/test/examples/missing-type-identifier/Sample.java";
+//         TextDocumentItem textDocument = new TextDocumentItem();
+//         textDocument.uri = URI.create("file:///" + filePath);
+//         try {
+//             textDocument.text = Files.readString(Path.of(filePath));
+//         } catch (IOException e) {
+//             System.out.println(e.toString());
+//         }
+//         textDocument.version = 1;
+//         textDocument.languageId = "java";
+//         JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+//         server.didOpenTextDocument(new DidOpenTextDocumentParams(textDocument));
+//
+//         // Should not fail
+//         server.lint(Collections.singleton(Paths.get(textDocument.uri)));
+//     }
+//
+//     @Test
+//     public void lintDoesNotRefreshCompletionIndex() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var hello = FindResource.path("org/javacs/example/HelloWorld.java");
+//         var before = completionIndexVersion(server);
+//         server.lint(List.of(hello));
+//         var after = completionIndexVersion(server);
+//         Assert.assertEquals("diagnostics lint should not rebuild completion index", before, after);
+//     }
+//
+//     @Test
+//     public void didSaveRefreshesCompletionIndexWithoutDiagnosticsCoupling() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var initial = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = initial;
+//         server.didOpenTextDocument(open);
+//
+//         var before = completionIndexVersion(server);
+//         var save = new DidSaveTextDocumentParams();
+//         save.textDocument = new TextDocumentIdentifier(file.toUri());
+//         server.didSaveTextDocument(save);
+//         var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
+//         Assert.assertTrue("didSave should trigger completion index refresh", updated);
+//     }
+//
+//     @Test
+//     public void didChangeRefreshesCompletionIndexIncrementallyForLombokModel() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var model = FindResource.path("org/javacs/example/LombokCrossTypeModel.java");
+//         var original = FileStore.contents(model);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = model.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = original;
+//         server.didOpenTextDocument(open);
+//         Assert.assertTrue(
+//                 "expected completion index to initialize before didChange check",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         var before = completionIndexVersion(server);
+//         var change = new DidChangeTextDocumentParams();
+//         change.textDocument.uri = model.toUri();
+//         change.textDocument.version = 2;
+//         var delta = new TextDocumentContentChangeEvent();
+//         delta.text = original.replace("private String name;", "private String title;");
+//         change.contentChanges.add(delta);
+//         server.didChangeTextDocument(change);
+//
+//         Assert.assertTrue(
+//                 "didChange should refresh completion index for Lombok model updates",
+//                 awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+//     }
+//
+//     @Test
+//     public void completionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer();
+//             var file = FindResource.path("org/javacs/example/LombokCrossTypeCompletion.java");
+//
+//             Assert.assertEquals("expected empty completion index before bootstrap", 0L, completionIndexVersion(server));
+//
+//             var position =
+//                     new TextDocumentPositionParams(
+//                             new TextDocumentIdentifier(file.toUri()), new Position(5, 14));
+//             Optional<CompletionList> initialCompletion = server.completion(position);
+//
+//             Assert.assertTrue("expected completion result while bootstrap is pending", initialCompletion.isPresent());
+//             Assert.assertTrue(
+//                     "completion should schedule async workspace bootstrap when the index is empty",
+//                     capture.countContaining("completion_index_debounce trigger=completionBootstrap") > 0);
+//             Assert.assertEquals(
+//                     "completion should not do synchronous index rebuilds on cold start",
+//                     0,
+//                     capture.countContaining("completion_index_refresh_sync trigger=completionBootstrap"));
+//             Assert.assertEquals(
+//                     "completion should not perform a full workspace compile directly",
+//                     0,
+//                     capture.countContaining("compile request=completion mode=full"));
+//
+//             Assert.assertTrue(
+//                     "completion bootstrap should initialize the completion index asynchronously",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//             Assert.assertTrue(
+//                     "completion bootstrap should log workspace bootstrap start",
+//                     capture.countContaining("completion_index_debounce trigger=completionBootstrap") > 0);
+//             Assert.assertTrue(
+//                     "completion bootstrap should log workspace index install",
+//                     capture.countContaining("index installed trigger=completionBootstrap") > 0);
+//
+//             Optional<CompletionList> completion = server.completion(position);
+//             Assert.assertTrue("expected completion result after bootstrap", completion.isPresent());
+//             var labels =
+//                     completion.get().items.stream()
+//                             .map(item -> item.label)
+//                             .collect(java.util.stream.Collectors.toSet());
+//             Assert.assertTrue("expected getter completion after bootstrap", labels.contains("getName"));
+//             Assert.assertTrue("expected setter completion after bootstrap", labels.contains("setName"));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void definitionBootstrapsInitialCompletionIndexWhenStillEmpty() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/LombokFieldReferences.java");
+//
+//         Assert.assertEquals("expected empty completion index before definition bootstrap", 0L, completionIndexVersion(server));
+//
+//         var result =
+//                 server.gotoDefinition(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()),
+//                                 new Position(9, 12)));
+//
+//         Assert.assertTrue("expected definition result after bootstrap", result.isPresent());
+//         Assert.assertTrue("expected definition bootstrap to initialize completion index", completionIndexVersion(server) > 0);
+//     }
+//
+//     @Test
+//     public void referencesBootstrapInitialCompletionIndexWhenStillEmpty() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/GotoImplementation.java");
+//
+//         Assert.assertEquals("expected empty completion index before references bootstrap", 0L, completionIndexVersion(server));
+//
+//         var params = new ReferenceParams();
+//         params.textDocument = new TextDocumentIdentifier(file.toUri());
+//         params.position = new Position(8, 20);
+//         var result = server.findReferences(params);
+//
+//         Assert.assertTrue("expected references result after bootstrap", result.isPresent());
+//         Assert.assertTrue("expected references bootstrap to initialize completion index", completionIndexVersion(server) > 0);
+//     }
+//
+//     @Test
+//     public void didOpenBootstrapPreservesLombokAccessorBackingFieldMetadata() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         configureLombokClasspath(server);
+//         var file = FindResource.path("org/javacs/example/LombokFieldReferences.java");
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = Files.readString(file);
+//         server.didOpenTextDocument(open);
+//
+//         Assert.assertTrue(
+//                 "expected completion index bootstrap before Lombok accessor metadata check",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         var member =
+//                 workspaceIndex(server)
+//                         .member("org.javacs.example.LombokFieldReferences", "getBar", false, new String[0]);
+//         Assert.assertTrue("expected indexed Lombok accessor after didOpen bootstrap", member.isPresent());
+//         Assert.assertEquals("bar", member.get().backingFieldName);
+//     }
+//
+//     @Test
+//     public void didOpenBootstrapPublishesSourceSnapshotsAndDeclarationRanges() throws Exception {
+//         FileStore.reset();
+//         var workspace = Files.createTempDirectory("jls-index-source-snapshot");
+//         try {
+//             var pkg = workspace.resolve("src/com/example");
+//             Files.createDirectories(pkg);
+//             var file = pkg.resolve("SnapshotExample.java");
+//             Files.writeString(
+//                     file,
+//                     "package com.example;\n"
+//                             + "import java.util.List;\n"
+//                             + "import static java.util.Collections.emptyList;\n"
+//                             + "class SnapshotExample {\n"
+//                             + "  static class Nested {\n"
+//                             + "    static final String VALUE = \"x\";\n"
+//                             + "    List<String> values() { return emptyList(); }\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+//             openJavaFile(server, file);
+//
+//             Assert.assertTrue(
+//                     "expected completion index bootstrap before snapshot assertion",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//             var index = workspaceIndex(server);
+//             var source = index.sourceFile(file);
+//             Assert.assertTrue("expected indexed source snapshot", source.isPresent());
+//             Assert.assertEquals(List.of("java.util.List"), source.get().imports);
+//             Assert.assertEquals(List.of("java.util.Collections.emptyList"), source.get().staticImports);
+//             Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample"));
+//             Assert.assertTrue(source.get().declaredTypes.contains("com.example.SnapshotExample.Nested"));
+//
+//             var nestedType = index.typeInfo("com.example.SnapshotExample.Nested");
+//             Assert.assertTrue("expected nested type in workspace snapshot", nestedType.isPresent());
+//
+//             var field = index.member("com.example.SnapshotExample.Nested", "VALUE", true);
+//             Assert.assertTrue("expected nested field in workspace snapshot", field.isPresent());
+//
+//             var method = index.member("com.example.SnapshotExample.Nested", "values", false, new String[0]);
+//             Assert.assertTrue("expected nested method in workspace snapshot", method.isPresent());
+//             Assert.assertEquals("List<String>", method.get().declaredReturnType);
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didOpenSchedulesWorkspaceCompletionBootstrapInsteadOfSharedDiagnosticsIndex() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer();
+//             var file = FindResource.path("org/javacs/example/HelloWorld.java");
+//             var text = FileStore.contents(file);
+//
+//             Assert.assertEquals("expected empty completion index before didOpen", 0L, completionIndexVersion(server));
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = file.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = text;
+//             server.didOpenTextDocument(open);
+//
+//             Assert.assertTrue(
+//                     "didOpen should initialize the completion index from workspace bootstrap",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//             Assert.assertTrue(
+//                     "didOpen should log workspace bootstrap start",
+//                     capture.countContaining("completion_index_debounce trigger=didOpen") > 0);
+//             Assert.assertTrue(
+//                     "didOpen should log workspace index install",
+//                     capture.countContaining("index installed trigger=didOpen") > 0);
+//             Assert.assertEquals(
+//                     "startup should not schedule a separate compilerRecreated completion refresh when no active docs existed",
+//                     0,
+//                     capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
+//             Assert.assertEquals(
+//                     "full bootstrap should not immediately schedule a redundant activeDeclarations refresh",
+//                     0,
+//                     capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void didOpenSynchronouslyBootstrapsWorkspaceDiagnosticsAndIndex() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//             var file = FindResource.path("org/javacs/example/HelloWorld.java");
+//
+//             Assert.assertEquals("expected empty completion index before didOpen bootstrap", 0L, completionIndexVersion(server));
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = file.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = FileStore.contents(file);
+//             server.didOpenTextDocument(open);
+//
+//             Assert.assertTrue(
+//                     "didOpen should install the workspace index asynchronously",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//             Assert.assertEquals(
+//                     "didOpen bootstrap should not schedule a separate completion bootstrap",
+//                     0,
+//                     capture.countContaining("completion_index_debounce trigger=didOpenActiveBootstrap"));
+//             Assert.assertTrue(
+//                     "didOpen bootstrap should log workspace bootstrap start",
+//                     capture.countContaining("completion_index_debounce trigger=didOpen") > 0);
+//             Assert.assertTrue(
+//                     "didOpen bootstrap should log workspace index installation",
+//                     capture.countContaining("index installed trigger=didOpen") > 0);
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void configurationChangeKeepsExternalBinaryIndexReadyWithoutWorkspaceBootstrap() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var beforeVersion = completionIndexVersion(server);
+//         var initialExternal = externalBinaryIndex(server);
+//
+//         Assert.assertNotSame("compiler initialization should create a non-empty external index", ExternalBinaryTypeIndex.EMPTY, initialExternal);
+//
+//         var settings = new JsonObject();
+//         var java = new JsonObject();
+//         var extraCompilerArgs = new com.google.gson.JsonArray();
+//         extraCompilerArgs.add("-Xlint:deprecation");
+//         java.add("extraCompilerArgs", extraCompilerArgs);
+//         settings.add("java", java);
+//         var change = new DidChangeConfigurationParams();
+//         change.settings = settings;
+//         server.didChangeConfiguration(change);
+//
+//         var refreshedExternal = externalBinaryIndex(server);
+//         Assert.assertNotSame("compiler recreation should refresh the external binary index", initialExternal, refreshedExternal);
+//         Assert.assertNotSame("refreshed external index should remain usable", ExternalBinaryTypeIndex.EMPTY, refreshedExternal);
+//         Assert.assertEquals(
+//                 "compiler recreation without opened files should not reset workspace index version",
+//                 beforeVersion,
+//                 completionIndexVersion(server));
+//     }
+//
+//     @Test
+//     public void didOpenBootstrapIndexIncludesReferencedTypesForMemberCompletion() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var fieldFile = FindResource.path("org/javacs/example/CompletionBootstrapFieldMembers.java");
+//         var fieldText = FileStore.contents(fieldFile);
+//
+//         var openField = new DidOpenTextDocumentParams();
+//         openField.textDocument.uri = fieldFile.toUri();
+//         openField.textDocument.version = 1;
+//         openField.textDocument.languageId = "java";
+//         openField.textDocument.text = fieldText;
+//         server.didOpenTextDocument(openField);
+//
+//         Assert.assertTrue(
+//                 "didOpen should initialize the completion index",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         var fieldCompletion =
+//                 server.completion(
+//                                 new TextDocumentPositionParams(
+//                                         new TextDocumentIdentifier(fieldFile.toUri()),
+//                                         new Position(6, 19)))
+//                         .orElseThrow();
+//         var fieldLabels =
+//                 fieldCompletion.items.stream()
+//                         .map(item -> item.label)
+//                         .collect(java.util.stream.Collectors.toSet());
+//         Assert.assertTrue("field receiver should resolve referenced type members", fieldLabels.contains("value"));
+//
+//         FileStore.reset();
+//         server = LanguageServerFixture.getJavaLanguageServer();
+//         var localFile = FindResource.path("org/javacs/example/CompletionBootstrapLocalMembers.java");
+//         var localText = FileStore.contents(localFile);
+//
+//         var openLocal = new DidOpenTextDocumentParams();
+//         openLocal.textDocument.uri = localFile.toUri();
+//         openLocal.textDocument.version = 1;
+//         openLocal.textDocument.languageId = "java";
+//         openLocal.textDocument.text = localText;
+//         server.didOpenTextDocument(openLocal);
+//
+//         Assert.assertTrue(
+//                 "didOpen should initialize the completion index for local receiver test",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         var localCompletion =
+//                 server.completion(
+//                                 new TextDocumentPositionParams(
+//                                         new TextDocumentIdentifier(localFile.toUri()),
+//                                         new Position(5, 10)))
+//                         .orElseThrow();
+//         var localLabels =
+//                 localCompletion.items.stream()
+//                         .map(item -> item.label)
+//                         .collect(java.util.stream.Collectors.toSet());
+//         Assert.assertTrue("local receiver should resolve referenced type members", localLabels.contains("value"));
+//     }
+//
+//     @Test
+//     public void didOpenWorkspaceBootstrapIncludesSplitInheritedDotCompletion() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/SplitInheritedFooDot.java");
+//         var text = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = text;
+//         server.didOpenTextDocument(open);
+//
+//         Assert.assertTrue(
+//                 "didOpen should initialize the completion index",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         CompileBatch.resetPerfCounters();
+//         var completion =
+//                 server.completion(
+//                                 new TextDocumentPositionParams(
+//                                         new TextDocumentIdentifier(file.toUri()),
+//                                         new Position(4, 25)))
+//                         .orElseThrow();
+//         var labels =
+//                 completion.items.stream()
+//                         .map(item -> item.label)
+//                         .collect(java.util.stream.Collectors.toSet());
+//         Assert.assertTrue(
+//                 "split-file inherited dot completion should work without opening the superclass first",
+//                 labels.contains("perform"));
+//         Assert.assertEquals(
+//                 "completion should not use full compile after workspace bootstrap",
+//                 0L,
+//                 CompileBatch.perfCounters().fullBatches);
+//         Assert.assertEquals(
+//                 "completion should not analyze after workspace bootstrap",
+//                 0L,
+//                 CompileBatch.perfCounters().analyzeInvocations);
+//         Assert.assertEquals(
+//                 "completion should not run annotation processing after workspace bootstrap",
+//                 0L,
+//                 CompileBatch.perfCounters().apEnabledBatches);
+//     }
+//
+//     @Test
+//     public void didChangedDoesNotPushDiagnostics() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer(LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var text = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = text;
+//         server.didOpenTextDocument(open);
+//
+//         var change = new DidChangeTextDocumentParams();
+//         change.textDocument.uri = file.toUri();
+//         change.textDocument.version = 2;
+//         var delta = new TextDocumentContentChangeEvent();
+//         delta.text = text + "\n// clear-stale";
+//         change.contentChanges.add(delta);
+//         server.didChangeTextDocument(change);
+//
+//         // Pull diagnostics should reflect the updated content
+//         var report = pullDiagnostics(server, file.toUri());
+//         Assert.assertNotNull("pull diagnostics should return a report", report);
+//     }
+//
+//     @Test
+//     public void didSaveRefreshesIndexAndDiagnosticsArePullable() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/HelloWorld.java");
+//         var text = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = text;
+//         server.didOpenTextDocument(open);
+//
+//         Thread.sleep(900);
+//
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var before = completionIndexVersion(server);
+//
+//             var change = new DidChangeTextDocumentParams();
+//             change.textDocument.uri = file.toUri();
+//             change.textDocument.version = 2;
+//             var delta = new TextDocumentContentChangeEvent();
+//             delta.text = text + "\n// force-save-compile";
+//             change.contentChanges.add(delta);
+//             server.didChangeTextDocument(change);
+//
+//             Thread.sleep(80);
+//             var save = new DidSaveTextDocumentParams();
+//             save.textDocument = new TextDocumentIdentifier(file.toUri());
+//             server.didSaveTextDocument(save);
+//             var updated = awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS);
+//             Assert.assertTrue("didSave should refresh completion index", updated);
+//
+//             Assert.assertTrue(
+//                     "didSave should schedule a dedicated completion-index refresh",
+//                     capture.countContaining("[perf] completion_index_debounce trigger=didSave") > 0);
+//
+//             var report = pullDiagnostics(server, file.toUri());
+//             Assert.assertNotNull("pull diagnostics should return a report after save", report);
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void lombokAnnotationTypeDetectionHandlesQualifiedAndSimpleNames() {
+//         Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("lombok.Data"));
+//         Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("lombok.experimental.SuperBuilder"));
+//         Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("Data"));
+//         Assert.assertTrue(LombokAnnotations.isLombokAnnotationType("Getter"));
+//
+//         Assert.assertFalse(LombokAnnotations.isLombokAnnotationType(null));
+//         Assert.assertFalse(LombokAnnotations.isLombokAnnotationType(""));
+//         Assert.assertFalse(LombokAnnotations.isLombokAnnotationType("org.example.Custom"));
+//     }
+//
+//
+//
+//     @Test
+//     public void lombokStructuralAnnotationDetectionExcludesSlf4j() {
+//         Assert.assertTrue(LombokAnnotations.isStructuralLombokAnnotationType("lombok.Data"));
+//         Assert.assertTrue(LombokAnnotations.isStructuralLombokAnnotationType("Getter"));
+//         Assert.assertFalse(LombokAnnotations.isStructuralLombokAnnotationType("lombok.extern.slf4j.Slf4j"));
+//         Assert.assertFalse(LombokAnnotations.isStructuralLombokAnnotationType("Slf4j"));
+//     }
+//
+//     @Test
+//     public void didChangeDoesNotPushDiagnosticsForOtherOpenFiles() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-diagnostics-open-batch");
+//         try {
+//             var pkg = workspace.resolve("src/p");
+//             Files.createDirectories(pkg);
+//             var serviceFile = pkg.resolve("ServiceTwo.java");
+//             var otherFile = pkg.resolve("Other.java");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package p;\n"
+//                             + "class ServiceTwo {\n"
+//                             + "  void test() {}\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     otherFile,
+//                     "package p;\n"
+//                             + "class Other {\n"
+//                             + "  void test(ServiceTwo service) {\n"
+//                             + "    service.toString();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var otherOpen = new DidOpenTextDocumentParams();
+//             otherOpen.textDocument.uri = otherFile.toUri();
+//             otherOpen.textDocument.version = 1;
+//             otherOpen.textDocument.languageId = "java";
+//             otherOpen.textDocument.text = Files.readString(otherFile);
+//             server.didOpenTextDocument(otherOpen);
+//
+//             var change = new DidChangeTextDocumentParams();
+//             change.textDocument.uri = serviceFile.toUri();
+//             change.textDocument.version = 2;
+//             var delta = new TextDocumentContentChangeEvent();
+//             delta.text = serviceOpen.textDocument.text + "\n// updated";
+//             change.contentChanges.add(delta);
+//             server.didChangeTextDocument(change);
+//
+//             // Each file can be pulled independently after a change
+//             var serviceReport = pullDiagnostics(server, serviceFile.toUri());
+//             var otherReport = pullDiagnostics(server, otherFile.toUri());
+//             Assert.assertNotNull("pull diagnostics should work for changed file", serviceReport);
+//             Assert.assertNotNull("pull diagnostics should work for other open file", otherReport);
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didOpenConsumerIncludesUnsavedActiveEnumDependencyInDiagnosticsCompile() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-enum-related-open");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var models = workspace.resolve("src/com/example/demo/models");
+//             var service = workspace.resolve("src/com/example/demo/service");
+//             Files.createDirectories(models);
+//             Files.createDirectories(service);
+//
+//             var enumFile = models.resolve("MyEnum.java");
+//             var serviceFile = service.resolve("ServiceTwo.java");
+//             Files.writeString(
+//                     enumFile,
+//                     "package com.example.demo.models;\n"
+//                             + "public enum MyEnum {\n"
+//                             + "  FIRST;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package com.example.demo.service;\n"
+//                             + "import com.example.demo.models.MyEnum;\n"
+//                             + "class ServiceTwo {\n"
+//                             + "  String test() {\n"
+//                             + "    return MyEnum.FIRST.getType();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//
+//             var enumOpen = new DidOpenTextDocumentParams();
+//             enumOpen.textDocument.uri = enumFile.toUri();
+//             enumOpen.textDocument.version = 1;
+//             enumOpen.textDocument.languageId = "java";
+//             enumOpen.textDocument.text =
+//                     "package com.example.demo.models;\n"
+//                             + "public enum MyEnum {\n"
+//                             + "  FIRST;\n"
+//                             + "  public String getType() {\n"
+//                             + "    return name();\n"
+//                             + "  }\n"
+//                             + "}\n";
+//             server.didOpenTextDocument(enumOpen);
+//
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var report = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertFalse(
+//                     "consumer diagnostics should include the active unsaved enum dependency on open",
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getType()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didOpenPublishesDiagnosticsOnlyForRequestedFileUri() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-diagnostics-requested-uri");
+//         try {
+//             var pkg = workspace.resolve("src/p");
+//             Files.createDirectories(pkg);
+//
+//             var fooFile = pkg.resolve("Foo.java");
+//             var serviceFile = pkg.resolve("Service.java");
+//             Files.writeString(
+//                     fooFile,
+//                     "package p;\n"
+//                             + "class Foo {\n"
+//                             + "  private String unused = \"x\";\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package p;\n"
+//                             + "class Service {\n"
+//                             + "  Foo test() {\n"
+//                             + "    return new Foo();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = serviceFile.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(open);
+//
+//             var serviceReport = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertEquals(
+//                     "pull diagnostics should report zero errors for the clean service file",
+//                     0,
+//                     serviceReport.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .count());
+//             var fooReport = pullDiagnostics(server, fooFile.toUri());
+//             Assert.assertEquals(
+//                     "pull diagnostics for Foo should not be triggered by opening Service",
+//                     0,
+//                     fooReport.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .count());
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didOpenConsumerIncludesReferencedLombokEnumDependencyWithoutOpeningEnum() throws Exception {
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//         var serviceFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproEnumService.java");
+//         try {
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var report = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertFalse(
+//                     "consumer diagnostics should include the referenced Lombok enum dependency on first open",
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getType()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void openingDependencyAfterConsumerDoesNotChangeConsumerDiagnosticsOutcome() throws Exception {
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//         var serviceFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproService.java");
+//         var modelFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/model/ReproTxn.java");
+//
+//         var serviceOpen = new DidOpenTextDocumentParams();
+//         serviceOpen.textDocument.uri = serviceFile.toUri();
+//         serviceOpen.textDocument.version = 1;
+//         serviceOpen.textDocument.languageId = "java";
+//         serviceOpen.textDocument.text = Files.readString(serviceFile);
+//         server.didOpenTextDocument(serviceOpen);
+//
+//         var beforeReport = pullDiagnostics(server, serviceFile.toUri());
+//         Assert.assertFalse(
+//                 "expected clean consumer diagnostics before dependency is opened",
+//                 beforeReport.items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//
+//         var modelOpen = new DidOpenTextDocumentParams();
+//         modelOpen.textDocument.uri = modelFile.toUri();
+//         modelOpen.textDocument.version = 1;
+//         modelOpen.textDocument.languageId = "java";
+//         modelOpen.textDocument.text = Files.readString(modelFile);
+//         server.didOpenTextDocument(modelOpen);
+//
+//         var afterReport = pullDiagnostics(server, serviceFile.toUri());
+//         Assert.assertFalse(
+//                 "opening the dependency should not change the consumer diagnostics outcome",
+//                 afterReport.items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//     }
+//
+//     @Test
+//     public void completionOnDependencyDoesNotWarmDiagnosticsParseCache() throws Exception {
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//
+//         var consumerFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproService.java");
+//         var dependencyFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/model/ReproTxn.java");
+//         server.completion(
+//                 new TextDocumentPositionParams(
+//                         new TextDocumentIdentifier(dependencyFile.toUri()), new Position(4, 12)));
+//
+//         var consumerOpen = new DidOpenTextDocumentParams();
+//         consumerOpen.textDocument.uri = consumerFile.toUri();
+//         consumerOpen.textDocument.version = 1;
+//         consumerOpen.textDocument.languageId = "java";
+//         consumerOpen.textDocument.text = Files.readString(consumerFile);
+//         server.didOpenTextDocument(consumerOpen);
+//
+//         var report = pullDiagnostics(server, consumerFile.toUri());
+//         Assert.assertFalse(
+//                 "expected clean consumer diagnostics after dependency completion warmup",
+//                 report.items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//     }
+//
+//     @Test
+//     public void didOpenConsumerLogsLombokDiagnosticsExpansionDetails() throws Exception {
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//
+//         var serviceFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproService.java");
+//         var serviceOpen = new DidOpenTextDocumentParams();
+//         serviceOpen.textDocument.uri = serviceFile.toUri();
+//         serviceOpen.textDocument.version = 1;
+//         serviceOpen.textDocument.languageId = "java";
+//         serviceOpen.textDocument.text = Files.readString(serviceFile);
+//         server.didOpenTextDocument(serviceOpen);
+//
+//         var report = pullDiagnostics(server, serviceFile.toUri());
+//         Assert.assertFalse(
+//                 "expected clean consumer diagnostics for the Lombok repro service",
+//                 report.items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//     }
+//
+//     @Test
+//     public void didOpenConsumerIncludesActiveUnsavedTransitiveLombokDependency() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-lombok-transitive-active");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var model = workspace.resolve("src/p/model");
+//             var service = workspace.resolve("src/p/service");
+//             Files.createDirectories(model);
+//             Files.createDirectories(service);
+//
+//             var fooFile = model.resolve("Foo.java");
+//             var barFile = model.resolve("Bar.java");
+//             var serviceFile = service.resolve("Service.java");
+//             Files.writeString(
+//                     fooFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Foo {\n"
+//                             + "  private Bar bar;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     barFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Bar {\n"
+//                             + "  private String biz;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package p.service;\n"
+//                             + "import p.model.Foo;\n"
+//                             + "public class Service {\n"
+//                             + "  void run(Foo foo) {\n"
+//                             + "    var bar = foo.getBar();\n"
+//                             + "    var biz = bar.getBiz();\n"
+//                             + "    biz.length();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//
+//             var settings = new JsonObject();
+//             var java = new JsonObject();
+//             var classPath = new com.google.gson.JsonArray();
+//             classPath.add(TestRuntimeJars.lombokJar().toString());
+//             java.add("classPath", classPath);
+//             settings.add("java", java);
+//             var change = new DidChangeConfigurationParams();
+//             change.settings = settings;
+//             server.didChangeConfiguration(change);
+//
+//             var fooOpen = new DidOpenTextDocumentParams();
+//             fooOpen.textDocument.uri = fooFile.toUri();
+//             fooOpen.textDocument.version = 1;
+//             fooOpen.textDocument.languageId = "java";
+//             fooOpen.textDocument.text =
+//                     Files.readString(fooFile)
+//                             + "\n// keep Foo active and unsaved so diagnostics must use in-memory dependency content\n";
+//             server.didOpenTextDocument(fooOpen);
+//
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var report = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertFalse(
+//                     "consumer diagnostics should include active unsaved Lombok dependencies transitively",
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void repeatedDidOpenAcrossDifferentLombokConsumersKeepsDiagnosticsResolved() throws Exception {
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//
+//         var firstFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproService.java");
+//         var secondFile = FindResource.path("org/javacs/example/LombokNestedDiagnostics.java");
+//         try {
+//             var firstOpen = new DidOpenTextDocumentParams();
+//             firstOpen.textDocument.uri = firstFile.toUri();
+//             firstOpen.textDocument.version = 1;
+//             firstOpen.textDocument.languageId = "java";
+//             firstOpen.textDocument.text = Files.readString(firstFile);
+//             server.didOpenTextDocument(firstOpen);
+//
+//             var firstReport = pullDiagnostics(server, firstFile.toUri());
+//             Assert.assertFalse(
+//                     "first Lombok consumer diagnostics should stay resolved",
+//                     firstReport.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//
+//             var secondOpen = new DidOpenTextDocumentParams();
+//             secondOpen.textDocument.uri = secondFile.toUri();
+//             secondOpen.textDocument.version = 1;
+//             secondOpen.textDocument.languageId = "java";
+//             secondOpen.textDocument.text = Files.readString(secondFile);
+//             server.didOpenTextDocument(secondOpen);
+//
+//             var secondReport = pullDiagnostics(server, secondFile.toUri());
+//             Assert.assertFalse(
+//                     "second Lombok consumer diagnostics should stay resolved after reusing diagnostics compiler",
+//                     secondReport.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getBar()", "getName()")));
+//             Assert.assertEquals(
+//                     "repeated Lombok diagnostics should not disable annotation processing",
+//                     0,
+//                     capture.countContaining("[perf] lombok_ap disabled=true"));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void lombokSlf4jBridgeBreaksDataClassExpansion() throws Exception {
+//         // Reproducer for the @Slf4j LombokTypeIndex exclusion bug.
+//         //
+//         // BFS expansion from the opened file resolves type references and adds each resolved path
+//         // to the explicit diagnostic batch only if that path is in LombokTypeIndex. Because
+//         // SOURCE_EXPANSION_PATTERN in LombokAnnotations omits @Slf4j, a class annotated with only
+//         // @Slf4j is excluded from LombokTypeIndex. BFS stops at that class and never explores its
+//         // own type references. Any @Data class reachable only through the @Slf4j bridge is also
+//         // excluded, so it is compiled via source path without AP and its generated getters are never
+//         // created. Calls to those getters on the opened file then produce false diagnostics.
+//         //
+//         // Setup:
+//         //   Processor (opened) → calls Dispatcher.process() → returns Route
+//         //   Dispatcher has @Slf4j only  → excluded from LombokTypeIndex → BFS stops
+//         //   Route has @Data             → never reached by BFS → compiled via source path without AP
+//         //   Route.getTarget() is missing → false "cannot find symbol" error on Processor
+//         var workspace = Files.createTempDirectory("jls-lombok-slf4j-bridge");
+//         try {
+//             var modelDir = workspace.resolve("src/main/java/p/model");
+//             var dispatchDir = workspace.resolve("src/main/java/p/dispatch");
+//             var serviceDir = workspace.resolve("src/main/java/p/service");
+//             Files.createDirectories(modelDir);
+//             Files.createDirectories(dispatchDir);
+//             Files.createDirectories(serviceDir);
+//
+//             // @Data class reachable only through the @Slf4j bridge — must get AP to have getters.
+//             Files.writeString(
+//                     modelDir.resolve("Route.java"),
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Route {\n"
+//                             + "  private String target;\n"
+//                             + "}\n");
+//
+//             // @Slf4j-only bridge — excluded from LombokTypeIndex; BFS stops here.
+//             Files.writeString(
+//                     dispatchDir.resolve("Dispatcher.java"),
+//                     "package p.dispatch;\n"
+//                             + "import lombok.extern.slf4j.Slf4j;\n"
+//                             + "@Slf4j\n"
+//                             + "public class Dispatcher {\n"
+//                             + "  public p.model.Route process() {\n"
+//                             + "    log.info(\"dispatching\");\n"
+//                             + "    return new p.model.Route();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             // Opened file: calls Dispatcher.process().getTarget() — getTarget() is Lombok-generated.
+//             var processorFile = serviceDir.resolve("Processor.java");
+//             Files.writeString(
+//                     processorFile,
+//                     "package p.service;\n"
+//                             + "import p.dispatch.Dispatcher;\n"
+//                             + "public class Processor {\n"
+//                             + "  Dispatcher dispatcher = new Dispatcher();\n"
+//                             + "  public String run() {\n"
+//                             + "    return dispatcher.process().getTarget();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//             configureLombokClasspath(server);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = processorFile.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = Files.readString(processorFile);
+//             server.didOpenTextDocument(open);
+//
+//             var report = pullDiagnostics(server, processorFile.toUri());
+//             Assert.assertFalse(
+//                     "@Slf4j bridge should not block @Data getter expansion; errors: "
+//                             + report.items.stream()
+//                                     .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                                     .map(d -> d.message)
+//                                     .toList(),
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> d.message.contains("getTarget")));
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void enterpriseStyleLombokDiagnosticsResolveFieldSetterVariant() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-enterprise-lombok-setter-variant");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var model = workspace.resolve("src/main/java/p/model");
+//             var service = workspace.resolve("src/main/java/p/service");
+//             Files.createDirectories(model);
+//             Files.createDirectories(service);
+//
+//             var fooFile = model.resolve("Foo.java");
+//             var barFile = model.resolve("Bar.java");
+//             var bizFile = model.resolve("Biz.java");
+//             var consumerFile = service.resolve("FooService.java");
+//             Files.writeString(
+//                     fooFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Foo {\n"
+//                             + "  @lombok.Setter private Bar bar;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     barFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Bar {\n"
+//                             + "  private Biz biz = new Biz();\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     bizFile,
+//                     "package p.model;\n"
+//                             + "public class Biz {\n"
+//                             + "  public String value() {\n"
+//                             + "    return \"ok\";\n"
+//                             + "  }\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     consumerFile,
+//                     "package p.service;\n"
+//                             + "import p.model.Foo;\n"
+//                             + "public class FooService {\n"
+//                             + "  String use(Foo foo) {\n"
+//                             + "    var bar = foo.getBar();\n"
+//                             + "    var biz = bar.getBiz();\n"
+//                             + "    return biz.value();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//             configureLombokClasspath(server);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = consumerFile.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = Files.readString(consumerFile);
+//             server.didOpenTextDocument(open);
+//
+//             var report = pullDiagnostics(server, consumerFile.toUri());
+//             Assert.assertFalse(
+//                     "field-level setter variant should still resolve generated getter chain",
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void enterpriseStyleLombokDiagnosticsResolveSplitPackageGetterChain() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-enterprise-lombok-split-package");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var model = workspace.resolve("src/main/java/p/model");
+//             var nested = workspace.resolve("src/main/java/p/nested");
+//             var service = workspace.resolve("src/main/java/p/service");
+//             Files.createDirectories(model);
+//             Files.createDirectories(nested);
+//             Files.createDirectories(service);
+//
+//             var fooFile = model.resolve("Foo.java");
+//             var barFile = nested.resolve("Bar.java");
+//             var bizFile = nested.resolve("Biz.java");
+//             var consumerFile = service.resolve("FooService.java");
+//             Files.writeString(
+//                     fooFile,
+//                     "package p.model;\n"
+//                             + "import p.nested.Bar;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Foo {\n"
+//                             + "  private Bar bar;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     barFile,
+//                     "package p.nested;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Bar {\n"
+//                             + "  private Biz biz = new Biz();\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     bizFile,
+//                     "package p.nested;\n"
+//                             + "public class Biz {\n"
+//                             + "  public String value() {\n"
+//                             + "    return \"ok\";\n"
+//                             + "  }\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     consumerFile,
+//                     "package p.service;\n"
+//                             + "import p.model.Foo;\n"
+//                             + "public class FooService {\n"
+//                             + "  String use(Foo foo) {\n"
+//                             + "    var bar = foo.getBar();\n"
+//                             + "    var biz = bar.getBiz();\n"
+//                             + "    return biz.value();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//             configureLombokClasspath(server);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = consumerFile.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = Files.readString(consumerFile);
+//             server.didOpenTextDocument(open);
+//
+//             var report = pullDiagnostics(server, consumerFile.toUri());
+//             Assert.assertFalse(
+//                     "split-package getter chain should not produce diagnostics in consumer",
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getBar()", "getBiz()", "value()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void lombokNestedClassNameCollidesWithInterfaceNoFalseDiagnostics() throws Exception {
+//         // Reproducer for: interface Foo in package A, outer @Data class in package B with a nested
+//         // @Data class also named Foo (same simple name as the interface). Consumer imports both
+//         // packages via wildcard and calls a getter chain through the nested Lombok type.
+//         // Diagnostics should not falsely report that Lombok-generated methods do not exist.
+//         var workspace = Files.createTempDirectory("jls-lombok-nested-name-collision");
+//         try {
+//             var contractDir = workspace.resolve("src/main/java/p/contract");
+//             var modelDir = workspace.resolve("src/main/java/p/model");
+//             var serviceDir = workspace.resolve("src/main/java/p/service");
+//             Files.createDirectories(contractDir);
+//             Files.createDirectories(modelDir);
+//             Files.createDirectories(serviceDir);
+//
+//             // Interface named "Response" in p.contract — no Lombok
+//             Files.writeString(
+//                     contractDir.resolve("Response.java"),
+//                     "package p.contract;\n"
+//                             + "public interface Response {\n"
+//                             + "  String getStatus();\n"
+//                             + "}\n");
+//
+//             // Outer @Data class with two nested @Data classes, one named "Response"
+//             // (same simple name as the interface above)
+//             Files.writeString(
+//                     modelDir.resolve("Request.java"),
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Request {\n"
+//                             + "  private Response response;\n"
+//                             + "  private Detail detail;\n"
+//                             + "  @lombok.Data\n"
+//                             + "  public static class Response {\n"
+//                             + "    private Detail detail;\n"
+//                             + "    private String code;\n"
+//                             + "  }\n"
+//                             + "  @lombok.Data\n"
+//                             + "  public static class Detail {\n"
+//                             + "    private String message;\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             // Consumer: wildcard imports bring in both the interface and the outer class.
+//             // Getter chain goes through nested Lombok types.
+//             var consumerFile = serviceDir.resolve("Consumer.java");
+//             Files.writeString(
+//                     consumerFile,
+//                     "package p.service;\n"
+//                             + "import p.contract.*;\n"
+//                             + "import p.model.*;\n"
+//                             + "public class Consumer {\n"
+//                             + "  String use(Request req) {\n"
+//                             + "    return req.getResponse().getDetail().getMessage();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//             configureLombokClasspath(server);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = consumerFile.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = Files.readString(consumerFile);
+//             server.didOpenTextDocument(open);
+//
+//             var report = pullDiagnostics(server, consumerFile.toUri());
+//             Assert.assertFalse(
+//                     "nested Lombok class with same name as interface should not produce false getter diagnostics; errors: "
+//                             + report.items.stream()
+//                                     .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                                     .map(d -> d.message)
+//                                     .toList(),
+//                     report.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getResponse()", "getDetail()", "getMessage()")));
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didChangeEnumRefreshesActiveConsumerDiagnostics() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-enum-related-change");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var models = workspace.resolve("src/com/example/demo/models");
+//             var service = workspace.resolve("src/com/example/demo/service");
+//             Files.createDirectories(models);
+//             Files.createDirectories(service);
+//
+//             var enumFile = models.resolve("MyEnum.java");
+//             var serviceFile = service.resolve("ServiceTwo.java");
+//             Files.writeString(
+//                     enumFile,
+//                     "package com.example.demo.models;\n"
+//                             + "public enum MyEnum {\n"
+//                             + "  FIRST;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package com.example.demo.service;\n"
+//                             + "import com.example.demo.models.MyEnum;\n"
+//                             + "class ServiceTwo {\n"
+//                             + "  String test() {\n"
+//                             + "    return MyEnum.FIRST.getType();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//
+//             var enumOpen = new DidOpenTextDocumentParams();
+//             enumOpen.textDocument.uri = enumFile.toUri();
+//             enumOpen.textDocument.version = 1;
+//             enumOpen.textDocument.languageId = "java";
+//             enumOpen.textDocument.text = Files.readString(enumFile);
+//             server.didOpenTextDocument(enumOpen);
+//
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var baseline = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertTrue(
+//                     "baseline should show the missing enum member error before the unsaved enum change",
+//                     baseline.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getType()")));
+//
+//             var enumChange = new DidChangeTextDocumentParams();
+//             enumChange.textDocument.uri = enumFile.toUri();
+//             enumChange.textDocument.version = 2;
+//             var delta = new TextDocumentContentChangeEvent();
+//             delta.text =
+//                     "package com.example.demo.models;\n"
+//                             + "public enum MyEnum {\n"
+//                             + "  FIRST;\n"
+//                             + "  public String getType() {\n"
+//                             + "    return name();\n"
+//                             + "  }\n"
+//                             + "}\n";
+//             enumChange.contentChanges.add(delta);
+//             server.didChangeTextDocument(enumChange);
+//
+//             var after = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertFalse(
+//                     "changing the enum should resolve consumer diagnostics on next pull",
+//                     after.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getType()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didChangeEnumKeepsClosedConsumerDirtyUntilReopen() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-enum-related-reopen");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var models = workspace.resolve("src/com/example/demo/models");
+//             var service = workspace.resolve("src/com/example/demo/service");
+//             Files.createDirectories(models);
+//             Files.createDirectories(service);
+//
+//             var enumFile = models.resolve("MyEnum.java");
+//             var serviceFile = service.resolve("ServiceTwo.java");
+//             Files.writeString(
+//                     enumFile,
+//                     "package com.example.demo.models;\n"
+//                             + "public enum MyEnum {\n"
+//                             + "  FIRST;\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package com.example.demo.service;\n"
+//                             + "import com.example.demo.models.MyEnum;\n"
+//                             + "class ServiceTwo {\n"
+//                             + "  String test() {\n"
+//                             + "    return MyEnum.FIRST.getType();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//
+//             var enumOpen = new DidOpenTextDocumentParams();
+//             enumOpen.textDocument.uri = enumFile.toUri();
+//             enumOpen.textDocument.version = 1;
+//             enumOpen.textDocument.languageId = "java";
+//             enumOpen.textDocument.text = Files.readString(enumFile);
+//             server.didOpenTextDocument(enumOpen);
+//
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var baseline = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertTrue(
+//                     "baseline should show the missing enum member error before the unsaved enum change",
+//                     baseline.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getType()")));
+//
+//             var serviceClose = new DidCloseTextDocumentParams();
+//             serviceClose.textDocument.uri = serviceFile.toUri();
+//             server.didCloseTextDocument(serviceClose);
+//
+//             var enumChange = new DidChangeTextDocumentParams();
+//             enumChange.textDocument.uri = enumFile.toUri();
+//             enumChange.textDocument.version = 2;
+//             var delta = new TextDocumentContentChangeEvent();
+//             delta.text =
+//                     "package com.example.demo.models;\n"
+//                             + "public enum MyEnum {\n"
+//                             + "  FIRST;\n"
+//                             + "  public String getType() {\n"
+//                             + "    return name();\n"
+//                             + "  }\n"
+//                             + "}\n";
+//             enumChange.contentChanges.add(delta);
+//             server.didChangeTextDocument(enumChange);
+//
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             var after = pullDiagnostics(server, serviceFile.toUri());
+//             Assert.assertFalse(
+//                     "reopening the consumer after dependency change should resolve diagnostics on pull",
+//                     after.items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .anyMatch(d -> containsAny(d.message, "getType()")));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void lombokConsumerDiagnosticsRemainResolvedBeforeAndAfterModelSave() throws Exception {
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//
+//         var serviceFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproService.java");
+//         var modelFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/model/ReproTxn.java");
+//
+//         var serviceOpen = new DidOpenTextDocumentParams();
+//         serviceOpen.textDocument.uri = serviceFile.toUri();
+//         serviceOpen.textDocument.version = 1;
+//         serviceOpen.textDocument.languageId = "java";
+//         serviceOpen.textDocument.text = Files.readString(serviceFile);
+//         server.didOpenTextDocument(serviceOpen);
+//
+//         var baselineDiagnostics =
+//                 diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items);
+//         Assert.assertFalse(
+//                 "expected Lombok member diagnostics to resolve from referenced Lombok source expansion",
+//                 pullDiagnostics(server, serviceFile.toUri()).items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//
+//         var modelOpen = new DidOpenTextDocumentParams();
+//         modelOpen.textDocument.uri = modelFile.toUri();
+//         modelOpen.textDocument.version = 1;
+//         modelOpen.textDocument.languageId = "java";
+//         modelOpen.textDocument.text = Files.readString(modelFile);
+//         server.didOpenTextDocument(modelOpen);
+//
+//         Assert.assertEquals(
+//                 "opening an unchanged Lombok dependency should not change consumer diagnostics",
+//                 baselineDiagnostics,
+//                 diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
+//
+//         var modelSave = new DidSaveTextDocumentParams();
+//         modelSave.textDocument = new TextDocumentIdentifier(modelFile.toUri());
+//         server.didSaveTextDocument(modelSave);
+//
+//         var changed = new FileEvent();
+//         changed.uri = modelFile.toUri();
+//         changed.type = FileChangeType.Changed;
+//         var watched = new DidChangeWatchedFilesParams();
+//         watched.changes = List.of(changed);
+//         server.didChangeWatchedFiles(watched);
+//
+//         Assert.assertEquals(
+//                 "saving an unchanged Lombok dependency should not change consumer diagnostics",
+//                 baselineDiagnostics,
+//                 diagnosticFingerprints(pullDiagnostics(server, serviceFile.toUri()).items));
+//     }
+//
+//     @Test
+//     public void didChangeLombokModelRefreshesOpenConsumerDiagnostics() throws Exception {
+//         var server =
+//                 LanguageServerFixture.getJavaLanguageServer(
+//                         LanguageServerFixture.DEFAULT_WORKSPACE_ROOT);
+//
+//         var serviceFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/service/ReproService.java");
+//         var modelFile =
+//                 LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.resolve(
+//                         "src/org/javacs/repro/model/ReproTxn.java");
+//         var originalModel = Files.readString(modelFile);
+//
+//         var serviceOpen = new DidOpenTextDocumentParams();
+//         serviceOpen.textDocument.uri = serviceFile.toUri();
+//         serviceOpen.textDocument.version = 1;
+//         serviceOpen.textDocument.languageId = "java";
+//         serviceOpen.textDocument.text = Files.readString(serviceFile);
+//         server.didOpenTextDocument(serviceOpen);
+//
+//         var modelOpen = new DidOpenTextDocumentParams();
+//         modelOpen.textDocument.uri = modelFile.toUri();
+//         modelOpen.textDocument.version = 1;
+//         modelOpen.textDocument.languageId = "java";
+//         modelOpen.textDocument.text = originalModel;
+//         server.didOpenTextDocument(modelOpen);
+//
+//         Assert.assertFalse(
+//                 "expected baseline Lombok consumer diagnostics to be clean",
+//                 pullDiagnostics(server, serviceFile.toUri()).items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//
+//         var brokenModel = originalModel.replace("msref", "title");
+//         var change = new DidChangeTextDocumentParams();
+//         change.textDocument.uri = modelFile.toUri();
+//         change.textDocument.version = 2;
+//         var delta = new TextDocumentContentChangeEvent();
+//         delta.text = brokenModel;
+//         change.contentChanges.add(delta);
+//         server.didChangeTextDocument(change);
+//
+//         Assert.assertTrue(
+//                 "changing a Lombok model should surface errors in the consumer on the next pull",
+//                 pullDiagnostics(server, serviceFile.toUri()).items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//
+//         var revert = new DidChangeTextDocumentParams();
+//         revert.textDocument.uri = modelFile.toUri();
+//         revert.textDocument.version = 3;
+//         var revertDelta = new TextDocumentContentChangeEvent();
+//         revertDelta.text = originalModel;
+//         revert.contentChanges.add(revertDelta);
+//         server.didChangeTextDocument(revert);
+//
+//         Assert.assertFalse(
+//                 "restoring the Lombok model should clear consumer errors on the next pull",
+//                 pullDiagnostics(server, serviceFile.toUri()).items.stream()
+//                         .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                         .anyMatch(d -> containsAny(d.message, "getMsref()", "setMsref(")));
+//     }
+//
+//     @Test
+//     public void watchedLombokDependencyChangeRefreshesOpenConsumerDiagnosticsWithoutOpeningDependency()
+//             throws Exception {
+//         var workspace = Files.createTempDirectory("jls-watched-lombok-dependency-refresh");
+//         try {
+//             var model = workspace.resolve("src/main/java/p/model");
+//             var service = workspace.resolve("src/main/java/p/service");
+//             Files.createDirectories(model);
+//             Files.createDirectories(service);
+//
+//             var fooFile = model.resolve("Foo.java");
+//             var barFile = model.resolve("Bar.java");
+//             var bizFile = model.resolve("Biz.java");
+//             var serviceFile = service.resolve("Service.java");
+//             Files.writeString(
+//                     fooFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Foo {\n"
+//                             + "  private Bar bar = new Bar();\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     barFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Bar {\n"
+//                             + "  private Biz biz = new Biz();\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     bizFile,
+//                     "package p.model;\n"
+//                             + "public class Biz {\n"
+//                             + "  public String value() {\n"
+//                             + "    return \"ok\";\n"
+//                             + "  }\n"
+//                             + "}\n");
+//             Files.writeString(
+//                     serviceFile,
+//                     "package p.service;\n"
+//                             + "import p.model.Foo;\n"
+//                             + "class Service {\n"
+//                             + "  String run(Foo foo) {\n"
+//                             + "    return foo.getBar().getBiz().value();\n"
+//                             + "  }\n"
+//                             + "}\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace);
+//             configureLombokClasspath(server);
+//
+//             var serviceOpen = new DidOpenTextDocumentParams();
+//             serviceOpen.textDocument.uri = serviceFile.toUri();
+//             serviceOpen.textDocument.version = 1;
+//             serviceOpen.textDocument.languageId = "java";
+//             serviceOpen.textDocument.text = Files.readString(serviceFile);
+//             server.didOpenTextDocument(serviceOpen);
+//
+//             Assert.assertFalse(
+//                     "consumer diagnostics should resolve against an unopened Lombok dependency on disk",
+//                     pullDiagnostics(server, serviceFile.toUri()).items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .findAny()
+//                             .isPresent());
+//
+//             Files.writeString(
+//                     fooFile,
+//                     "package p.model;\n"
+//                             + "@lombok.Data\n"
+//                             + "public class Foo {\n"
+//                             + "  private Bar bar = new Bar();\n"
+//                             + "  // watched dependency change\n"
+//                             + "}\n");
+//             var changed = new FileEvent();
+//             changed.uri = fooFile.toUri();
+//             changed.type = FileChangeType.Changed;
+//             var watched = new DidChangeWatchedFilesParams();
+//             watched.changes = List.of(changed);
+//             server.didChangeWatchedFiles(watched);
+//
+//             Assert.assertFalse(
+//                     "watched Lombok dependency changes should not introduce errors in the consumer",
+//                     pullDiagnostics(server, serviceFile.toUri()).items.stream()
+//                             .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                             .findAny()
+//                             .isPresent());
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void completionUsesCurrentIndexEvenAfterUnsavedVersionChange() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var original = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = original;
+//         server.didOpenTextDocument(open);
+//         Assert.assertTrue(
+//                 "expected completion index to initialize before unsaved-change check",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         var broken = original.replace("this.", "this.\n");
+//         var change = new org.javacs.lsp.DidChangeTextDocumentParams();
+//         change.textDocument.uri = file.toUri();
+//         change.textDocument.version = 2;
+//         var delta = new org.javacs.lsp.TextDocumentContentChangeEvent();
+//         delta.text = broken;
+//         change.contentChanges.add(delta);
+//         server.didChangeTextDocument(change);
+//
+//         var completion =
+//                 server.completion(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+//         Assert.assertTrue(completion.isPresent());
+//         Assert.assertTrue(
+//                 "member completion should keep using index after unsaved change",
+//                 completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
+//     }
+//
+//     @Test
+//     public void incompleteBodyEditDoesNotTriggerDeclarationDriftRefresh() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer();
+//             var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//             var original = FileStore.contents(file);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = file.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = original;
+//             server.didOpenTextDocument(open);
+//             Assert.assertTrue(
+//                     "expected completion index bootstrap before didChange drift check",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//             var before = completionIndexVersion(server);
+//             var change = new DidChangeTextDocumentParams();
+//             change.textDocument.uri = file.toUri();
+//             change.textDocument.version = 2;
+//             var delta = new TextDocumentContentChangeEvent();
+//             delta.text = original.replace("        return \"foo\";\n", "        if (\n");
+//             change.contentChanges.add(delta);
+//             server.didChangeTextDocument(change);
+//
+//             Thread.sleep(1600);
+//
+//             Assert.assertEquals(
+//                     "incomplete method-body edits should keep the published completion snapshot",
+//                     before,
+//                     completionIndexVersion(server));
+//             Assert.assertNull(
+//                     "incomplete source should skip declaration-drift refresh",
+//                     capture.lastLineContaining(
+//                             "[perf] completion_index_didChange_refresh file=AutocompleteMember.java reason=declaration_drift"));
+//             Assert.assertNotNull(
+//                     "incomplete source should log the didChange skip reason",
+//                     capture.lastLineContaining(
+//                             "[perf] completion_index_didChange_skip file=AutocompleteMember.java reason=incomplete_source"));
+//             Assert.assertEquals(
+//                     "didChange should not schedule a completion-index debounce for incomplete body edits",
+//                     0,
+//                     capture.countContaining("[perf] completion_index_debounce trigger=didChange"));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void hasDeclarationDriftCoversStructuralCompareBranches() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         openAndBootstrap(server, file);
+//
+//         var indexed = indexedTypeForFile(server, file);
+//         var matchingShape = declaredTypeShape(indexed, false);
+//
+//         Assert.assertFalse(
+//                 "matching indexed declaration shape should not report drift",
+//                 hasDeclarationDrift(server, file, List.of(matchingShape)));
+//
+//         Assert.assertTrue(
+//                 "missing or extra declared types should report drift",
+//                 hasDeclarationDrift(server, file, List.of()));
+//
+//         Assert.assertTrue(
+//                 "same-size declared type sets with different qualified names should report drift",
+//                 hasDeclarationDrift(
+//                         server,
+//                         file,
+//                         List.of(
+//                                 declaredTypeShape(
+//                                         indexed.qualifiedName + "Renamed",
+//                                         directMemberSignatures(indexed),
+//                                         indexed.superclass,
+//                                         indexed.interfaces,
+//                                         false))));
+//
+//         Assert.assertTrue(
+//                 "superclass changes should report drift",
+//                 hasDeclarationDrift(
+//                         server,
+//                         file,
+//                         List.of(
+//                                 declaredTypeShape(
+//                                         indexed.qualifiedName,
+//                                         directMemberSignatures(indexed),
+//                                         "java.lang.Number",
+//                                         indexed.interfaces,
+//                                         false))));
+//
+//         Assert.assertTrue(
+//                 "interface changes should report drift",
+//                 hasDeclarationDrift(
+//                         server,
+//                         file,
+//                         List.of(
+//                                 declaredTypeShape(
+//                                         indexed.qualifiedName,
+//                                         directMemberSignatures(indexed),
+//                                         indexed.superclass,
+//                                         List.of("java.io.Serializable"),
+//                                         false))));
+//
+//         var changedMembers = new java.util.ArrayList<>(directMemberSignatures(indexed));
+//         changedMembers.add("M:extra:0:false");
+//         Assert.assertTrue(
+//                 "direct member signature changes should report drift",
+//                 hasDeclarationDrift(
+//                         server,
+//                         file,
+//                         List.of(
+//                                 declaredTypeShape(
+//                                         indexed.qualifiedName,
+//                                         changedMembers,
+//                                         indexed.superclass,
+//                                         indexed.interfaces,
+//                                         false))));
+//     }
+//
+//     @Test
+//     public void hasDeclarationDriftDetectsIndexedStructuralLombokMismatch() throws Exception {
+//         FileStore.reset();
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = Paths.get("/tmp/DriftCoverage.java");
+//         var qualifiedName = "p.DriftCoverage";
+//
+//         var indexed =
+//                 new IndexedType(
+//                         qualifiedName,
+//                         "DriftCoverage",
+//                         List.of(
+//                                 new IndexedMember(
+//                                         qualifiedName,
+//                                         "plainField",
+//                                         CompletionItemKind.Field,
+//                                         false,
+//                                         false,
+//                                         0,
+//                                         "String plainField",
+//                                         "java.lang.String",
+//                                         null,
+//                                         null,
+//                                         qualifiedName + "#plainField",
+//                                         qualifiedName + "#plainField",
+//                                         null,
+//                                         false),
+//                                 new IndexedMember(
+//                                         qualifiedName,
+//                                         "halfSynthetic",
+//                                         CompletionItemKind.Method,
+//                                         false,
+//                                         false,
+//                                         0,
+//                                         "String halfSynthetic()",
+//                                         "java.lang.String",
+//                                         new String[0],
+//                                         new String[0],
+//                                         qualifiedName + "#halfSynthetic()",
+//                                         qualifiedName + "#halfSynthetic()",
+//                                         null,
+//                                         true),
+//                                 new IndexedMember(
+//                                         qualifiedName,
+//                                         "getName",
+//                                         CompletionItemKind.Method,
+//                                         false,
+//                                         false,
+//                                         0,
+//                                         "String getName()",
+//                                         "java.lang.String",
+//                                         new String[0],
+//                                         new String[0],
+//                                         qualifiedName + "#getName()",
+//                                         qualifiedName + "#getName()",
+//                                         "name",
+//                                         true)),
+//                         false,
+//                         file,
+//                         null,
+//                         List.of(),
+//                         IndexedMember.Provenance.WORKSPACE);
+//
+//         publishWorkspaceSnapshot(server, workspaceIndexOf(indexed), 1);
+//
+//         Assert.assertFalse(
+//                 "matching structural Lombok should not report drift",
+//                 hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, true))));
+//         Assert.assertTrue(
+//                 "structural Lombok mismatch should report drift against the indexed snapshot",
+//                 hasDeclarationDrift(server, file, List.of(declaredTypeShape(indexed, false))));
+//     }
+//
+//     @Test
+//     public void completionRequestDoesNotInvokeCompileBatch() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//
+//         Thread.sleep(1200);
+//         CompileBatch.resetPerfCounters();
+//
+//         var completion =
+//                 server.completion(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+//         Assert.assertTrue(completion.isPresent());
+//         Assert.assertEquals(
+//                 "completion should not invoke semantic compile",
+//                 0L,
+//                 CompileBatch.perfCounters().analyzeInvocations);
+//     }
+//
+//     @Test
+//     public void completionUsesPublishedSnapshotWhileIncrementalRefreshBuildsNextVersion() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer();
+//             var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//             var original = FileStore.contents(file);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = file.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = original;
+//             server.didOpenTextDocument(open);
+//             Assert.assertTrue(
+//                     "expected completion index bootstrap before snapshot publication check",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//             var before = completionIndexVersion(server);
+//             var change = new DidChangeTextDocumentParams();
+//             change.textDocument.uri = file.toUri();
+//             change.textDocument.version = 2;
+//             var delta = new TextDocumentContentChangeEvent();
+//             delta.text =
+//                     original.replace(
+//                             "    public String testFields;\n",
+//                             "    public String testFields;\n    public String refreshedField;\n");
+//             change.contentChanges.add(delta);
+//             server.didChangeTextDocument(change);
+//
+//             var completion =
+//                     server.completion(
+//                             new TextDocumentPositionParams(
+//                                     new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+//             Assert.assertTrue("expected completion result during incremental refresh", completion.isPresent());
+//             Assert.assertTrue(
+//                     "completion should keep serving published members while refresh builds the next snapshot",
+//                     completion.get().items.stream().anyMatch(i -> "testFields".equals(i.label)));
+//             Assert.assertEquals(
+//                     "completion should return before the refreshed snapshot is published",
+//                     before,
+//                     completionIndexVersion(server));
+//
+//             var completionFlow = capture.lastLineContaining("[perf] completion_flow file=AutocompleteMember.java");
+//             Assert.assertNotNull("expected completion flow log for snapshot publication check", completionFlow);
+//             Assert.assertTrue(
+//                     "completion should log the currently published snapshot version",
+//                     completionFlow.contains("index_version=" + before));
+//             Assert.assertTrue(
+//                     "completion flow metrics should stay isolated from compiler phases",
+//                     completionFlow.contains("enter=0 analyze=0 ap=0"));
+//
+//             Assert.assertTrue(
+//                     "expected incremental refresh to publish a newer snapshot after completion returns",
+//                     awaitCompletionIndexAdvance(server, before, 10, TimeUnit.SECONDS));
+//             var mergeLog = capture.lastLineContaining("[perf] completion_type_index_merge trigger=index:didChange");
+//             if (mergeLog != null) {
+//                 Assert.assertTrue(
+//                         "incremental refresh should log the published base snapshot version",
+//                         mergeLog.contains("base_version=" + before));
+//             }
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void parseLifecycleParsesOnOpenAndChangeThenReusesForRequestsAndSave() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var text = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = text;
+//         server.didOpenTextDocument(open);
+//
+//         var compiler = server.getOrCreateCompiler();
+//         Assert.assertNull("didOpen should not eagerly parse in the interactive compiler", compiler.parsedUnits.get(file));
+//
+//         var firstCompletion =
+//                 server.completion(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+//         Assert.assertTrue(firstCompletion.isPresent());
+//         server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
+//
+//         var afterOpenRequests = compiler.parsedUnits.get(file);
+//         Assert.assertNotNull("completion/hover should populate the interactive parse cache on demand", afterOpenRequests);
+//         var openedRoot = afterOpenRequests.task().root();
+//         Assert.assertSame(
+//                 "completion/hover should reuse the lazily populated parse result when text is unchanged",
+//                 openedRoot,
+//                 afterOpenRequests.task().root());
+//
+//         var save = new DidSaveTextDocumentParams();
+//         save.textDocument = new TextDocumentIdentifier(file.toUri());
+//         server.didSaveTextDocument(save);
+//
+//         var afterSave = compiler.parsedUnits.get(file);
+//         Assert.assertNotNull(afterSave);
+//         Assert.assertSame(
+//                 "didSave should reuse existing parse result when there is no text change",
+//                 openedRoot,
+//                 afterSave.task().root());
+//
+//         var change = new DidChangeTextDocumentParams();
+//         change.textDocument.uri = file.toUri();
+//         change.textDocument.version = 2;
+//         var delta = new TextDocumentContentChangeEvent();
+//         delta.text = text + "\n// parse-lifecycle-change";
+//         change.contentChanges.add(delta);
+//         server.didChangeTextDocument(change);
+//
+//         var changed = compiler.parsedUnits.get(file);
+//         Assert.assertNotNull("didChange should refresh parsed unit", changed);
+//         Assert.assertNotSame(
+//                 "didChange should reparse when text changes", openedRoot, changed.task().root());
+//         var changedRoot = changed.task().root();
+//
+//         var secondCompletion =
+//                 server.completion(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+//         Assert.assertTrue(secondCompletion.isPresent());
+//         server.hover(new TextDocumentPositionParams(new TextDocumentIdentifier(file.toUri()), new Position(2, 13)));
+//
+//         var afterChangeRequests = compiler.parsedUnits.get(file);
+//         Assert.assertNotNull(afterChangeRequests);
+//         Assert.assertSame(
+//                 "completion/hover should reuse didChange parse result until next edit",
+//                 changedRoot,
+//                 afterChangeRequests.task().root());
+//     }
+//
+//     @Test
+//     public void concurrentCompilerCallsAfterSettingsChangeReuseAlreadyRecreatedCompiler() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var logger = Logger.getLogger("main");
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//
+//             var settings = new JsonObject();
+//             var java = new JsonObject();
+//             var extraCompilerArgs = new com.google.gson.JsonArray();
+//             extraCompilerArgs.add("-Xlint:deprecation");
+//             java.add("extraCompilerArgs", extraCompilerArgs);
+//             settings.add("java", java);
+//             var change = new DidChangeConfigurationParams();
+//             change.settings = settings;
+//             server.didChangeConfiguration(change);
+//
+//             var workers = 6;
+//             var ready = new CountDownLatch(workers);
+//             var start = new CountDownLatch(1);
+//             var done = new CountDownLatch(workers);
+//             var failures = new java.util.concurrent.ConcurrentLinkedQueue<Throwable>();
+//
+//             for (int i = 0; i < workers; i++) {
+//                 var t =
+//                         new Thread(
+//                                 () -> {
+//                                     try {
+//                                         ready.countDown();
+//                                         start.await(5, TimeUnit.SECONDS);
+//                                         server.getOrCreateCompiler();
+//                                     } catch (Throwable e) {
+//                                         failures.add(e);
+//                                     } finally {
+//                                         done.countDown();
+//                                     }
+//                                 },
+//                                 "compiler-race-" + i);
+//                 t.start();
+//             }
+//
+//             Assert.assertTrue("workers were not ready in time", ready.await(5, TimeUnit.SECONDS));
+//             start.countDown();
+//             Assert.assertTrue("workers did not finish in time", done.await(60, TimeUnit.SECONDS));
+//             Assert.assertTrue("compiler workers failed: " + failures, failures.isEmpty());
+//
+//             Assert.assertEquals(
+//                     "settings change should recreate compiler immediately and only once",
+//                     1,
+//                     capture.countContaining("[perf] compiler_recreate trigger=didChangeConfiguration"));
+//         } finally {
+//             logger.removeHandler(capture);
+//         }
+//     }
+//
+//     @Test
+//     public void completionRequestUsesParseOnlyOnceIndexIsReady() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var tracking = replaceInteractiveCompilerWithTracking(server);
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var before = completionIndexVersion(server);
+//         openJavaFile(server, file);
+//         Assert.assertTrue(
+//                 "completion index should bootstrap before the request-path assertion",
+//                 awaitCompletionIndexAdvance(server, before, 5, TimeUnit.SECONDS));
+//
+//         tracking.resetCounters();
+//         var result =
+//                 server.completion(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()), new Position(4, 13)));
+//
+//         Assert.assertTrue("completion request should succeed", result.isPresent());
+//         Assert.assertTrue("completion should parse the active file", tracking.parseCalls.get() > 0);
+//         Assert.assertEquals("completion should not use full compile", 0, tracking.compileCalls.get());
+//         Assert.assertEquals("completion should not use fast compile", 0, tracking.compileFastCalls.get());
+//         Assert.assertEquals(
+//                 "completion should not use fast compile with processors",
+//                 0,
+//                 tracking.compileFastWithProcessorsCalls.get());
+//     }
+//
+//     @Test
+//     public void nonCompilerSettingsDoNotRecreateGetOrCreateCompiler() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var before = completionIndexVersion(server);
+//
+//         var settings = new JsonObject();
+//         var java = new JsonObject();
+//         java.addProperty("codeLens", true);
+//         settings.add("java", java);
+//         var change = new DidChangeConfigurationParams();
+//         change.settings = settings;
+//         server.didChangeConfiguration(change);
+//
+//         server.getOrCreateCompiler();
+//         var after = completionIndexVersion(server);
+//         Assert.assertEquals(
+//                 "non-compiler Java settings should not recreate compiler",
+//                 before,
+//                 after);
+//     }
+//
+//     @Test
+//     public void userReleaseOverridesInferredMavenRelease() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-maven-release-override");
+//         try {
+//             Files.writeString(
+//                     workspace.resolve("pom.xml"),
+//                     """
+//                     <project xmlns="http://maven.apache.org/POM/4.0.0"
+//                              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+//                              xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+//                       <modelVersion>4.0.0</modelVersion>
+//                       <groupId>example</groupId>
+//                       <artifactId>override</artifactId>
+//                       <version>1</version>
+//                       <properties>
+//                         <maven.compiler.release>21</maven.compiler.release>
+//                       </properties>
+//                     </project>
+//                     """);
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingMessageClient());
+//             var settings = new JsonObject();
+//             var java = new JsonObject();
+//             var extra = new com.google.gson.JsonArray();
+//             extra.add("--release 17");
+//             java.add("extraCompilerArgs", extra);
+//             settings.add("java", java);
+//             var change = new DidChangeConfigurationParams();
+//             change.settings = settings;
+//             server.didChangeConfiguration(change);
+//
+//             var compiler = interactiveCompiler(server);
+//             Assert.assertEquals(List.of("--release", "17"), compiler.extraArgs);
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void didChangeRefreshesCompletionIndexWithInferredMavenRelease() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-maven-release-didchange");
+//         var sourceRoot = Files.createDirectories(workspace.resolve("src/main/java/example"));
+//         var file = sourceRoot.resolve("App.java");
+//         try {
+//             Files.writeString(
+//                     workspace.resolve("pom.xml"),
+//                     """
+//                     <project xmlns="http://maven.apache.org/POM/4.0.0"
+//                              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+//                              xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+//                       <modelVersion>4.0.0</modelVersion>
+//                       <groupId>example</groupId>
+//                       <artifactId>release-didchange</artifactId>
+//                       <version>1</version>
+//                       <properties>
+//                         <maven.compiler.release>21</maven.compiler.release>
+//                       </properties>
+//                     </project>
+//                     """);
+//             var original =
+//                     """
+//                     package example;
+//
+//                     class App {
+//                         String value() {
+//                             return "ok";
+//                         }
+//                     }
+//                     """;
+//             Files.writeString(file, original);
+//
+//             var logger = Logger.getLogger("main");
+//             var previousLevel = logger.getLevel();
+//             logger.setLevel(Level.FINE);
+//             var capture = new TestLogCapture();
+//             logger.addHandler(capture);
+//             try {
+//                 var server = LanguageServerFixture.getJavaLanguageServer(workspace, new RecordingDiagnosticsClient());
+//                 Assert.assertEquals(List.of("--release", "21"), interactiveCompiler(server).extraArgs);
+//
+//                 var open = new DidOpenTextDocumentParams();
+//                 open.textDocument.uri = file.toUri();
+//                 open.textDocument.version = 1;
+//                 open.textDocument.languageId = "java";
+//                 open.textDocument.text = original;
+//                 server.didOpenTextDocument(open);
+//
+//                 Assert.assertTrue(
+//                         "expected initial workspace bootstrap before didChange",
+//                         awaitCompletionIndexAdvance(server, 0, 15, TimeUnit.SECONDS));
+//
+//                 var before = completionIndexVersion(server);
+//                 var changed =
+//                         """
+//                         package example;
+//
+//                         class App {
+//                             String value() {
+//                                 return "ok";
+//                             }
+//
+//                             String title() {
+//                                 return value();
+//                             }
+//                         }
+//                         """;
+//                 var change = new DidChangeTextDocumentParams();
+//                 change.textDocument.uri = file.toUri();
+//                 change.textDocument.version = 2;
+//                 var delta = new TextDocumentContentChangeEvent();
+//                 delta.text = changed;
+//                 change.contentChanges.add(delta);
+//                 server.didChangeTextDocument(change);
+//
+//                 Assert.assertTrue(
+//                         "didChange should still refresh the completion index with inferred --release",
+//                         awaitCompletionIndexAdvance(server, before, 15, TimeUnit.SECONDS));
+//                 Assert.assertEquals(
+//                         "completion refresh should not combine --source with inferred --release",
+//                         0,
+//                         capture.countContaining("option --source cannot be used together with --release"));
+//                 Assert.assertEquals(
+//                         "completion refresh should not leave the compiler locked after an option failure",
+//                         0,
+//                         capture.countContaining("Compiler is already in-use!"));
+//             } finally {
+//                 logger.removeHandler(capture);
+//                 logger.setLevel(previousLevel);
+//             }
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void mixedMavenModulesWarnOnceAndFallBackGracefully() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-mixed-maven-warning");
+//         try {
+//             Files.createDirectories(workspace.resolve("mod17"));
+//             Files.createDirectories(workspace.resolve("mod21"));
+//             Files.writeString(
+//                     workspace.resolve("pom.xml"),
+//                     """
+//                     <project xmlns="http://maven.apache.org/POM/4.0.0"
+//                              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+//                              xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+//                       <modelVersion>4.0.0</modelVersion>
+//                       <groupId>example</groupId>
+//                       <artifactId>mixed-parent</artifactId>
+//                       <version>1</version>
+//                       <packaging>pom</packaging>
+//                       <modules>
+//                         <module>mod17</module>
+//                         <module>mod21</module>
+//                       </modules>
+//                     </project>
+//                     """);
+//             Files.writeString(
+//                     workspace.resolve("mod17/pom.xml"),
+//                     """
+//                     <project xmlns="http://maven.apache.org/POM/4.0.0"
+//                              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+//                              xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+//                       <modelVersion>4.0.0</modelVersion>
+//                       <parent>
+//                         <groupId>example</groupId>
+//                         <artifactId>mixed-parent</artifactId>
+//                         <version>1</version>
+//                       </parent>
+//                       <artifactId>mod17</artifactId>
+//                       <properties>
+//                         <maven.compiler.release>17</maven.compiler.release>
+//                       </properties>
+//                     </project>
+//                     """);
+//             Files.writeString(
+//                     workspace.resolve("mod21/pom.xml"),
+//                     """
+//                     <project xmlns="http://maven.apache.org/POM/4.0.0"
+//                              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+//                              xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+//                       <modelVersion>4.0.0</modelVersion>
+//                       <parent>
+//                         <groupId>example</groupId>
+//                         <artifactId>mixed-parent</artifactId>
+//                         <version>1</version>
+//                       </parent>
+//                       <artifactId>mod21</artifactId>
+//                       <properties>
+//                         <maven.compiler.release>21</maven.compiler.release>
+//                       </properties>
+//                     </project>
+//                     """);
+//
+//             var client = new RecordingMessageClient();
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace, client);
+//
+//             Assert.assertEquals(1, client.messages.size());
+//             Assert.assertThat(
+//                     client.messages.get(0).message,
+//                     org.hamcrest.Matchers.containsString("mixed Maven module Java levels"));
+//             Assert.assertEquals(List.of(), interactiveCompiler(server).extraArgs);
+//
+//             var settings = new JsonObject();
+//             var java = new JsonObject();
+//             java.addProperty("lombokEnabled", false);
+//             settings.add("java", java);
+//             var change = new DidChangeConfigurationParams();
+//             change.settings = settings;
+//             server.didChangeConfiguration(change);
+//
+//             Assert.assertEquals("warning should be shown only once per workspace session", 1, client.messages.size());
+//         } finally {
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void configurationChangeSchedulesWorkspaceRefreshForActiveFiles() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var text = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = text;
+//         server.didOpenTextDocument(open);
+//
+//         Assert.assertTrue(
+//                 "wait for initial completion index before triggering config change",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var settings = new JsonObject();
+//             var java = new JsonObject();
+//             var extraCompilerArgs = new com.google.gson.JsonArray();
+//             extraCompilerArgs.add("-Xlint:deprecation");
+//             java.add("extraCompilerArgs", extraCompilerArgs);
+//             settings.add("java", java);
+//             var change = new DidChangeConfigurationParams();
+//             change.settings = settings;
+//             server.didChangeConfiguration(change);
+//
+//             Assert.assertEquals(
+//                     "compilerRecreated should not schedule a separate sync completion refresh when active files exist",
+//                     0,
+//                     capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
+//             Assert.assertTrue(
+//                     "compilerRecreated should schedule a dedicated workspace completion bootstrap when active files exist",
+//                     capture.countContaining("completion_index_debounce trigger=compilerRecreated") > 0);
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void initializedDoesNotScheduleCompilerRecreatedRefreshWithoutActiveDocs() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server =
+//                     new JavaLanguageServer(
+//                             new org.javacs.lsp.LanguageClient() {
+//                                 @Override
+//                                 public void publishDiagnostics(org.javacs.lsp.PublishDiagnosticsParams params) {}
+//
+//                                 @Override
+//                                 public void showMessage(org.javacs.lsp.ShowMessageParams params) {}
+//
+//                                 @Override
+//                                 public void registerCapability(
+//                                         String method, com.google.gson.JsonElement options) {}
+//
+//                                 @Override
+//                                 public void customNotification(
+//                                         String method, com.google.gson.JsonElement params) {}
+//                             });
+//             var init = new org.javacs.lsp.InitializeParams();
+//             init.rootUri = LanguageServerFixture.DEFAULT_WORKSPACE_ROOT.toUri();
+//             server.initialize(init);
+//             server.initialized();
+//
+//             Assert.assertEquals(
+//                     "startup should not do synchronous full refresh when no active docs",
+//                     0,
+//                     capture.countContaining("completion_index_refresh_sync trigger=compilerRecreated"));
+//             Assert.assertEquals(
+//                     "startup should not schedule compilerRecreated refresh without active docs",
+//                     0,
+//                     capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+//             Assert.assertEquals(
+//                     "startup should not log a compilerRecreated defer path",
+//                     0,
+//                     capture.countContaining("completion_index_refresh_deferred trigger=compilerRecreated"));
+//
+//             server.shutdown();
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//     @Test
+//     public void didOpenDoesNotOverlapWithCompilerRecreatedProjectIndexCompile() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer();
+//             var file = FindResource.path("org/javacs/example/HelloWorld.java");
+//             var text = FileStore.contents(file);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = file.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = text;
+//             server.didOpenTextDocument(open);
+//
+//             Assert.assertTrue(
+//                     "didOpen should still bootstrap the completion index",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//             Assert.assertEquals(
+//                     "startup should not run compilerRecreated refresh during first didOpen bootstrap",
+//                     0,
+//                     capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+//             Assert.assertEquals(
+//                     "didOpen bootstrap should not schedule a second declaration refresh compile",
+//                     0,
+//                     capture.countContaining("completion_index_debounce trigger=index:async:didOpen:activeDeclarations"));
+//         } finally {
+//             logger.removeHandler(capture);
+//         }
+//     }
+//
+//     @Test
+//     public void watchedGradleBuildChangeRecreatesCompilerImmediatelyWithoutActiveDocs() throws Exception {
+//         var workspace = Files.createTempDirectory("jls-watched-gradle-recreate");
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var src = workspace.resolve("src/main/java/p");
+//             Files.createDirectories(src);
+//             Files.writeString(src.resolve("App.java"), "package p;\nclass App {}\n");
+//             var buildGradle = workspace.resolve("build.gradle");
+//             Files.writeString(buildGradle, "plugins { id 'java' }\n");
+//
+//             var server = LanguageServerFixture.getJavaLanguageServer(workspace, diagnostic -> {});
+//             var initialExternal = externalBinaryIndex(server);
+//
+//             var changed = new FileEvent();
+//             changed.uri = buildGradle.toUri();
+//             changed.type = FileChangeType.Changed;
+//             var watched = new DidChangeWatchedFilesParams();
+//             watched.changes = List.of(changed);
+//             server.didChangeWatchedFiles(watched);
+//
+//             var refreshedExternal = externalBinaryIndex(server);
+//             Assert.assertNotSame(
+//                     "watched Gradle build changes should recreate the compiler immediately",
+//                     initialExternal,
+//                     refreshedExternal);
+//             Assert.assertTrue(
+//                     "expected explicit compiler recreation log for watched Gradle build change",
+//                     capture.countContaining("[perf] compiler_recreate trigger=didChangeWatchedFiles") > 0);
+//             Assert.assertEquals(
+//                     "watched Gradle build change without active docs should not schedule compilerRecreated refresh",
+//                     0,
+//                     capture.countContaining("completion_index_debounce trigger=compilerRecreated"));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//             deleteRecursively(workspace);
+//         }
+//     }
+//
+//     @Test
+//     public void reopeningAfterConfigurationChangeWithNoActiveDocsBootstrapsWorkspaceAgain() throws Exception {
+//         FileStore.reset();
+//         var logger = Logger.getLogger("main");
+//         var previousLevel = logger.getLevel();
+//         logger.setLevel(Level.FINE);
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var server = LanguageServerFixture.getJavaLanguageServer();
+//             var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//             var text = FileStore.contents(file);
+//
+//             var open = new DidOpenTextDocumentParams();
+//             open.textDocument.uri = file.toUri();
+//             open.textDocument.version = 1;
+//             open.textDocument.languageId = "java";
+//             open.textDocument.text = text;
+//             server.didOpenTextDocument(open);
+//             Assert.assertTrue(
+//                     "expected first didOpen bootstrap to publish an index",
+//                     awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//
+//             var close = new DidCloseTextDocumentParams();
+//             close.textDocument.uri = file.toUri();
+//             server.didCloseTextDocument(close);
+//
+//             var settings = new JsonObject();
+//             var java = new JsonObject();
+//             var extra = new com.google.gson.JsonArray();
+//             extra.add("-Xlint:deprecation");
+//             java.add("extraCompilerArgs", extra);
+//             settings.add("java", java);
+//             var change = new DidChangeConfigurationParams();
+//             change.settings = settings;
+//             server.didChangeConfiguration(change);
+//
+//             Assert.assertSame(
+//                     "compiler recreation without active docs should clear the workspace snapshot",
+//                     WorkspaceTypeIndex.EMPTY,
+//                     workspaceIndex(server));
+//
+//             var beforeReopen = completionIndexVersion(server);
+//             var reopen = new DidOpenTextDocumentParams();
+//             reopen.textDocument.uri = file.toUri();
+//             reopen.textDocument.version = 2;
+//             reopen.textDocument.languageId = "java";
+//             reopen.textDocument.text = text;
+//             server.didOpenTextDocument(reopen);
+//
+//             Assert.assertTrue(
+//                     "reopening after config change should bootstrap the workspace again",
+//                     awaitCompletionIndexAdvance(server, beforeReopen, 10, TimeUnit.SECONDS));
+//             Assert.assertEquals(
+//                     "expected didOpen bootstrap to run once before and once after config change",
+//                     2,
+//                     capture.countContaining("[perf] completion_index_debounce trigger=didOpen"));
+//         } finally {
+//             logger.removeHandler(capture);
+//             logger.setLevel(previousLevel);
+//         }
+//     }
+//
+//
+//
+//     @Test
+//     public void watchedCreatedForActiveJavaFileSkipsDuplicateWork() throws Exception {
+//         var server = LanguageServerFixture.getJavaLanguageServer();
+//         var file = FindResource.path("org/javacs/example/AutocompleteMember.java");
+//         var text = FileStore.contents(file);
+//
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = text;
+//         server.didOpenTextDocument(open);
+//
+//         Thread.sleep(700);
+//
+//         var logger = Logger.getLogger("main");
+//         var capture = new TestLogCapture();
+//         logger.addHandler(capture);
+//         try {
+//             var created = new FileEvent();
+//             created.uri = file.toUri();
+//             created.type = FileChangeType.Created;
+//             var watched = new DidChangeWatchedFilesParams();
+//             watched.changes = List.of(created);
+//             server.didChangeWatchedFiles(watched);
+//
+//             Thread.sleep(250);
+//             Assert.assertEquals(
+//                     "active-doc watched create should not trigger full-project index refresh",
+//                     0,
+//                     capture.countContaining(
+//                             "[perf] completion_index_debounce trigger=didChangeWatchedFiles:javaCreated "));
+//             Assert.assertEquals(
+//                     "active-doc watched create should not trigger diagnostics debounce",
+//                     0,
+//                     capture.countContaining(
+//                             "[perf] diagnostics_debounce trigger=didChangeWatchedFiles"));
+//         } finally {
+//             logger.removeHandler(capture);
+//         }
+//     }
+//
+//     private long completionIndexVersion(JavaLanguageServer server) throws Exception {
+//         var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
+//         field.setAccessible(true);
+//         return ((AtomicLong) field.get(server)).get();
+//     }
+//
+//     private void openAndBootstrap(JavaLanguageServer server, Path file) throws Exception {
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = Files.readString(file);
+//         server.didOpenTextDocument(open);
+//         Assert.assertTrue(
+//                 "expected completion index bootstrap before drift test",
+//                 awaitCompletionIndexAdvance(server, 0, 10, TimeUnit.SECONDS));
+//     }
+//
+//     private boolean hasDeclarationDrift(JavaLanguageServer server, Path file, List<?> shapes) throws Exception {
+//         Method method =
+//                 JavaLanguageServer.class.getDeclaredMethod("hasDeclarationDrift", Path.class, List.class);
+//         method.setAccessible(true);
+//         return (boolean) method.invoke(server, file, shapes);
+//     }
+//
+//     private Object declaredTypeShape(IndexedType indexed, boolean structuralLombok) throws Exception {
+//         return declaredTypeShape(
+//                 indexed.qualifiedName,
+//                 directMemberSignatures(indexed),
+//                 indexed.superclass,
+//                 indexed.interfaces,
+//                 structuralLombok);
+//     }
+//
+//     private Object declaredTypeShape(
+//             String qualifiedName,
+//             List<String> directMemberSignatures,
+//             String superclass,
+//             List<String> interfaces,
+//             boolean structuralLombok)
+//             throws Exception {
+//         Class<?> shapeClass = Class.forName("org.javacs.JavaLanguageServer$DeclaredTypeShape");
+//         Constructor<?> constructor =
+//                 shapeClass.getDeclaredConstructor(
+//                         String.class, List.class, String.class, List.class, boolean.class);
+//         constructor.setAccessible(true);
+//         return constructor.newInstance(
+//                 qualifiedName,
+//                 List.copyOf(directMemberSignatures),
+//                 superclass,
+//                 List.copyOf(interfaces),
+//                 structuralLombok);
+//     }
+//
+//     private IndexedType indexedTypeForFile(JavaLanguageServer server, Path file) throws Exception {
+//         return workspaceIndex(server).types().values().stream()
+//                 .filter(type -> file.equals(type.sourcePath))
+//                 .findFirst()
+//                 .orElseThrow();
+//     }
+//
+//     private WorkspaceTypeIndex workspaceIndexOf(IndexedType... types) throws Exception {
+//         var constructor =
+//                 WorkspaceTypeIndex.class.getDeclaredConstructor(Map.class, Map.class);
+//         constructor.setAccessible(true);
+//         var byName = new java.util.LinkedHashMap<String, IndexedType>();
+//         for (var type : types) {
+//             byName.put(type.qualifiedName, type);
+//         }
+//         return constructor.newInstance(byName, Map.of());
+//     }
+//
+//     private void publishWorkspaceSnapshot(JavaLanguageServer server, WorkspaceTypeIndex index, long version)
+//             throws Exception {
+//         var method =
+//                 JavaLanguageServer.class.getDeclaredMethod(
+//                         "publishCompletionSnapshot",
+//                         WorkspaceTypeIndex.class,
+//                         ExternalBinaryTypeIndex.class,
+//                         long.class,
+//                         Class.forName("org.javacs.JavaLanguageServer$CompletionIndexScope"));
+//         method.setAccessible(true);
+//         method.invoke(server, index, ExternalBinaryTypeIndex.EMPTY, version, null);
+//     }
+//
+//     private List<String> directMemberSignatures(IndexedType type) {
+//         var signatures = new java.util.ArrayList<String>();
+//         for (var member : type.members) {
+//             if (member.synthetic || member.priority != 0) {
+//                 continue;
+//             }
+//             if (member.kind == CompletionItemKind.Field) {
+//                 signatures.add("F:" + member.name + ":" + member.isStatic);
+//             } else if (member.kind == CompletionItemKind.Method) {
+//                 signatures.add(
+//                         "M:"
+//                                 + member.name
+//                                 + ":"
+//                                 + (member.erasedParameterTypes == null ? 0 : member.erasedParameterTypes.length)
+//                                 + ":"
+//                                 + member.isStatic);
+//             }
+//         }
+//         return List.copyOf(signatures);
+//     }
+//
+//     private ExternalBinaryTypeIndex externalBinaryIndex(JavaLanguageServer server) throws Exception {
+//         var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
+//         field.setAccessible(true);
+//         var snapshot = ((AtomicReference<?>) field.get(server)).get();
+//         var method = snapshot.getClass().getDeclaredMethod("externalIndex");
+//         method.setAccessible(true);
+//         return (ExternalBinaryTypeIndex) method.invoke(snapshot);
+//     }
+//
+//     private WorkspaceTypeIndex workspaceIndex(JavaLanguageServer server) throws Exception {
+//         var field = JavaLanguageServer.class.getDeclaredField("completionSnapshotRef");
+//         field.setAccessible(true);
+//         var snapshot = ((AtomicReference<?>) field.get(server)).get();
+//         var method = snapshot.getClass().getDeclaredMethod("workspaceIndex");
+//         method.setAccessible(true);
+//         return (WorkspaceTypeIndex) method.invoke(snapshot);
+//     }
+//
+//     private void setCompletionIndexVersion(JavaLanguageServer server, long value) throws Exception {
+//         var field = JavaLanguageServer.class.getDeclaredField("completionIndexVersion");
+//         field.setAccessible(true);
+//         ((AtomicLong) field.get(server)).set(value);
+//     }
+//
+//     private JavaCompilerService interactiveCompiler(JavaLanguageServer server) throws Exception {
+//         var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
+//         field.setAccessible(true);
+//         return (JavaCompilerService) field.get(server);
+//     }
+//
+//     private void setInteractiveCompiler(JavaLanguageServer server, JavaCompilerService compiler) throws Exception {
+//         var field = JavaLanguageServer.class.getDeclaredField("interactiveCompiler");
+//         field.setAccessible(true);
+//         field.set(server, compiler);
+//     }
+//
+//     private MethodTrackingCompiler replaceInteractiveCompilerWithTracking(JavaLanguageServer server) throws Exception {
+//         var original = interactiveCompiler(server);
+//         var tracking =
+//                 new MethodTrackingCompiler(
+//                         original.classPath,
+//                         original.docPath,
+//                         original.addExports,
+//                         original.extraArgs,
+//                         original.apEnabled,
+//                         original.compilerRole);
+//         setInteractiveCompiler(server, tracking);
+//         return tracking;
+//     }
+//
+//     private static void deleteRecursively(Path root) throws IOException {
+//         try (var walk = Files.walk(root)) {
+//             walk.sorted(java.util.Comparator.reverseOrder())
+//                     .forEach(
+//                             path -> {
+//                                 try {
+//                                     Files.deleteIfExists(path);
+//                                 } catch (IOException ignored) {
+//                                 }
+//                             });
+//         }
+//     }
+//
+//     private boolean awaitCompletionIndexAdvance(
+//             JavaLanguageServer server, long before, long timeout, TimeUnit unit) throws Exception {
+//         var deadline = System.nanoTime() + unit.toNanos(timeout);
+//         while (System.nanoTime() < deadline) {
+//             if (completionIndexVersion(server) > before) {
+//                 return true;
+//             }
+//             Thread.sleep(20);
+//         }
+//         return false;
+//     }
+//
+//     private static DocumentDiagnosticReport pullDiagnostics(
+//             JavaLanguageServer server, java.net.URI uri) {
+//         var params = new DocumentDiagnosticParams();
+//         params.textDocument = new TextDocumentIdentifier(uri);
+//         return server.textDocumentDiagnostic(params);
+//     }
+//
+//     private static List<String> diagnosticFingerprints(List<Diagnostic> diagnostics) {
+//         return diagnostics.stream()
+//                 .map(
+//                         d ->
+//                                 String.format(
+//                                         "%s|%s|%s|%d:%d",
+//                                         d.severity,
+//                                         d.code,
+//                                         d.message,
+//                                         d.range.start.line,
+//                                         d.range.start.character))
+//                 .toList();
+//     }
+//
+//     private static boolean containsAny(String text, String... needles) {
+//         if (text == null) {
+//             return false;
+//         }
+//         for (var needle : needles) {
+//             if (text.contains(needle)) {
+//                 return true;
+//             }
+//         }
+//         return false;
+//     }
+//
+//     private static void openJavaFile(JavaLanguageServer server, Path file) throws IOException {
+//         var open = new DidOpenTextDocumentParams();
+//         open.textDocument.uri = file.toUri();
+//         open.textDocument.version = 1;
+//         open.textDocument.languageId = "java";
+//         open.textDocument.text = Files.readString(file);
+//         server.didOpenTextDocument(open);
+//     }
+//
+//     private static CompletionList completionAtMarker(
+//             JavaLanguageServer server, Path file, String contents, String marker) {
+//         var offset = contents.indexOf(marker);
+//         Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
+//         offset += marker.length();
+//         var line = 0;
+//         var character = 0;
+//         for (int i = 0; i < offset; i++) {
+//             if (contents.charAt(i) == '\n') {
+//                 line++;
+//                 character = 0;
+//             } else {
+//                 character++;
+//             }
+//         }
+//         return server.completion(
+//                         new TextDocumentPositionParams(
+//                                 new TextDocumentIdentifier(file.toUri()), new Position(line, character)))
+//                 .orElseThrow();
+//     }
+//
+//     private static CompletionList isolatedCompletionAtMarker(
+//             JavaLanguageServer server, Path file, String contents, int version, String marker, String... allMarkers) {
+//         var isolated = contents;
+//         for (var candidate : allMarkers) {
+//             if (!candidate.equals(marker)) {
+//                 isolated = isolated.replace(candidate, sanitizeCompletionMarker(candidate));
+//             }
+//         }
+//         var change = new DidChangeTextDocumentParams();
+//         change.textDocument.uri = file.toUri();
+//         change.textDocument.version = version;
+//         var delta = new TextDocumentContentChangeEvent();
+//         delta.text = isolated;
+//         change.contentChanges.add(delta);
+//         server.didChangeTextDocument(change);
+//         return completionAtMarker(server, file, isolated, marker);
+//     }
+//
+//     private static Process startLanguageServerProcess() throws IOException {
+//         var script = Paths.get("dist/lang_server_mac.sh").toAbsolutePath().toString();
+//         return new ProcessBuilder(script).directory(Paths.get("").toAbsolutePath().toFile()).start();
+//     }
+//
+//     private static JsonObject initializeParams(Path workspace) {
+//         var params = new JsonObject();
+//         params.addProperty("rootUri", workspace.toUri().toString());
+//         params.add("capabilities", new JsonObject());
+//         return params;
+//     }
+//
+//     private static JsonObject didOpenParams(Path file, String text) {
+//         var params = new JsonObject();
+//         var textDocument = new JsonObject();
+//         textDocument.addProperty("uri", file.toUri().toString());
+//         textDocument.addProperty("languageId", "java");
+//         textDocument.addProperty("version", 0);
+//         textDocument.addProperty("text", text);
+//         params.add("textDocument", textDocument);
+//         return params;
+//     }
+//
+//     private static JsonObject documentParams(Path file) {
+//         var params = new JsonObject();
+//         var textDocument = new JsonObject();
+//         textDocument.addProperty("uri", file.toUri().toString());
+//         params.add("textDocument", textDocument);
+//         return params;
+//     }
+//
+//     private static JsonObject textDocumentPositionParams(Path file, int line, int character) {
+//         var params = documentParams(file);
+//         params.add("position", jsonPosition(line, character));
+//         return params;
+//     }
+//
+//     private static JsonObject jsonPosition(int line, int character) {
+//         var position = new JsonObject();
+//         position.addProperty("line", line);
+//         position.addProperty("character", character);
+//         return position;
+//     }
+//
+//     private static JsonObject toJson(Position position) {
+//         var json = new JsonObject();
+//         json.addProperty("line", position.line);
+//         json.addProperty("character", position.character);
+//         return json;
+//     }
+//
+//     private static void writeSources(Path workspace, Map<String, String> sources) throws IOException {
+//         for (var entry : sources.entrySet()) {
+//             var file = workspace.resolve(entry.getKey());
+//             Files.createDirectories(file.getParent());
+//             Files.writeString(file, entry.getValue());
+//         }
+//     }
+//
+//     private static Map<String, String> lombokBuilderDefinitionReplaySources() {
+//         return Map.ofEntries(
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/AddressInfo.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import lombok.AllArgsConstructor;
+//                         import lombok.Builder;
+//                         import lombok.Data;
+//                         import lombok.NoArgsConstructor;
+//
+//                         @Data
+//                         @Builder
+//                         @NoArgsConstructor
+//                         @AllArgsConstructor
+//                         public class AddressInfo {
+//                           private String lineOne;
+//                           private String lineTwo;
+//                           private String city;
+//                           private String region;
+//                           private String postalCode;
+//                           private String countryCode;
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/ContactWindow.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         public class ContactWindow {
+//                           private String preferredZone;
+//                           private int startHour;
+//                           private int endHour;
+//
+//                           public ContactWindow() {}
+//
+//                           public ContactWindow(String preferredZone, int startHour, int endHour) {
+//                             this.preferredZone = preferredZone;
+//                             this.startHour = startHour;
+//                             this.endHour = endHour;
+//                           }
+//
+//                           public String getPreferredZone() {
+//                             return preferredZone;
+//                           }
+//
+//                           public void setPreferredZone(String preferredZone) {
+//                             this.preferredZone = preferredZone;
+//                           }
+//
+//                           public int getStartHour() {
+//                             return startHour;
+//                           }
+//
+//                           public void setStartHour(int startHour) {
+//                             this.startHour = startHour;
+//                           }
+//
+//                           public int getEndHour() {
+//                             return endHour;
+//                           }
+//
+//                           public void setEndHour(int endHour) {
+//                             this.endHour = endHour;
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/AbstractTrackedRecord.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.time.Instant;
+//                         import java.util.ArrayList;
+//                         import java.util.List;
+//
+//                         public abstract class AbstractTrackedRecord {
+//                           private String externalId;
+//                           private Instant createdAt = Instant.now();
+//                           private Instant updatedAt = Instant.now();
+//                           private final List<String> tags = new ArrayList<>();
+//
+//                           public String getExternalId() {
+//                             return externalId;
+//                           }
+//
+//                           public void setExternalId(String externalId) {
+//                             this.externalId = externalId;
+//                           }
+//
+//                           public Instant getCreatedAt() {
+//                             return createdAt;
+//                           }
+//
+//                           public void setCreatedAt(Instant createdAt) {
+//                             this.createdAt = createdAt;
+//                           }
+//
+//                           public Instant getUpdatedAt() {
+//                             return updatedAt;
+//                           }
+//
+//                           public void setUpdatedAt(Instant updatedAt) {
+//                             this.updatedAt = updatedAt;
+//                           }
+//
+//                           public List<String> getTags() {
+//                             return tags;
+//                           }
+//
+//                           public boolean hasTag(String tag) {
+//                             return tags.stream().anyMatch(tag::equalsIgnoreCase);
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/AbstractPartyRecord.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         public abstract class AbstractPartyRecord extends AbstractTrackedRecord {
+//                           private String displayName;
+//                           private String segment;
+//                           private boolean archived;
+//
+//                           public String getDisplayName() {
+//                             return displayName;
+//                           }
+//
+//                           public void setDisplayName(String displayName) {
+//                             this.displayName = displayName;
+//                           }
+//
+//                           public String getSegment() {
+//                             return segment;
+//                           }
+//
+//                           public void setSegment(String segment) {
+//                             this.segment = segment;
+//                           }
+//
+//                           public boolean isArchived() {
+//                             return archived;
+//                           }
+//
+//                           public void setArchived(boolean archived) {
+//                             this.archived = archived;
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/AbstractCustomerRecord.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.util.LinkedHashMap;
+//                         import java.util.Map;
+//                         import lombok.Getter;
+//                         import lombok.Setter;
+//
+//                         @Getter
+//                         @Setter
+//                         public abstract class AbstractCustomerRecord extends AbstractPartyRecord {
+//                           private final Map<String, String> attributes = new LinkedHashMap<>();
+//                           private AddressInfo primaryAddress;
+//                           private ContactWindow contactWindow;
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/CustomerProfile.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.util.ArrayList;
+//                         import java.util.List;
+//                         import lombok.EqualsAndHashCode;
+//                         import lombok.Getter;
+//                         import lombok.Setter;
+//
+//                         @Getter
+//                         @Setter
+//                         @EqualsAndHashCode(callSuper = true)
+//                         public class CustomerProfile extends AbstractCustomerRecord {
+//                           private String loyaltyTier;
+//                           private boolean vip;
+//                           private final List<OrderEnvelope> recentOrders = new ArrayList<>();
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/DeepGraph.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.util.ArrayList;
+//                         import java.util.List;
+//
+//                         public class DeepGraph {
+//                           private String graphName;
+//                           private final List<DeepNode> nodes = new ArrayList<>();
+//
+//                           public String getGraphName() {
+//                             return graphName;
+//                           }
+//
+//                           public void setGraphName(String graphName) {
+//                             this.graphName = graphName;
+//                           }
+//
+//                           public List<DeepNode> getNodes() {
+//                             return nodes;
+//                           }
+//
+//                           public static class DeepNode {
+//                             private String key;
+//                             private OrderEnvelope envelope;
+//                             private final List<DeepNode> children = new ArrayList<>();
+//
+//                             public String getKey() {
+//                               return key;
+//                             }
+//
+//                             public void setKey(String key) {
+//                               this.key = key;
+//                             }
+//
+//                             public OrderEnvelope getEnvelope() {
+//                               return envelope;
+//                             }
+//
+//                             public void setEnvelope(OrderEnvelope envelope) {
+//                               this.envelope = envelope;
+//                             }
+//
+//                             public List<DeepNode> getChildren() {
+//                               return children;
+//                             }
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/LineItem.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.math.BigDecimal;
+//                         import java.util.ArrayList;
+//                         import java.util.List;
+//                         import lombok.AllArgsConstructor;
+//                         import lombok.Builder;
+//                         import lombok.Data;
+//                         import lombok.NoArgsConstructor;
+//
+//                         @Data
+//                         @Builder
+//                         @NoArgsConstructor
+//                         @AllArgsConstructor
+//                         public class LineItem {
+//                           private String sku;
+//                           private String family;
+//                           private int quantity;
+//                           private BigDecimal unitPrice;
+//                           private List<String> flags = new ArrayList<>();
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/MoneyBucket.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.math.BigDecimal;
+//                         import java.util.Currency;
+//
+//                         public class MoneyBucket {
+//                           private Currency currency;
+//                           private BigDecimal subtotal;
+//                           private BigDecimal taxes;
+//                           private BigDecimal discount;
+//
+//                           public Currency getCurrency() {
+//                             return currency;
+//                           }
+//
+//                           public void setCurrency(Currency currency) {
+//                             this.currency = currency;
+//                           }
+//
+//                           public BigDecimal getSubtotal() {
+//                             return subtotal;
+//                           }
+//
+//                           public void setSubtotal(BigDecimal subtotal) {
+//                             this.subtotal = subtotal;
+//                           }
+//
+//                           public BigDecimal getTaxes() {
+//                             return taxes;
+//                           }
+//
+//                           public void setTaxes(BigDecimal taxes) {
+//                             this.taxes = taxes;
+//                           }
+//
+//                           public BigDecimal getDiscount() {
+//                             return discount;
+//                           }
+//
+//                           public void setDiscount(BigDecimal discount) {
+//                             this.discount = discount;
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/model/OrderEnvelope.java",
+//                         """
+//                         package com.example.demo.complex.model;
+//
+//                         import java.time.LocalDate;
+//                         import java.util.ArrayList;
+//                         import java.util.List;
+//                         import lombok.AllArgsConstructor;
+//                         import lombok.Builder;
+//                         import lombok.Data;
+//                         import lombok.NoArgsConstructor;
+//
+//                         @Data
+//                         @Builder
+//                         @NoArgsConstructor
+//                         @AllArgsConstructor
+//                         public class OrderEnvelope {
+//                           private String orderId;
+//                           private String regionCode;
+//                           private LocalDate requestedShipDate;
+//                           private CustomerProfile customer;
+//                           private MoneyBucket totals;
+//                           private List<LineItem> items = new ArrayList<>();
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/spi/AuditPort.java",
+//                         """
+//                         package com.example.demo.complex.spi;
+//
+//                         import com.example.demo.complex.model.OrderEnvelope;
+//                         import java.util.List;
+//
+//                         public interface AuditPort {
+//                           List<String> LEVELS = List.of("TRACE", "DEBUG", "INFO", "WARN", "ERROR");
+//
+//                           String describe(OrderEnvelope envelope, String decision);
+//
+//                           default boolean isNoisy(String level) {
+//                             LEVELS.getFirst();
+//                             describe(null, null);
+//                             return LEVELS.indexOf(level) >= LEVELS.indexOf("WARN");
+//                           }
+//
+//                           static String hardcodedDecision() {
+//                             LEVELS.getFirst();
+//                             return "DIRECT_INTERFACE_DECISION";
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/spi/PricingPort.java",
+//                         """
+//                         package com.example.demo.complex.spi;
+//
+//                         import com.example.demo.complex.model.LineItem;
+//                         import com.example.demo.complex.model.OrderEnvelope;
+//                         import java.math.BigDecimal;
+//                         import java.util.List;
+//                         import java.util.Map;
+//
+//                         public interface PricingPort {
+//                           Map<String, BigDecimal> SEGMENT_MULTIPLIERS =
+//                               Map.of(
+//                                   "enterprise", new BigDecimal("0.91"),
+//                                   "mid-market", new BigDecimal("0.96"),
+//                                   "starter", new BigDecimal("1.00"));
+//
+//                           List<String> HARD_CODED_REGIONS = List.of("EU", "US", "APAC", "INTERNAL");
+//
+//                           BigDecimal price(OrderEnvelope envelope, LineItem item);
+//
+//                           default BigDecimal fallbackDiscount(String segment) {
+//                             HARD_CODED_REGIONS.add(null);
+//                             price(null, null);
+//                             price(null, null);
+//                             HARD_CODED_REGIONS.getFirst();
+//                             SEGMENT_MULTIPLIERS.get(null);
+//                             return SEGMENT_MULTIPLIERS.getOrDefault(segment, BigDecimal.ONE);
+//                           }
+//
+//                           static String directLookup(String region) {
+//                             SEGMENT_MULTIPLIERS.get(null);
+//                             HARD_CODED_REGIONS.getFirst();
+//                             return HARD_CODED_REGIONS.stream()
+//                                 .filter(region::equalsIgnoreCase)
+//                                 .findFirst()
+//                                 .orElse("OTHER");
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/util/ComplexStatics.java",
+//                         """
+//                         package com.example.demo.complex.util;
+//
+//                         import com.example.demo.complex.model.LineItem;
+//                         import com.example.demo.complex.model.OrderEnvelope;
+//                         import com.example.demo.complex.spi.PricingPort;
+//                         import java.math.BigDecimal;
+//                         import java.util.Comparator;
+//                         import java.util.List;
+//                         import java.util.Locale;
+//                         import java.util.concurrent.atomic.AtomicInteger;
+//
+//                         public final class ComplexStatics {
+//                           private ComplexStatics() {}
+//
+//                           public static String resolveRiskBand(OrderEnvelope envelope) {
+//                             var itemCount = envelope.getItems() == null ? 0 : envelope.getItems().size();
+//                             return itemCount > 10 ? "HIGH" : itemCount > 5 ? "MEDIUM" : "LOW";
+//                           }
+//
+//                           public static BigDecimal aggregate(List<LineItem> items, PricingPort pricingPort, OrderEnvelope envelope) {
+//                             return items.stream()
+//                                 .map(item -> pricingPort.price(envelope, item))
+//                                 .reduce(BigDecimal.ZERO, BigDecimal::add);
+//                           }
+//
+//                           public static final class NestedFormatter {
+//                             private final AtomicInteger sequence = new AtomicInteger();
+//
+//                             public String label(LineItem item) {
+//                               return item.getSku().toUpperCase(Locale.ROOT) + "-" + sequence.incrementAndGet();
+//                             }
+//
+//                             public Comparator<LineItem> comparator() {
+//                               return Comparator.comparing(LineItem::getFamily).thenComparing(LineItem::getSku);
+//                             }
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/models/Foo.java",
+//                         """
+//                         package com.example.demo.models;
+//
+//                         import lombok.Data;
+//
+//                         @Data
+//                         public class Foo {
+//                           private Bar bar;
+//                           private Integer dome;
+//                           private String iba;
+//                           private String adwqzxckqp;
+//                           private String wakqll;
+//                           private String someField;
+//                           private String dfaa;
+//                           private String name;
+//                           private String hxawqp;
+//                           private long zxczx;
+//                           private String uws;
+//                           private String qpo;
+//                           private String halo;
+//                           private String hihi;
+//                           private String huhu;
+//                           private String pipi;
+//                           private String poppo;
+//                           private int number;
+//                           private String asd;
+//                           private String koo;
+//                           private String kk;
+//                           private String xx;
+//                           private String uui;
+//                           private int oo;
+//                           private static final String asdss = "SD";
+//
+//                           public static String getOne(String a) {
+//                             return "asd";
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/models/Bar.java",
+//                         """
+//                         package com.example.demo.models;
+//
+//                         import lombok.Data;
+//                         import lombok.extern.slf4j.Slf4j;
+//
+//                         @Data
+//                         @Slf4j
+//                         public class Bar {
+//                           private Biz biz;
+//                           private String xkkk;
+//                           private String poo;
+//                           private String pi;
+//                           private String k;
+//                           private int asd;
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/models/Biz.java",
+//                         """
+//                         package com.example.demo.models;
+//
+//                         public class Biz {
+//                           private String bvca;
+//                           private long jshq;
+//                           private int huh;
+//                           private long uuhas;
+//                           private long buhk;
+//                           private String alpoq;
+//                           private long khasd;
+//                           private String hzxww;
+//
+//                           public Biz() {}
+//
+//                           public Biz(String a) {
+//                             this.bvca = a;
+//                           }
+//
+//                           public String getBvca() {
+//                             return this.bvca;
+//                           }
+//
+//                           public void setBvca(String bvca) {
+//                             this.bvca = bvca;
+//                           }
+//
+//                           public long getJshq() {
+//                             return this.jshq;
+//                           }
+//
+//                           public void setJshq(long jshq) {
+//                             this.jshq = jshq;
+//                           }
+//
+//                           public String getHzxww() {
+//                             return this.hzxww;
+//                           }
+//
+//                           public void setHzxww(String hzxww) {
+//                             this.hzxww = hzxww;
+//                           }
+//
+//                           public String getAlpoq() {
+//                             return this.alpoq;
+//                           }
+//
+//                           public void setAlpoq(String alpoq) {
+//                             this.alpoq = alpoq;
+//                           }
+//
+//                           public long getKhasd() {
+//                             return this.khasd;
+//                           }
+//
+//                           public void setKhasd(long khasd) {
+//                             this.khasd = khasd;
+//                           }
+//
+//                           public long getBuhk() {
+//                             return this.buhk;
+//                           }
+//
+//                           public void setBuhk(long buhk) {
+//                             this.buhk = buhk;
+//                           }
+//
+//                           public long getUuhas() {
+//                             return this.uuhas;
+//                           }
+//
+//                           public void setUuhas(long uuhas) {
+//                             this.uuhas = uuhas;
+//                           }
+//
+//                           public int getHuh() {
+//                             return this.huh;
+//                           }
+//
+//                           public void setHuh(int huh) {
+//                             this.huh = huh;
+//                           }
+//
+//                           @Override
+//                           public boolean equals(Object o) {
+//                             if (this == o) return true;
+//                             if (o == null || getClass() != o.getClass()) return false;
+//                             Biz that = (Biz) o;
+//                             if (!java.util.Objects.equals(this.huh, that.huh)) return false;
+//                             if (!java.util.Objects.equals(this.uuhas, that.uuhas)) return false;
+//                             if (!java.util.Objects.equals(this.buhk, that.buhk)) return false;
+//                             if (!java.util.Objects.equals(this.alpoq, that.alpoq)) return false;
+//                             if (!java.util.Objects.equals(this.khasd, that.khasd)) return false;
+//                             if (!java.util.Objects.equals(this.hzxww, that.hzxww)) return false;
+//                             return true;
+//                           }
+//
+//                           @Override
+//                           public int hashCode() {
+//                             return java.util.Objects.hash(this.huh, this.uuhas, this.buhk, this.alpoq, this.khasd, this.hzxww);
+//                           }
+//                         }
+//                         """),
+//                 Map.entry(
+//                         "src/main/java/com/example/demo/complex/service/ComplexScenarioService.java",
+//                         """
+//                         package com.example.demo.complex.service;
+//
+//                         import com.example.demo.complex.model.AddressInfo;
+//                         import com.example.demo.complex.model.ContactWindow;
+//                         import com.example.demo.complex.model.CustomerProfile;
+//                         import com.example.demo.complex.model.DeepGraph;
+//                         import com.example.demo.complex.model.LineItem;
+//                         import com.example.demo.complex.model.MoneyBucket;
+//                         import com.example.demo.complex.model.OrderEnvelope;
+//                         import com.example.demo.complex.spi.AuditPort;
+//                         import com.example.demo.complex.spi.PricingPort;
+//                         import com.example.demo.complex.util.ComplexStatics;
+//                         import com.example.demo.models.Bar;
+//                         import com.example.demo.models.Biz;
+//                         import com.example.demo.models.Foo;
+//                         import com.google.common.collect.ImmutableMap;
+//                         import java.math.BigDecimal;
+//                         import java.time.LocalDate;
+//                         import java.util.ArrayList;
+//                         import java.util.Comparator;
+//                         import java.util.Currency;
+//                         import java.util.LinkedHashMap;
+//                         import java.util.List;
+//                         import java.util.Map;
+//                         import java.util.Objects;
+//                         import java.util.stream.Collectors;
+//                         import lombok.extern.slf4j.Slf4j;
+//                         import org.apache.commons.lang3.StringUtils;
+//                         import org.springframework.beans.factory.annotation.Autowired;
+//                         import org.springframework.cache.annotation.Cacheable;
+//                         import org.springframework.stereotype.Service;
+//
+//                         @Service
+//                         @Slf4j
+//                         public class ComplexScenarioService implements AuditPort {
+//                           @Autowired private PricingPort pricingPort;
+//                           @Autowired private AuditPort auditPort;
+//
+//                           @Cacheable("complex-snapshots")
+//                           public Map<String, Object> generateSnapshot(String seed) {
+//                             auditPort.isNoisy(null);
+//                             auditPort.describe(null, null);
+//                             auditPort.isNoisy(null);
+//
+//                             var envelope = sampleEnvelope(seed);
+//                             var kasd = envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());
+//                             envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());
+//                             envelope.getItems().stream().map(i -> i.getFlags().getFirst()).collect(Collectors.toList());
+//                             envelope.getItems().stream().map(LineItem::getFlags).collect(Collectors.toList());
+//                             envelope.getItems().stream().map(i -> i.getFlags()).collect(Collectors.toList());
+//                             var formatter = new ComplexStatics.NestedFormatter();
+//                             formatter.comparator();
+//                             var graph = buildGraph(envelope);
+//                             graph.getGraphName();
+//                             var results = new LinkedHashMap<String, Object>();
+//                             results.put(null, null);
+//                             results.get(null);
+//                             results.get(null);
+//                             var region = PricingPort.directLookup(envelope.getRegionCode());
+//                             results.get(0);
+//                             region.isBlank();
+//                             log.info(null);
+//                             var riskBand = ComplexStatics.resolveRiskBand(envelope);
+//                             ComplexStatics.resolveRiskBand(null);
+//                             ComplexStatics.aggregate(null, null, null);
+//                             var hardDecision = AuditPort.hardcodedDecision();
+//                             hardDecision.isBlank();
+//                             hardDecision.isBlank();
+//                             AuditPort.LEVELS.getFirst();
+//                             AuditPort.LEVELS.getFirst();
+//                             AuditPort.LEVELS.getLast();
+//                             AuditPort.LEVELS.get(0);
+//                             AuditPort.LEVELS.getFirst();
+//                             envelope.getCustomer().getLoyaltyTier();
+//                             envelope.getCustomer().getContactWindow().getEndHour();
+//                             envelope.getItems().stream().map(LineItem::getFamily).collect(Collectors.toList());
+//                             envelope.getItems().stream().map(i -> i.getFamily()).collect(Collectors.toList());
+//
+//                             var labels =
+//                                 envelope.getItems().stream()
+//                                     .sorted(formatter.comparator())
+//                                     .map(formatter::label)
+//                                     .collect(Collectors.toCollection(ArrayList::new));
+//
+//                             var k = envelope.getItems().stream().sorted(formatter.comparator());
+//                             var pk = k.collect(Collectors.toList());
+//                             pk.getFirst();
+//                             labels.get(0);
+//                             labels.getFirst();
+//
+//                             var xx = envelope.getItems().stream().sorted(formatter.comparator())
+//                                 .map(formatter::label)
+//                                 .toList();
+//
+//                             xx.getFirst();
+//                             labels.get(0);
+//                             var total = ComplexStatics.aggregate(envelope.getItems(), pricingPort, envelope);
+//                             total.add(null);
+//                             var flaggedFamilies =
+//                                 envelope.getItems().stream()
+//                                     .filter(item -> item.getFlags().stream().anyMatch(flag -> flag.contains("manual")))
+//                                     .collect(Collectors.groupingBy(LineItem::getFamily, Collectors.counting()));
+//                             flaggedFamilies.get(null);
+//                             flaggedFamilies.get(null);
+//
+//                             StringUtils.appendIfMissing(null, null, null);
+//                             var branch =
+//                                 switch (region) {
+//                                   case "asd" -> null;
+//                                   case "EU" -> total.compareTo(new BigDecimal("2000")) > 0 ? "EU-HEAVY" : "EU-LIGHT";
+//                                   case "US" -> total.compareTo(new BigDecimal("1000")) > 0 ? "US-HEAVY" : "US-LIGHT";
+//                                   case "APAC" -> "APAC-" + riskBand;
+//                                   default -> "OTHER-" + riskBand;
+//                                 };
+//
+//                             switch (region) {
+//                               case "d" -> System.out.print("");
+//                               default -> System.out.print("");
+//                             }
+//                             StringUtils.isBlank(null);
+//                             if (StringUtils.isBlank(seed)) {
+//                               results.put("seedState", "blank");
+//                               results.get(null);
+//                             } else if (seed.length() > 12 && envelope.getCustomer().isVip()) {
+//                               results.put("seedState", "long-vip");
+//                             } else if (seed.length() > 4) {
+//                               results.put("seedState", "normal");
+//                             } else {
+//                               results.put("seedState", "tiny");
+//                             }
+//
+//                             var expensiveItems =
+//                                 envelope.getItems().stream()
+//                                     .map(item -> Map.entry(item.getSku(), pricingPort.price(envelope, item)))
+//                                     .filter(entry -> entry.getValue().compareTo(new BigDecimal("150")) > 0)
+//                                     .sorted(Map.Entry.comparingByValue(Comparator.reverseOrder()))
+//                                     .toList();
+//
+//                             expensiveItems.getFirst();
+//
+//                             Foo foo = new Foo();
+//                             foo.getAdwqzxckqp();
+//                             foo.setBar(new Bar());
+//                             foo.getBar().setBiz(new Biz("seed-" + seed));
+//                             foo.setAsd(seed);
+//                             foo.getAdwqzxckqp();
+//
+//                             results.put(null, null);
+//                             results.put("region", region);
+//                             results.put("riskBand", riskBand);
+//                             results.put("branch", branch);
+//                             results.put("hardDecision", hardDecision);
+//                             results.put("labels", labels);
+//                             results.put("graphSize", graph.getNodes().size());
+//                             results.put("priceTotal", total);
+//                             results.put("flaggedFamilies", flaggedFamilies);
+//                             results.put("expensiveItems", expensiveItems);
+//                             results.put("auditDescription", auditPort.describe(envelope, branch));
+//                             results.put("localAuditDescription", describe(envelope, branch));
+//                             results.put("fooBarName", foo.getBar().getBiz().getAlpoq());
+//                             results.put("fooSeed", foo.getAsd());
+//                             results.put("staticMultiplierKeys", ImmutableMap.copyOf(PricingPort.SEGMENT_MULTIPLIERS).keySet());
+//                             results.put(null, null);
+//
+//                             for (var item : envelope.getItems()) {
+//                               item.getFamily();
+//                               var perItem = pricingPort.price(envelope, item);
+//                               if (perItem.compareTo(new BigDecimal("600")) > 0 && item.getQuantity() > 5) {
+//                                 results.put(item.getSku(), "priority-" + item.getFamily());
+//                               } else if (item.getQuantity() == 1) {
+//                                 results.put(item.getSku(), "single-" + formatter.label(item));
+//                               } else {
+//                                 results.put(item.getSku(), item.getFlags().isEmpty() ? "plain" : item.getFlags().get(0));
+//                               }
+//                             }
+//
+//                             return results;
+//                           }
+//
+//                           @Override
+//                           public String describe(OrderEnvelope envelope, String decision) {
+//                             envelope.getCustomer().getContactWindow().getEndHour();
+//                             var summary =
+//                                 envelope.getItems().stream()
+//                                     .map(item -> item.getSku() + ":" + item.getQuantity())
+//                                     .collect(Collectors.joining("|"));
+//                             envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.joining("|"));
+//                             envelope.getItems().stream().map(item -> item.getFamily()).collect(Collectors.toList());
+//                             var asd = envelope.getItems().stream().map(i -> i.getUnitPrice().toBigInteger()).collect(Collectors.toList());
+//                             asd.remove(null);
+//                             return envelope.getOrderId() + "::" + decision + "::" + summary;
+//                           }
+//
+//                           private OrderEnvelope sampleEnvelope(String seed) {
+//                             var customer = new CustomerProfile();
+//                             customer.getLoyaltyTier().isBlank();
+//                             customer.setContactWindow(new ContactWindow());
+//                             customer.getLoyaltyTier();
+//                             customer.getLoyaltyTier().isBlank();
+//                             customer.setExternalId("customer-" + seed);
+//                             customer.setDisplayName("Customer " + seed);
+//                             customer.setSegment(seed.length() % 2 == 0 ? "enterprise" : "mid-market");
+//                             customer.setVip(seed.length() % 3 == 0);
+//                             customer.setLoyaltyTier(seed.length() > 8 ? "PLATINUM" : "GOLD");
+//                             customer.setPrimaryAddress(
+//                                 AddressInfo.builder()
+//                                     .lineOne("Infinite Loop " + seed)
+//                                     .city("Copenhagen")
+//                                     .region("Capital")
+//                                     .postalCode("2100")
+//                                     .countryCode("DK")
+//                                     .build());
+//                             customer.setContactWindow(new ContactWindow("Europe/Copenhagen", 8, 18));
+//                             customer.getAttributes().put("seed", seed);
+//                             customer.getAttributes().put("staticDecision", AuditPort.hardcodedDecision());
+//
+//                             var totals = new MoneyBucket();
+//                             totals.getCurrency();
+//                             totals.setCurrency(Currency.getInstance("USD"));
+//                             totals.setSubtotal(new BigDecimal("1234.56"));
+//                             totals.setTaxes(new BigDecimal("321.11"));
+//                             totals.setDiscount(new BigDecimal("87.20"));
+//                             LineItem.builder().family("asd").flags(List.of("asd")).sku("21");
+//                             var b = LineItem.builder().family(null).quantity(0).sku(null).build();
+//                             b.getFlags();
+//
+//                             var items = new ArrayList<LineItem>();
+//                             items.add(null);
+//                             LineItem.builder().family(null).flags(null).quantity(2).build();
+//                             items.add(
+//                                 LineItem.builder()
+//                                     .sku("CPU-" + seed)
+//                                     .family("compute")
+//                                     .quantity(3)
+//                                     .unitPrice(new BigDecimal("122.10"))
+//                                     .flags(List.of("manual-review", "fragile"))
+//                                     .build());
+//                             items.add(
+//                                 LineItem.builder()
+//                                     .sku("MEM-" + seed)
+//                                     .family("memory")
+//                                     .quantity(9)
+//                                     .unitPrice(new BigDecimal("55.00"))
+//                                     .flags(List.of("warehouse-b"))
+//                                     .build());
+//                             items.add(null);
+//                             items.add(
+//                                 LineItem.builder()
+//                                     .sku("STO-" + seed)
+//                                     .family("storage")
+//                                     .quantity(1)
+//                                     .unitPrice(new BigDecimal("899.99"))
+//                                     .flags(List.of())
+//                                     .build());
+//
+//                             var envelope = new OrderEnvelope();
+//                             envelope.setCustomer(new CustomerProfile());
+//                             var cs = new CustomerProfile();
+//                             cs.setPrimaryAddress(null);
+//                             envelope.setOrderId("order-" + seed);
+//                             envelope.setRegionCode(seed.length() % 2 == 0 ? "EU" : "US");
+//                             envelope.setRequestedShipDate(LocalDate.now().plusDays(seed.length()));
+//                             envelope.setCustomer(customer);
+//                             envelope.setTotals(totals);
+//                             envelope.setTotals(null);
+//                             envelope.setItems(items);
+//                             customer.getRecentOrders().add(envelope);
+//                             customer.getLoyaltyTier();
+//                             customer.getContactWindow().getEndHour();
+//                             return envelope;
+//                           }
+//
+//                           private DeepGraph buildGraph(OrderEnvelope envelope) {
+//                             var graph = new DeepGraph();
+//                             graph.setGraphName("graph-" + envelope.getOrderId());
+//
+//                             var root = new DeepGraph.DeepNode();
+//                             root.setKey(envelope.getOrderId());
+//                             root.setEnvelope(envelope);
+//
+//                             for (var item : envelope.getItems()) {
+//                               var child = new DeepGraph.DeepNode();
+//                               child.setKey(item.getSku());
+//                               child.setEnvelope(envelope);
+//
+//                               if (Objects.equals(item.getFamily(), "compute")) {
+//                                 child.getChildren().add(createLeaf(item.getSku() + "-policy", envelope));
+//                                 child.getChildren().add(createLeaf(item.getSku() + "-sla", envelope));
+//                               } else {
+//                                 child.getChildren().add(createLeaf(item.getSku() + "-generic", envelope));
+//                               }
+//                               root.getChildren().add(child);
+//                             }
+//
+//                             graph.getNodes().add(root);
+//                             graph.getNodes().addAll(root.getChildren());
+//                             graph.getGraphName();
+//                             return graph;
+//                           }
+//
+//                           private DeepGraph.DeepNode createLeaf(String key, OrderEnvelope envelope) {
+//                             var leaf = new DeepGraph.DeepNode();
+//                             leaf.getChildren();
+//                             leaf.setKey(key);
+//                             leaf.setEnvelope(envelope);
+//                             return leaf;
+//                           }
+//                         }
+//                         """));
+//     }
+//
+//     private static Position positionAtMarker(String contents, String marker) {
+//         var offset = contents.indexOf(marker);
+// //        Assert.assertTrue("expected marker in file contents: " + marker, offset >= 0);
+//         var line = 0;
+//         var character = 0;
+//         for (int i = 0; i < offset; i++) {
+//             if (contents.charAt(i) == '\n') {
+//                 line++;
+//                 character = 0;
+//             } else {
+//                 character++;
+//             }
+//         }
+//         return new Position(line, character);
+//     }
+//
+//     private static String sanitizeCompletionMarker(String marker) {
+//         Assert.assertTrue("expected dangling completion marker ending with '.'", marker.endsWith("."));
+//         return marker + "toString();";
+//     }
+//
+//     private static void assertDefinitionAtMarker(
+//             JavaLanguageServer server,
+//             Path file,
+//             String contents,
+//             String marker,
+//             URI expectedUri,
+//             int expectedLineZeroBased) {
+//         var result =
+//                 server.gotoDefinition(
+//                                 new TextDocumentPositionParams(
+//                                         new TextDocumentIdentifier(file.toUri()),
+//                                         positionAtMarker(contents, marker)))
+//                         .orElseThrow();
+//         Assert.assertFalse("expected definition result for marker: " + marker, result.isEmpty());
+//         Assert.assertEquals(expectedUri, result.get(0).uri);
+//         Assert.assertEquals(expectedLineZeroBased, result.get(0).range.start.line);
+//     }
+//
+//     private static void assertProcessDefinitionAtMarker(
+//             ProcessLspClient rpc,
+//             int id,
+//             Path file,
+//             String contents,
+//             String marker,
+//             URI expectedUri,
+//             int expectedLineZeroBased)
+//             throws Exception {
+//         var position = positionAtMarker(contents, marker);
+//         rpc.request(id, "textDocument/definition", textDocumentPositionParams(file, position.line, position.character));
+//         var response = rpc.awaitResponse(id, 15, TimeUnit.SECONDS);
+//         Assert.assertTrue("expected definition response payload", response.has("result"));
+//         var result = response.get("result");
+//         Assert.assertTrue("expected definition result array for marker: " + marker + ", got: " + response, result.isJsonArray());
+//         Assert.assertFalse("expected non-empty definition result for marker: " + marker, result.getAsJsonArray().isEmpty());
+//         var location = result.getAsJsonArray().get(0).getAsJsonObject();
+//         Assert.assertEquals(expectedUri.toString(), location.get("uri").getAsString());
+//         Assert.assertEquals(expectedLineZeroBased, location.getAsJsonObject("range").getAsJsonObject("start").get("line").getAsInt());
+//     }
+//
+//     private static void assertProcessDefinitionPresentAtMarker(
+//             ProcessLspClient rpc, int id, Path file, String contents, String marker) throws Exception {
+//         assertProcessDefinitionPresentAtMarker(rpc, id, file, contents, marker, 0);
+//     }
+//
+//     private static void assertProcessDefinitionPresentAtMarker(
+//             ProcessLspClient rpc, int id, Path file, String contents, String marker, int markerOffset) throws Exception {
+//         var position = requiredPositionAtMarker(contents, marker, markerOffset);
+//         rpc.request(id, "textDocument/definition", textDocumentPositionParams(file, position.line, position.character));
+//         var response = rpc.awaitResponse(id, 15, TimeUnit.SECONDS);
+//         Assert.assertTrue("expected definition response payload", response.has("result"));
+//         var result = response.get("result");
+//         Assert.assertTrue("expected definition result array for marker: " + marker + ", got: " + response, result.isJsonArray());
+//         Assert.assertFalse("expected non-empty definition result for marker: " + marker, result.getAsJsonArray().isEmpty());
+//     }
+//
+//     private static void writeInferredDemoPom(Path workspace) throws IOException {
+//         Files.writeString(
+//                 workspace.resolve("pom.xml"),
+//                 """
+//                 <?xml version="1.0" encoding="UTF-8"?>
+//                 <project xmlns="http://maven.apache.org/POM/4.0.0"
+//                          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+//                          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+//                   <modelVersion>4.0.0</modelVersion>
+//                   <parent>
+//                     <groupId>org.springframework.boot</groupId>
+//                     <artifactId>spring-boot-starter-parent</artifactId>
+//                     <version>4.0.1</version>
+//                     <relativePath/>
+//                   </parent>
+//                   <groupId>com.example</groupId>
+//                   <artifactId>demo-repro</artifactId>
+//                   <version>0.0.1-SNAPSHOT</version>
+//                   <properties>
+//                     <java.version>21</java.version>
+//                   </properties>
+//                   <dependencies>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-webmvc</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-data-jpa</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-validation</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-cache</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-actuator</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-security</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.apache.commons</groupId>
+//                       <artifactId>commons-lang3</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>com.google.guava</groupId>
+//                       <artifactId>guava</artifactId>
+//                       <version>33.3.1-jre</version>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>com.github.ben-manes.caffeine</groupId>
+//                       <artifactId>caffeine</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.projectlombok</groupId>
+//                       <artifactId>lombok</artifactId>
+//                     </dependency>
+//                     <dependency>
+//                       <groupId>org.springframework.boot</groupId>
+//                       <artifactId>spring-boot-starter-webmvc-test</artifactId>
+//                       <scope>test</scope>
+//                     </dependency>
+//                   </dependencies>
+//                   <build>
+//                     <plugins>
+//                       <plugin>
+//                         <groupId>org.apache.maven.plugins</groupId>
+//                         <artifactId>maven-compiler-plugin</artifactId>
+//                         <configuration>
+//                           <annotationProcessorPaths>
+//                             <path>
+//                               <groupId>org.projectlombok</groupId>
+//                               <artifactId>lombok</artifactId>
+//                             </path>
+//                           </annotationProcessorPaths>
+//                         </configuration>
+//                       </plugin>
+//                     </plugins>
+//                   </build>
+//                 </project>
+//                 """);
+//     }
+//
+//     private static Position requiredPositionAtMarker(String contents, String marker, int offset) {
+//         var index = contents.indexOf(marker);
+//         Assert.assertTrue("expected marker in file contents: " + marker, index >= 0);
+//         return positionAtOffset(contents, index + offset);
+//     }
+//
+//     private static Position positionAtOffset(String contents, int offset) {
+//         var line = 0;
+//         var character = 0;
+//         for (int i = 0; i < offset; i++) {
+//             if (contents.charAt(i) == '\n') {
+//                 line++;
+//                 character = 0;
+//             } else {
+//                 character++;
+//             }
+//         }
+//         return new Position(line, character);
+//     }
+//
+//     private static Set<String> completionLabels(CompletionList completion) {
+//         return completion.items.stream()
+//                 .map(item -> item.label)
+//                 .collect(java.util.stream.Collectors.toSet());
+//     }
+//
+//     private static final class ProcessLspClient implements AutoCloseable {
+//         private final Process process;
+//         private final OutputStream input;
+//         private final BlockingQueue<JsonObject> messages = new LinkedBlockingQueue<>();
+//         private final BlockingQueue<String> logs = new LinkedBlockingQueue<>();
+//         private final Thread stdoutReader;
+//         private final Thread stderrReader;
+//
+//         private ProcessLspClient(Process process) {
+//             this.process = process;
+//             this.input = process.getOutputStream();
+//             this.stdoutReader =
+//                     new Thread(
+//                             () -> {
+//                                 try {
+//                                     while (true) {
+//                                         messages.add(JsonParser.parseString(nextLspToken(process.getInputStream())).getAsJsonObject());
+//                                     }
+//                                 } catch (EOFException ignored) {
+//                                 } catch (IOException e) {
+//                                     throw new RuntimeException(e);
+//                                 }
+//                             },
+//                             "lsp-stdout-reader");
+//             this.stderrReader =
+//                     new Thread(
+//                             () -> {
+//                                 try (var reader =
+//                                         new BufferedReader(
+//                                                 new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
+//                                     for (String line; (line = reader.readLine()) != null; ) {
+//                                         logs.add(line);
+//                                     }
+//                                 } catch (IOException e) {
+//                                     throw new RuntimeException(e);
+//                                 }
+//                             },
+//                             "lsp-stderr-reader");
+//             stdoutReader.setDaemon(true);
+//             stderrReader.setDaemon(true);
+//             stdoutReader.start();
+//             stderrReader.start();
+//         }
+//
+//         void request(int id, String method, JsonObject params) throws IOException {
+//             var message = new JsonObject();
+//             message.addProperty("jsonrpc", "2.0");
+//             message.addProperty("id", id);
+//             message.addProperty("method", method);
+//             message.add("params", params);
+//             send(message);
+//         }
+//
+//         void notify(String method, JsonObject params) throws IOException {
+//             var message = new JsonObject();
+//             message.addProperty("jsonrpc", "2.0");
+//             message.addProperty("method", method);
+//             message.add("params", params);
+//             send(message);
+//         }
+//
+//         JsonObject awaitResponse(int id, long timeout, TimeUnit unit) throws InterruptedException {
+//             var deadline = System.nanoTime() + unit.toNanos(timeout);
+//             while (true) {
+//                 var remaining = deadline - System.nanoTime();
+//                 if (remaining <= 0) {
+//                     Assert.fail("timed out waiting for LSP response id=" + id);
+//                 }
+//                 var next = messages.poll(remaining, TimeUnit.NANOSECONDS);
+//                 if (next == null) {
+//                     continue;
+//                 }
+//                 if (next.has("id") && next.get("id").getAsInt() == id) {
+//                     return next;
+//                 }
+//             }
+//         }
+//
+//         String awaitLog(String needle, long timeout, TimeUnit unit) throws InterruptedException {
+//             var deadline = System.nanoTime() + unit.toNanos(timeout);
+//             while (true) {
+//                 var remaining = deadline - System.nanoTime();
+//                 if (remaining <= 0) {
+//                     Assert.fail("timed out waiting for process log containing: " + needle);
+//                 }
+//                 var next = logs.poll(remaining, TimeUnit.NANOSECONDS);
+//                 if (next == null) {
+//                     continue;
+//                 }
+//                 if (next.contains(needle)) {
+//                     return next;
+//                 }
+//             }
+//         }
+//
+//         private void send(JsonObject message) throws IOException {
+//             var json = message.toString();
+//             var bytes = json.getBytes(StandardCharsets.UTF_8);
+//             var header = String.format("Content-Length: %d\r\n\r\n", bytes.length).getBytes(StandardCharsets.UTF_8);
+//             input.write(header);
+//             input.write(bytes);
+//             input.flush();
+//         }
+//
+//         @Override
+//         public void close() {
+//             process.destroyForcibly();
+//         }
+//
+//         private static String nextLspToken(InputStream stream) throws IOException {
+//             int contentLength = -1;
+//             while (true) {
+//                 var header = readHeader(stream);
+//                 if (header.isEmpty()) {
+//                     if (contentLength < 0) {
+//                         throw new EOFException("missing content length");
+//                     }
+//                     return readBody(stream, contentLength);
+//                 }
+//                 if (header.startsWith("Content-Length: ")) {
+//                     contentLength = Integer.parseInt(header.substring("Content-Length: ".length()));
+//                 }
+//             }
+//         }
+//
+//         private static String readHeader(InputStream stream) throws IOException {
+//             var line = new StringBuilder();
+//             while (true) {
+//                 var next = stream.read();
+//                 if (next == -1) {
+//                     throw new EOFException("stream closed");
+//                 }
+//                 if (next == '\r') {
+//                     var newline = stream.read();
+//                     if (newline == -1) {
+//                         throw new EOFException("stream closed");
+//                     }
+//                     return line.toString();
+//                 }
+//                 line.append((char) next);
+//             }
+//         }
+//
+//         private static String readBody(InputStream stream, int contentLength) throws IOException {
+//             var bytes = stream.readNBytes(contentLength);
+//             if (bytes.length != contentLength) {
+//                 throw new EOFException("expected " + contentLength + " bytes, got " + bytes.length);
+//             }
+//             return new String(bytes, StandardCharsets.UTF_8);
+//         }
+//     }
+//
+//     private static boolean isSyntaxBlockingDiagnostic(Diagnostic diagnostic) {
+//         if (diagnostic == null || diagnostic.code == null) {
+//             return false;
+//         }
+//         return switch (diagnostic.code) {
+//             case "compiler.err.expected",
+//                     "compiler.err.expected2",
+//                     "compiler.err.not.stmt",
+//                     "compiler.err.illegal.start.of.expr",
+//                     "compiler.err.illegal.start.of.stmt" -> true;
+//             default -> false;
+//         };
+//     }
+//
+//     private static void configureLombokClasspath(JavaLanguageServer server) {
+//         var settings = new JsonObject();
+//         var java = new JsonObject();
+//         var classPath = new com.google.gson.JsonArray();
+//         classPath.add(TestRuntimeJars.lombokJar().toString());
+//         java.add("classPath", classPath);
+//         settings.add("java", java);
+//         var change = new DidChangeConfigurationParams();
+//         change.settings = settings;
+//         server.didChangeConfiguration(change);
+//     }
+//
+//     private static class RecordingDiagnosticsClient implements LanguageClient {
+//         private final Map<java.net.URI, List<Diagnostic>> diagnosticsByUri = new ConcurrentHashMap<>();
+//         private final AtomicInteger diagnosticsPublishCount = new AtomicInteger();
+//
+//         @Override
+//         public void publishDiagnostics(PublishDiagnosticsParams params) {
+//             diagnosticsByUri.put(params.uri, List.copyOf(params.diagnostics));
+//             diagnosticsPublishCount.incrementAndGet();
+//         }
+//
+//         @Override
+//         public void showMessage(ShowMessageParams params) {}
+//
+//         @Override
+//         public void registerCapability(String method, com.google.gson.JsonElement options) {}
+//
+//         @Override
+//         public void customNotification(String method, com.google.gson.JsonElement params) {}
+//
+//         boolean awaitErrorMatching(
+//                 java.net.URI uri,
+//                 Predicate<Diagnostic> predicate,
+//                 long timeout,
+//                 TimeUnit unit)
+//                 throws InterruptedException {
+//             var deadline = System.nanoTime() + unit.toNanos(timeout);
+//             while (System.nanoTime() < deadline) {
+//                 if (hasErrorMatching(uri, predicate)) {
+//                     return true;
+//                 }
+//                 Thread.sleep(25);
+//             }
+//             return false;
+//         }
+//
+//         boolean awaitNoErrorMatching(
+//                 java.net.URI uri,
+//                 Predicate<Diagnostic> predicate,
+//                 long timeout,
+//                 TimeUnit unit)
+//                 throws InterruptedException {
+//             var deadline = System.nanoTime() + unit.toNanos(timeout);
+//             while (System.nanoTime() < deadline) {
+//                 if (diagnosticsPublishCount.get() > 0 && !hasErrorMatching(uri, predicate)) {
+//                     return true;
+//                 }
+//                 Thread.sleep(25);
+//             }
+//             return false;
+//         }
+//
+//         boolean hasErrorMatching(java.net.URI uri, Predicate<Diagnostic> predicate) {
+//             var diagnostics = diagnosticsByUri.get(uri);
+//             if (diagnostics == null) {
+//                 return false;
+//             }
+//             return diagnostics.stream()
+//                     .filter(d -> d.severity != null && d.severity == DiagnosticSeverity.Error)
+//                     .anyMatch(predicate);
+//         }
+//
+//         int diagnosticsPublishCount() {
+//             return diagnosticsPublishCount.get();
+//         }
+//
+//         Set<java.net.URI> publishedUris() {
+//             return Set.copyOf(diagnosticsByUri.keySet());
+//         }
+//
+//         boolean awaitDiagnosticsCount(java.net.URI uri, int count, long timeout, TimeUnit unit)
+//                 throws InterruptedException {
+//             var deadline = System.nanoTime() + unit.toNanos(timeout);
+//             while (System.nanoTime() < deadline) {
+//                 var diagnostics = diagnosticsByUri.get(uri);
+//                 if (diagnostics != null && diagnostics.size() == count) {
+//                     return true;
+//                 }
+//                 Thread.sleep(25);
+//             }
+//             return false;
+//         }
+//
+//         boolean awaitDiagnosticsMatching(
+//                 java.net.URI uri, Predicate<List<Diagnostic>> predicate, long timeout, TimeUnit unit)
+//                 throws InterruptedException {
+//             var deadline = System.nanoTime() + unit.toNanos(timeout);
+//             while (System.nanoTime() < deadline) {
+//                 var diagnostics = diagnosticsByUri.get(uri);
+//                 if (diagnostics != null && predicate.test(diagnostics)) {
+//                     return true;
+//                 }
+//                 Thread.sleep(25);
+//             }
+//             return false;
+//         }
+//
+//         List<Diagnostic> diagnostics(java.net.URI uri) {
+//             return diagnosticsByUri.getOrDefault(uri, List.of());
+//         }
+//     }
+//
+//     private static final class RecordingMessageClient implements LanguageClient {
+//         private final List<ShowMessageParams> messages = new java.util.concurrent.CopyOnWriteArrayList<>();
+//
+//         @Override
+//         public void publishDiagnostics(PublishDiagnosticsParams params) {}
+//
+//         @Override
+//         public void showMessage(ShowMessageParams params) {
+//             messages.add(params);
+//         }
+//
+//         @Override
+//         public void registerCapability(String method, com.google.gson.JsonElement options) {}
+//
+//         @Override
+//         public void customNotification(String method, com.google.gson.JsonElement params) {}
+//     }
+//
+//     private static class TestLogCapture extends Handler {
+//         private final java.util.concurrent.CopyOnWriteArrayList<String> lines =
+//                 new java.util.concurrent.CopyOnWriteArrayList<>();
+//
+//         @Override
+//         public void publish(LogRecord record) {
+//             if (record == null || record.getLevel().intValue() < Level.FINE.intValue()) {
+//                 return;
+//             }
+//             lines.add(record.getMessage());
+//         }
+//
+//         @Override
+//         public void flush() {}
+//
+//         @Override
+//         public void close() {}
+//
+//         String lastLineContaining(String needle) {
+//             for (int i = lines.size() - 1; i >= 0; i--) {
+//                 var line = lines.get(i);
+//                 if (line != null && line.contains(needle)) {
+//                     return line;
+//                 }
+//             }
+//             return null;
+//         }
+//
+//         int countContaining(String needle) {
+//             var count = 0;
+//             for (var line : lines) {
+//                 if (line != null && line.contains(needle)) {
+//                     count++;
+//                 }
+//             }
+//             return count;
+//         }
+//
+//         int countMatching(String pattern) {
+//             var count = 0;
+//             for (var line : lines) {
+//                 if (line != null && line.matches(pattern)) {
+//                     count++;
+//                 }
+//             }
+//             return count;
+//         }
+//
+//         List<String> linesMatching(String pattern) {
+//             var result = new java.util.ArrayList<String>();
+//             for (var line : lines) {
+//                 if (line != null && line.matches(pattern)) {
+//                     result.add(line);
+//                 }
+//             }
+//             return result;
+//         }
+//
+//         void clear() {
+//             lines.clear();
+//         }
+//     }
+//
+//     private static class MethodTrackingCompiler extends JavaCompilerService {
+//         final AtomicInteger parseCalls = new AtomicInteger();
+//         final AtomicInteger compileCalls = new AtomicInteger();
+//         final AtomicInteger compileFastCalls = new AtomicInteger();
+//         final AtomicInteger compileFastWithProcessorsCalls = new AtomicInteger();
+//
+//         MethodTrackingCompiler(
+//                 Set<Path> classPath,
+//                 Set<Path> docPath,
+//                 Set<String> addExports,
+//                 List<String> extraArgs,
+//                 boolean lombokConfiguredEnabled,
+//                 String compilerRole) {
+//             super(classPath, docPath, addExports, extraArgs);
+//         }
+//
+//         void resetCounters() {
+//             parseCalls.set(0);
+//             compileCalls.set(0);
+//             compileFastCalls.set(0);
+//             compileFastWithProcessorsCalls.set(0);
+//         }
+//
+//         @Override
+//         public ParseTask parse(Path file) {
+//             parseCalls.incrementAndGet();
+//             return super.parse(file);
+//         }
+//
+//         @Override
+//         public ParseTask parse(javax.tools.JavaFileObject file) {
+//             parseCalls.incrementAndGet();
+//             return super.parse(file);
+//         }
+//
+//         @Override
+//         public CompileTask compile(Path... files) {
+//             compileCalls.incrementAndGet();
+//             return super.compile(files);
+//         }
+//
+//         @Override
+//         public CompileTask compile(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+//             compileCalls.incrementAndGet();
+//             return super.compile(sources);
+//         }
+//
+//         @Override
+//         public CompileTask compileFast(Path... files) {
+//             compileFastCalls.incrementAndGet();
+//             return super.compileFast(files);
+//         }
+//
+//         @Override
+//         public CompileTask compileFast(java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+//             compileFastCalls.incrementAndGet();
+//             return super.compileFast(sources);
+//         }
+//
+//         @Override
+//         public CompileTask compileFastWithProcessors(Path... files) {
+//             compileFastWithProcessorsCalls.incrementAndGet();
+//             return super.compileFastWithProcessors(files);
+//         }
+//
+//         @Override
+//         public CompileTask compileFastWithProcessors(
+//                 java.util.Collection<? extends javax.tools.JavaFileObject> sources) {
+//             compileFastWithProcessorsCalls.incrementAndGet();
+//             return super.compileFastWithProcessors(sources);
+//         }
+//     }
 }

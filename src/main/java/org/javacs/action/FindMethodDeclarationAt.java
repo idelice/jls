@@ -8,8 +8,8 @@ public class FindMethodDeclarationAt extends TreeScanner<MethodTree, Long> {
     private final SourcePositions pos;
     private CompilationUnitTree root;
 
-    public FindMethodDeclarationAt(JavacTask task) {
-        pos = Trees.instance(task).getSourcePositions();
+    public FindMethodDeclarationAt(Trees trees) {
+        pos = trees.getSourcePositions();
     }
 
     @Override

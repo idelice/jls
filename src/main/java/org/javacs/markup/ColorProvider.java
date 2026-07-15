@@ -16,7 +16,7 @@ public class ColorProvider {
             var root = task.roots.get(i);
             colors[i] = new SemanticColors();
             colors[i].uri = root.getSourceFile().toUri();
-            new Colorizer(task.task).scan(root, colors[i]);
+            new Colorizer(task.trees).scan(root, colors[i]);
         }
         return colors;
     }

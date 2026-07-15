@@ -287,6 +287,18 @@ public class GotoTest {
         assertThat(doGoto(file, 5, 38), hasItem("GotoUnqualifiedStaticMethod.java:7"));
     }
 
+    @Test
+    public void gotoLombokBuilderResolvesToField() {
+        var file = "/org/javacs/example/LombokBuilderTest.java";
+        assertThat(doGoto(file, 16, 19), hasItem("LombokBuilderTest.java:10"));
+    }
+
+    @Test
+    public void gotoLombokValueResolvesToField() {
+        var file = "/org/javacs/example/LombokValueTest.java";
+        assertThat(doGoto(file, 11, 15), hasItem("LombokValueTest.java:7"));
+    }
+
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
     private List<String> doGoto(String file, int row, int column) {

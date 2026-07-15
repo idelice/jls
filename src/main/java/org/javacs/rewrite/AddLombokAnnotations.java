@@ -2,7 +2,6 @@ package org.javacs.rewrite;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.SourcePositions;
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.*;
 import org.javacs.CompilerProvider;
@@ -28,12 +27,12 @@ public class AddLombokAnnotations implements Rewrite {
         if (file == CompilerProvider.NOT_FOUND) {
             return CANCELLED;
         }
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var root = task.root(file);
             if (root == null) {
                 return CANCELLED;
             }
-            var trees = Trees.instance(task.task);
+            var trees = task.trees;
             var pos = trees.getSourcePositions();
 
             var classTree = findClassTree(root, className);

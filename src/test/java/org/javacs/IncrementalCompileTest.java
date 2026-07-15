@@ -48,9 +48,10 @@ public class IncrementalCompileTest implements TaskListener, DiagnosticListener<
         for (var i = 0; i < 2; i++) {
             var files = fileManager.getJavaFileObjects(foo);
             LOG.info(String.format("Compile %d...", i));
-            try (var borrow = pool.getTask(fileManager, this, options, null, files)) {
-                checkInvokeType(borrow.task);
-            }
+            pool.compile(fileManager, this, options, List.of(files.iterator().next()), task -> {
+                checkInvokeType(task);
+                return null;
+            });
         }
     }
 

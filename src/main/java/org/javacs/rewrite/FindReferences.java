@@ -7,7 +7,7 @@ import com.sun.source.tree.VariableTree;
 import com.sun.source.util.*;
 import java.util.function.Consumer;
 
-class FindReferences extends TreePathScanner<Void, Consumer<TreePath>> {
+public class FindReferences extends TreePathScanner<Void, Consumer<TreePath>> {
     @Override
     public Void visitVariable(VariableTree node, Consumer<TreePath> forEach) {
         forEach.accept(getCurrentPath());

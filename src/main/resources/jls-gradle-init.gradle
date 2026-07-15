@@ -5,20 +5,29 @@ rootProject {
     task jlsProjectInfo {
         doLast {
             def modules = []
+            def totalClasspathJars = 0
+            def emptyClasspathProjects = []
+
             rootProject.allprojects { proj ->
                 def info = [:]
                 info.projectPath = proj.path
                 info.projectDir = proj.projectDir.absolutePath
 
+                def hasJavaPlugin = proj.plugins.hasPlugin('java') || proj.plugins.hasPlugin('java-library')
+                System.err.println("[jls-gradle] processing project=${proj.path} dir=${proj.projectDir} hasJavaPlugin=${hasJavaPlugin}")
+
                 // Source directories
                 def srcDirs = []
-                if (proj.plugins.hasPlugin('java') || proj.plugins.hasPlugin('java-library')) {
+                if (hasJavaPlugin) {
                     proj.sourceSets.each { ss ->
                         ss.java.srcDirs.each { dir ->
                             if (dir.exists()) {
                                 srcDirs.add(dir.absolutePath)
                             }
                         }
+                    }
+                    if (srcDirs.isEmpty()) {
+                        System.err.println("[jls-gradle]   WARNING: sourceSets empty for ${proj.path}")
                     }
                 }
                 info.sourceDirs = srcDirs
@@ -27,16 +36,30 @@ rootProject {
                 def classpath = [] as Set
                 try {
                     proj.configurations.each { config ->
-                        if (config.name.endsWith('CompileClasspath') && config.isCanBeResolved()) {
-                            config.resolve().each { file ->
-                                classpath.add(file.absolutePath)
+                        def resolvable = config.isCanBeResolved()
+                        if (config.name.endsWith('CompileClasspath')) {
+                            System.err.println("[jls-gradle]   config=${config.name} canBeResolved=${resolvable}")
+                            if (resolvable) {
+                                try {
+                                    def resolved = config.resolve()
+                                    System.err.println("[jls-gradle]   config=${config.name} resolved=${resolved.size()} jars")
+                                    resolved.each { file ->
+                                        classpath.add(file.absolutePath)
+                                    }
+                                } catch (Exception resolveEx) {
+                                    System.err.println("[jls-gradle]   ERROR resolving ${config.name}: ${resolveEx.class.simpleName}: ${resolveEx.message}")
+                                }
                             }
                         }
                     }
                 } catch (Exception e) {
-                    // Configuration may not be resolvable
+                    System.err.println("[jls-gradle]   ERROR iterating configurations for ${proj.path}: ${e.class.simpleName}: ${e.message}")
                 }
                 info.externalClasspath = classpath.toList()
+                totalClasspathJars += classpath.size()
+                if (classpath.isEmpty() && hasJavaPlugin) {
+                    emptyClasspathProjects.add(proj.path)
+                }
 
                 // Inter-module (project) dependencies
                 def moduleDeps = []
@@ -50,9 +73,18 @@ rootProject {
                         }
                     }
                 } catch (Exception e) {
-                    // Ignore
+                    System.err.println("[jls-gradle]   ERROR reading moduleDeps for ${proj.path}: ${e.message}")
                 }
                 info.moduleDeps = moduleDeps
+
+                // Build output directory for inter-module classpath
+                def buildDir
+                try {
+                    buildDir = proj.layout.buildDirectory.get().asFile
+                } catch (Exception e) {
+                    buildDir = proj.buildDir
+                }
+                info.classOutputDir = new File(buildDir, 'classes/java/main').absolutePath
 
                 // Source compatibility
                 info.sourceCompatibility = null
@@ -63,12 +95,14 @@ rootProject {
                             info.sourceCompatibility = javaExt.sourceCompatibility.toString()
                         }
                     } catch (Exception e) {
-                        // Ignore
+                        System.err.println("[jls-gradle]   ERROR reading sourceCompatibility for ${proj.path}: ${e.message}")
                     }
                 }
 
                 modules.add(info)
             }
+
+            System.err.println("[jls-gradle] SUMMARY: modules=${modules.size()} totalClasspathJars=${totalClasspathJars} emptyClasspath=${emptyClasspathProjects}")
 
             def json = groovy.json.JsonOutput.toJson([modules: modules])
             println "___JLS_MODULE_GRAPH_START___"

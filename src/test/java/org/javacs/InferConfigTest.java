@@ -9,9 +9,11 @@ import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import org.javacs.MavenTooling;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -23,9 +25,9 @@ public class InferConfigTest {
     private Path mavenHome = Paths.get("src/test/examples/home-dir/.m2");
     private Path gradleHome = Paths.get("src/test/examples/home-dir/.gradle");
     private Set<String> externalDependencies = Set.of("com.external:external-library:1.2");
-    private InferConfig both = new InferConfig(workspaceRoot, externalDependencies, mavenHome, gradleHome);
-    private InferConfig gradle = new InferConfig(workspaceRoot, externalDependencies, Paths.get("nowhere"), gradleHome);
-    private InferConfig thisProject = new InferConfig(Paths.get("."), (Map<String, String>) null);
+    private InferConfig both = new InferConfig(workspaceRoot, externalDependencies, mavenHome, gradleHome, null);
+    private InferConfig gradle = new InferConfig(workspaceRoot, externalDependencies, Paths.get("nowhere"), gradleHome, null);
+    private InferConfig thisProject = new InferConfig(Paths.get("."), Collections.emptySet());
 
     @Test
     public void mavenClassPath() {
@@ -68,7 +70,7 @@ public class InferConfigTest {
     @Test
     public void dependencyList() {
         assertThat(
-                InferConfig.mvnDependencies(Paths.get("pom.xml"), "dependency:list", Paths.get(System.getProperty("user.home"), ".m2"), System.getenv()),
+                MavenTooling.mvnDependencies(Paths.get("pom.xml"), "dependency:list", Paths.get(System.getProperty("user.home"), ".m2"), System.getenv()),
                 not(empty()));
     }
 
@@ -94,7 +96,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferCompilerArgs(
+                MavenTooling.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_release"));
@@ -130,7 +132,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferCompilerArgs(
+                MavenTooling.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_release"));
@@ -160,7 +162,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferCompilerArgs(
+                MavenTooling.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_source_target"));
@@ -229,7 +231,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferCompilerArgs(
+                MavenTooling.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("fallback_mixed_modules"));
@@ -302,7 +304,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferCompilerArgs(
+                MavenTooling.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("maven_release"));
@@ -325,7 +327,7 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
 
         var inferred =
-                InferConfig.inferCompilerArgs(
+                MavenTooling.inferCompilerArgs(
                         workspace.resolve("pom.xml"), m2, envWithCacheHome(cacheHome));
 
         assertThat(inferred.source(), equalTo("none"));
@@ -342,14 +344,14 @@ public class InferConfigTest {
         envVars.put("CLASSPATH", dummyClassPath);
         envVars.put("PATH", System.getenv("PATH"));
 
-        InferConfig config = new InferConfig(Paths.get("."), envVars);
+        InferConfig config = new InferConfig(Paths.get("."), Collections.emptySet(), null, null, envVars);
         Set<Path> classPath = config.classPath();
         assertThat(classPath, containsInAnyOrder(Paths.get(dummyPath1), Paths.get(dummyPath2)));
     }
 
     @Test
     public void thisProjectClassPath() {
-        InferConfig currentTestProject = new InferConfig(Paths.get("."), (Map<String, String>) null);
+        InferConfig currentTestProject = new InferConfig(Paths.get("."), Collections.emptySet());
         assertThat(
                 currentTestProject.classPath(),
                 hasItem(hasToString(endsWith(".m2/repository/junit/junit/4.13.1/junit-4.13.1.jar"))));
@@ -357,7 +359,7 @@ public class InferConfigTest {
 
     @Test
     public void thisProjectDocPath() {
-        InferConfig currentTestProject = new InferConfig(Paths.get("."), (Map<String, String>) null);
+        InferConfig currentTestProject = new InferConfig(Paths.get("."), Collections.emptySet());
         assertThat(
                 currentTestProject.buildDocPath(),
                 hasItem(hasToString(endsWith(".m2/repository/junit/junit/4.13.1/junit-4.13.1-sources.jar"))));
@@ -383,7 +385,7 @@ public class InferConfigTest {
             assert pair.length == 2;
             var line = pair[0];
             var expect = pair[1];
-            var path = InferConfig.readDependency(line);
+            var path = MavenTooling.readDependency(line);
             assertThat(path, equalTo(Paths.get(expect)));
         }
     }
@@ -392,7 +394,7 @@ public class InferConfigTest {
     public void mavenCacheUsesWorkspaceSpecificFile() throws Exception {
         var cacheHome = temp.newFolder("cache-home").toPath();
         var workspace = temp.newFolder("demo").toPath();
-        var cacheFile = InferConfig.workspaceCacheFile(workspace, cacheHome);
+        var cacheFile = MavenTooling.workspaceCacheFile(workspace, cacheHome);
 
         assertThat(cacheFile.toString(), containsString("cache-home"));
         assertThat(cacheFile.toString(), containsString("jls"));
@@ -410,22 +412,22 @@ public class InferConfigTest {
         Files.writeString(m2.resolve("settings.xml"), "<settings/>");
         var cacheHome = temp.newFolder("cache-home").toPath();
 
-        InferConfig.storeCachedMavenDependencies(
+        MavenTooling.storeCachedMavenDependencies(
                 workspace.resolve("pom.xml"),
                 "dependency:list",
                 m2,
                 cacheHome,
-                Set.of(workspace.resolve("lib/example.jar")));
+                Set.of(workspace.resolve("lib/example.jar")), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 hasItem(workspace.resolve("lib/example.jar").toAbsolutePath().normalize()));
 
         Thread.sleep(5);
         Files.writeString(module.resolve("pom.xml"), "<project><version>2</version></project>");
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 empty());
     }
 
@@ -438,22 +440,22 @@ public class InferConfigTest {
         Files.writeString(settings, "<settings><mirrors/></settings>");
         var cacheHome = temp.newFolder("cache-home").toPath();
 
-        InferConfig.storeCachedMavenDependencies(
+        MavenTooling.storeCachedMavenDependencies(
                 workspace.resolve("pom.xml"),
                 "dependency:sources",
                 m2,
                 cacheHome,
-                Set.of(workspace.resolve("lib/example-sources.jar")));
+                Set.of(workspace.resolve("lib/example-sources.jar")), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
                 hasItem(workspace.resolve("lib/example-sources.jar").toAbsolutePath().normalize()));
 
         Thread.sleep(5);
         Files.writeString(settings, "<settings><proxies/></settings>");
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
                 empty());
     }
 
@@ -465,7 +467,7 @@ public class InferConfigTest {
         var cacheHome = temp.newFolder("cache-home").toPath();
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 empty());
     }
 
@@ -475,12 +477,12 @@ public class InferConfigTest {
         Files.writeString(workspace.resolve("pom.xml"), "<project/>");
         var m2 = temp.newFolder("m2").toPath();
         var cacheHome = temp.newFolder("cache-home").toPath();
-        var cacheFile = InferConfig.workspaceCacheFile(workspace, cacheHome);
+        var cacheFile = MavenTooling.workspaceCacheFile(workspace, cacheHome);
         Files.createDirectories(cacheFile.getParent());
         Files.writeString(cacheFile, "{not-json");
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 empty());
     }
 
@@ -493,16 +495,16 @@ public class InferConfigTest {
         var listJar = workspace.resolve("lib/list.jar");
         var sourcesJar = workspace.resolve("lib/list-sources.jar");
 
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(listJar));
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, Set.of(sourcesJar));
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(listJar), null);
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, Set.of(sourcesJar), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 hasItem(listJar.toAbsolutePath().normalize()));
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
                 hasItem(sourcesJar.toAbsolutePath().normalize()));
     }
 
@@ -514,18 +516,18 @@ public class InferConfigTest {
         var cacheHome = temp.newFolder("cache-home").toPath();
         var jar = workspace.resolve("lib/example.jar");
 
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(jar));
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(jar), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 hasItem(jar.toAbsolutePath().normalize()));
 
         Thread.sleep(5);
         Files.writeString(m2.resolve("settings.xml"), "<settings/>");
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 empty());
     }
 
@@ -539,11 +541,11 @@ public class InferConfigTest {
         Files.writeString(workspaceTwo.resolve("pom.xml"), "<project><name>two</name></project>");
         var jar = workspaceOne.resolve("lib/example.jar");
 
-        InferConfig.storeCachedMavenDependencies(
-                workspaceOne.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(jar));
+        MavenTooling.storeCachedMavenDependencies(
+                workspaceOne.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(jar), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspaceTwo.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspaceTwo.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 empty());
     }
 
@@ -552,13 +554,13 @@ public class InferConfigTest {
         var workspace = temp.newFolder("workspace").toPath();
         Files.writeString(workspace.resolve("pom.xml"), "<project/>");
         var cacheHome = temp.newFolder("cache-home").toPath();
-        var cacheFile = InferConfig.workspaceCacheFile(workspace, cacheHome);
+        var cacheFile = MavenTooling.workspaceCacheFile(workspace, cacheHome);
         Files.createDirectories(cacheFile.getParent());
         Files.writeString(cacheFile, "{\"workspaceRoot\":\"" + workspace.toAbsolutePath().normalize() + "\"}");
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(
-                        workspace.resolve("pom.xml"), "dependency:list", temp.newFolder("m2").toPath(), cacheHome),
+                MavenTooling.loadCachedMavenDependencies(
+                        workspace.resolve("pom.xml"), "dependency:list", temp.newFolder("m2").toPath(), cacheHome, null),
                 empty());
     }
 
@@ -569,11 +571,11 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
         var cacheHome = temp.newFolder("cache-home").toPath();
 
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(workspace.resolve("lib/example.jar")));
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(workspace.resolve("lib/example.jar")), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
                 empty());
     }
 
@@ -584,16 +586,16 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
         var cacheHome = temp.newFolder("cache-home").toPath();
 
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(workspace.resolve("lib/list.jar")));
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, Set.of(workspace.resolve("lib/src.jar")));
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, Set.of(workspace.resolve("lib/list.jar")), null);
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, Set.of(workspace.resolve("lib/src.jar")), null);
 
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
                 hasItem(workspace.resolve("lib/list.jar").toAbsolutePath().normalize()));
         assertThat(
-                InferConfig.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome),
+                MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
                 hasItem(workspace.resolve("lib/src.jar").toAbsolutePath().normalize()));
     }
 
@@ -604,27 +606,27 @@ public class InferConfigTest {
         var m2 = temp.newFolder("m2").toPath();
         var blockingFile = temp.newFile("cache-root-file").toPath();
 
-        InferConfig.storeCachedMavenDependencies(
-                workspace.resolve("pom.xml"), "dependency:list", m2, blockingFile, Set.of(workspace.resolve("lib/list.jar")));
+        MavenTooling.storeCachedMavenDependencies(
+                workspace.resolve("pom.xml"), "dependency:list", m2, blockingFile, Set.of(workspace.resolve("lib/list.jar")), null);
 
-        var cacheFile = InferConfig.workspaceCacheFile(workspace, blockingFile);
+        var cacheFile = MavenTooling.workspaceCacheFile(workspace, blockingFile);
         assertThat(Files.exists(cacheFile), equalTo(false));
     }
 
     @Test
     public void workspaceCacheFileUsesWorkspaceFallbackNameForRootPath() {
-        var cacheFile = InferConfig.workspaceCacheFile(Paths.get("/"), Paths.get("/tmp/cache-home"));
-        assertThat(cacheFile.getParent().getFileName().toString(), startsWith("workspace-"));
+        var cacheFile = MavenTooling.workspaceCacheFile(Paths.get("/"), Paths.get("/tmp/cache-home"));
+        assertThat(cacheFile.getParent().getParent().getFileName().toString(), startsWith("workspace-"));
     }
 
     @Test
     public void invalidDependencyLineReturnsNotFound() {
-        assertThat(InferConfig.readDependency("not a dependency line"), equalTo(Paths.get("")));
+        assertThat(MavenTooling.readDependency("not a dependency line"), equalTo(Paths.get("")));
     }
 
     @Test
     public void fingerprintExistingFileThrowsForMissingPath() throws Exception {
-        var method = InferConfig.class.getDeclaredMethod("fingerprintExistingFile", Path.class);
+        var method = MavenTooling.class.getDeclaredMethod("fingerprintExistingFile", Path.class);
         method.setAccessible(true);
 
         try {

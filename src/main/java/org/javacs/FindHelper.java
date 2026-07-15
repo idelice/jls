@@ -27,6 +27,7 @@ import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import org.javacs.CacheAudit;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.Range;
 
@@ -35,7 +36,7 @@ public class FindHelper {
     private static Path jarCacheDir;
 
     public static String[] erasedParameterTypes(CompileTask task, ExecutableElement method) {
-        var types = task.task.getTypes();
+        var types = task.types;
         var erasedParameterTypes = new String[method.getParameters().size()];
         for (var i = 0; i < erasedParameterTypes.length; i++) {
             var p = method.getParameters().get(i).asType();
@@ -74,7 +75,7 @@ public class FindHelper {
 
     public static ExecutableElement findMethod(
             CompileTask task, String className, String methodName, String[] erasedParameterTypes) {
-        var type = task.task.getElements().getTypeElement(className);
+        var type = task.elements.getTypeElement(className);
         for (var member : type.getEnclosedElements()) {
             if (member.getKind() != ElementKind.METHOD) continue;
             var method = (ExecutableElement) member;
@@ -91,7 +92,7 @@ public class FindHelper {
             String className,
             String methodName,
             String[] erasedParameterTypes) {
-        var types = task.task.getTypes();
+        var types = task.types;
         var parent = (TypeElement) method.getEnclosingElement();
         if (!parent.getQualifiedName().contentEquals(className)) return false;
         if (!method.getSimpleName().contentEquals(methodName)) return false;
@@ -139,23 +140,27 @@ public class FindHelper {
     }
 
     public static Location location(ParseTask task, TreePath path) {
-        return location(task.task(), path, "", false);
+        return location(Trees.instance(task.task()), path, "", false);
+    }
+
+    public static Location location(CompileTask task, TreePath path) {
+        return location(task.trees, path, "", false);
     }
 
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
-        return location(task.task, path, name, false);
+        return location(task.trees, path, name, false);
     }
 
     public static Location location(ParseTask task, TreePath path, CharSequence name) {
-        return location(task.task(), path, name, false);
+        return location(Trees.instance(task.task()), path, name, false);
     }
 
     public static Location locationStrict(ParseTask task, TreePath path, CharSequence name) {
-        return location(task.task(), path, name, true);
+        return location(Trees.instance(task.task()), path, name, true);
     }
 
-    public static Location location(JavacTask task, TreePath path, CharSequence name, boolean strictNameMatch) {
-        var pos = Trees.instance(task).getSourcePositions();
+    public static Location location(Trees trees, TreePath path, CharSequence name, boolean strictNameMatch) {
+        var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = -1;
         var end = -1;

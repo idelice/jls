@@ -1,7 +1,6 @@
 package org.javacs.markup;
 
 import com.sun.source.tree.*;
-import com.sun.source.util.JavacTask;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
@@ -44,8 +43,8 @@ class WarnUnused extends TreeScanner<Void, Void> {
     private final Map<Element, TreePath> nonPrivateDeclarations = new HashMap<>();
     private final Set<Element> used = new HashSet<>();
 
-    WarnUnused(JavacTask task) {
-        this.trees = Trees.instance(task);
+    WarnUnused(Trees trees) {
+        this.trees = trees;
     }
 
     Set<Element> notUsed() {
@@ -57,16 +56,6 @@ class WarnUnused extends TreeScanner<Void, Void> {
         // during async work which calls `lint`
         unused.removeIf(Objects::isNull);
         // Remove if <error > field was injected while forming the AST
-        unused.removeIf(i -> i.toString().equals("<error>"));
-        return unused;
-    }
-
-    /** Non-private members not referenced within the same file. Needs workspace confirmation. */
-    Set<Element> potentiallyUnusedNonPrivate() {
-        var unused = new HashSet<Element>();
-        unused.addAll(nonPrivateDeclarations.keySet());
-        unused.removeAll(used);
-        unused.removeIf(Objects::isNull);
         unused.removeIf(i -> i.toString().equals("<error>"));
         return unused;
     }

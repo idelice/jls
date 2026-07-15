@@ -1,5 +1,6 @@
 package org.javacs.rewrite;
 
+import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.Map;
 import org.javacs.CompilerProvider;
@@ -18,7 +19,7 @@ public class RemoveClass implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var task = compiler.parse(file);
-        var type = new FindTypeDeclarationAt(task.task()).scan(task.root(), (long) position);
+        var type = new FindTypeDeclarationAt(Trees.instance(task.task())).scan(task.root(), (long) position);
         TextEdit[] edits = {new EditHelper(task.task()).removeTree(task.root(), type)};
         return Map.of(file, edits);
     }

@@ -26,8 +26,7 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
     public Iterable<JavaFileObject> list(
             Location location, String packageName, Set<JavaFileObject.Kind> kinds, boolean recurse) throws IOException {
         if (location == StandardLocation.SOURCE_PATH) {
-            var stream = FileStore.list(packageName).stream().map(this::asJavaFileObject);
-            return stream::iterator;
+            return List.<JavaFileObject>of();
         } else {
             return super.list(location, packageName, kinds, recurse);
         }
@@ -58,23 +57,12 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
 
     @Override
     public boolean hasLocation(Location location) {
-        return location == StandardLocation.SOURCE_PATH || super.hasLocation(location);
+        return location != StandardLocation.SOURCE_PATH && super.hasLocation(location);
     }
 
     @Override
     public JavaFileObject getJavaFileForInput(Location location, String className, JavaFileObject.Kind kind)
             throws IOException {
-        // FileStore shadows disk
-        if (location == StandardLocation.SOURCE_PATH) {
-            var packageName = StringSearch.mostName(className);
-            var simpleClassName = StringSearch.lastName(className);
-            for (var f : FileStore.list(packageName)) {
-                if (f.getFileName().toString().equals(simpleClassName + kind.extension)) {
-                    return new SourceFileObject(f);
-                }
-            }
-            // Fall through to disk in case we have .jar or .zip files on the source path
-        }
         return super.getJavaFileForInput(location, className, kind);
     }
 

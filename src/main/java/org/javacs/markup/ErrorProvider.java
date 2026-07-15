@@ -12,18 +12,25 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Collections;
 import java.util.Set;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.TypeKind;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
+import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
+import org.javacs.LombokAnnotations;
 import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
+    private final CompilerProvider compiler;
     private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
@@ -47,7 +54,12 @@ public class ErrorProvider {
             long warningMs) {}
 
     public ErrorProvider(CompileTask task) {
+        this(task, null);
+    }
+
+    public ErrorProvider(CompileTask task, CompilerProvider compiler) {
         this.task = task;
+        this.compiler = compiler;
     }
 
     public ErrorReport errors(Set<URI> requestedUris) {
@@ -75,9 +87,13 @@ public class ErrorProvider {
             var convertStarted = System.nanoTime();
             var filtered = filterCompilerDiagnostics(compilerErrors(root), root);
             convertNanos += System.nanoTime() - convertStarted;
-            params.diagnostics.addAll(filtered.compilerDiagnostics());
+            var filteredDiagnostics = filtered.compilerDiagnostics();
+            filteredDiagnostics = suppressLogErrors(filteredDiagnostics, root);
+            filteredDiagnostics = suppressLombokBytecodeErrors(filteredDiagnostics, root);
+            params.diagnostics.addAll(filteredDiagnostics);
             compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
+                params.diagnostics.addAll(parseTreeDiagnostics(root, filteredDiagnostics));
                 var warningStarted = System.nanoTime();
                 var unused = unusedWarnings(root);
                 var notThrown = notThrownWarnings(root);
@@ -188,9 +204,15 @@ public class ErrorProvider {
 
     private List<Diagnostic> unusedWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
-        var warnUnused = new WarnUnused(task.task);
+        var warnUnused = new WarnUnused(task.trees);
         warnUnused.scan(root, null);
-        for (var unusedEl : warnUnused.notUsed()) {
+        var allUnused = warnUnused.notUsed();
+
+        // Phase 1: Identify Lombok private fields and suppress false positives
+        var suppressed = suppressLombokFalsePositives(root, allUnused);
+
+        for (var unusedEl : allUnused) {
+            if (suppressed.contains(unusedEl)) continue;
             result.add(warnUnused(unusedEl));
         }
 
@@ -198,9 +220,93 @@ public class ErrorProvider {
         return result;
     }
 
+    /** Cross-file reference check: for private fields in @Data/@Getter/@Setter/@Value classes,
+     *  suppress warning if their generated getter/setter is referenced from files that
+     *  import the owning class. */
+    private Set<Element> suppressLombokFalsePositives(CompilationUnitTree root, Set<Element> allUnused) {
+        // Guard: skip if no compiler access or Lombok not on classpath
+        if (compiler == null || !compiler.lombokPresentOnClasspath()) {
+            return Set.of();
+        }
+
+        var trees = task.trees;
+        var suppressed = new HashSet<Element>();
+
+        // Collect Lombok field info
+        record LombokFieldInfo(Element element, Set<String> accessorNames, String ownerType) {}
+        List<LombokFieldInfo> lombokFields = new ArrayList<>();
+
+        for (var unusedEl : allUnused) {
+            // Must be a field (not method/class/param)
+            if (!(unusedEl instanceof VariableElement)) continue;
+            // Enclosing element must be a class (not method — guard against class cast exception)
+            if (!(unusedEl.getEnclosingElement() instanceof TypeElement typeEl)) continue;
+
+            // Get the ClassTree to check annotations
+            var classPath = trees.getPath(typeEl);
+            if (classPath == null || !(classPath.getLeaf() instanceof ClassTree classTree)) continue;
+
+            // Only suppress for @Data, @Getter, @Setter, @Value
+            if (!LombokAnnotations.hasAnnotation(classTree.getModifiers(), "Data", "Getter", "Setter", "Value"))
+                continue;
+
+            // Derive getter/setter names
+            var names = new HashSet<String>();
+            var fieldName = unusedEl.getSimpleName().toString();
+            var cap = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+            names.add("get" + cap);
+            names.add("set" + cap);
+            // Check if boolean-like
+            var fieldType = unusedEl.asType();
+            if (fieldType.getKind() == TypeKind.BOOLEAN || "boolean".equals(fieldType.toString())) {
+                names.add("is" + cap);
+            }
+            lombokFields.add(new LombokFieldInfo(unusedEl, names, typeEl.getQualifiedName().toString()));
+        }
+
+        // Phase 2: Scoped reference check
+        if (!lombokFields.isEmpty()) {
+            // Collect unique owner types
+            var ownerTypes =
+                    lombokFields.stream().map(LombokFieldInfo::ownerType).collect(Collectors.toSet());
+
+            // Find files that reference ANY of the owner types
+            Set<Path> referencingFiles = new HashSet<>();
+            for (var ownerType : ownerTypes) {
+                Collections.addAll(referencingFiles, compiler.findTypeReferences(ownerType));
+            }
+
+            // In those files only, check for getter/setter names
+            var currentUri = root.getSourceFile().toUri();
+            var allAccessorNames =
+                    lombokFields.stream()
+                            .flatMap(f -> f.accessorNames().stream())
+                            .collect(Collectors.toSet());
+
+            for (var file : referencingFiles) {
+                if (file.toUri().equals(currentUri)) continue;
+                var content = FileStore.contents(file);
+                for (var name : allAccessorNames) {
+                    // Word-boundary match: "getName" should NOT match "getNameFromDb"
+                    if (Pattern.compile("\\b" + Pattern.quote(name) + "\\b").matcher(content).find()) {
+                        // Find which fields have this accessor name
+                        for (var field : lombokFields) {
+                            if (field.accessorNames().contains(name)) {
+                                suppressed.add(field.element());
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+
+        return suppressed;
+    }
+
     private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var pos = trees.getSourcePositions();
         var importTrees = new ArrayList<ImportTree>();
         var importNames = new ArrayList<String>();
@@ -246,7 +352,7 @@ public class ErrorProvider {
     private List<Diagnostic> notThrownWarnings(CompilationUnitTree root) {
         var result = new ArrayList<Diagnostic>();
         var notThrown = new HashMap<TreePath, String>();
-        new WarnNotThrown(task.task).scan(root, notThrown);
+        new WarnNotThrown(task.trees).scan(root, notThrown);
         for (var location : notThrown.keySet()) {
             result.add(warnNotThrown(notThrown.get(location), location));
         }
@@ -302,7 +408,7 @@ public class ErrorProvider {
     }
 
     private Diagnostic warnNotThrown(String name, TreePath path) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = pos.getStartPosition(root, path.getLeaf());
@@ -317,7 +423,7 @@ public class ErrorProvider {
     }
 
     private Diagnostic warnUnused(Element unusedEl) {
-        var trees = Trees.instance(task.task);
+        var trees = task.trees;
         var path = trees.getPath(unusedEl);
         if (path == null) {
             throw new RuntimeException(unusedEl + " has no path");
@@ -391,5 +497,112 @@ public class ErrorProvider {
         result.tags = List.of(DiagnosticTag.Unnecessary);
         result.range = RangeHelper.range(root, start, end);
         return result;
+    }
+
+    /**
+     * Parse-tree diagnostics that don't require type attribution.
+     * Supplements javac's flow analysis which skips methods with erroneous types.
+     */
+    private List<Diagnostic> parseTreeDiagnostics(
+            CompilationUnitTree root, List<Diagnostic> existingDiagnostics) {
+        for (var d : existingDiagnostics) {
+            if (d.code != null && d.code.contains("missing.ret.stmt")) return List.of();
+        }
+        var lineMap = root.getLineMap();
+        var positions = Trees.instance(task.task).getSourcePositions();
+        var result = new ArrayList<Diagnostic>();
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void visitMethod(MethodTree method, Void unused) {
+                if (MissingReturnCheck.isMissingReturn(method)) {
+                    long pos = positions.getEndPosition(root, method.getBody()) - 1;
+                    int line = (int) lineMap.getLineNumber(pos) - 1;
+                    int col = (int) lineMap.getColumnNumber(pos) - 1;
+                    var d = new Diagnostic();
+                    d.range = new Range(new Position(line, col), new Position(line, col + 1));
+                    d.severity = DiagnosticSeverity.Error;
+                    d.code = "compiler.err.missing.ret.stmt";
+                    d.message = "missing return statement";
+                    result.add(d);
+                }
+                return super.visitMethod(method, unused);
+            }
+        }.scan(root, null);
+        return result;
+    }
+
+    // Lombok log field is generated bytecode, not source. Suppress "cannot resolve 'log'" errors.
+    private List<Diagnostic> suppressLogErrors(List<Diagnostic> diagnostics, CompilationUnitTree root) {
+        if (!LombokAnnotations.hasLogAnnotation(root)) return diagnostics;
+        // null workspaceRoot → default "log" field name. Full impl would read lombok.config.
+        var fieldName = LombokAnnotations.logFieldName(null);
+        var result = new ArrayList<Diagnostic>();
+        for (var d : diagnostics) {
+            if (d.code != null && d.code.contains("cant.resolve") && d.message != null && d.message.contains("'" + fieldName + "'")) {
+                continue;
+            }
+            result.add(d);
+        }
+        return result;
+    }
+
+    // For Lombok-annotated files, check .class bytecode before reporting cant.resolve / cant.apply.symbol.
+    // If the symbol exists in bytecode, Lombok generated it — suppress the false positive.
+    private List<Diagnostic> suppressLombokBytecodeErrors(List<Diagnostic> diagnostics, CompilationUnitTree root) {
+        if (compiler == null || !compiler.lombokPresentOnClasspath()) return diagnostics;
+        var file = Paths.get(root.getSourceFile().toUri());
+        if (!LombokAnnotations.sourceMayRequireLombokExpansion(file, 50)) return diagnostics;
+        var className = qualifiedClassName(root);
+        var classFile = compiler.findClassFile(className);
+        if (classFile.isEmpty()) return diagnostics;
+        java.lang.classfile.ClassModel model;
+        try {
+            model = java.lang.classfile.ClassFile.of().parse(classFile.get());
+        } catch (Exception e) {
+            return diagnostics;
+        }
+        var result = new ArrayList<Diagnostic>();
+        for (var d : diagnostics) {
+            if (d.code == null) { result.add(d); continue; }
+            if (d.code.contains("cant.resolve")) {
+                var name = extractLombokSymbolName(d.message);
+                if (name != null && hasMember(model, name)) {
+                    continue;
+                }
+            }
+            if (d.code.contains("cant.apply.symbol")) {
+                if (isConstructorError(d.message)) {
+                    continue;
+                }
+            }
+            result.add(d);
+        }
+        return result;
+    }
+
+    private static String qualifiedClassName(CompilationUnitTree root) {
+        var pkg = root.getPackageName();
+        var decls = root.getTypeDecls();
+        if (decls.isEmpty()) return null;
+        var name = ((ClassTree) decls.getFirst()).getSimpleName().toString();
+        return pkg != null ? pkg + "." + name : name;
+    }
+
+    private static String extractLombokSymbolName(String message) {
+        if (message == null) return null;
+        var m = Pattern.compile("'([^']+)'").matcher(message);
+        if (!m.find()) return null;
+        var name = m.group(1);
+        var paren = name.indexOf('(');
+        return paren >= 0 ? name.substring(0, paren) : name;
+    }
+
+    private static boolean hasMember(java.lang.classfile.ClassModel model, String name) {
+        return model.methods().stream().anyMatch(m -> m.methodName().equalsString(name))
+                || model.fields().stream().anyMatch(f -> f.fieldName().equalsString(name));
+    }
+
+    private static boolean isConstructorError(String message) {
+        return message != null && message.startsWith("constructor ");
     }
 }

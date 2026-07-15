@@ -32,8 +32,8 @@ public class ScopeHelper {
     }
 
     public static List<Element> scopeMembers(CompileTask task, Scope inner, Predicate<CharSequence> filter) {
-        var trees = Trees.instance(task.task);
-        var elements = task.task.getElements();
+        var trees = task.trees;
+        var elements = task.elements;
         var isStatic = false;
         var list = new ArrayList<Element>();
         for (var scope : fastScopes(inner)) {

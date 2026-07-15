@@ -26,7 +26,7 @@ public class AutoFixImports implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         LOG.info("Fix imports in " + file + "...");
-        try (var task = compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var used = usedImports(task);
             var unresolved = unresolvedNames(task);
             var resolved = resolveNames(compiler, unresolved);
@@ -89,7 +89,7 @@ public class AutoFixImports implements Rewrite {
     }
 
     private TextEdit replaceImports(CompileTask task, List<String> qualifiedNames) {
-        var pos = Trees.instance(task.task).getSourcePositions();
+        var pos = task.trees.getSourcePositions();
         var root = task.root(file);
         // Find the range covering all existing non-static imports
         Position start = null;
@@ -118,7 +118,7 @@ public class AutoFixImports implements Rewrite {
     }
 
     private Position insertPosition(CompileTask task) {
-        var pos = Trees.instance(task.task).getSourcePositions();
+        var pos = task.trees.getSourcePositions();
         var root = task.root(file);
         // If there are imports, use the start of the first import as the insert position
         for (var i : root.getImports()) {

@@ -2,12 +2,12 @@ package org.javacs;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import javax.tools.JavaFileObject;
-import java.util.ArrayList;
 
 public interface CompilerProvider {
     Set<String> imports();
@@ -38,28 +38,10 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
-    default CompileTask compileFast(Path... files) {
+    default CompileTask compileFresh(Path... files) {
         return compile(files);
     }
 
-    default CompileTask compileFast(Collection<? extends JavaFileObject> sources) {
-        return compile(sources);
-    }
-
-    default CompileTask compileFastWithProcessors(Path... files) {
-        return compileFast(files);
-    }
-
-    default CompileTask compileFastWithProcessors(Collection<? extends JavaFileObject> sources) {
-        return compileFast(sources);
-    }
-
-    /**
-     * Parse all files without attribution.
-     *
-     * <p>Returns one {@link ParseTask} per file using the parser cache. No {@code task.analyze()}
-     * is called, so this is typically ~15x faster than any compile path for large workspaces.
-     */
     default List<ParseTask> parseAll(Collection<Path> files) {
         var result = new ArrayList<ParseTask>(files.size());
         for (var file : files) {
@@ -68,19 +50,15 @@ public interface CompilerProvider {
         return result;
     }
 
-   /** Returns true when Lombok is present on the project classpath. */
     default boolean lombokPresentOnClasspath() {
         return false;
     }
 
-    /**
-     * Decompile the top-level source file that contains {@code qualifiedName} using the bundled
-     * Vineflower decompiler and return the path to the generated {@code .java} file.
-     *
-     * <p>The result is cached on disk by fingerprint so repeated calls are cheap. Returns empty
-     * when the type cannot be located on the classpath or decompilation fails.
-     */
     default Optional<Path> decompileClass(String qualifiedName) {
+        return Optional.empty();
+    }
+
+    default Optional<byte[]> findClassFile(String qualifiedName) {
         return Optional.empty();
     }
 

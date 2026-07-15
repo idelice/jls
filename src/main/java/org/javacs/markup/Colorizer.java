@@ -10,8 +10,8 @@ import org.javacs.lsp.Range;
 class Colorizer extends TreePathScanner<Void, SemanticColors> {
     private final Trees trees;
 
-    Colorizer(JavacTask task) {
-        trees = Trees.instance(task);
+    Colorizer(Trees trees) {
+        this.trees = trees;
     }
 
     private void maybeField(Name name, SemanticColors colors) {

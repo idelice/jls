@@ -25,6 +25,7 @@ public class FileStore {
     private static final Set<Path> workspaceRoots = ConcurrentHashMap.newKeySet();
 
     private static final Map<Path, VersionedContent> activeDocuments = new ConcurrentHashMap<>();
+    private static final Set<Path> dirtyDocuments = ConcurrentHashMap.newKeySet();
     private static final AtomicLong contentRevision = new AtomicLong();
 
     /** javaSources[file] is the javaSources time of a .java source file. */
@@ -129,6 +130,8 @@ public class FileStore {
 
     static void reset() {
         activeDocuments.clear();
+        LOG.info("[dirty] reset() clearing ALL dirty flags");
+        dirtyDocuments.clear();
         workspaceRoots.clear();
         javaSources.clear();
         packageIndex.clear();
@@ -301,6 +304,9 @@ public class FileStore {
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
         if (existing == null) return;
+        // Always mark dirty — the user attempted to edit this file
+        LOG.info("[dirty] change() marking dirty: " + file.getFileName() + " (version=" + document.version + " existing=" + existing.version + ")");
+        dirtyDocuments.add(file);
         if (document.version <= existing.version) {
             LOG.warning("Ignored change with version " + document.version + " <= " + existing.version);
             return;
@@ -312,6 +318,23 @@ public class FileStore {
         }
         activeDocuments.put(file, new VersionedContent(newText, document.version));
         bumpContentRevision();
+        // If content now matches disk (e.g. undo), clear dirty flag — no cross-file errors needed
+        var diskInfo = javaSources.get(file);
+        if (diskInfo != null) {
+            try {
+                var diskContent = Files.readString(file);
+                if (diskContent.equals(newText)) {
+                    dirtyDocuments.remove(file);
+                    LOG.info("[dirty] change() content matches disk — clearing dirty: " + file.getFileName());
+                } else {
+                    dirtyDocuments.add(file);
+                }
+            } catch (IOException ignored) {
+                dirtyDocuments.add(file);
+            }
+        } else {
+            dirtyDocuments.add(file);
+        }
     }
 
     static void close(DidCloseTextDocumentParams params) {
@@ -333,14 +356,20 @@ public class FileStore {
         if (!isJavaFile(file)) {
             return;
         }
+        LOG.info("[dirty] save() clearing dirty: " + file.getFileName());
         bumpContentRevision();
+        dirtyDocuments.remove(file);
     }
 
     static Set<Path> activeDocuments() {
         return activeDocuments.keySet();
     }
 
-    static long contentRevision() {
+    static Set<Path> dirtyDocuments() {
+        return Set.copyOf(dirtyDocuments);
+    }
+
+    public static long contentRevision() {
         return contentRevision.get();
     }
 

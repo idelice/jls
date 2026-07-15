@@ -389,21 +389,26 @@ public final class ExternalBinaryTypeIndex {
                         parameterNames[i] = parameter.getName();
                         if (!parameter.isNamePresent()) hasSyntheticNames = true;
                         erasedParameterTypes[i] = method.getParameterTypes()[i].getTypeName();
-                        parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + parameter.getName());
+                        parameters.add(TypeNames.simpleName(erasedParameterTypes[i]) + " " + parameter.getName());
                     }
                     if (hasSyntheticNames && method.getParameterCount() > 0) {
                         var sourceNames = resolveParameterNamesFromSource(
                                 declaring, method.getName(), method.getParameterCount(), erasedParameterTypes);
+                        if (sourceNames == null) {
+                            sourceNames = resolveParameterNamesFromClassFile(
+                                    declaring, method.getName(), method.getParameterCount(),
+                                    Modifier.isStatic(method.getModifiers()));
+                        }
                         if (sourceNames != null) {
                             parameters = new StringJoiner(", ");
                             for (int i = 0; i < method.getParameterCount(); i++) {
                                 parameterNames[i] = sourceNames[i];
-                                parameters.add(canonicalTypeName(method.getParameterTypes()[i]) + " " + sourceNames[i]);
+                                parameters.add(TypeNames.simpleName(erasedParameterTypes[i]) + " " + sourceNames[i]);
                             }
                         }
                     }
                     var detail =
-                            canonicalTypeName(method.getReturnType())
+                            TypeNames.simpleName(canonicalTypeName(method.getReturnType()))
                                     + " "
                                     + method.getName()
                                     + "("
@@ -509,7 +514,6 @@ public final class ExternalBinaryTypeIndex {
                             qualifiedName,
                             binaryClass.getSimpleName(),
                             members,
-                            false,
                             null,
                             superclass,
                             interfaces,
@@ -534,7 +538,6 @@ public final class ExternalBinaryTypeIndex {
                                 fallback.get().qualifiedName(),
                                 fallback.get().simpleName(),
                                 fallback.get().members(),
-                                false,
                                 null,
                                 null,
                                 List.of(),
@@ -813,7 +816,6 @@ public final class ExternalBinaryTypeIndex {
                 raw.qualifiedName,
                 raw.simpleName,
                 linkedMembers,
-                raw.fromCompiledRoot,
                 raw.sourcePath,
                 raw.superclass,
                 raw.interfaces,
@@ -1132,6 +1134,46 @@ public final class ExternalBinaryTypeIndex {
                 break;
         }
         return baseType + "[]".repeat(dimensions);
+    }
+
+    /** Read parameter names from the classfile's LocalVariableTable (available when compiled with -g). */
+    private String[] resolveParameterNamesFromClassFile(
+            String className, String methodName, int paramCount, boolean isStatic) {
+        if (compiler == null) return null;
+        var classFile = compiler.findClassFile(className);
+        if (classFile.isEmpty()) {
+            LOG.fine("[param-names] classfile not found for " + className);
+            return null;
+        }
+        try {
+            var model = ClassFile.of().parse(classFile.get());
+            for (var m : model.methods()) {
+                if (!m.methodName().equalsString(methodName)) continue;
+                var code = m.findAttribute(java.lang.classfile.Attributes.code()).orElse(null);
+                if (code == null) continue;
+                var lvt = code.findAttribute(java.lang.classfile.Attributes.localVariableTable()).orElse(null);
+                if (lvt == null) {
+                    LOG.fine("[param-names] no LocalVariableTable for " + className + "#" + methodName);
+                    continue;
+                }
+                // LocalVariableTable slots: instance methods start at 1 (0=this), static at 0
+                int firstSlot = isStatic ? 0 : 1;
+                var names = new String[paramCount];
+                int found = 0;
+                for (var entry : lvt.localVariables()) {
+                    int idx = entry.slot() - firstSlot;
+                    if (idx < 0 || idx >= paramCount) continue;
+                    if (entry.startPc() != 0) continue; // params have startPc=0
+                    names[idx] = entry.name().stringValue();
+                    found++;
+                }
+                if (found == paramCount) return names;
+                LOG.fine("[param-names] partial match for " + className + "#" + methodName + " found=" + found + "/" + paramCount);
+            }
+        } catch (Exception e) {
+            LOG.fine("[param-names] failed to read classfile for " + className + ": " + e.getMessage());
+        }
+        return null;
     }
 
     private String[] resolveParameterNamesFromSource(

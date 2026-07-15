@@ -27,13 +27,13 @@ public class GenerateFieldMethod implements Rewrite {
         if (file == CompilerProvider.NOT_FOUND) {
             return CANCELLED;
         }
-        try (var task = compiler.lombokPresentOnClasspath() ? compiler.compileFastWithProcessors(file) : compiler.compileFast(file)) {
+        try (var task = compiler.compile(file)) {
             var root = task.root(file);
             if (root == null) {
                 return CANCELLED;
             }
-            var trees = Trees.instance(task.task);
-            var typeElement = task.task.getElements().getTypeElement(className);
+            var trees = task.trees;
+            var typeElement = task.elements.getTypeElement(className);
             if (typeElement == null) {
                 return CANCELLED;
             }
