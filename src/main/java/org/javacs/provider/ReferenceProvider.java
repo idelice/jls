@@ -153,7 +153,7 @@ public class ReferenceProvider {
         try (var task = compiler.compileFresh(files.toArray(Path[]::new))) {
             var paths = new ArrayList<TreePath>();
             for (var root : task.roots) {
-                new FindLombokReferences(task.trees, names).scan(root, paths);
+                new FindLombokReferences(task, names, className).scan(root, paths);
             }
             var locations = new ArrayList<Location>();
             for (var p : paths) {

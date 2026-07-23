@@ -921,9 +921,6 @@ public class CompletionProvider {
                 var name = t.getName().toString();
                 if (name.isEmpty()) return super.visitVariable(t, null);
                 if (!StringSearch.matchesPartialName(name, partial)) return super.visitVariable(t, null);
-                if (isTypeLikeIdentifier(name)) {
-                    return super.visitVariable(t, null);
-                }
                 if (seen.add(name)) {
                      list.items.add(variable(name, syntacticType(t)));
                 }
@@ -1150,13 +1147,6 @@ public class CompletionProvider {
             return;
         }
         list.items.add(syntacticType(name, nested.getKind(), ownerType));
-    }
-
-    private boolean isTypeLikeIdentifier(String name) {
-        if (name == null || name.isBlank()) {
-            return false;
-        }
-        return Character.isUpperCase(name.charAt(0));
     }
 
     private void addSlf4jLoggerIfAnnotated(
@@ -1567,6 +1557,7 @@ public class CompletionProvider {
             var methodPriority = new HashMap<String, Integer>();
             for (var member : members) {
                 if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
+                if (member.kind == CompletionItemKind.Constructor) continue;
                 if (member.kind == CompletionItemKind.Method) {
                     methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
                     methodPriority.merge(member.name, indexMemberPriority(member), Math::min);

@@ -46,6 +46,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
 import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.completion.FindCompletionsAt;
 import org.javacs.index.IndexedMember;
 import org.javacs.index.IndexedType;
@@ -184,6 +185,10 @@ public final class ParseTypeResolver {
         if (enclosingField.isPresent()) {
             return enclosingField;
         }
+        var staticImportField = resolveStaticImportField(fallbackIdentifier);
+        if (staticImportField.isPresent()) {
+            return staticImportField;
+        }
         return resolveIdentifier(fallbackIdentifier)
                 .map(type -> new TypeResolution(type.qualifiedName, true, false));
     }
@@ -237,6 +242,10 @@ public final class ParseTypeResolver {
             var enclosingField = resolveEnclosingField(name);
             if (enclosingField.isPresent()) {
                 return enclosingField;
+            }
+            var staticImportField = resolveStaticImportField(name);
+            if (staticImportField.isPresent()) {
+                return staticImportField;
             }
             return resolveIdentifier(name).map(type -> new TypeResolution(type.qualifiedName, true, false));
         }
@@ -344,9 +353,27 @@ public final class ParseTypeResolver {
         }
         var field = resolveIndexedMember(current.get().qualifiedType(), identifier, false, null);
         if (field.isEmpty() || field.get().kind != CompletionItemKind.Field) {
+            // Also try static context — interface constants are implicitly static.
+            field = resolveIndexedMember(current.get().qualifiedType(), identifier, true, null);
+        }
+        if (field.isEmpty() || field.get().kind != CompletionItemKind.Field) {
             return Optional.empty();
         }
         return returnTypeOf(field.get());
+    }
+
+    private Optional<TypeResolution> resolveStaticImportField(String identifier) {
+        if (identifier == null || identifier.isBlank()) {
+            return Optional.empty();
+        }
+        var owners = WorkspaceTypeIndex.staticImportOwnerTypes(identifier, root);
+        for (var owner : owners) {
+            var field = resolveIndexedMember(owner, identifier, true, null);
+            if (field.isPresent() && field.get().kind == CompletionItemKind.Field) {
+                return returnTypeOf(field.get());
+            }
+        }
+        return Optional.empty();
     }
 
     private Optional<TypeResolution> resolveMethodReturnType(
