@@ -129,7 +129,8 @@ public class FindHelper {
             return erasedType.endsWith(simpleName);
         }
         if (candidate instanceof MemberSelectTree) {
-            return candidate.toString().equals(erasedType);
+            var qualifiedName = candidate.toString();
+            return erasedType.equals(qualifiedName) || erasedType.endsWith("." + qualifiedName);
         }
         if (candidate instanceof ArrayTypeTree array) {
             if (!erasedType.endsWith("[]")) return false;

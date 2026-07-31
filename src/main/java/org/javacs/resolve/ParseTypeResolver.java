@@ -756,6 +756,19 @@ public final class ParseTypeResolver {
         if (member == null) {
             return Optional.empty();
         }
+        var typeName = member.declaredReturnType != null && !member.declaredReturnType.isBlank()
+                ? member.declaredReturnType : member.returnType;
+        // For workspace members with simple (non-qualified) return type names, resolve against the
+        // declaring type's source imports first. This avoids the caller's wildcard imports shadowing
+        // the correct type (e.g. caller imports com.foo.model.* which contains a same-named class).
+        if (member.provenance == IndexedMember.Provenance.WORKSPACE
+                && typeName != null && !typeName.isBlank()
+                && !TypeNames.normalize(typeName).contains(".")) {
+            var ownerResolved = resolveViaOwnerSource(member);
+            if (ownerResolved.isPresent()) {
+                return ownerResolved;
+            }
+        }
         if (member.declaredReturnType != null && !member.declaredReturnType.isBlank()) {
             var declared = resolveDeclaredTypeName(member.declaredReturnType);
             if (declared.isPresent()) {
