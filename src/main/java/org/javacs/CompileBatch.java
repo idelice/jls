@@ -168,7 +168,7 @@ public class CompileBatch implements AutoCloseable {
                 var source = new SourceFileObject(file);
                 var parser = Parser.parseJavaFileObject(source);
                 for (var decl : parser.root.getTypeDecls()) {
-                    if (decl instanceof com.sun.source.tree.ClassTree cls) {
+                    if (decl instanceof ClassTree cls) {
                         if (cls.getSimpleName().toString().equals(simpleName)) {
                             return file;
                         }

@@ -12,6 +12,7 @@ import java.util.Set;
 import java.time.Instant;
 import java.util.jar.JarFile;
 import java.util.logging.Logger;
+import org.javacs.resolve.TypeNames;
 import org.jetbrains.java.decompiler.api.Decompiler;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger;
 import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences;
@@ -82,7 +83,8 @@ public final class ExternalBinaryDecompiler {
 
     private Optional<Path> decompile(BinaryTarget target) {
         var outputRoot = decompiledOutputRoot(target.topLevelQualifiedName());
-        var outputFile = findGeneratedSource(outputRoot, simpleName(target.topLevelQualifiedName()) + ".java");
+    
+        var outputFile = findGeneratedSource(outputRoot, TypeNames.simpleName(target.topLevelQualifiedName()) + ".java");
         if (Files.isRegularFile(outputFile)) {
             return Optional.of(outputFile);
         }
@@ -118,7 +120,7 @@ public final class ExternalBinaryDecompiler {
                                 .option(IFernflowerPreferences.INDENT_STRING, "    ");
                 builder.build().decompile();
             }
-            var generated = findGeneratedSource(outputRoot, simpleName(target.topLevelQualifiedName()) + ".java");
+            var generated = findGeneratedSource(outputRoot, TypeNames.simpleName(target.topLevelQualifiedName()) + ".java");
             return Files.isRegularFile(generated) ? Optional.of(generated) : Optional.empty();
         } catch (IOException | RuntimeException ex) {
             LOG.fine(
@@ -315,11 +317,6 @@ public final class ExternalBinaryDecompiler {
             candidate = dot < 0 ? null : candidate.substring(0, dot) + "$" + candidate.substring(dot + 1);
         }
         return candidates;
-    }
-
-    private static String simpleName(String qualifiedType) {
-        var index = qualifiedType.lastIndexOf('.');
-        return index >= 0 ? qualifiedType.substring(index + 1) : qualifiedType;
     }
 
     private record BinaryTarget(
