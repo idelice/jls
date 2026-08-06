@@ -26,6 +26,7 @@ public final class IndexedMember {
         DECLARED,
         RECORD_COMPONENT,
         LOMBOK_ACCESSOR,
+        LOMBOK_CONSTRUCTOR,
         LOMBOK_BUILDER,
         LOMBOK_LOGGER,
         DECOMPILATION

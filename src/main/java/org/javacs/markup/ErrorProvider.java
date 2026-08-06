@@ -18,6 +18,7 @@ import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeKind;
@@ -25,12 +26,17 @@ import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
+import org.javacs.FindNameAt;
 import org.javacs.LombokAnnotations;
+import org.javacs.index.IndexedMember;
+import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.*;
+import org.javacs.resolve.TypeNames;
 
 public class ErrorProvider {
     final CompileTask task;
     private final CompilerProvider compiler;
+    private final TypeIndexRouter typeIndex;
     private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
@@ -54,12 +60,17 @@ public class ErrorProvider {
             long warningMs) {}
 
     public ErrorProvider(CompileTask task) {
-        this(task, null);
+        this(task, null, null);
     }
 
     public ErrorProvider(CompileTask task, CompilerProvider compiler) {
+        this(task, compiler, null);
+    }
+
+    public ErrorProvider(CompileTask task, CompilerProvider compiler, TypeIndexRouter typeIndex) {
         this.task = task;
         this.compiler = compiler;
+        this.typeIndex = typeIndex;
     }
 
     public ErrorReport errors(Set<URI> requestedUris) {
@@ -94,6 +105,7 @@ public class ErrorProvider {
             compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
                 params.diagnostics.addAll(parseTreeDiagnostics(root, filteredDiagnostics));
+                params.diagnostics.addAll(staleWorkspaceAccessorErrors(root));
                 var warningStarted = System.nanoTime();
                 var unused = unusedWarnings(root);
                 var notThrown = notThrownWarnings(root);
@@ -112,6 +124,75 @@ public class ErrorProvider {
                 warningDiagnosticsCount,
                 convertNanos / 1_000_000,
                 warningNanos / 1_000_000);
+    }
+
+    private List<Diagnostic> staleWorkspaceAccessorErrors(CompilationUnitTree root) {
+        if (typeIndex == null) return List.of();
+
+        var result = new ArrayList<Diagnostic>();
+        var positions = task.trees.getSourcePositions();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitMethodInvocation(MethodInvocationTree invocation, Void unused) {
+                var methodPath = new TreePath(getCurrentPath(), invocation.getMethodSelect());
+                var element = task.trees.getElement(methodPath);
+                if (!(element instanceof ExecutableElement method) || task.trees.getPath(method) != null) {
+                    return super.visitMethodInvocation(invocation, unused);
+                }
+                if (!(method.getEnclosingElement() instanceof TypeElement owner)) {
+                    return super.visitMethodInvocation(invocation, unused);
+                }
+
+                var ownerName = owner.getQualifiedName().toString();
+                var liveOwner = typeIndex.workspace().typeInfo(ownerName).orElse(null);
+                if (liveOwner == null) {
+                    return super.visitMethodInvocation(invocation, unused);
+                }
+
+                var methodName = method.getSimpleName().toString();
+                var fieldName = LombokAnnotations.accessorFieldName(methodName).orElse(null);
+                if (fieldName == null) {
+                    return super.visitMethodInvocation(invocation, unused);
+                }
+
+                var parameterTypes = method.getParameters().stream()
+                        .map(parameter -> task.types.erasure(parameter.asType()).toString())
+                        .toArray(String[]::new);
+                var methodStillExists = false;
+                for (var member : liveOwner.members) {
+                    if (member.kind != CompletionItemKind.Method
+                            || !member.name.equals(methodName)
+                            || member.erasedParameterTypes.length != parameterTypes.length) continue;
+                    methodStillExists = true;
+                    for (var i = 0; i < parameterTypes.length; i++) {
+                        if (!TypeNames.simpleName(member.erasedParameterTypes[i])
+                                .equals(TypeNames.simpleName(parameterTypes[i]))) {
+                            methodStillExists = false;
+                            break;
+                        }
+                    }
+                    if (methodStillExists) break;
+                }
+                if (methodStillExists) {
+                    return super.visitMethodInvocation(invocation, unused);
+                }
+
+                var end = positions.getEndPosition(root, invocation.getMethodSelect());
+                var start = end - methodName.length();
+                if (start < 0 || end < start) {
+                    return super.visitMethodInvocation(invocation, unused);
+                }
+
+                var diagnostic = new Diagnostic();
+                diagnostic.range = RangeHelper.range(root, start, end);
+                diagnostic.severity = DiagnosticSeverity.Error;
+                diagnostic.code = "compiler.err.cant.resolve.location.args";
+                diagnostic.message = "cannot resolve symbol '" + methodName + "()'";
+                result.add(diagnostic);
+                return super.visitMethodInvocation(invocation, unused);
+            }
+        }.scan(root, null);
+        return result;
     }
 
     private boolean isJarOrCachedSource(URI uri) {
@@ -546,12 +627,11 @@ public class ErrorProvider {
         return result;
     }
 
-    // For Lombok-annotated files, check .class bytecode before reporting cant.resolve / cant.apply.symbol.
-    // If the symbol exists in bytecode, Lombok generated it — suppress the false positive.
+    // Structural Lombok annotations generate methods and constructors that proc:none cannot see.
+    // Logging annotations are handled separately and must not make ordinary bytecode fields look generated.
     private List<Diagnostic> suppressLombokBytecodeErrors(List<Diagnostic> diagnostics, CompilationUnitTree root) {
-        if (compiler == null || !compiler.lombokPresentOnClasspath()) return diagnostics;
-        var file = Paths.get(root.getSourceFile().toUri());
-        if (!LombokAnnotations.sourceMayRequireLombokExpansion(file, 50)) return diagnostics;
+        if (compiler == null || typeIndex == null || !compiler.lombokPresentOnClasspath()) return diagnostics;
+        if (!LombokAnnotations.hasStructuralLombokAnnotation(root)) return diagnostics;
         var className = qualifiedClassName(root);
         var classFile = compiler.findClassFile(className);
         if (classFile.isEmpty()) return diagnostics;
@@ -564,14 +644,42 @@ public class ErrorProvider {
         var result = new ArrayList<Diagnostic>();
         for (var d : diagnostics) {
             if (d.code == null) { result.add(d); continue; }
-            if (d.code.contains("cant.resolve")) {
-                var name = extractLombokSymbolName(d.message);
-                if (name != null && hasMember(model, name)) {
-                    continue;
+            if (d.code.contains("cant.resolve") && d.message != null) {
+                var signatureMatcher = Pattern.compile("'([^']+)'", Pattern.DOTALL).matcher(d.message);
+                if (signatureMatcher.find()) {
+                    var signature = signatureMatcher.group(1);
+                    var open = signature.indexOf('(');
+                    var close = signature.lastIndexOf(')');
+                    if (open > 0 && close > open) {
+                        var name = signature.substring(0, open);
+                        var parameters = signature.substring(open + 1, close);
+                        var requestedTypes = parameters.isBlank() ? new String[0] : parameters.split(",");
+                        var liveType = typeIndex.workspace().typeInfo(className).orElse(null);
+                        var liveMethod = false;
+                        if (liveType != null) {
+                            for (var member : liveType.members) {
+                                if (!member.name.equals(name)
+                                        || member.kind != CompletionItemKind.Method
+                                        || member.erasedParameterTypes.length != requestedTypes.length) continue;
+                                liveMethod = true;
+                                for (var i = 0; i < requestedTypes.length; i++) {
+                                    if (!TypeNames.simpleName(member.erasedParameterTypes[i])
+                                            .equals(TypeNames.simpleName(requestedTypes[i]))) {
+                                        liveMethod = false;
+                                        break;
+                                    }
+                                }
+                                if (liveMethod) break;
+                            }
+                        }
+                        if (liveMethod && hasMethod(model, name)) {
+                            continue;
+                        }
+                    }
                 }
             }
             if (d.code.contains("cant.apply.symbol")) {
-                if (isConstructorError(d.message)) {
+                if (isGeneratedConstructorError(d, root, className, model)) {
                     continue;
                 }
             }
@@ -588,21 +696,95 @@ public class ErrorProvider {
         return pkg != null ? pkg + "." + name : name;
     }
 
-    private static String extractLombokSymbolName(String message) {
-        if (message == null) return null;
-        var m = Pattern.compile("'([^']+)'").matcher(message);
-        if (!m.find()) return null;
-        var name = m.group(1);
-        var paren = name.indexOf('(');
-        return paren >= 0 ? name.substring(0, paren) : name;
+    private static boolean hasMethod(java.lang.classfile.ClassModel model, String name) {
+        return model.methods().stream().anyMatch(m -> m.methodName().equalsString(name));
     }
 
-    private static boolean hasMember(java.lang.classfile.ClassModel model, String name) {
-        return model.methods().stream().anyMatch(m -> m.methodName().equalsString(name))
-                || model.fields().stream().anyMatch(f -> f.fieldName().equalsString(name));
-    }
+    private boolean isGeneratedConstructorError(
+            Diagnostic diagnostic,
+            CompilationUnitTree root,
+            String className,
+            java.lang.classfile.ClassModel model) {
+        if (diagnostic.message == null
+                || !diagnostic.message.startsWith("constructor " + TypeNames.simpleName(className) + " ")
+                || diagnostic.range == null) {
+            return false;
+        }
 
-    private static boolean isConstructorError(String message) {
-        return message != null && message.startsWith("constructor ");
+        var offset = root.getLineMap().getPosition(
+                diagnostic.range.start.line + 1,
+                diagnostic.range.start.character + 1);
+        var invocationPath = new FindNameAt(task).scan(root, offset);
+        while (invocationPath != null && !(invocationPath.getLeaf() instanceof NewClassTree)) {
+            invocationPath = invocationPath.getParentPath();
+        }
+        if (invocationPath == null || !(invocationPath.getLeaf() instanceof NewClassTree invocation)) {
+            return false;
+        }
+
+        var owner = task.elements.getTypeElement(className);
+        if (owner == null) {
+            return false;
+        }
+        var fields = new HashMap<String, VariableElement>();
+        for (var element : owner.getEnclosedElements()) {
+            if (element instanceof VariableElement field) {
+                fields.put(field.getSimpleName().toString(), field);
+            }
+        }
+
+        for (var constructor : typeIndex.workspace().constructors(className)) {
+            if (constructor.origin != IndexedMember.Origin.LOMBOK_CONSTRUCTOR
+                    || constructor.parameterNames.length != invocation.getArguments().size()) {
+                continue;
+            }
+
+            var parameterTypes = new ArrayList<javax.lang.model.type.TypeMirror>();
+            var acceptsArguments = true;
+            for (var i = 0; i < constructor.parameterNames.length; i++) {
+                var field = fields.get(constructor.parameterNames[i]);
+                if (field == null) {
+                    acceptsArguments = false;
+                    break;
+                }
+                var expected = field.asType();
+                var actual = task.trees.getTypeMirror(
+                        new TreePath(invocationPath, invocation.getArguments().get(i)));
+                if (actual == null
+                        || !(task.types.isAssignable(actual, expected)
+                                || expected.getKind() == TypeKind.TYPEVAR
+                                        && task.types.isAssignable(actual, task.types.erasure(expected)))) {
+                    acceptsArguments = false;
+                    break;
+                }
+                parameterTypes.add(task.types.erasure(expected));
+            }
+            if (!acceptsArguments) {
+                continue;
+            }
+
+            for (var method : model.methods()) {
+                if (!method.methodName().equalsString("<init>")
+                        || method.methodTypeSymbol().parameterCount() != parameterTypes.size()) {
+                    continue;
+                }
+                var sameSignature = true;
+                for (var i = 0; i < parameterTypes.size(); i++) {
+                    var binaryType = method.methodTypeSymbol().parameterType(i);
+                    var binaryName = binaryType.packageName().isBlank()
+                            ? binaryType.displayName()
+                            : binaryType.packageName() + "." + binaryType.displayName();
+                    if (!binaryName.replace('$', '.')
+                            .equals(parameterTypes.get(i).toString().replace('$', '.'))) {
+                        sameSignature = false;
+                        break;
+                    }
+                }
+                if (sameSignature) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }

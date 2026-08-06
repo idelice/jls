@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Modifier;
 import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
 import java.lang.classfile.constantpool.ConstantPoolException;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
@@ -23,8 +24,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -373,6 +376,8 @@ public final class ExternalBinaryTypeIndex {
                 }
             }
             var publicMethods = visibleMethods(binaryClass);
+            var parameterSourceRoots = new HashMap<String, Optional<CompilationUnitTree>>();
+            var parameterClassModels = new HashMap<String, Optional<ClassModel>>();
             for (var method : publicMethods) {
                 try {
                     if (method.isSynthetic() || method.isBridge()) {
@@ -393,11 +398,18 @@ public final class ExternalBinaryTypeIndex {
                     }
                     if (hasSyntheticNames && method.getParameterCount() > 0) {
                         var sourceNames = resolveParameterNamesFromSource(
-                                declaring, method.getName(), method.getParameterCount(), erasedParameterTypes);
+                                declaring,
+                                method.getName(),
+                                method.getParameterCount(),
+                                erasedParameterTypes,
+                                parameterSourceRoots);
                         if (sourceNames == null) {
                             sourceNames = resolveParameterNamesFromClassFile(
-                                    declaring, method.getName(), method.getParameterCount(),
-                                    Modifier.isStatic(method.getModifiers()));
+                                    declaring,
+                                    method.getName(),
+                                    erasedParameterTypes,
+                                    Modifier.isStatic(method.getModifiers()),
+                                    parameterClassModels);
                         }
                         if (sourceNames != null) {
                             parameters = new StringJoiner(", ");
@@ -878,9 +890,6 @@ public final class ExternalBinaryTypeIndex {
             if (declaration == null) {
                 return Optional.empty();
             }
-            if (!LombokAnnotations.hasAccessorLombokAnnotation(declaration.getModifiers())) {
-                return Optional.empty();
-            }
             var accessorToField = new LinkedHashMap<String, String>();
             var syntheticAccessors = new ArrayList<IndexedMember>();
             for (var member : declaration.getMembers()) {
@@ -1138,60 +1147,78 @@ public final class ExternalBinaryTypeIndex {
 
     /** Read parameter names from the classfile's LocalVariableTable (available when compiled with -g). */
     private String[] resolveParameterNamesFromClassFile(
-            String className, String methodName, int paramCount, boolean isStatic) {
-        if (compiler == null) return null;
-        var classFile = compiler.findClassFile(className);
-        if (classFile.isEmpty()) {
-            LOG.fine("[param-names] classfile not found for " + className);
-            return null;
-        }
+            String className,
+            String methodName,
+            String[] parameterTypes,
+            boolean isStatic,
+            Map<String, Optional<ClassModel>> classModels) {
+        var model = classModels.computeIfAbsent(className, this::readParameterClassModel).orElse(null);
+        if (model == null) return null;
         try {
-            var model = ClassFile.of().parse(classFile.get());
             for (var m : model.methods()) {
                 if (!m.methodName().equalsString(methodName)) continue;
+                if (!Arrays.equals(parseBinaryParameterTypes(m.methodTypeSymbol()), parameterTypes)) continue;
                 var code = m.findAttribute(java.lang.classfile.Attributes.code()).orElse(null);
                 if (code == null) continue;
                 var lvt = code.findAttribute(java.lang.classfile.Attributes.localVariableTable()).orElse(null);
-                if (lvt == null) {
-                    LOG.fine("[param-names] no LocalVariableTable for " + className + "#" + methodName);
-                    continue;
-                }
+                if (lvt == null) continue;
                 // LocalVariableTable slots: instance methods start at 1 (0=this), static at 0
-                int firstSlot = isStatic ? 0 : 1;
-                var names = new String[paramCount];
+                int slot = isStatic ? 0 : 1;
+                var names = new String[parameterTypes.length];
                 int found = 0;
-                for (var entry : lvt.localVariables()) {
-                    int idx = entry.slot() - firstSlot;
-                    if (idx < 0 || idx >= paramCount) continue;
-                    if (entry.startPc() != 0) continue; // params have startPc=0
-                    names[idx] = entry.name().stringValue();
-                    found++;
+                for (var i = 0; i < parameterTypes.length; i++) {
+                    for (var entry : lvt.localVariables()) {
+                        if (entry.slot() == slot && entry.startPc() == 0) {
+                            names[i] = entry.name().stringValue();
+                            found++;
+                            break;
+                        }
+                    }
+                    slot += parameterTypes[i].equals("long") || parameterTypes[i].equals("double") ? 2 : 1;
                 }
-                if (found == paramCount) return names;
-                LOG.fine("[param-names] partial match for " + className + "#" + methodName + " found=" + found + "/" + paramCount);
+                if (found == parameterTypes.length) return names;
             }
         } catch (Exception e) {
-            LOG.fine("[param-names] failed to read classfile for " + className + ": " + e.getMessage());
+            return null;
         }
         return null;
     }
 
-    private String[] resolveParameterNamesFromSource(
-            String className, String methodName, int paramCount, String[] erasedParameterTypes) {
-        if (compiler == null) return null;
+    private Optional<ClassModel> readParameterClassModel(String className) {
+        if (compiler == null) return Optional.empty();
+        var classFile = compiler.findClassFile(className);
+        if (classFile.isEmpty()) return Optional.empty();
         try {
-            var source = compiler.findAnywhere(className);
-            if (source.isEmpty()) return null;
-            var parse = compiler.parse(source.get());
-            var root = parse.root();
-            for (var decl : root.getTypeDecls()) {
-                var result = findMethodParamNames(decl, methodName, paramCount, erasedParameterTypes);
-                if (result != null) return result;
-            }
+            return Optional.of(ClassFile.of().parse(classFile.get()));
         } catch (Exception e) {
-            // Source parsing is best-effort
+            return Optional.empty();
+        }
+    }
+
+    private String[] resolveParameterNamesFromSource(
+            String className,
+            String methodName,
+            int paramCount,
+            String[] erasedParameterTypes,
+            Map<String, Optional<CompilationUnitTree>> sourceRoots) {
+        var root = sourceRoots.computeIfAbsent(className, this::readParameterSourceRoot).orElse(null);
+        if (root == null) return null;
+        for (var decl : root.getTypeDecls()) {
+            var result = findMethodParamNames(decl, methodName, paramCount, erasedParameterTypes);
+            if (result != null) return result;
         }
         return null;
+    }
+
+    private Optional<CompilationUnitTree> readParameterSourceRoot(String className) {
+        if (compiler == null) return Optional.empty();
+        try {
+            var source = compiler.findAnywhere(className);
+            if (source.isEmpty()) return Optional.empty();
+            return Optional.of(compiler.parse(source.get()).root());
+        } catch (Exception e) {
+            return Optional.empty();
+        }
     }
 
     private String[] findMethodParamNames(

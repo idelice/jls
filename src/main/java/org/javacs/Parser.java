@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import javax.lang.model.element.*;
+import javax.tools.DiagnosticCollector;
 import javax.tools.JavaCompiler;
 import javax.tools.JavaFileObject;
 import org.javacs.lsp.*;
@@ -15,9 +16,10 @@ class Parser {
     private static final SourceFileManager FILE_MANAGER = new SourceFileManager();
 
     /** Create a task that compiles a single file */
-    private static JavacTask singleFileTask(JavaFileObject file) {
+    private static JavacTask singleFileTask(
+            JavaFileObject file, DiagnosticCollector<JavaFileObject> diagnostics) {
         return (JavacTask)
-                COMPILER.getTask(null, FILE_MANAGER, Parser::ignoreError, List.of(), List.of(), List.of(file));
+                COMPILER.getTask(null, FILE_MANAGER, diagnostics, List.of(), List.of(), List.of(file));
     }
 
     final JavaFileObject file;
@@ -25,6 +27,7 @@ class Parser {
     final JavacTask task;
     final CompilationUnitTree root;
     final Trees trees;
+    final boolean hasSyntaxErrors;
 
     private Parser(JavaFileObject file) {
         this.file = file;
@@ -33,13 +36,16 @@ class Parser {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        this.task = singleFileTask(file);
+        var diagnostics = new DiagnosticCollector<JavaFileObject>();
+        this.task = singleFileTask(file, diagnostics);
         try {
             this.root = task.parse().iterator().next();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
         this.trees = Trees.instance(task);
+        this.hasSyntaxErrors = diagnostics.getDiagnostics().stream()
+                .anyMatch(diagnostic -> diagnostic.getKind() == javax.tools.Diagnostic.Kind.ERROR);
     }
 
     static void parseFile(Path file) {
@@ -50,11 +56,5 @@ class Parser {
         // Parse directly from the current SourceFileObject document contents.
         // This avoids cross-request stale AST races on shared global parse state.
         return new Parser(file);
-    }
-
-
-    private static void ignoreError(javax.tools.Diagnostic<? extends JavaFileObject> __) {
-        // Too noisy, this only comes up in parse tasks which tend to be less important
-        // LOG.warning(err.getMessage(Locale.getDefault()));
     }
 }

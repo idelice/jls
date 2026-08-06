@@ -69,34 +69,26 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     /** Atomically extend the classpath with new entries (e.g. compiled module output dirs). */
-    void addClassPathEntries(Set<Path> entries) {
+    synchronized void addClassPathEntries(Set<Path> entries) {
         if (entries.isEmpty()) return;
         var updated = new LinkedHashSet<>(this.classPath);
         if (updated.addAll(entries)) {
             this.classPath = Collections.unmodifiableSet(updated);
+            cachedRevision = -1;
             LOG.info(String.format("[compiler] classpath_extended added=%d total=%d", entries.size(), updated.size()));
         }
     }
 
     // --- Small LRU compile cache ---
-    // Invalidation: global contentRevision (bumps on any edit/save).
+    // Invalidation: content revision or classpath extension.
     // Eviction: LRU, max 4 entries. No cross-file tracking needed.
-    private final Map<URI, CompileBatch> compileCache = new LinkedHashMap<>(4, 0.75f, true) {
+    private final Map<List<URI>, CompileBatch> compileCache = new LinkedHashMap<>(4, 0.75f, true) {
         @Override
-        protected boolean removeEldestEntry(Map.Entry<URI, CompileBatch> eldest) {
+        protected boolean removeEldestEntry(Map.Entry<List<URI>, CompileBatch> eldest) {
             return size() > 4;
         }
     };
-    private long cachedRevision = -1;
-
-    private boolean needsCompile() {
-        return FileStore.contentRevision() != cachedRevision;
-    }
-
-    private void loadCompile(URI key, Collection<? extends JavaFileObject> sources) {
-        compileCache.put(key, doCompile(sources));
-        cachedRevision = FileStore.contentRevision();
-    }
+    private volatile long cachedRevision = -1;
 
     private CompileBatch doCompile(Collection<? extends JavaFileObject> sources) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
@@ -125,15 +117,21 @@ class JavaCompilerService implements CompilerProvider {
 
     private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
         LOG.info("[cache] compileBatch " + sources.size() + " source(s)");
-        var key = sources.iterator().next().toUri();
-        var needsFresh = needsCompile() || !compileCache.containsKey(key);
-        if (!needsFresh) {
-            LOG.info("[cache] HIT");
-            return compileCache.get(key);
+        var key = sources.stream().map(JavaFileObject::toUri).toList();
+        var revision = FileStore.contentRevision();
+        if (revision != cachedRevision) {
+            compileCache.clear();
+            cachedRevision = revision;
         }
-        LOG.info("[cache] MISS revision=" + FileStore.contentRevision() + " prev=" + cachedRevision);
-        loadCompile(key, sources);
-        return compileCache.get(key);
+        var cached = compileCache.get(key);
+        if (cached != null) {
+            LOG.info("[cache] HIT");
+            return cached;
+        }
+        LOG.info("[cache] MISS revision=" + revision);
+        var compiled = doCompile(sources);
+        compileCache.put(key, compiled);
+        return compiled;
     }
 
     @Override
@@ -152,7 +150,7 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public ParseTask parse(Path file) {
         var parser = Parser.parseJavaFileObject(new SourceFileObject(file));
-        return new ParseTask(parser.task, parser.root);
+        return new ParseTask(parser.task, parser.root, parser.hasSyntaxErrors);
     }
 
     @Override
@@ -166,7 +164,7 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public ParseTask parse(JavaFileObject file) {
         var parser = Parser.parseJavaFileObject(file);
-        return new ParseTask(parser.task, parser.root);
+        return new ParseTask(parser.task, parser.root, parser.hasSyntaxErrors);
     }
 
     // --- Type/symbol lookups ---
@@ -259,28 +257,45 @@ class JavaCompilerService implements CompilerProvider {
         return lombokPresentOnClasspath;
     }
 
-    // find build output dir from classpath, fallback to Maven/Gradle convention
+    // Find one unambiguous output directory for startup generation.
     Path findBuildOutputDir() {
-        for (var p : classPath) {
-            if (Files.isDirectory(p) && !p.getFileName().toString().endsWith(".jar")) {
-                return p;
-            }
-        }
+        Path outputDir = null;
         for (var root : FileStore.workspaceRoots()) {
-            if (Files.exists(root.resolve("pom.xml"))) {
-                var dir = MavenTooling.outputDirectory(root);
-                if (!Files.exists(dir)) {
-                    try { Files.createDirectories(dir); } catch (IOException e) { return null; }
+            var nameCount = root.getNameCount();
+            // Startup generation only writes main-source classes.
+            if (nameCount >= 3
+                    && root.getName(nameCount - 3).toString().equals("src")
+                    && !root.getName(nameCount - 2).toString().equals("main")
+                    && root.getName(nameCount - 1).toString().equals("java")) continue;
+            var candidate = findBuildOutputDir(root);
+            if (candidate == null) return null;
+            if (outputDir != null && !outputDir.equals(candidate)) return null;
+            outputDir = candidate;
+        }
+        return outputDir;
+    }
+
+    // Find the output directory owned by this source file's nearest module.
+    Path findBuildOutputDir(Path source) {
+        var normalizedSource = source.toAbsolutePath().normalize();
+        for (var module = normalizedSource; module != null; module = module.getParent()) {
+            var testSource = normalizedSource.startsWith(module.resolve("src/test"));
+            Path outputDir;
+            if (Files.exists(module.resolve("pom.xml"))) {
+                outputDir = testSource ? module.resolve("target/test-classes") : MavenTooling.outputDirectory(module);
+            } else if (Files.exists(module.resolve("build.gradle"))
+                    || Files.exists(module.resolve("build.gradle.kts"))) {
+                var relativeSource = module.relativize(normalizedSource);
+                var sourceSet = "main";
+                if (relativeSource.getNameCount() > 1
+                        && relativeSource.getName(0).toString().equals("src")) {
+                    sourceSet = relativeSource.getName(1).toString();
                 }
-                addClassPathEntries(Set.of(dir));
-                return dir;
+                outputDir = module.resolve("build/classes/java").resolve(sourceSet);
+            } else {
+                continue;
             }
-            if (Files.exists(root.resolve("build.gradle"))
-                    || Files.exists(root.resolve("build.gradle.kts"))) {
-                // Gradle default. Override when per-module buildDir detection is added.
-                var dir = root.resolve("build").resolve("classes").resolve("java").resolve("main");
-                return Files.isDirectory(dir) ? dir : null;
-            }
+            return outputDir;
         }
         return null;
     }
@@ -290,8 +305,15 @@ class JavaCompilerService implements CompilerProvider {
         if (!lombokPresentOnClasspath) return;
         var outputDir = findBuildOutputDir();
         if (outputDir == null) return;
+        try {
+            Files.createDirectories(outputDir);
+        } catch (IOException e) {
+            return;
+        }
+        addClassPathEntries(Set.of(outputDir));
         var sources = FileStore.all().stream()
                 .filter(FileStore::isJavaFile)
+                .filter(file -> outputDir.equals(findBuildOutputDir(file)))
                 .map(SourceFileObject::new)
                 .toList();
         if (sources.isEmpty()) return;
@@ -319,8 +341,14 @@ class JavaCompilerService implements CompilerProvider {
 
     // recompile on save — updates .class in build output for cross-file resolution
     void refreshBuildOutput(Path file) {
-        var outputDir = findBuildOutputDir();
+        var outputDir = findBuildOutputDir(file);
         if (outputDir == null) return;
+        try {
+            Files.createDirectories(outputDir);
+        } catch (IOException e) {
+            return;
+        }
+        addClassPathEntries(Set.of(outputDir));
         var options = CompileBatch.options(classPath, addExports, extraArgs);
         options.addAll(List.of("-d", outputDir.toString()));
         if (lombokPresentOnClasspath) {

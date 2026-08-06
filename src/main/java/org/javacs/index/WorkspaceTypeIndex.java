@@ -17,6 +17,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -52,6 +53,7 @@ public class WorkspaceTypeIndex {
         public final List<String> imports;
         public final List<String> staticImports;
         public final List<String> declaredTypes;
+        public final String declarationKey;
 
         /**
          * Immutable summary of one source file as seen by the workspace index.
@@ -80,13 +82,15 @@ public class WorkspaceTypeIndex {
                 String packageName,
                 List<String> imports,
                 List<String> staticImports,
-                List<String> declaredTypes) {
+                List<String> declaredTypes,
+                String declarationKey) {
             this.sourcePath = sourcePath;
             this.sourceUri = sourceUri;
             this.packageName = packageName;
             this.imports = Collections.unmodifiableList(new ArrayList<>(imports));
             this.staticImports = Collections.unmodifiableList(new ArrayList<>(staticImports));
             this.declaredTypes = Collections.unmodifiableList(new ArrayList<>(declaredTypes));
+            this.declarationKey = declarationKey == null ? "" : declarationKey;
         }
     }
 
@@ -165,6 +169,18 @@ public class WorkspaceTypeIndex {
             return Optional.empty();
         }
         return Optional.ofNullable(sourceFiles.get(file));
+    }
+
+    /** Return true when an update contains the same index-facing declarations for these files. */
+    public boolean hasSameDeclarations(WorkspaceTypeIndex updates, Collection<Path> files) {
+        if (updates == null) return false;
+        for (var file : files) {
+            var before = sourceFiles.get(file);
+            var after = updates.sourceFiles.get(file);
+            if (before == null || after == null
+                    || !Objects.equals(before.declarationKey, after.declarationKey)) return false;
+        }
+        return true;
     }
 
 
@@ -337,7 +353,7 @@ public class WorkspaceTypeIndex {
                 if (!seenStorageKeys.add(storageKey)) {
                     continue;
                 }
-                members.add(member);
+                members.add(withInheritedPriority(member));
             }
             pending.addAll(directSupertypes(superType));
         }
@@ -394,10 +410,10 @@ public class WorkspaceTypeIndex {
                             && Arrays.equals(
                                     erasedParameterTypes == null ? new String[0] : erasedParameterTypes,
                                     member.erasedParameterTypes == null ? new String[0] : member.erasedParameterTypes)) {
-                        return Optional.of(member);
+                        return Optional.of(withInheritedPriority(member));
                     }
                 } else if (Objects.equals(name, member.name)) {
-                    return Optional.of(member);
+                    return Optional.of(withInheritedPriority(member));
                 }
             }
             pending.addAll(directSupertypes(superType));
@@ -531,14 +547,17 @@ public class WorkspaceTypeIndex {
      * names rather than fully qualified), but are sufficient for bootstrap completion candidate
      * lists. {@link org.javacs.resolve.ParseTypeResolver} resolves these at query time.
      *
-     * <p>Inherited workspace members are resolved by walking the superclass chain after all direct
-     * members are collected. External inherited members are resolved lazily at query time via
-     * {@link ExternalBinaryTypeIndex}.
+     * <p>Inherited members are resolved lazily at query time.
      *
      * <p>Record component accessors are synthesized from the parse tree without attribution.
      * Lombok synthetics use the same parse-tree-based path as the compiled index.
      */
     public static WorkspaceTypeIndex fromParseTrees(java.util.List<ParseTask> parseTasks) {
+        return fromParseTrees(parseTasks, __ -> false);
+    }
+
+    public static WorkspaceTypeIndex fromParseTrees(
+            java.util.List<ParseTask> parseTasks, Predicate<String> knownType) {
         // === Phase 1: Scan all roots — collect type names, class trees, and file metadata ===
         var allQualifiedNames = new ObjectOpenHashSet<String>();
         var typeClassTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
@@ -556,8 +575,9 @@ public class WorkspaceTypeIndex {
                     nestedTypesByOwner, typeRoots, sourceFileSnapshots);
         }
 
-        // Predicate used to resolve simple type names via imports/same-package lookup
-        Predicate<String> workspaceContains = allQualifiedNames::contains;
+        // Resolve against this batch plus types already known by the caller.
+        Predicate<String> workspaceContains =
+                name -> allQualifiedNames.contains(name) || knownType.test(name);
 
         // === Phase 2: Extract direct members from parse trees ===
         var typeDirectMembers =
@@ -593,16 +613,7 @@ public class WorkspaceTypeIndex {
             }
         }
 
-        // === Phase 3: Walk workspace inheritance chain — add inherited members ===
-        for (var qualifiedName : allQualifiedNames) {
-            var seen = typeDirectMembers.get(qualifiedName);
-            var visited = new ObjectOpenHashSet<String>();
-            visited.add(qualifiedName);
-            addInheritedWorkspaceMembers(qualifiedName, seen, typeDirectMembers,
-                    typeSupertypes, typeInterfacesList, visited);
-        }
-
-        // === Phase 4: Synthetics + build IndexedType entries ===
+        // === Phase 3: Synthetics + build IndexedType entries ===
         var typeEntries = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
 
         for (var qualifiedName : allQualifiedNames) {
@@ -611,6 +622,7 @@ public class WorkspaceTypeIndex {
             var sourcePath = typeSources.get(qualifiedName);
 
             addSyntheticLombokAccessors(qualifiedName, classTree, seen);
+            addSyntheticLombokConstructors(qualifiedName, classTree, seen);
             addSyntheticSlf4jLoggerField(qualifiedName, classTree, seen);
 
             var members = new ArrayList<>(seen.values());
@@ -638,9 +650,11 @@ public class WorkspaceTypeIndex {
 
         normalizeLombokBuilderTypes(typeEntries, typeClassTrees, typeSources);
 
+        var finalizedSourceFiles = finalizeSourceFiles(sourceFileSnapshots, typeEntries);
+
         return new WorkspaceTypeIndex(
                         Collections.unmodifiableMap(typeEntries),
-                        Collections.unmodifiableMap(sourceFileSnapshots));
+                        Collections.unmodifiableMap(finalizedSourceFiles));
     }
 
     /** First-pass scanner: collects all qualified type names and per-file metadata from a single root. */
@@ -720,8 +734,104 @@ public class WorkspaceTypeIndex {
         if (finalSourcePath != null) {
             sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
                     finalSourcePath, finalSourceUri, packageName,
-                    explicitImports, staticImports, declaredTypesInFile));
+                    explicitImports, staticImports, declaredTypesInFile, ""));
         }
+    }
+
+    private static Map<Path, SourceFileSnapshot> finalizeSourceFiles(
+            Map<Path, SourceFileSnapshot> sourceFiles, Map<String, IndexedType> types) {
+        var declaredTypesByFile = new Object2ObjectLinkedOpenHashMap<Path, List<String>>();
+        for (var type : types.values()) {
+            if (type.sourcePath != null) {
+                declaredTypesByFile
+                        .computeIfAbsent(type.sourcePath, __ -> new ArrayList<>())
+                        .add(type.qualifiedName);
+            }
+        }
+        var result = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+        for (var entry : sourceFiles.entrySet()) {
+            var snapshot = entry.getValue();
+            var declaredTypes = new ArrayList<>(
+                    declaredTypesByFile.getOrDefault(entry.getKey(), snapshot.declaredTypes));
+            declaredTypes.sort(String::compareTo);
+            result.put(entry.getKey(), new SourceFileSnapshot(
+                    snapshot.sourcePath,
+                    snapshot.sourceUri,
+                    snapshot.packageName,
+                    snapshot.imports,
+                    snapshot.staticImports,
+                    declaredTypes,
+                    declarationKey(snapshot, declaredTypes, types)));
+        }
+        return result;
+    }
+
+    private static String declarationKey(
+            SourceFileSnapshot source, List<String> declaredTypes, Map<String, IndexedType> types) {
+        var key = new StringBuilder();
+        appendDeclarationValue(key, source.packageName);
+        appendDeclarationValues(key, source.imports);
+        appendDeclarationValues(key, source.staticImports);
+        appendDeclarationValues(key, declaredTypes);
+        for (var qualifiedName : declaredTypes) {
+            var type = types.get(qualifiedName);
+            if (type == null) continue;
+            appendDeclarationValue(key, type.qualifiedName);
+            appendDeclarationValue(key, type.superclass);
+            appendDeclarationValues(key, type.interfaces);
+            appendDeclarationValues(key, type.nestedTypes.stream().sorted().toList());
+            appendDeclarationValue(key, Integer.toString(type.kind));
+            appendDeclarationValues(
+                    key, type.modifiers.stream().map(Modifier::name).sorted().toList());
+            appendDeclarationValue(key, Integer.toString(type.members.size()));
+            for (var member : type.members) {
+                appendDeclarationValue(key, member.ownerType);
+                appendDeclarationValue(key, member.name);
+                appendDeclarationValue(key, Integer.toString(member.kind));
+                appendDeclarationValue(key, Boolean.toString(member.isStatic));
+                appendDeclarationValue(key, Boolean.toString(member.isPrivate));
+                appendDeclarationValue(key, Boolean.toString(member.isProtected));
+                appendDeclarationValue(key, Boolean.toString(member.isPublic));
+                appendDeclarationValue(key, Boolean.toString(member.isAbstract));
+                appendDeclarationValue(key, Integer.toString(member.priority));
+                appendDeclarationValue(key, member.detail);
+                appendDeclarationValue(key, member.returnType);
+                appendDeclarationValue(key, member.declaredReturnType);
+                appendDeclarationValues(key, member.parameterNames);
+                appendDeclarationValues(key, member.erasedParameterTypes);
+                appendDeclarationValues(key, member.declaredParameterTypes);
+                appendDeclarationValue(key, member.canonicalKey);
+                appendDeclarationValue(key, member.logicalKey);
+                appendDeclarationValue(key, member.backingFieldName);
+                appendDeclarationValue(key, Boolean.toString(member.synthetic));
+                appendDeclarationValue(key, member.origin.name());
+                appendDeclarationValue(key, member.provenance.name());
+                appendDeclarationValues(
+                        key, member.modifiers.stream().map(Modifier::name).sorted().toList());
+                appendDeclarationValue(key, member.declarationOwnerType);
+                appendDeclarationValue(key, member.targetDeclarationKey);
+            }
+        }
+        return key.toString();
+    }
+
+    private static void appendDeclarationValues(StringBuilder target, List<String> values) {
+        target.append(values == null ? -1 : values.size()).append(':');
+        if (values != null) {
+            for (var value : values) appendDeclarationValue(target, value);
+        }
+    }
+
+    private static void appendDeclarationValues(StringBuilder target, String[] values) {
+        target.append(values == null ? -1 : values.length).append(':');
+        if (values != null) {
+            for (var value : values) appendDeclarationValue(target, value);
+        }
+    }
+
+    private static void appendDeclarationValue(StringBuilder target, String value) {
+        target.append(value == null ? -1 : value.length()).append(':');
+        if (value != null) target.append(value);
     }
 
     private static int parseTreeKindToCompletionItemKind(Tree.Kind kind) {
@@ -968,58 +1078,6 @@ public class WorkspaceTypeIndex {
                 IndexedMember.Origin.RECORD_COMPONENT, Set.of(Modifier.PUBLIC), null, null));
     }
 
-    /**
-     * Walk the workspace superclass and interface chains to add inherited members.
-     *
-     * <p>Only workspace-declared types are walked here. External inherited members are resolved
-     * lazily at completion-query time via {@link ExternalBinaryTypeIndex}.
-     *
-     * <p>Declared members (priority 0) in the child always win over inherited members (priority 1).
-     * The {@code visited} set prevents infinite loops on cyclic class hierarchies.
-     */
-    private static void addInheritedWorkspaceMembers(
-            String qualifiedName,
-            Map<String, IndexedMember> seen,
-            Map<String, Map<String, IndexedMember>> typeDirectMembers,
-            Map<String, String> typeSupertypes,
-            Map<String, java.util.List<String>> typeInterfaces,
-            Set<String> visited) {
-        var superclass = typeSupertypes.get(qualifiedName);
-        if (superclass != null && !superclass.isBlank() && visited.add(superclass)) {
-            var parentMembers = typeDirectMembers.get(superclass);
-            if (parentMembers != null) {
-                copyInheritedParseMembers(parentMembers, seen);
-                // Recurse: grandparent members reach the child transitively
-                addInheritedWorkspaceMembers(superclass, seen, typeDirectMembers,
-                        typeSupertypes, typeInterfaces, visited);
-            }
-        }
-        var ifaces = typeInterfaces.get(qualifiedName);
-        if (ifaces != null) {
-            for (var iface : ifaces) {
-                if (!iface.isBlank() && visited.add(iface)) {
-                    var ifaceMembers = typeDirectMembers.get(iface);
-                    if (ifaceMembers != null) {
-                        copyInheritedParseMembers(ifaceMembers, seen);
-                        addInheritedWorkspaceMembers(iface, seen, typeDirectMembers,
-                                typeSupertypes, typeInterfaces, visited);
-                    }
-                }
-            }
-        }
-    }
-
-    /** Copy non-private parent members into the child's seen map at inherited priority. */
-    private static void copyInheritedParseMembers(
-            Map<String, IndexedMember> parentMembers, Map<String, IndexedMember> childSeen) {
-        for (var entry : parentMembers.entrySet()) {
-            var parentMember = entry.getValue();
-            if (parentMember.isPrivate) continue;
-            if (parentMember.kind == CompletionItemKind.Constructor) continue; // constructors are not inherited
-            childSeen.putIfAbsent(entry.getKey(), withInheritedPriority(parentMember));
-        }
-    }
-
     private static IndexedMember withInheritedPriority(IndexedMember member) {
         return new IndexedMember(
                 member.ownerType, member.name, member.kind,
@@ -1049,7 +1107,7 @@ public class WorkspaceTypeIndex {
 
     private static void addSyntheticLombokAccessors(
             String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
-        if (declaration == null || !LombokAnnotations.hasAccessorLombokAnnotation(declaration.getModifiers())) {
+        if (declaration == null) {
             return;
         }
         for (var member : declaration.getMembers()) {
@@ -1139,6 +1197,118 @@ public class WorkspaceTypeIndex {
                                 null,
                                 null).withNavigation(ownerQualifiedName, fieldKey));
             }
+        }
+    }
+
+    private static void addSyntheticLombokConstructors(
+            String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
+        if (declaration == null
+                || declaration.getKind() == Tree.Kind.INTERFACE
+                || declaration.getKind() == Tree.Kind.ANNOTATION_TYPE
+                || declaration.getKind() == Tree.Kind.RECORD) {
+            return;
+        }
+
+        var modifiers = declaration.getModifiers();
+        var noArgs = LombokAnnotations.hasAnnotation(modifiers, "NoArgsConstructor");
+        var requiredArgs = LombokAnnotations.hasAnnotation(modifiers, "RequiredArgsConstructor");
+        var allArgs = LombokAnnotations.hasAnnotation(modifiers, "AllArgsConstructor");
+        var data = LombokAnnotations.hasAnnotation(modifiers, "Data");
+        var value = LombokAnnotations.hasAnnotation(modifiers, "Value");
+        var builder = LombokAnnotations.hasAnnotation(modifiers, "Builder");
+        if (!noArgs && !requiredArgs && !allArgs && !data && !value && !builder) {
+            return;
+        }
+
+        var writtenConstructor = false;
+        for (var member : declaration.getMembers()) {
+            if (member instanceof MethodTree method && method.getReturnType() == null) {
+                writtenConstructor = true;
+                break;
+            }
+        }
+        var explicitConstructorAnnotation = noArgs || requiredArgs || allArgs;
+        requiredArgs |= data && !writtenConstructor && !explicitConstructorAnnotation;
+        allArgs |= value && !writtenConstructor && !explicitConstructorAnnotation;
+        allArgs |= builder && !writtenConstructor && !explicitConstructorAnnotation;
+
+        var fields = new ArrayList<VariableTree>();
+        for (var member : declaration.getMembers()) {
+            if (!(member instanceof VariableTree field)
+                    || field.getModifiers().getFlags().contains(Modifier.STATIC)
+                    || field instanceof JCVariableDecl jcField && (jcField.mods.flags & Flags.ENUM) != 0) {
+                continue;
+            }
+            fields.add(field);
+        }
+
+        var constructors = new ArrayList<List<VariableTree>>();
+        if (noArgs) {
+            constructors.add(List.of());
+        }
+        if (requiredArgs) {
+            constructors.add(fields.stream()
+                    .filter(field -> field.getInitializer() == null)
+                    .filter(field -> field.getModifiers().getFlags().contains(Modifier.FINAL)
+                            || LombokAnnotations.hasAnnotation(field.getModifiers(), "NonNull"))
+                    .toList());
+        }
+        if (allArgs) {
+            constructors.add(fields.stream()
+                    .filter(field -> !(field.getModifiers().getFlags().contains(Modifier.FINAL)
+                            && field.getInitializer() != null))
+                    .filter(field -> !(value
+                            && field.getInitializer() != null
+                            && !LombokAnnotations.hasAnnotation(field.getModifiers(), "NonFinal")))
+                    .toList());
+        }
+
+        for (var constructorFields : constructors) {
+            var parameterNames = new String[constructorFields.size()];
+            var erasedParameterTypes = new String[constructorFields.size()];
+            var declaredParameterTypes = new String[constructorFields.size()];
+            for (var i = 0; i < constructorFields.size(); i++) {
+                var field = constructorFields.get(i);
+                var fieldName = field.getName().toString();
+                var fieldType = resolvedFieldType(field, fieldName, seen);
+                parameterNames[i] = fieldName;
+                erasedParameterTypes[i] = TypeNames.normalize(fieldType);
+                declaredParameterTypes[i] = fieldType;
+            }
+
+            var canonicalKey = IndexedMember.canonicalKey(
+                    ownerQualifiedName, CompletionItemKind.Constructor, "<init>", erasedParameterTypes);
+            if (seen.containsKey(canonicalKey)) {
+                continue;
+            }
+            var detail = TypeNames.simpleName(ownerQualifiedName)
+                    + "("
+                    + String.join(", ", declaredParameterTypes)
+                    + ")";
+            seen.put(canonicalKey, new IndexedMember(
+                    ownerQualifiedName,
+                    "<init>",
+                    CompletionItemKind.Constructor,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    0,
+                    detail,
+                    "void",
+                    "void",
+                    parameterNames,
+                    erasedParameterTypes,
+                    declaredParameterTypes,
+                    canonicalKey,
+                    canonicalKey,
+                    null,
+                    true,
+                    IndexedMember.Origin.LOMBOK_CONSTRUCTOR,
+                    Set.of(Modifier.PUBLIC),
+                    null,
+                    null));
         }
     }
 

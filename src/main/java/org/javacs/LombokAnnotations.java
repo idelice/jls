@@ -5,6 +5,7 @@ import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ModifiersTree;
 import com.sun.source.util.TreePath;
+import com.sun.source.util.TreeScanner;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -13,6 +14,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import org.javacs.lsp.Location;
 
@@ -37,6 +39,7 @@ public final class LombokAnnotations {
                     "AllArgsConstructor",
                     "NoArgsConstructor",
                     "RequiredArgsConstructor",
+                    "NonNull",
                     "ToString",
                     "EqualsAndHashCode",
                     "With",
@@ -67,6 +70,21 @@ public final class LombokAnnotations {
     /** Returns whether the modifiers include a Lombok annotation that changes the declared shape. */
     public static boolean hasStructuralLombokAnnotation(ModifiersTree modifiers) {
         return hasAnnotation(modifiers, STRUCTURAL);
+    }
+
+    /** Returns whether this source file currently contains a structural Lombok annotation. */
+    public static boolean hasStructuralLombokAnnotation(CompilationUnitTree root) {
+        var found = new boolean[1];
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void visitAnnotation(AnnotationTree annotation, Void unused) {
+                if (isStructuralLombokAnnotationType(annotation.getAnnotationType().toString())) {
+                    found[0] = true;
+                }
+                return found[0] ? null : super.visitAnnotation(annotation, unused);
+            }
+        }.scan(root, null);
+        return found[0];
     }
 
     /** Returns whether the modifiers include Lombok annotations that only add logging helpers. */
@@ -151,20 +169,48 @@ public final class LombokAnnotations {
         if (fieldName == null || fieldName.isBlank()) {
             return Optional.empty();
         }
-        var classGetter = hasAnnotation(classModifiers, "Data", "Getter", "Value");
-        var classSetter = hasAnnotation(classModifiers, "Data", "Setter");
-        var getterEnabled = classGetter || hasAnnotation(fieldModifiers, "Getter");
-        var setterEnabled = classSetter || hasAnnotation(fieldModifiers, "Setter");
+        var getterEnabled = hasAnnotation(classModifiers, "Data", "Value");
+        var setterEnabled = hasAnnotation(classModifiers, "Data");
+        for (var annotation : classModifiers.getAnnotations()) {
+            var name = simpleName(annotation.getAnnotationType().toString());
+            var none = annotation.getArguments().stream()
+                    .map(Object::toString)
+                    .map(value -> value.replace(" ", ""))
+                    .anyMatch(value -> value.endsWith("AccessLevel.NONE")
+                            || value.equals("NONE")
+                            || value.equals("value=NONE"));
+            if (name.equals("Getter")) getterEnabled = !none;
+            if (name.equals("Setter")) setterEnabled = !none;
+        }
+        for (var annotation : fieldModifiers.getAnnotations()) {
+            var name = simpleName(annotation.getAnnotationType().toString());
+            var none = annotation.getArguments().stream()
+                    .map(Object::toString)
+                    .map(value -> value.replace(" ", ""))
+                    .anyMatch(value -> value.endsWith("AccessLevel.NONE")
+                            || value.equals("NONE")
+                            || value.equals("value=NONE"));
+            if (name.equals("Getter")) getterEnabled = !none;
+            if (name.equals("Setter")) setterEnabled = !none;
+        }
+        setterEnabled &= !fieldModifiers.getFlags().contains(Modifier.FINAL);
         if (!getterEnabled && !setterEnabled) {
             return Optional.empty();
         }
         var normalizedType = fieldType == null ? "" : fieldType.trim();
-        var suffix = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+        var booleanField = isBooleanType(normalizedType);
+        var booleanPrefix = booleanField
+                && fieldName.length() > 2
+                && fieldName.startsWith("is")
+                && Character.isUpperCase(fieldName.charAt(2));
+        var suffix = booleanPrefix
+                ? fieldName.substring(2)
+                : Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
         return Optional.of(
                 new AccessorInfo(
                         fieldName,
                         normalizedType,
-                        getterEnabled ? (isBooleanType(normalizedType) ? "is" : "get") + suffix : null,
+                        getterEnabled ? (booleanPrefix ? fieldName : (booleanField ? "is" : "get") + suffix) : null,
                         setterEnabled ? "set" + suffix : null));
     }
 
@@ -195,9 +241,7 @@ public final class LombokAnnotations {
     }
 
     private static boolean isBooleanType(String fieldType) {
-        return "boolean".equals(fieldType)
-                || "Boolean".equals(fieldType)
-                || "java.lang.Boolean".equals(fieldType);
+        return "boolean".equals(fieldType);
     }
 
     // ---- Navigation helpers -------------------------------------------------

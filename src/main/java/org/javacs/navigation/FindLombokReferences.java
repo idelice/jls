@@ -5,8 +5,9 @@ import com.sun.source.util.*;
 import java.util.List;
 import java.util.Set;
 import javax.lang.model.element.TypeElement;
-import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
+import javax.lang.model.type.TypeMirror;
+import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
 
@@ -17,13 +18,18 @@ import org.javacs.CompileTask;
  */
 public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> {
     private final Trees trees;
+    private final Types types;
     private final Set<String> names;
     private final String targetClassName;
+    private final TypeMirror targetType;
 
     public FindLombokReferences(CompileTask task, Set<String> names, String targetClassName) {
         this.trees = task.trees;
+        this.types = task.types;
         this.names = names;
         this.targetClassName = targetClassName;
+        var target = task.elements.getTypeElement(targetClassName);
+        this.targetType = target == null ? null : task.types.erasure(target.asType());
     }
 
     @Override
@@ -63,19 +69,32 @@ public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> 
                     && te.getQualifiedName().contentEquals(targetClassName);
         }
 
-        // Element didn't resolve — check receiver type for member access expressions
+        // Element didn't resolve — check the receiver or enclosing class type.
         var leaf = path.getLeaf();
         ExpressionTree receiver = switch (leaf) {
             case MemberSelectTree ms -> ms.getExpression();
             case MemberReferenceTree mr -> mr.getQualifierExpression();
             default -> null;
         };
-        if (receiver == null) return false;
+        TreePath receiverPath;
+        if (receiver != null) {
+            receiverPath = new TreePath(path, receiver);
+        } else if (leaf instanceof IdentifierTree && path.getParentPath() != null
+                && path.getParentPath().getLeaf() instanceof MethodInvocationTree invocation
+                && invocation.getMethodSelect() == leaf) {
+            receiverPath = path.getParentPath();
+            while (receiverPath != null && !(receiverPath.getLeaf() instanceof ClassTree)) {
+                receiverPath = receiverPath.getParentPath();
+            }
+            if (receiverPath == null) return false;
+        } else {
+            return false;
+        }
 
-        var receiverType = trees.getTypeMirror(new TreePath(path, receiver));
-        return receiverType != null
-                && receiverType.getKind() == TypeKind.DECLARED
-                && ((TypeElement) ((DeclaredType) receiverType).asElement())
-                        .getQualifiedName().contentEquals(targetClassName);
+        var receiverType = trees.getTypeMirror(receiverPath);
+        return targetType != null
+                && receiverType != null
+                && receiverType.getKind() != TypeKind.ERROR
+                && types.isSubtype(types.erasure(receiverType), targetType);
     }
 }
