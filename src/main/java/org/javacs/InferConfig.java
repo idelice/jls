@@ -123,7 +123,7 @@ class InferConfig {
             LOG.info("[classpath] Adding module build output: " + moduleOut);
             classPath.add(moduleOut);
         }
-        var graph = MavenTooling.resolveModuleGraph(buildRoot());
+        var graph = moduleGraph();
         if (graph != ModuleGraph.EMPTY) {
             for (var info : graph.modules().values()) {
                 var siblingOut = MavenTooling.outputDirectory(info.projectDir());

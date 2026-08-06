@@ -202,7 +202,7 @@ public final class MavenTooling {
 
         var cachedClasspath = loadCachedMavenDependencies(pomXml, DEPENDENCY_LIST, mavenHome, cacheHome, modulePath);
         var cachedSources = loadCachedMavenDependencies(pomXml, DEPENDENCY_SOURCES, mavenHome, cacheHome, modulePath);
-        if (!cachedClasspath.isEmpty() && !cachedSources.isEmpty()) {
+        if (cachedClasspath != null && cachedSources != null) {
             CacheAudit.hit("infer_config.maven_dependencies");
             CacheAudit.load("infer_config.maven_dependencies");
             LOG.info(String.format(
@@ -273,7 +273,7 @@ public final class MavenTooling {
         try {
             var cacheHome = cacheHome(envVars);
             var cached = loadCachedMavenDependencies(pomXml, goal, mavenHome, cacheHome, modulePath);
-            if (!cached.isEmpty()) {
+            if (cached != null) {
                 CacheAudit.hit("infer_config.maven_dependencies");
                 CacheAudit.load("infer_config.maven_dependencies");
                 LOG.info(String.format("[perf] infer_config_maven goal=%s source=cache_disk dependencies=%d took=%dms",
@@ -331,18 +331,18 @@ public final class MavenTooling {
         var cache = readCacheFile(cacheFile);
         if (cache == null || cache.entries() == null) {
             LOG.info("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_cache_file");
-            return Set.of();
+            return null;
         }
         var entry = cache.entries().get(goal);
         if (entry == null) {
             LOG.info("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_entry");
-            return Set.of();
+            return null;
         }
         var inputs = cacheInputs(workspaceRoot, mavenHome);
         if (!Objects.equals(entry.pomInputs(), inputs.pomInputs())
                 || !Objects.equals(entry.settings(), inputs.settings())) {
             LOG.info("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=fingerprint_mismatch");
-            return Set.of();
+            return null;
         }
         LOG.info("[maven-cache] hit goal=" + goal + " module=" + modulePath + " deps=" + entry.dependencies().size());
         var result = new LinkedHashSet<Path>();
