@@ -195,6 +195,7 @@ public class CompileBatch implements AutoCloseable {
 
         // Lombok AP intentionally disabled — types resolve from .class build output on classpath
         Collections.addAll(list, "-proc:none");
+        Collections.addAll(list, "-XDshould-stop.ifError=FLOW");
 
         Collections.addAll(list, "-g");
         Collections.addAll(list, "-Xmaxerrs", "9999");

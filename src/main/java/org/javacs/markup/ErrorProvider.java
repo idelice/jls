@@ -104,7 +104,6 @@ public class ErrorProvider {
             params.diagnostics.addAll(filteredDiagnostics);
             compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
-                params.diagnostics.addAll(parseTreeDiagnostics(root, filteredDiagnostics));
                 params.diagnostics.addAll(staleWorkspaceAccessorErrors(root));
                 var warningStarted = System.nanoTime();
                 var unused = unusedWarnings(root);
@@ -577,38 +576,6 @@ public class ErrorProvider {
         result.message = message;
         result.tags = List.of(DiagnosticTag.Unnecessary);
         result.range = RangeHelper.range(root, start, end);
-        return result;
-    }
-
-    /**
-     * Parse-tree diagnostics that don't require type attribution.
-     * Supplements javac's flow analysis which skips methods with erroneous types.
-     */
-    private List<Diagnostic> parseTreeDiagnostics(
-            CompilationUnitTree root, List<Diagnostic> existingDiagnostics) {
-        for (var d : existingDiagnostics) {
-            if (d.code != null && d.code.contains("missing.ret.stmt")) return List.of();
-        }
-        var lineMap = root.getLineMap();
-        var positions = Trees.instance(task.task).getSourcePositions();
-        var result = new ArrayList<Diagnostic>();
-        new TreeScanner<Void, Void>() {
-            @Override
-            public Void visitMethod(MethodTree method, Void unused) {
-                if (MissingReturnCheck.isMissingReturn(method)) {
-                    long pos = positions.getEndPosition(root, method.getBody()) - 1;
-                    int line = (int) lineMap.getLineNumber(pos) - 1;
-                    int col = (int) lineMap.getColumnNumber(pos) - 1;
-                    var d = new Diagnostic();
-                    d.range = new Range(new Position(line, col), new Position(line, col + 1));
-                    d.severity = DiagnosticSeverity.Error;
-                    d.code = "compiler.err.missing.ret.stmt";
-                    d.message = "missing return statement";
-                    result.add(d);
-                }
-                return super.visitMethod(method, unused);
-            }
-        }.scan(root, null);
         return result;
     }
 
