@@ -11,7 +11,6 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
-import javax.lang.model.element.Modifier;
 import javax.lang.model.util.*;
 import javax.tools.*;
 
@@ -131,7 +130,6 @@ public class CompileBatch implements AutoCloseable {
             var parse = Parser.parseJavaFileObject(new SourceFileObject(file));
             for (var declaration : parse.root.getTypeDecls()) {
                 if (!(declaration instanceof ClassTree cls)) continue;
-                if (cls.getModifiers().getFlags().contains(Modifier.PUBLIC)) continue;
                 if (cls.getSimpleName().contentEquals(className)) {
                     return file;
                 }
