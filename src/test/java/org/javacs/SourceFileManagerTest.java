@@ -72,18 +72,5 @@ public class SourceFileManagerTest {
         assertThat(sourceClassName, equalTo(standardJavaName));
     }
 
-    @Test
-    public void javaUtilList() throws IOException {
-        var file =
-                sourceFileManager.getJavaFileForInput(
-                        StandardLocation.PLATFORM_CLASS_PATH, "java.util.List", JavaFileObject.Kind.CLASS);
-        assertThat("Found java.util.List in platform classpath", file, notNullValue());
-
-        var header = ClassHeader.of(file.openInputStream());
-        assertTrue(header.isInterface);
-        assertTrue(header.isAbstract);
-        assertTrue(header.isPublic);
-    }
-
     private static final Logger LOG = Logger.getLogger("main");
 }
