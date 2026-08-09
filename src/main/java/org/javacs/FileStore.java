@@ -293,7 +293,15 @@ public class FileStore {
         var newContent = new VersionedContent(document.text, document.version);
         activeDocuments.put(file, newContent);
         // Only invalidate caches if the content actually changed (not just opened)
-        if (existing == null || existing.contentHash != newContent.contentHash) {
+        var contentChanged = existing != null && existing.contentHash != newContent.contentHash;
+        if (existing == null) {
+            try {
+                contentChanged = !Files.readString(file).equals(document.text);
+            } catch (IOException e) {
+                contentChanged = true;
+            }
+        }
+        if (contentChanged) {
             bumpContentRevision();
         }
     }

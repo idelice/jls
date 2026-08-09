@@ -114,6 +114,7 @@ class JavaLanguageServer extends LanguageServer {
 
     /** Monotonic revision for queued completion-index refreshes; newer schedules cancel older runs. */
     private final AtomicLong completionIndexRevision = new AtomicLong();
+    private final AtomicLong diagnosticRevision = new AtomicLong();
     private final AtomicLong completionIndexVersion = new AtomicLong();
     private final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
@@ -224,7 +225,16 @@ class JavaLanguageServer extends LanguageServer {
         appliedCompilerSettings = compilerSettingsSnapshot(settings);
         publishExternalBinaryIndexSnapshot();
         refreshStateForCompilerRecreated();
+        refreshDiagnostics();
+    }
+
+    private void refreshDiagnostics() {
+        diagnosticRevision.incrementAndGet();
         client.customNotification("workspace/diagnostic/refresh", null);
+    }
+
+    private String diagnosticResultId() {
+        return FileStore.contentRevision() + ":" + diagnosticRevision.get();
     }
 
     private void refreshStateForCompilerRecreated() {
@@ -693,7 +703,7 @@ class JavaLanguageServer extends LanguageServer {
         executeCommandOptions.add("commands", commands);
         c.add("executeCommandProvider", executeCommandOptions);
         var diagnosticOptions = new JsonObject();
-        diagnosticOptions.addProperty("interFileDependencies", false);
+        diagnosticOptions.addProperty("interFileDependencies", true);
         diagnosticOptions.addProperty("workspaceDiagnostics", false);
         c.add("diagnosticProvider", diagnosticOptions);
 
@@ -844,7 +854,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         if (refreshActiveDiagnostics) {
-            client.customNotification("workspace/diagnostic/refresh", null);
+            refreshDiagnostics();
         }
         if (compilerInputsChanged) {
             recreateCompilersAndRefreshState("didChangeWatchedFiles");
@@ -1172,6 +1182,10 @@ class JavaLanguageServer extends LanguageServer {
                 return new DocumentDiagnosticReport(List.of());
             }
             ensureTypeIndexReady("diagnosticBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
+            var resultId = diagnosticResultId();
+            if (resultId.equals(params.previousResultId)) {
+                return new DocumentDiagnosticReport("unchanged", resultId, null);
+            }
             LOG.info("[diagnostics] pull_compile_start file=" + file.getFileName());
             var started = System.nanoTime();
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));
@@ -1184,10 +1198,10 @@ class JavaLanguageServer extends LanguageServer {
                         file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
                 for (var diagParams : errorReport.diagnostics()) {
                     if (file.toUri().equals(diagParams.uri)) {
-                        return new DocumentDiagnosticReport(diagParams.diagnostics);
+                        return new DocumentDiagnosticReport("full", resultId, diagParams.diagnostics);
                     }
                 }
-                return new DocumentDiagnosticReport(List.of());
+                return new DocumentDiagnosticReport("full", resultId, List.of());
             }
         } catch (Exception e) {
             LOG.warning("[diagnostics] pull_compile_failed file=" + file.getFileName()
@@ -1221,7 +1235,7 @@ class JavaLanguageServer extends LanguageServer {
                     if (c != null) c.addClassPathEntries(existingDirs);
                 }
                 // Notify client to re-pull diagnostics now that deps are on classpath
-                client.customNotification("workspace/diagnostic/refresh", null);
+                refreshDiagnostics();
             } catch (Exception e) {
                 LOG.warning("[multi-module] background_dep_compile_failed module=" + projectPath
                         + " reason=" + e.getMessage());
@@ -1465,7 +1479,7 @@ class JavaLanguageServer extends LanguageServer {
                                     ? CompletionIndexScope.ACTIVE
                                     : baseSnapshot.scope();
             publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), indexVersion, nextScope);
-            client.customNotification("workspace/diagnostic/refresh", null);
+            refreshDiagnostics();
             LOG.fine(String.format(
                     "[perf] completion_type_index_merge trigger=%s base_version=%d version=%d types=%d files=%d took=%dms",
                     trigger,
