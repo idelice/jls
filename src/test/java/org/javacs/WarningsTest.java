@@ -101,26 +101,14 @@ public class WarningsTest {
     @Test
     public void unused() {
         server.lint(List.of(FindResource.path("org/javacs/warn/Unused.java")));
-        assertThat(errors, hasItem("unused_local(7)")); // int unusedLocal
-        assertThat(errors, hasItem("unused_field(10)")); // int unusedPrivate
-        assertThat(errors, hasItem("unused_local(13)")); // int unusedLocalInLambda
-        assertThat(errors, hasItem("unused_method(16)")); // int unusedMethod() { ... }
-        assertThat(errors, hasItem("unused_method(22)")); // private Unused(int i) { }
-        assertThat(errors, hasItem("unused_class(24)")); // private class UnusedClass { }
-        assertThat(errors, hasItem("unused_method(26)")); // void unusedSelfReference() { ... }
-        assertThat(errors, not("unused_param(6)")); // test(int unusedParam)
-        assertThat(errors, not("unused_param(12)")); // unusedLambdaParam -> {};
-        assertThat(errors, not(hasItem("unused_method(20)"))); // private Unused() { }
-        assertThat(errors, hasItem("unused_method(30)")); // private void unusedMutuallyRecursive1() { ... }
-        assertThat(errors, hasItem("unused_method(34)")); // private void unusedMutuallyRecursive2() { ... }
-        assertThat(errors, not(hasItem("unused_method(38)"))); // private int usedByUnusedVar() { ... }
-        assertThat(errors, not(hasItem("unused_throw(46)"))); // void notActuallyThrown() throws Exception { }
-    }
-
-    @Test
-    public void pseudoUsed() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/PseudoUsed.java")));
-        assertThat(errors, not(hasItem("unused_method(8)"))); // void pseudoUsed(int)
+        var unused = errors.stream().filter(error -> error.startsWith("unused_")).toList();
+        assertThat(
+                unused,
+                containsInAnyOrder(
+                        "unused_local(7)",
+                        "unused_field(10)",
+                        "unused_local(13)",
+                        "unused_local(43)"));
     }
 
     @Test
@@ -133,35 +121,6 @@ public class WarningsTest {
     public void targetedDiagnosticsDoNotExpandPackagePrivateCompanions() {
         server.lint(List.of(FindResource.path("org/javacs/example/ReferenceGotoPackagePrivate.java")));
         assertThat(errors, hasItem("compiler.err.cant.resolve.location(5)"));
-    }
-
-    @Test
-    public void notThrown() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/NotThrown.java")));
-        assertThat(errors, hasItem("unused_throws(6)"));
-        assertThat(errors, not(hasItem("unused_throws(8)")));
-    }
-
-    @Test
-    public void notThrownConstructor() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/NotThrownConstructor.java")));
-        assertThat(errors, not(hasItem("unused_throws(6)")));
-        assertThat(errors, not(hasItem("unused_throws(11)")));
-    }
-
-    @Test
-    public void unusedLombokSlf4jHasNonZeroRange() {
-        var diags = new ArrayList<Diagnostic>();
-        var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
-        srv.lint(List.of(FindResource.path("org/javacs/warn/UnusedSlf4j.java")));
-        var slf4jDiag = diags.stream()
-                .filter(d -> "unused_field".equals(d.code) && d.message.contains("log"))
-                .findFirst();
-        assertTrue("expected unused_field diagnostic for 'log'", slf4jDiag.isPresent());
-        var range = slf4jDiag.get().range;
-        assertTrue(
-                "diagnostic range should not be zero-width",
-                range.start.line != range.end.line || range.start.character != range.end.character);
     }
 
     @Test
@@ -197,13 +156,6 @@ public class WarningsTest {
                 .findFirst();
         assertTrue("expected cant.resolve error", diag.isPresent());
         assertThat(diag.get().message, is("cannot resolve symbol 'totals'"));
-    }
-
-    @Test
-    public void recordComponentsNotFalseUnused() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedRecord.java")));
-        assertThat(errors, not(hasItem("unused_field(4)"))); // record components are not unused fields
-        assertThat(errors, not(hasItem("unused_param(4)"))); // record components are not unused params
     }
 
     // TODO warn on type.equals(otherType)

@@ -131,4 +131,5 @@ public class StringSearchTest {
         assertTrue(StringSearch.matchesPartialName("foobar", "foo"));
         assertFalse(StringSearch.matchesPartialName("foo", "foobar"));
     }
+
 }

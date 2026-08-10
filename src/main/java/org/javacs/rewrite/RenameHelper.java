@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
@@ -25,6 +26,7 @@ import org.javacs.FindHelper;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
+import org.javacs.navigation.FindLombokReferences;
 
 class RenameHelper {
     final CompileTask task;
@@ -59,14 +61,26 @@ class RenameHelper {
     }
 
     Map<Path, TextEdit[]> renameField(
-            List<CompilationUnitTree> roots, String className, String fieldName, String newName) {
+            List<CompilationUnitTree> roots,
+            String className,
+            String fieldName,
+            String newName,
+            Map<String, String> accessorRenames) {
         var allEdits = new HashMap<Path, TextEdit[]>();
         for (var root : roots) {
             var file = Paths.get(root.getSourceFile().toUri());
             var references = findFieldReferences(root, className, fieldName);
-            if (references.isEmpty()) continue;
-            var fileEdits = replaceAll(references, newName);
-            allEdits.put(file, fileEdits);
+            var fileEdits = new ArrayList<TextEdit>();
+            fileEdits.addAll(List.of(replaceAll(references, newName)));
+            for (var rename : accessorRenames.entrySet()) {
+                var accessorReferences = new ArrayList<TreePath>();
+                new FindLombokReferences(task, Set.of(rename.getKey()), className)
+                        .scan(root, accessorReferences);
+                fileEdits.addAll(List.of(replaceAll(accessorReferences, rename.getValue())));
+            }
+            if (!fileEdits.isEmpty()) {
+                allEdits.put(file, fileEdits.toArray(TextEdit[]::new));
+            }
         }
         return allEdits;
     }

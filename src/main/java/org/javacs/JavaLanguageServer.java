@@ -975,14 +975,6 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     @Override
-    public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
-        if (compiler == null) return List.of();
-        var file = Paths.get(params.textDocument.uri);
-        return new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
-    }
-
-    @Override
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
@@ -1086,14 +1078,6 @@ class JavaLanguageServer extends LanguageServer {
         for (var editedFile : map.keySet()) {
             response.changes.put(editedFile.toUri(), Arrays.asList(map.get(editedFile)));
         }
-        // Schedule index refresh for modified files
-        if (!map.isEmpty()) {
-            completionIndexScheduler.scheduleRefresh(
-                    map.keySet(),
-                    "codeAction",
-                    0,
-                    CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-        }
         // For class renames, notify client to rename the file on disk
         if (rw instanceof RenameClass rc) {
             var sourceFile = getOrCreateCompiler().findTypeDeclaration(rc.oldQualifiedName);
@@ -1112,6 +1096,20 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         return response;
+    }
+
+    @Override
+    public void renameApplied(DidChangeWatchedFilesParams params) {
+        if (params == null || params.changes == null) return;
+        var compiler = getOrCreateCompiler();
+        for (var change : params.changes) {
+            var file = Paths.get(change.uri);
+            if (!FileStore.isWorkspaceJavaFile(change.uri) || !Files.exists(file)) continue;
+            var parse = compiler.parse(file);
+            if (LombokAnnotations.hasStructuralLombokAnnotation(parse.root())) {
+                compiler.refreshBuildOutput(file);
+            }
+        }
     }
 
     private Rewrite createRewrite(RenameParams params) {

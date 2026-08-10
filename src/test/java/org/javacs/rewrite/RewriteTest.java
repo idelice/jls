@@ -5,6 +5,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.fail;
 
 import java.nio.file.Path;
+import java.util.Arrays;
 import org.javacs.CompilerProvider;
 import org.javacs.LanguageServerFixture;
 import org.junit.Test;
@@ -35,6 +36,20 @@ public class RewriteTest {
         var edits = renamer.rewrite(compiler);
         assertThat(edits.keySet(), hasSize(1));
         assertThat(edits, hasKey(file("TestRenameField.java")));
+    }
+
+    @Test
+    public void renameLombokFieldUpdatesAccessorConsumers() {
+        var renamer = new RenameField(
+                "org.javacs.rewrite.TestRenameLombokField", "lombokRenameValue", "renamedValue");
+        var edits = renamer.rewrite(compiler);
+
+        assertThat(edits, hasKey(file("TestRenameLombokField.java")));
+        assertThat(edits, hasKey(file("TestRenameLombokFieldConsumer.java")));
+        var consumerEdits = Arrays.stream(edits.get(file("TestRenameLombokFieldConsumer.java")))
+                .map(edit -> edit.newText)
+                .toList();
+        assertThat(consumerEdits, containsInAnyOrder("getRenamedValue", "setRenamedValue"));
     }
 
     @Test

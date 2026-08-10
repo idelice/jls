@@ -407,11 +407,6 @@ class JavaCompilerService implements CompilerProvider {
     }
 
     @Override
-    public List<String> packagePrivateTopLevelTypes(String packageName) {
-        return List.of("TODO");
-    }
-
-    @Override
     public Iterable<Path> search(String query) {
         Predicate<Path> test = f -> StringSearch.containsWordMatching(f, query);
         return () -> FileStore.all().stream().filter(test).iterator();

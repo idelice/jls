@@ -333,29 +333,6 @@ public class CodeActionProvider {
             case "unused_local":
                 var toStatement = new ConvertVariableToStatement(file, findPosition(task, root, d.range.start));
                 return createQuickFix("Convert to statement", toStatement);
-            case "unused_field":
-                var toBlock = new ConvertFieldToBlock(file, findPosition(task, root, d.range.start));
-                return createQuickFix("Convert to block", toBlock);
-            case "unused_class":
-                var removeClass = new RemoveClass(file, findPosition(task, root, d.range.start));
-                return createQuickFix("Remove class", removeClass);
-            case "unused_method":
-                var unusedMethod = findMethod(task, root, d.range);
-                var removeMethod =
-                        new RemoveMethod(
-                                unusedMethod.className, unusedMethod.methodName, unusedMethod.erasedParameterTypes);
-                return createQuickFix("Remove method", removeMethod);
-            case "unused_throws":
-                var shortExceptionName = extractRange(root, d.range);
-                var notThrown = extractNotThrownExceptionName(d.message);
-                var methodWithExtraThrow = findMethod(task, root, d.range);
-                var removeThrow =
-                        new RemoveException(
-                                methodWithExtraThrow.className,
-                                methodWithExtraThrow.methodName,
-                                methodWithExtraThrow.erasedParameterTypes,
-                                notThrown);
-                return createQuickFix("Remove '" + shortExceptionName + "'", removeThrow);
             case "compiler.warn.unchecked.call.mbr.of.raw.type":
                 var warnedMethod = findMethod(task, root, d.range);
                 var suppressWarning =
@@ -475,17 +452,6 @@ public class CodeActionProvider {
                 erasedParameterTypes[i] = erased.toString();
             }
         }
-    }
-
-    private static final Pattern NOT_THROWN_EXCEPTION = Pattern.compile("^'((\\w+\\.)*\\w+)' is not thrown");
-
-    private String extractNotThrownExceptionName(String message) {
-        var matcher = NOT_THROWN_EXCEPTION.matcher(message);
-        if (!matcher.find()) {
-            LOG.warning(String.format("`%s` doesn't match `%s`", message, NOT_THROWN_EXCEPTION));
-            return "";
-        }
-        return matcher.group(1);
     }
 
     private static final Pattern UNREPORTED_EXCEPTION = Pattern.compile("unreported exception ((\\w+\\.)*\\w+)");

@@ -48,6 +48,10 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public void renameApplied(DidChangeWatchedFilesParams params) {
+        throw new RuntimeException("Unimplemented");
+    }
+
     public Optional<CompletionList> completion(TextDocumentPositionParams params) {
         throw new RuntimeException("Unimplemented");
     }
@@ -69,10 +73,6 @@ public class LanguageServer {
     }
 
     public Optional<List<Location>> findReferences(ReferenceParams params) {
-        throw new RuntimeException("Unimplemented");
-    }
-
-    public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
         throw new RuntimeException("Unimplemented");
     }
 

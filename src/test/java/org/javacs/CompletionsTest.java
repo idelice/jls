@@ -265,11 +265,6 @@ public class CompletionsTest extends CompletionsBase {
                             }
 
                             @Override
-                            public List<String> packagePrivateTopLevelTypes(String packageName) {
-                                return delegate.packagePrivateTopLevelTypes(packageName);
-                            }
-
-                            @Override
                             public Iterable<Path> search(String query) {
                                 return delegate.search(query);
                             }

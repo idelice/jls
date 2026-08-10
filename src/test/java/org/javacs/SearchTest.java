@@ -4,7 +4,6 @@ import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
 import java.io.IOException;
-import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Set;
@@ -38,13 +37,6 @@ public class SearchTest {
                 .collect(Collectors.toSet());
     }
 
-    private static Set<String> searchFile(URI uri) {
-        return server.documentSymbol(new DocumentSymbolParams(new TextDocumentIdentifier(uri)))
-                .stream()
-                .map(result -> result.name)
-                .collect(Collectors.toSet());
-    }
-
     @Test
     public void all() {
         var all = searchWorkspace("", 100);
@@ -66,37 +58,4 @@ public class SearchTest {
         assertThat(all, hasItem("methodStatic"));
     }
 
-    @Test
-    public void symbolsInFile() {
-        var path = "/org/javacs/example/AutocompleteMemberFixed.java";
-        var all = searchFile(FindResource.uri(path));
-
-        assertThat(
-                all,
-                hasItems(
-                        "methodStatic", "method",
-                        "methodStaticPrivate", "methodPrivate"));
-
-        assertThat(
-                all,
-                hasItems(
-                        "fieldStatic", "field",
-                        "fieldStaticPrivate", "fieldPrivate"));
-    }
-
-    @Test
-    public void explicitConstructor() {
-        var path = "/org/javacs/example/ReferenceConstructor.java";
-        var all = searchFile(FindResource.uri(path));
-
-        assertThat("includes explicit constructor", all, hasItem("ReferenceConstructor"));
-    }
-
-    @Test
-    public void symbolsInRecordFile() {
-        var path = "/org/javacs/example/RecordSymbols.java";
-        var all = searchFile(FindResource.uri(path));
-
-        assertThat(all, hasItems("RecordSymbols", "format"));
-    }
 }

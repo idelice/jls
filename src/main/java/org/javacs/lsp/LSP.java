@@ -311,6 +311,12 @@ public class LSP {
                             server.didChangeWatchedFiles(params);
                             break;
                         }
+                    case "java/renameApplied":
+                        {
+                            var params = gson.fromJson(r.params, DidChangeWatchedFilesParams.class);
+                            server.renameApplied(params);
+                            break;
+                        }
                     case "workspace/symbol":
                         {
                             var params = gson.fromJson(r.params, WorkspaceSymbolParams.class);
@@ -408,13 +414,6 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, ReferenceParams.class);
                             var response = server.findReferences(params);
-                            respond(send, r.id, response);
-                            break;
-                        }
-                    case "textDocument/documentSymbol":
-                        {
-                            var params = gson.fromJson(r.params, DocumentSymbolParams.class);
-                            var response = server.documentSymbol(params);
                             respond(send, r.id, response);
                             break;
                         }

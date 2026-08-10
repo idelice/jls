@@ -18,8 +18,6 @@ public interface CompilerProvider {
         return Set.of();
     }
 
-    List<String> packagePrivateTopLevelTypes(String packageName);
-
     Iterable<Path> search(String query);
 
     Optional<JavaFileObject> findAnywhere(String className);

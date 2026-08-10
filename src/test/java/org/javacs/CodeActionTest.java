@@ -31,16 +31,6 @@ public class CodeActionTest {
     }
 
     @Test
-    public void testConvertToBlock() {
-        assertThat(quickFix("org/javacs/action/TestConvertToBlock.java"), contains("Convert to block"));
-    }
-
-    @Test
-    public void testRemoveDeclaration() {
-        assertThat(quickFix("org/javacs/action/TestRemoveDeclaration.java"), contains("Remove method"));
-    }
-
-    @Test
     public void testUnusedException() {
         assertThat(quickFix("org/javacs/action/TestUnusedException.java"), empty());
     }
@@ -77,11 +67,6 @@ public class CodeActionTest {
     public void testAddImportInAnonymousClass() {
         String[] expect = {"Import 'java.util.List'"};
         assertThat(quickFix("org/javacs/action/TestAddImportAnonymousClass.java"), hasItems(expect));
-    }
-
-    @Test
-    public void testRemoveNotThrown() {
-        assertThat(quickFix("org/javacs/action/TestRemoveNotThrown.java"), contains("Remove 'IOException'"));
     }
 
     @Test

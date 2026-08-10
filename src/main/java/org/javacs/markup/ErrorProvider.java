@@ -12,12 +12,11 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Collections;
 import java.util.Set;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
@@ -107,11 +106,9 @@ public class ErrorProvider {
                 params.diagnostics.addAll(staleWorkspaceAccessorErrors(root));
                 var warningStarted = System.nanoTime();
                 var unused = unusedWarnings(root);
-                var notThrown = notThrownWarnings(root);
                 warningNanos += System.nanoTime() - warningStarted;
                 params.diagnostics.addAll(unused);
-                params.diagnostics.addAll(notThrown);
-                warningDiagnosticsCount += unused.size() + notThrown.size();
+                warningDiagnosticsCount += unused.size();
             }
         }
         return new ErrorReport(
@@ -286,102 +283,14 @@ public class ErrorProvider {
         var result = new ArrayList<Diagnostic>();
         var warnUnused = new WarnUnused(task.trees);
         warnUnused.scan(root, null);
-        var allUnused = warnUnused.notUsed();
+        var unusedDeclarations = warnUnused.notUsed();
 
-        // Phase 1: Identify Lombok private fields and suppress false positives
-        var suppressed = suppressLombokFalsePositives(root, allUnused);
-
-        for (var unusedEl : allUnused) {
-            if (suppressed.contains(unusedEl)) continue;
+        for (var unusedEl : unusedDeclarations) {
             result.add(warnUnused(unusedEl));
         }
 
         result.addAll(unusedImportWarnings(root));
         return result;
-    }
-
-    /** Cross-file reference check: for private fields in @Data/@Getter/@Setter/@Value classes,
-     *  suppress warning if their generated getter/setter is referenced from files that
-     *  import the owning class. */
-    private Set<Element> suppressLombokFalsePositives(CompilationUnitTree root, Set<Element> allUnused) {
-        // Guard: skip if no compiler access or Lombok not on classpath
-        if (compiler == null || !compiler.lombokPresentOnClasspath()) {
-            return Set.of();
-        }
-
-        var trees = task.trees;
-        var suppressed = new HashSet<Element>();
-
-        // Collect Lombok field info
-        record LombokFieldInfo(Element element, Set<String> accessorNames, String ownerType) {}
-        List<LombokFieldInfo> lombokFields = new ArrayList<>();
-
-        for (var unusedEl : allUnused) {
-            // Must be a field (not method/class/param)
-            if (!(unusedEl instanceof VariableElement)) continue;
-            // Enclosing element must be a class (not method — guard against class cast exception)
-            if (!(unusedEl.getEnclosingElement() instanceof TypeElement typeEl)) continue;
-
-            // Get the ClassTree to check annotations
-            var classPath = trees.getPath(typeEl);
-            if (classPath == null || !(classPath.getLeaf() instanceof ClassTree classTree)) continue;
-
-            // Only suppress for @Data, @Getter, @Setter, @Value
-            if (!LombokAnnotations.hasAnnotation(classTree.getModifiers(), "Data", "Getter", "Setter", "Value"))
-                continue;
-
-            // Derive getter/setter names
-            var names = new HashSet<String>();
-            var fieldName = unusedEl.getSimpleName().toString();
-            var cap = Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
-            names.add("get" + cap);
-            names.add("set" + cap);
-            // Check if boolean-like
-            var fieldType = unusedEl.asType();
-            if (fieldType.getKind() == TypeKind.BOOLEAN || "boolean".equals(fieldType.toString())) {
-                names.add("is" + cap);
-            }
-            lombokFields.add(new LombokFieldInfo(unusedEl, names, typeEl.getQualifiedName().toString()));
-        }
-
-        // Phase 2: Scoped reference check
-        if (!lombokFields.isEmpty()) {
-            // Collect unique owner types
-            var ownerTypes =
-                    lombokFields.stream().map(LombokFieldInfo::ownerType).collect(Collectors.toSet());
-
-            // Find files that reference ANY of the owner types
-            Set<Path> referencingFiles = new HashSet<>();
-            for (var ownerType : ownerTypes) {
-                Collections.addAll(referencingFiles, compiler.findTypeReferences(ownerType));
-            }
-
-            // In those files only, check for getter/setter names
-            var currentUri = root.getSourceFile().toUri();
-            var allAccessorNames =
-                    lombokFields.stream()
-                            .flatMap(f -> f.accessorNames().stream())
-                            .collect(Collectors.toSet());
-
-            for (var file : referencingFiles) {
-                if (file.toUri().equals(currentUri)) continue;
-                var content = FileStore.contents(file);
-                for (var name : allAccessorNames) {
-                    // Word-boundary match: "getName" should NOT match "getNameFromDb"
-                    if (Pattern.compile("\\b" + Pattern.quote(name) + "\\b").matcher(content).find()) {
-                        // Find which fields have this accessor name
-                        for (var field : lombokFields) {
-                            if (field.accessorNames().contains(name)) {
-                                suppressed.add(field.element());
-                            }
-                        }
-                    }
-                }
-            }
-
-        }
-
-        return suppressed;
     }
 
     private List<Diagnostic> unusedImportWarnings(CompilationUnitTree root) {
@@ -425,16 +334,6 @@ public class ErrorProvider {
                 d.tags = List.of(DiagnosticTag.Unnecessary);
                 result.add(d);
             }
-        }
-        return result;
-    }
-
-    private List<Diagnostic> notThrownWarnings(CompilationUnitTree root) {
-        var result = new ArrayList<Diagnostic>();
-        var notThrown = new HashMap<TreePath, String>();
-        new WarnNotThrown(task.trees).scan(root, notThrown);
-        for (var location : notThrown.keySet()) {
-            result.add(warnNotThrown(notThrown.get(location), location));
         }
         return result;
     }
@@ -487,21 +386,6 @@ public class ErrorProvider {
         return QUALIFIED_NAME.matcher(message).replaceAll("$3");
     }
 
-    private Diagnostic warnNotThrown(String name, TreePath path) {
-        var trees = task.trees;
-        var pos = trees.getSourcePositions();
-        var root = path.getCompilationUnit();
-        var start = pos.getStartPosition(root, path.getLeaf());
-        var end = pos.getEndPosition(root, path.getLeaf());
-        var d = new Diagnostic();
-        d.message = String.format("'%s' is not thrown in the body of the method", name);
-        d.range = RangeHelper.range(root, start, end);
-        d.code = "unused_throws";
-        d.severity = DiagnosticSeverity.Information;
-        d.tags = List.of(DiagnosticTag.Unnecessary);
-        return d;
-    }
-
     private Diagnostic warnUnused(Element unusedEl) {
         var trees = task.trees;
         var path = trees.getPath(unusedEl);
@@ -538,34 +422,9 @@ public class ErrorProvider {
             end = leafEnd;
         }
         var message = String.format("'%s' is not used", name);
-        String code;
-        int severity;
-        if (leaf instanceof VariableTree) {
-            var parent = path.getParentPath().getLeaf();
-            if (parent instanceof MethodTree) {
-                code = "unused_param";
-                severity = DiagnosticSeverity.Hint;
-            } else if (parent instanceof BlockTree) {
-                code = "unused_local";
-                severity = DiagnosticSeverity.Information;
-            } else if (parent instanceof ClassTree) {
-                code = "unused_field";
-                severity = DiagnosticSeverity.Information;
-            } else {
-                code = "unused_other";
-                severity = DiagnosticSeverity.Hint;
-            }
-        } else if (leaf instanceof MethodTree) {
-            code = "unused_method";
-            severity = DiagnosticSeverity.Information;
-        } else if (leaf instanceof ClassTree) {
-            code = "unused_class";
-            severity = DiagnosticSeverity.Information;
-        } else {
-            code = "unused_other";
-            severity = DiagnosticSeverity.Information;
-        }
-        return lspWarnUnused(severity, code, message, start, end, root);
+        var code = unusedEl.getKind() == ElementKind.FIELD ? "unused_field" : "unused_local";
+        return lspWarnUnused(
+                DiagnosticSeverity.Information, code, message, start, end, root);
     }
 
     private static Diagnostic lspWarnUnused(
