@@ -550,6 +550,7 @@ public final class MavenTooling {
                         command.add("--batch-mode");
                         command.add("-DskipTests");
                         command.add("-Dmaven.compiler.failOnError=false");
+                        command.add("-Dmaven.compiler.proc=none");
                         command.add(phase);
                         command.add(DEPENDENCY_LIST);
                         command.add("-pl");
@@ -561,16 +562,17 @@ public final class MavenTooling {
                         LOG.fine("[maven-exec] command=" + String.join(" ", command)
                                 + " reason=module_dependencies module=" + module.projectPath());
                         var started = Instant.now();
-                        var dependencies = new ProcessBuilder(command)
+                        var exit = new ProcessBuilder(command)
                                 .directory(buildRoot.toFile())
                                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                                .start();
-                        var exit = dependencies.waitFor();
-                        LOG.info("[maven-exec] reason=module_dependencies module="
-                                + module.projectPath() + " scope=" + (testSources ? "test" : "main")
-                                + " phase=" + phase + " exit=" + exit + " took="
-                                + Duration.between(started, Instant.now()).toMillis() + "ms");
+                                .start()
+                                .waitFor();
+                        LOG.info("[maven-exec] reason=module_dependencies module=" + module.projectPath()
+                                + " scope=" + (testSources ? "test" : "main")
+                                + " phase=" + phase
+                                + " exit=" + exit
+                                + " took=" + Duration.between(started, Instant.now()).toMillis() + "ms");
                         if (exit == 0 && Files.exists(output)) {
                             resolved = true;
                             break;
