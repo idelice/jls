@@ -15,11 +15,11 @@ import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.LspPosition;
 import org.javacs.index.IndexedMember;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.InlayHint;
-import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 
 /** Provides parameter-name inlay hints from javac's attributed tree. */
@@ -45,7 +45,6 @@ public class InlayHintProvider {
             var root = task.root(file);
             if (root == null) return List.of();
 
-            var lineMap = root.getLineMap();
             var positions = task.trees.getSourcePositions();
             long fileLength;
             try {
@@ -53,8 +52,10 @@ public class InlayHintProvider {
             } catch (IOException e) {
                 fileLength = Long.MAX_VALUE / 2;
             }
-            var rangeStart = position(lineMap, range.start, 0);
-            var rangeEnd = position(lineMap, range.end, fileLength);
+            var rangeStartOffset = LspPosition.offset(root, range.start);
+            var rangeEndOffset = LspPosition.offset(root, range.end);
+            var rangeStart = rangeStartOffset < 0 ? 0 : rangeStartOffset;
+            var rangeEnd = rangeEndOffset < 0 ? fileLength : rangeEndOffset;
             var hints = new ArrayList<InlayHint>();
 
             new TreePathScanner<Void, Void>() {
@@ -84,19 +85,29 @@ public class InlayHintProvider {
                 private void emitHints(List<? extends ExpressionTree> arguments) {
                     if (arguments.isEmpty()) return;
                     var element = task.trees.getElement(getCurrentPath());
-                    if (!(element instanceof ExecutableElement method)) return;
-
-                    var parameterNames = parameterNames(task, method);
+                    var parameterNames = element instanceof ExecutableElement method
+                            ? parameterNames(task, method)
+                            : constructorParameterNames();
+                    if (parameterNames == null) return;
                     var limit = Math.min(parameterNames.length, arguments.size());
                     for (var i = 0; i < limit; i++) {
                         var name = parameterNames[i];
                         if (name == null || name.matches("arg\\d+")) continue;
                         var start = positions.getStartPosition(root, arguments.get(i));
                         if (start < rangeStart || start >= rangeEnd) continue;
-                        var line = (int) lineMap.getLineNumber(start) - 1;
-                        var column = (int) lineMap.getColumnNumber(start) - 1;
-                        hints.add(new InlayHint(new Position(line, column), name + ":", 2, true));
+                        hints.add(new InlayHint(LspPosition.position(root, start), name + ":", 2, true));
                     }
+                }
+
+                private String[] constructorParameterNames() {
+                    if (!(getCurrentPath().getLeaf() instanceof NewClassTree constructor)) return null;
+                    var typeName = typeIndex.resolveTypeName(constructor.getIdentifier().toString(), root).orElse(null);
+                    if (typeName == null) return null;
+                    var constructors = typeIndex.constructors(typeName).stream()
+                            .filter(candidate -> candidate.parameterNames != null
+                                    && candidate.parameterNames.length == constructor.getArguments().size())
+                            .toList();
+                    return constructors.size() == 1 ? constructors.getFirst().parameterNames : null;
                 }
 
                 private String[] parameterNames(org.javacs.CompileTask compileTask, ExecutableElement method) {
@@ -142,15 +153,6 @@ public class InlayHintProvider {
             }.scan(root, null);
 
             return hints;
-        }
-    }
-
-    private static long position(com.sun.source.tree.LineMap lineMap, Position position, long fallback) {
-        try {
-            var offset = lineMap.getPosition(position.line + 1, position.character + 1);
-            return offset < 0 ? fallback : offset;
-        } catch (ArrayIndexOutOfBoundsException e) {
-            return fallback;
         }
     }
 }

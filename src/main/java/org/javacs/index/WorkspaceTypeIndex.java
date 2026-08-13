@@ -7,6 +7,7 @@ import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreeScanner;
 import java.util.ArrayDeque;
+import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
@@ -138,6 +139,24 @@ public class WorkspaceTypeIndex {
 
     public int size() {
         return typesByQualifiedName.size();
+    }
+
+    public WorkspaceTypeIndex restrictTo(Set<Path> sourceRoots) {
+        if (sourceRoots == null || sourceRoots.isEmpty()) return EMPTY;
+        var types = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
+        for (var entry : typesByQualifiedName.entrySet()) {
+            var source = entry.getValue().sourcePath;
+            if (source != null && sourceRoots.stream().anyMatch(source::startsWith)) {
+                types.put(entry.getKey(), entry.getValue());
+            }
+        }
+        var files = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+        for (var entry : sourceFiles.entrySet()) {
+            if (sourceRoots.stream().anyMatch(entry.getKey()::startsWith)) {
+                files.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return new WorkspaceTypeIndex(types, files);
     }
 
     public boolean containsType(String qualifiedName) {
@@ -558,6 +577,13 @@ public class WorkspaceTypeIndex {
 
     public static WorkspaceTypeIndex fromParseTrees(
             java.util.List<ParseTask> parseTasks, Predicate<String> knownType) {
+        return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true);
+    }
+
+    public static WorkspaceTypeIndex fromParseTrees(
+            java.util.List<ParseTask> parseTasks,
+            BiPredicate<Path, String> knownType,
+            BiPredicate<Path, Path> sourceVisible) {
         // === Phase 1: Scan all roots — collect type names, class trees, and file metadata ===
         var allQualifiedNames = new ObjectOpenHashSet<String>();
         var typeClassTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
@@ -575,10 +601,6 @@ public class WorkspaceTypeIndex {
                     nestedTypesByOwner, typeRoots, sourceFileSnapshots);
         }
 
-        // Resolve against this batch plus types already known by the caller.
-        Predicate<String> workspaceContains =
-                name -> allQualifiedNames.contains(name) || knownType.test(name);
-
         // === Phase 2: Extract direct members from parse trees ===
         var typeDirectMembers =
                 new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
@@ -588,6 +610,12 @@ public class WorkspaceTypeIndex {
         for (var qualifiedName : allQualifiedNames) {
             var classTree = typeClassTrees.get(qualifiedName);
             var root = typeRoots.get(qualifiedName);
+            var sourcePath = typeSources.get(qualifiedName);
+            Predicate<String> workspaceContains = name -> {
+                var declaredSource = typeSources.get(name);
+                return declaredSource != null && sourceVisible.test(sourcePath, declaredSource)
+                        || knownType.test(sourcePath, name);
+            };
             var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
             typeDirectMembers.put(qualifiedName, seen);
 

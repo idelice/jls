@@ -5,7 +5,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
-import org.javacs.lsp.Position;
+import org.javacs.LspPosition;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
 
@@ -33,11 +33,10 @@ public class AddSuppressWarningAnnotation implements Rewrite {
             var startMethod = (int) pos.getStartPosition(task.root(), methodTree);
             var lines = task.root().getLineMap();
             var line = (int) lines.getLineNumber(startMethod);
-            var column = (int) lines.getColumnNumber(startMethod);
             var startLine = (int) lines.getStartPosition(line);
             var indent = " ".repeat(startMethod - startLine);
             var insertText = "@SuppressWarnings(\"unchecked\")\n" + indent;
-            var insertPoint = new Position(line - 1, column - 1);
+            var insertPoint = LspPosition.position(task.root(), startMethod);
             var insert = new TextEdit(new Range(insertPoint, insertPoint), insertText);
             TextEdit[] edits = {insert};
             return Map.of(file, edits);

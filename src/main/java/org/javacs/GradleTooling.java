@@ -121,9 +121,16 @@ public final class GradleTooling {
             modules.put(m.projectPath, new ModuleGraph.ModuleInfo(
                     m.projectPath, Paths.get(m.projectDir),
                     m.sourceDirs == null ? List.of() : m.sourceDirs.stream().map(Paths::get).toList(),
+                    null,
+                    m.classOutputDir == null ? null : Paths.get(m.classOutputDir),
+                    null,
                     m.externalClasspath == null ? List.of() : m.externalClasspath.stream().map(Paths::get).toList(),
                     m.moduleDeps == null ? List.of() : List.copyOf(m.moduleDeps),
-                    m.sourceCompatibility));
+                    m.moduleDeps == null ? List.of() : List.copyOf(m.moduleDeps),
+                    m.sourceCompatibility,
+                    List.of(),
+                    null,
+                    null));
         }
         return new ModuleGraph(Collections.unmodifiableMap(modules));
     }
@@ -134,7 +141,7 @@ public final class GradleTooling {
 
     private static final class GradlewOutput { List<GradlewModule> modules; }
     private static final class GradlewModule {
-        String projectPath, projectDir, sourceCompatibility;
+        String projectPath, projectDir, classOutputDir, sourceCompatibility;
         List<String> sourceDirs, externalClasspath, moduleDeps;
     }
 
@@ -156,6 +163,7 @@ public final class GradleTooling {
             m.projectPath = info.projectPath();
             m.projectDir = info.projectDir().toString();
             m.sourceDirs = info.sourceDirs().stream().map(Path::toString).toList();
+            m.classOutputDir = info.mainOutputDir() == null ? null : info.mainOutputDir().toString();
             m.externalClasspath = info.externalClasspath().stream().map(Path::toString).toList();
             m.moduleDeps = List.copyOf(info.moduleDeps());
             m.sourceCompatibility = info.sourceCompatibility();

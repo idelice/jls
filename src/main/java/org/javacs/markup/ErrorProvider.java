@@ -27,6 +27,7 @@ import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindNameAt;
 import org.javacs.LombokAnnotations;
+import org.javacs.LspPosition;
 import org.javacs.index.IndexedMember;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.*;
@@ -212,7 +213,7 @@ public class ErrorProvider {
             if (d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
             if ("compiler.warn.proc.messager".equals(d.getCode())) continue;
 
-            result.add(lspDiagnostic(d, root.getLineMap()));
+            result.add(lspDiagnostic(d));
         }
         return result;
     }
@@ -339,10 +340,10 @@ public class ErrorProvider {
     }
 
     /**
-     * lspDiagnostic(d, lines) converts d to LSP format, with its position shifted appropriately for the latest version
+     * lspDiagnostic(d) converts d to LSP format, with its position shifted appropriately for the latest version
      * of the file.
      */
-    private Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d, LineMap lines) {
+    private Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d) {
         var start = d.getStartPosition();
         var end = d.getEndPosition();
         var severity = severity(d.getKind());
@@ -537,9 +538,7 @@ public class ErrorProvider {
             return false;
         }
 
-        var offset = root.getLineMap().getPosition(
-                diagnostic.range.start.line + 1,
-                diagnostic.range.start.character + 1);
+        var offset = LspPosition.offset(root, diagnostic.range.start);
         var invocationPath = new FindNameAt(task).scan(root, offset);
         while (invocationPath != null && !(invocationPath.getLeaf() instanceof NewClassTree)) {
             invocationPath = invocationPath.getParentPath();

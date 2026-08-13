@@ -7,9 +7,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Map;
 import org.javacs.CompilerProvider;
+import org.javacs.LspPosition;
 import org.javacs.action.FindMethodDeclarationAt;
-import org.javacs.lsp.Position;
-import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
 
 public class CatchException implements Rewrite {
@@ -106,16 +105,7 @@ public class CatchException implements Rewrite {
                     + innerIndent + "// TODO: handle exception\n"
                     + outerIndent + "}";
 
-            var stmtStartLine = (int) lines.getLineNumber(stmtStart);
-            var stmtStartCol = (int) lines.getColumnNumber(stmtStart);
-            var stmtEndLine = (int) lines.getLineNumber(stmtEnd);
-            var stmtEndCol = (int) lines.getColumnNumber(stmtEnd);
-
-            var rangeStart = new Position(stmtStartLine - 1, stmtStartCol - 1);
-            var rangeEnd = new Position(stmtEndLine - 1, stmtEndCol - 1);
-            var range = new Range(rangeStart, rangeEnd);
-
-            var edit = new TextEdit(range, replacement);
+            var edit = new TextEdit(LspPosition.range(root, stmtStart, stmtEnd), replacement);
             return Map.of(file, new TextEdit[] {edit});
         }
     }

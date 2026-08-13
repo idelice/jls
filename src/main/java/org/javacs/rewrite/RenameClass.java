@@ -10,8 +10,7 @@ import java.util.function.Consumer;
 import java.util.logging.Logger;
 import javax.lang.model.element.TypeElement;
 import org.javacs.CompilerProvider;
-import org.javacs.lsp.Position;
-import org.javacs.lsp.Range;
+import org.javacs.LspPosition;
 import org.javacs.lsp.TextEdit;
 
 public class RenameClass implements Rewrite {
@@ -250,7 +249,6 @@ public class RenameClass implements Rewrite {
 
         for (var p : paths) {
             var root = p.getCompilationUnit();
-            var lines = root.getLineMap();
             var leaf = p.getLeaf();
 
             long nameStart, nameEnd;
@@ -277,15 +275,8 @@ public class RenameClass implements Rewrite {
 
             if (nameStart < 0 || nameEnd <= nameStart) continue;
 
-            var startLine = (int) lines.getLineNumber(nameStart);
-            var startCol = (int) lines.getColumnNumber(nameStart);
-            var endLine = (int) lines.getLineNumber(nameEnd);
-            var endCol = (int) lines.getColumnNumber(nameEnd);
-
             edits.add(new TextEdit(
-                    new Range(
-                            new Position(startLine - 1, startCol - 1),
-                            new Position(endLine - 1, endCol - 1)),
+                    LspPosition.range(root, nameStart, nameEnd),
                     newName));
         }
 

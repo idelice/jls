@@ -1,13 +1,17 @@
 package org.javacs.provider;
+
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
@@ -24,6 +28,8 @@ import org.javacs.navigation.NavigationHelper;
 
 public class ReferenceProvider {
     private final CompilerProvider compiler;
+    private final Function<Path, CompilerProvider> compilerForFile;
+    private final BiPredicate<Path, Path> candidateAllowed;
     private final Path file;
     private final int line, column;
 
@@ -32,7 +38,19 @@ public class ReferenceProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
+        this(compiler, file, line, column, __ -> compiler, (__, ___) -> true);
+    }
+
+    public ReferenceProvider(
+            CompilerProvider compiler,
+            Path file,
+            int line,
+            int column,
+            Function<Path, CompilerProvider> compilerForFile,
+            BiPredicate<Path, Path> candidateAllowed) {
         this.compiler = compiler;
+        this.compilerForFile = compilerForFile;
+        this.candidateAllowed = candidateAllowed;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -50,6 +68,10 @@ public class ReferenceProvider {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
+                var declarationPath = task.trees.getPath(parentClass);
+                var declaration = declarationPath == null
+                        ? compiler.findTypeDeclaration(className)
+                        : Path.of(declarationPath.getCompilationUnit().getSourceFile().toUri());
                 LOG.fine(String.format("[ref] isMember kind=%s name=%s in=%s", element.getKind(), memberName, className));
                 if (memberName.equals("<init>")) {
                     memberName = parentClass.getSimpleName().toString();
@@ -65,7 +87,7 @@ public class ReferenceProvider {
                     LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
                 task.close();
-                return findMemberReferences(className, memberName);
+                return findMemberReferences(className, memberName, declaration);
             }
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(task);
@@ -91,26 +113,43 @@ public class ReferenceProvider {
         var files = compiler.findTypeReferences(className);
         LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d", className, files.length));
         if (files.length == 0) return List.of();
-        try (var task = compiler.compileFresh(files)) {
-            return findReferences(task);
-        }
+        return findReferences(files, compiler.findTypeDeclaration(className));
     }
 
-    private List<Location> findMemberReferences(String className, String memberName) {
+    private List<Location> findMemberReferences(String className, String memberName, Path declaration) {
         var files = compiler.findMemberReferences(className, memberName);
         LOG.fine(String.format(
                 "[ref] member_scan owner=%s name=%s candidates=%d", className, memberName, files.length));
         if (files.length == 0) return List.of();
-        try (var task = compiler.compileFresh(files)) {
-            return findReferences(task);
+        return findReferences(files, declaration);
+    }
+
+    private List<Location> findReferences(Path[] files, Path declaration) {
+        var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
+        for (var candidate : files) {
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            var candidateCompiler = compilerForFile.apply(candidate);
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>())
+                    .add(candidate);
         }
+        var locations = new LinkedHashMap<String, Location>();
+        for (var entry : groups.entrySet()) {
+            entry.getValue().add(file);
+            try (var task = entry.getKey().compileFresh(entry.getValue().toArray(Path[]::new))) {
+                for (var location : findReferences(task)) {
+                    locations.put(location.uri + ":" + location.range, location);
+                }
+            }
+        }
+        return new ArrayList<>(locations.values());
     }
 
     private List<Location> findReferences(CompileTask task) {
         var element = NavigationHelper.findElement(task, file, line, column);
         var paths = new ArrayList<TreePath>();
         for (var root : task.roots) {
-                new FindReferences(task, element).scan(root, paths);
+            new FindReferences(task, element).scan(root, paths);
         }
         var locations = new ArrayList<Location>();
         for (var p : paths) {
@@ -194,26 +233,41 @@ public class ReferenceProvider {
                     className, names, System.currentTimeMillis() - start));
             return List.of();
         }
-        try (var task = compiler.compileFresh(files.toArray(Path[]::new))) {
-            var paths = new ArrayList<TreePath>();
-            for (var root : task.roots) {
-                new FindLombokReferences(task, names, className).scan(root, paths);
-            }
-            var locations = new ArrayList<Location>();
-            for (var p : paths) {
-                locations.add(FindHelper.location(task, p));
-            }
-            var errors = task.diagnostics.stream().filter(d -> d.getKind() == Diagnostic.Kind.ERROR).count();
-            LOG.fine(String.format(
-                    "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d total=%dms",
-                    className,
-                    names,
-                    files.size(),
-                    task.roots.size(),
-                    errors,
-                    locations.size(),
-                    System.currentTimeMillis() - start));
-            return locations;
+        var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
+        var declaration = compiler.findTypeDeclaration(className);
+        for (var candidate : files) {
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            var candidateCompiler = compilerForFile.apply(candidate);
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>())
+                    .add(candidate);
         }
+        var locations = new LinkedHashMap<String, Location>();
+        var roots = 0;
+        long errors = 0;
+        for (var entry : groups.entrySet()) {
+            try (var task = entry.getKey().compileFresh(entry.getValue().toArray(Path[]::new))) {
+                var paths = new ArrayList<TreePath>();
+                for (var root : task.roots) {
+                    new FindLombokReferences(task, names, className).scan(root, paths);
+                }
+                for (var path : paths) {
+                    var location = FindHelper.location(task, path);
+                    locations.put(location.uri + ":" + location.range, location);
+                }
+                roots += task.roots.size();
+                errors += task.diagnostics.stream().filter(d -> d.getKind() == Diagnostic.Kind.ERROR).count();
+            }
+        }
+        LOG.fine(String.format(
+                "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d total=%dms",
+                className,
+                names,
+                files.size(),
+                roots,
+                errors,
+                locations.size(),
+                System.currentTimeMillis() - start));
+        return new ArrayList<>(locations.values());
     }
 }

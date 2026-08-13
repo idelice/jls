@@ -6,9 +6,8 @@ import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.Map;
 import org.javacs.CompilerProvider;
+import org.javacs.LspPosition;
 import org.javacs.ParseTask;
-import org.javacs.lsp.Position;
-import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
 
 public class ConvertVariableToStatement implements Rewrite {
@@ -25,7 +24,6 @@ public class ConvertVariableToStatement implements Rewrite {
         var task = compiler.parse(file);
         var trees = Trees.instance(task.task());
         var pos = trees.getSourcePositions();
-        var lines = task.root().getLineMap();
         var variable = findVariable(task, position);
         if (variable == null) {
             return CANCELLED;
@@ -39,14 +37,7 @@ public class ConvertVariableToStatement implements Rewrite {
         }
         var start = pos.getStartPosition(task.root(), variable);
         var end = pos.getStartPosition(task.root(), expression);
-        var startLine = (int) lines.getLineNumber(start);
-        var startColumn = (int) lines.getColumnNumber(start);
-        var startPos = new Position(startLine - 1, startColumn - 1);
-        var endLine = (int) lines.getLineNumber(end);
-        var endColumn = (int) lines.getColumnNumber(end);
-        var endPos = new Position(endLine - 1, endColumn - 1);
-        var delete = new Range(startPos, endPos);
-        var edit = new TextEdit(delete, "");
+        var edit = new TextEdit(LspPosition.range(task.root(), start, end), "");
         TextEdit[] edits = {edit};
         return Map.of(file, edits);
     }
