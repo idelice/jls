@@ -46,10 +46,6 @@ public final class MavenTooling {
 
     private MavenTooling() {}
 
-    // =========================================================================
-    // Records
-    // =========================================================================
-
     static final class CompilerArgs {
         final List<String> args;
         final String source;
@@ -96,6 +92,42 @@ public final class MavenTooling {
             String artifactId,
             String coordinates) {}
     private record MavenCacheInputs(List<FileFingerprint> pomInputs, FileFingerprint settings) {}
+
+    // fingerprint-once-per-generation. Computed at compiler creation, reused
+    // for all module cache lookups in that generation. Avoids re-scanning all pom files
+    // on every cache check
+    private static volatile MavenCacheInputs cachedInputsSnapshot;
+    private static volatile Path cachedInputsWorkspaceRoot;
+
+    /**
+     * Compute and cache the reactor fingerprint for this compiler generation.
+     * Call this once at compiler creation time. All subsequent cache lookups
+     * reuse this snapshot until the next generation.
+     */
+    static void refreshCacheInputsSnapshot(Path workspaceRoot, Path mavenHome) {
+        var started = Instant.now();
+        cachedInputsWorkspaceRoot = normalizePath(workspaceRoot);
+        cachedInputsSnapshot = cacheInputs(cachedInputsWorkspaceRoot, mavenHome);
+        LOG.info("[maven-cache] fingerprint snapshot refreshed took="
+                + Duration.between(started, Instant.now()).toMillis() + "ms"
+                + " poms=" + cachedInputsSnapshot.pomInputs().size());
+    }
+
+    /** Invalidate the snapshot (forces recomputation on next access). */
+    static void invalidateCacheInputsSnapshot() {
+        cachedInputsSnapshot = null;
+        cachedInputsWorkspaceRoot = null;
+    }
+
+    private static MavenCacheInputs getCacheInputs(Path workspaceRoot, Path mavenHome) {
+        var snapshot = cachedInputsSnapshot;
+        var snapshotRoot = cachedInputsWorkspaceRoot;
+        if (snapshot != null && snapshotRoot != null && snapshotRoot.equals(normalizePath(workspaceRoot))) {
+            return snapshot;
+        }
+        // Fallback: compute on the fly (shouldn't happen if refreshCacheInputsSnapshot was called)
+        return cacheInputs(workspaceRoot, mavenHome);
+    }
     static final record MavenDependencies(
             Set<Path> classpath, Set<Path> sources, Set<Path> sourceRoots) {
         MavenDependencies(Set<Path> classpath, Set<Path> sources) {
@@ -479,12 +511,13 @@ public final class MavenTooling {
             var workingDirectory = pomXml.toAbsolutePath().getParent().toFile();
             LOG.fine("[maven-exec] command=" + String.join(" ", cmd) + " reason=dependency_resolution workingDir=" + workingDirectory);
             var processStarted = Instant.now();
-            var process = new ProcessBuilder()
+            var process = trackProcess(new ProcessBuilder()
                     .command(cmd).directory(workingDirectory)
                     .redirectError(ProcessBuilder.Redirect.INHERIT)
-                    .redirectOutput(output.toFile()).start();
+                    .redirectOutput(output.toFile()).start());
 
-            var result = process.waitFor();
+            int result;
+            try { result = process.waitFor(); } finally { untrackProcess(process); }
             LOG.info("[maven-exec] reason=dependency_resolution exit=" + result + " took="
                     + Duration.between(processStarted, Instant.now()).toMillis() + "ms");
             if (result != 0) {
@@ -562,12 +595,13 @@ public final class MavenTooling {
                         LOG.fine("[maven-exec] command=" + String.join(" ", command)
                                 + " reason=module_dependencies module=" + module.projectPath());
                         var started = Instant.now();
-                        var exit = new ProcessBuilder(command)
+                        var process = trackProcess(new ProcessBuilder(command)
                                 .directory(buildRoot.toFile())
                                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                                .start()
-                                .waitFor();
+                                .start());
+                        int exit;
+                        try { exit = process.waitFor(); } finally { untrackProcess(process); }
                         LOG.info("[maven-exec] reason=module_dependencies module=" + module.projectPath()
                                 + " scope=" + (testSources ? "test" : "main")
                                 + " phase=" + phase
@@ -660,12 +694,13 @@ public final class MavenTooling {
         LOG.fine("[maven-exec] command=" + String.join(" ", command)
                 + " reason=missing_module_outputs module=" + module.projectPath());
         var started = Instant.now();
-        var process = new ProcessBuilder(command)
+        var process = trackProcess(new ProcessBuilder(command)
                 .directory(buildRoot.toFile())
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .start();
-        var exit = process.waitFor();
+                .start());
+        int exit;
+        try { exit = process.waitFor(); } finally { untrackProcess(process); }
         LOG.info("[maven-exec] reason=missing_module_outputs module="
                 + module.projectPath() + " exit=" + exit + " took="
                 + Duration.between(started, Instant.now()).toMillis() + "ms");
@@ -735,7 +770,7 @@ public final class MavenTooling {
             LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_entry");
             return null;
         }
-        var inputs = cacheInputs(workspaceRoot, mavenHome);
+        var inputs = getCacheInputs(workspaceRoot, mavenHome);
         if (!Objects.equals(entry.pomInputs(), inputs.pomInputs())
                 || !Objects.equals(entry.settings(), inputs.settings())) {
             LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=fingerprint_mismatch");
@@ -752,7 +787,7 @@ public final class MavenTooling {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cache = readCacheFile(workspaceCacheFile(workspaceRoot, cacheHome));
         if (cache == null || cache.version() != CACHE_VERSION || cache.compilerLevel() == null || cache.moduleGraph() == null) return null;
-        var inputs = cacheInputs(workspaceRoot, mavenHome);
+        var inputs = getCacheInputs(workspaceRoot, mavenHome);
         if (!Objects.equals(cache.moduleGraph().pomInputs(), inputs.pomInputs())
                 || !Objects.equals(cache.moduleGraph().settings(), inputs.settings())
                 || !Objects.equals(cache.compilerLevel().pomInputs(), inputs.pomInputs())
@@ -792,7 +827,7 @@ public final class MavenTooling {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome);
         var cache = readCacheFile(cacheFile);
-        var inputs = cacheInputs(workspaceRoot, mavenHome);
+        var inputs = getCacheInputs(workspaceRoot, mavenHome);
         var modules = model.graph().modules().values().stream()
                 .map(module -> new CachedMavenModule(
                         module.projectPath(),
@@ -844,7 +879,7 @@ public final class MavenTooling {
         var cache = readCacheFile(cacheFile);
         var entries = new LinkedHashMap<String, MavenInferenceCacheEntry>();
         if (cache != null && cache.entries() != null) entries.putAll(cache.entries());
-        var inputs = cacheInputs(workspaceRoot, mavenHome);
+        var inputs = getCacheInputs(workspaceRoot, mavenHome);
         for (var dependencySet : dependencies.entrySet()) {
             var dependencyStrings = dependencySet.getValue().stream()
                     .map(path -> path.toAbsolutePath().normalize().toString()).sorted().toList();
@@ -992,11 +1027,12 @@ public final class MavenTooling {
             var workingDir = normalizePath(pomXml).getParent().toFile();
             LOG.fine("[maven-exec] command=" + String.join(" ", command) + " reason=effective_pom workingDir=" + workingDir);
             var processStarted = Instant.now();
-            var process = new ProcessBuilder()
+            var process = trackProcess(new ProcessBuilder()
                     .command(command).directory(workingDir)
                     .redirectError(ProcessBuilder.Redirect.INHERIT)
-                    .redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
-            var result = process.waitFor();
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD).start());
+            int result;
+            try { result = process.waitFor(); } finally { untrackProcess(process); }
             LOG.info("[maven-exec] reason=effective_pom exit=" + result + " took="
                     + Duration.between(processStarted, Instant.now()).toMillis() + "ms");
             if (result != 0 || !Files.exists(output)) {
@@ -1059,17 +1095,105 @@ public final class MavenTooling {
         return false;
     }
 
+    // warnings queued during Maven resolution for the client to display.
+    // Flushed by JavaLanguageServer after createCompilers().
+    private static final List<String> pendingWarnings = Collections.synchronizedList(new ArrayList<>());
+
+    // Track active Maven subprocesses for cleanup on shutdown
+    private static final List<Process> activeProcesses = Collections.synchronizedList(new ArrayList<>());
+
+    static List<String> flushWarnings() {
+        var copy = new ArrayList<>(pendingWarnings);
+        pendingWarnings.clear();
+        return copy;
+    }
+
+    /** Kill all tracked Maven subprocesses. Call on server shutdown. */
+    static void destroyAllProcesses() {
+        var snapshot = new ArrayList<>(activeProcesses);
+        activeProcesses.clear();
+        for (var process : snapshot) {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                LOG.info("[maven] killed orphaned subprocess pid=" + process.pid());
+            }
+        }
+    }
+
+    static Process trackProcess(Process process) {
+        activeProcesses.add(process);
+        return process;
+    }
+
+    static void untrackProcess(Process process) {
+        activeProcesses.remove(process);
+    }
+
     static String findMvnCommand(Path projectDir, Map<String, String> envVars) {
+        // 1. Prefer mvnd (Maven Daemon) — dramatically faster for large reactors
+        var mvnd = findMvnd(envVars);
+        if (mvnd != null) {
+            LOG.info("[maven] using mvnd: " + mvnd);
+            return mvnd;
+        }
+
+        // 2. Try project wrapper (mvnw)
         var wrapperName = File.separatorChar == '\\' ? "mvnw.cmd" : "mvnw";
         for (var dir = projectDir; dir != null; dir = dir.getParent()) {
             var candidate = dir.resolve(wrapperName);
             if (Files.isRegularFile(candidate)) {
+                if (!Files.isExecutable(candidate)) {
+                    try {
+                        var perms = Files.getPosixFilePermissions(candidate);
+                        perms.add(java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE);
+                        Files.setPosixFilePermissions(candidate, perms);
+                        LOG.info("[maven] set executable bit on wrapper: " + candidate);
+                    } catch (IOException | UnsupportedOperationException e) {
+                        LOG.warning("[maven] wrapper not executable and chmod failed: " + candidate + " — " + e.getMessage());
+                        continue;
+                    }
+                }
+                if (!validateWrapper(candidate)) {
+                    var msg = "Maven wrapper '" + candidate + "' is broken (missing .mvn/wrapper/ files?). Falling back to system mvn. Fix: run 'mvn -N wrapper:wrapper' in your project.";
+                    LOG.warning("[maven] " + msg);
+                    pendingWarnings.add(msg);
+                    break;
+                }
                 LOG.fine("[maven] using wrapper: " + candidate);
                 return candidate.toString();
             }
         }
-        LOG.fine("[maven] using system mvn (no wrapper found)");
+
+        // 3. System mvn
+        LOG.fine("[maven] using system mvn");
         return getMvnCommand(envVars);
+    }
+
+    private static String findMvnd(Map<String, String> envVars) {
+        var name = File.separatorChar == '\\' ? "mvnd.cmd" : "mvnd";
+        // 1. MVND_HOME env var (canonical, set by sdkman and manual installs)
+        var mvndHome = envVars.getOrDefault("MVND_HOME", System.getenv("MVND_HOME"));
+        if (mvndHome != null && !mvndHome.isBlank()) {
+            var candidate = Path.of(mvndHome, "bin", name);
+            if (Files.isExecutable(candidate)) return candidate.toString();
+        }
+        // 2. PATH (covers brew, macports, manual, sdkman, any install that modifies PATH)
+        return findExecutableOnPath(name, envVars);
+    }
+
+    private static boolean validateWrapper(Path wrapper) {
+        try {
+            var process = new ProcessBuilder()
+                    .command(wrapper.toString(), "--version")
+                    .directory(wrapper.getParent().toFile())
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+            var exit = process.waitFor();
+            return exit == 0;
+        } catch (IOException | InterruptedException e) {
+            return false;
+        }
     }
 
     static String getMvnCommand(Map<String, String> envVars) {

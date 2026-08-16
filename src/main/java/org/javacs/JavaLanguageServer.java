@@ -18,7 +18,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Predicate;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
 import javax.tools.JavaFileObject;
@@ -124,6 +123,11 @@ class JavaLanguageServer extends LanguageServer {
     private List<String> configuredUserCompilerArgs = List.of();
     private volatile Path activeModuleFile;
 
+    // Background executor for async Maven module pre-resolution
+    private final java.util.concurrent.ExecutorService mavenPreResolveExecutor =
+            Executors.newSingleThreadExecutor(
+                    Thread.ofPlatform().daemon().name("javacs-maven-preresolve").factory());
+
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
     private ModuleGraph moduleGraph = ModuleGraph.EMPTY;
@@ -203,7 +207,15 @@ class JavaLanguageServer extends LanguageServer {
         if (existing != null) return existing.compiler;
         var test = key.endsWith("#test");
         var started = Instant.now();
-        var dependencies = inferredConfig.mavenModuleDependencies(module, test);
+        var progressToken = beginWorkDoneProgress(
+                "Resolving module",
+                "Resolving classpath for " + module.projectPath());
+        MavenTooling.MavenDependencies dependencies;
+        try {
+            dependencies = inferredConfig.mavenModuleDependencies(module, test);
+        } finally {
+            endWorkDoneProgress(progressToken, "Dependencies resolved");
+        }
         var args = new ArrayList<>(configuredUserCompilerArgs);
         if (!hasExplicitJavaLevelOverride(args)) args.addAll(module.compilerArgs());
         var next = new JavaCompilerService(
@@ -224,7 +236,57 @@ class JavaLanguageServer extends LanguageServer {
                 "[maven] compiler_ready module=%s scope=%s classpath=%d source_roots=%d took=%dms",
                 module.projectPath(), test ? "test" : "main", dependencies.classpath().size(),
                 sourceRoots.size(), Duration.between(started, Instant.now()).toMillis()));
+        // Async pre-resolve direct dependency modules so cross-module jumps are instant
+        preResolveDependencyModules(module, test);
         return next;
+    }
+
+    /**
+     * Async pre-resolve direct dependency modules so that cross-module navigation
+     * (go-to-definition, find-references) doesn't block on Maven when the user jumps.
+     */
+    private void preResolveDependencyModules(ModuleGraph.ModuleInfo module, boolean test) {
+        var deps = test ? module.testModuleDeps() : module.moduleDeps();
+        if (deps == null || deps.isEmpty()) return;
+        var unresolvedDeps = new ArrayList<String>();
+        for (var dep : deps) {
+            var depModule = moduleGraph.modules().get(dep);
+            if (depModule == null) continue;
+            if (depModule.sourceDirs().isEmpty()) continue;
+            var depKey = depModule.projectPath() + (test ? "#test" : "#main");
+            if (mavenModuleCompilers.containsKey(depKey)) continue;
+            unresolvedDeps.add(dep);
+        }
+        if (unresolvedDeps.isEmpty()) return;
+        LOG.info("[maven] pre-resolving " + unresolvedDeps.size() + " dependency modules in background: " + unresolvedDeps);
+        mavenPreResolveExecutor.submit(() -> {
+            for (var dep : unresolvedDeps) {
+                var depModule = moduleGraph.modules().get(dep);
+                if (depModule == null) continue;
+                var depKey = depModule.projectPath() + (test ? "#test" : "#main");
+                if (mavenModuleCompilers.containsKey(depKey)) continue;
+                try {
+                    var started = Instant.now();
+                    var dependencies = inferredConfig.mavenModuleDependencies(depModule, test);
+                    var args = new ArrayList<>(configuredUserCompilerArgs);
+                    if (!hasExplicitJavaLevelOverride(args)) args.addAll(depModule.compilerArgs());
+                    var depCompiler = new JavaCompilerService(
+                            dependencies.classpath(), dependencies.sources(), configuredAddExports, args);
+                    depCompiler.setModuleGraph(moduleGraph);
+                    var depSourceRoots = dependencies.sourceRoots();
+                    depCompiler.setSourceRoots(depSourceRoots);
+                    mavenModuleCompilers.putIfAbsent(
+                            depKey, new ModuleCompiler(depCompiler, new ExternalBinaryTypeIndex(depCompiler), depSourceRoots));
+                    LOG.info(String.format(
+                            "[maven] pre-resolved module=%s scope=%s classpath=%d took=%dms",
+                            depModule.projectPath(), test ? "test" : "main",
+                            dependencies.classpath().size(),
+                            Duration.between(started, Instant.now()).toMillis()));
+                } catch (Exception e) {
+                    LOG.warning("[maven] pre-resolve failed for " + dep + ": " + e.getMessage());
+                }
+            }
+        });
     }
 
     private TypeIndexRouter typeIndexFor(Path file) {
@@ -358,6 +420,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private synchronized void recreateCompilersAndRefreshState(String trigger) {
         var started = Instant.now();
+        MavenTooling.invalidateCacheInputsSnapshot();
         completionIndexScheduler.cancel(trigger);
         try {
             createCompilers();
@@ -620,6 +683,14 @@ class JavaLanguageServer extends LanguageServer {
         compiler = new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs);
         compiler.setModuleGraph(moduleGraph);
 
+        // Flush any warnings from Maven resolution (e.g. broken wrapper) to the user
+        for (var warning : MavenTooling.flushWarnings()) {
+            var params = new org.javacs.lsp.ShowMessageParams();
+            params.type = org.javacs.lsp.MessageType.Warning;
+            params.message = warning;
+            client.showMessage(params);
+        }
+
         LOG.info(String.format(
                 "[perf] create_compilers classpath=%d docpath=%d extra_args=%d add_exports=%d settings=%dms inference=%dms total=%dms",
                 classPath.size(),
@@ -843,6 +914,7 @@ class JavaLanguageServer extends LanguageServer {
         c.addProperty("referencesProvider", true);
         c.addProperty("definitionProvider", true);
         c.addProperty("workspaceSymbolProvider", true);
+        c.addProperty("documentSymbolProvider", true);
         c.addProperty("documentFormattingProvider", true);
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
@@ -912,6 +984,8 @@ class JavaLanguageServer extends LanguageServer {
             pendingCompletionIndexTrigger = null;
         }
         completionIndexExecutor.shutdownNow();
+        mavenPreResolveExecutor.shutdownNow();
+        MavenTooling.destroyAllProcesses();
         CacheAudit.logSummary(LOG);
     }
 
@@ -922,6 +996,14 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<SymbolInformation> workspaceSymbols(WorkspaceSymbolParams params) {
         return new SymbolProvider(getOrCreateCompiler()).findSymbols(params.query, 50);
+    }
+
+    @Override
+    public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
+        if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
+        if (compiler == null) return List.of();
+        var file = Paths.get(params.textDocument.uri);
+        return new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
     }
 
     @Override
@@ -1096,7 +1178,6 @@ class JavaLanguageServer extends LanguageServer {
         var line = params.position.line + 1;
         var column = params.position.character + 1;
         ensureTypeIndexReady("signatureBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
-        var snapshot = completionSnapshotRef.get();
         var signatureProvider = new SignatureProvider(compilerFor(file), typeIndexFor(file)).signatureHelp(file, line, column);
         if (signatureProvider == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(signatureProvider);

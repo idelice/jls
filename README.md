@@ -53,7 +53,7 @@ require('lspconfig').jls.setup({
 - **Lombok** — @Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.
 - **Private repositories** — Maven authentication inherited from `~/.m2/settings.xml`
 - **JAR navigation** — go-to-definition into dependency source JARs
-- **Multi Module Gradle Support** - natively support multi module gradle projects
+- **Multi Module Gradle/Maven Support (BETA)**
 
 ### Code actions
 
@@ -140,6 +140,20 @@ export JLS_JVM_OPTS="-Xmx1g -Xms256m"
 ```
 
 The nvim-jls client exposes a `jvm_args` config field that sets this automatically.
+
+## Multi-Module Maven Projects
+
+For large reactors (50+ modules), install the [Maven Daemon](https://github.com/apache/maven-mvnd):
+
+```bash
+sdk install mvnd
+```
+
+JLS auto-detects `mvnd` on PATH and uses it instead of `mvn`/`mvnw`. The daemon keeps Maven warm in memory, reducing module resolution from seconds to milliseconds after the first run.
+
+**Limitations for very large reactors (500+ modules):**
+- Direct dependency modules are pre-resolved in background after opening a file
+- The server does not eagerly resolve all modules — only those you navigate to
 
 ## Debugging
 

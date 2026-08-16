@@ -178,6 +178,8 @@ class InferConfig {
                 var workspace = MavenTooling.resolveWorkspace(
                         workspaceRoot, buildRoot(), mavenHome, envVars);
                 buildRoot = workspace.buildRoot();
+                // fingerprint once per compiler generation, not per cache lookup
+                MavenTooling.refreshCacheInputsSnapshot(buildRoot, mavenHome);
                 yield workspace.graph();
             }
             default -> ModuleGraph.EMPTY;
