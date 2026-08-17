@@ -574,9 +574,7 @@ public final class MavenTooling {
                 var mainClasspath = new LinkedHashSet<Path>();
                 var testClasspath = new LinkedHashSet<Path>();
                 try {
-                    var resolved = false;
-                    var phases = testSources ? List.of("test-compile") : List.of("compile", "test-compile");
-                    for (var phase : phases) {
+                        var resolved = false;
                         deleteIfExists(output);
                         var command = new ArrayList<String>();
                         command.add(mvn);
@@ -584,7 +582,6 @@ public final class MavenTooling {
                         command.add("-DskipTests");
                         command.add("-Dmaven.compiler.failOnError=false");
                         command.add("-Dmaven.compiler.proc=none");
-                        command.add(phase);
                         command.add(DEPENDENCY_LIST);
                         command.add("-pl");
                         command.add(selector);
@@ -592,8 +589,10 @@ public final class MavenTooling {
                         command.add("-DincludeScope=test");
                         command.add("-DoutputAbsoluteArtifactFilename=true");
                         command.add("-DoutputFile=" + output);
+
                         LOG.fine("[maven-exec] command=" + String.join(" ", command)
                                 + " reason=module_dependencies module=" + module.projectPath());
+
                         var started = Instant.now();
                         var process = trackProcess(new ProcessBuilder(command)
                                 .directory(buildRoot.toFile())
@@ -602,16 +601,14 @@ public final class MavenTooling {
                                 .start());
                         int exit;
                         try { exit = process.waitFor(); } finally { untrackProcess(process); }
+
                         LOG.info("[maven-exec] reason=module_dependencies module=" + module.projectPath()
                                 + " scope=" + (testSources ? "test" : "main")
-                                + " phase=" + phase
                                 + " exit=" + exit
                                 + " took=" + Duration.between(started, Instant.now()).toMillis() + "ms");
                         if (exit == 0 && Files.exists(output)) {
                             resolved = true;
-                            break;
                         }
-                    }
                     if (!resolved) {
                         throw new RuntimeException(
                                 "Maven dependency resolution failed for " + module.projectPath());
