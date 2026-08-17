@@ -3,6 +3,8 @@ package org.javacs.markup;
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import java.io.IOException;
+import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
 import java.net.URI;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -21,6 +23,7 @@ import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeKind;
+import javax.lang.model.type.TypeMirror;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
@@ -492,9 +495,9 @@ public class ErrorProvider {
         var className = qualifiedClassName(root);
         var classFile = compiler.findClassFile(className);
         if (classFile.isEmpty()) return diagnostics;
-        java.lang.classfile.ClassModel model;
+        ClassModel model;
         try {
-            model = java.lang.classfile.ClassFile.of().parse(classFile.get());
+            model = ClassFile.of().parse(classFile.get());
         } catch (Exception e) {
             return diagnostics;
         }
@@ -561,7 +564,7 @@ public class ErrorProvider {
             Diagnostic diagnostic,
             CompilationUnitTree root,
             String className,
-            java.lang.classfile.ClassModel model) {
+            ClassModel model) {
         if (diagnostic.message == null
                 || !diagnostic.message.startsWith("constructor " + TypeNames.simpleName(className) + " ")
                 || diagnostic.range == null) {
@@ -594,7 +597,7 @@ public class ErrorProvider {
                 continue;
             }
 
-            var parameterTypes = new ArrayList<javax.lang.model.type.TypeMirror>();
+            var parameterTypes = new ArrayList<TypeMirror>();
             var acceptsArguments = true;
             for (var i = 0; i < constructor.parameterNames.length; i++) {
                 var field = fields.get(constructor.parameterNames[i]);

@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
+import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -569,7 +570,7 @@ class JavaCompilerService implements CompilerProvider {
                     }
                 }
             } else if (root.toString().endsWith(".jar") && Files.exists(root)) {
-                try (var jar = new java.util.jar.JarFile(root.toFile())) {
+                try (var jar = new JarFile(root.toFile())) {
                     var entry = jar.getEntry(relative);
                     if (entry != null) {
                         try (var in = jar.getInputStream(entry)) {
