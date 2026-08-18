@@ -1162,7 +1162,6 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
-        ensureTypeIndexReady("hoverBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var content = new HoverProvider(compilerFor(file)).hover(file, line, column);
         if (content == null) {
             return Optional.empty();
@@ -1177,7 +1176,6 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
-        ensureTypeIndexReady("signatureBootstrap", NAVIGATION_BOOTSTRAP_WAIT_MS, true);
         var signatureProvider = new SignatureProvider(compilerFor(file), typeIndexFor(file)).signatureHelp(file, line, column);
         if (signatureProvider == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(signatureProvider);
