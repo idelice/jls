@@ -527,9 +527,10 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Path[] findMemberReferences(String className, String memberName) {
+        var pkg = packageName(className);
         var candidates = new ArrayList<Path>();
         for (var f : FileStore.all()) {
-            if (containsWord(f, memberName)) {
+            if (containsWord(f, memberName) && (pkg.equals(FileStore.packageName(f)) || containsImport(f, className))) {
                 candidates.add(f);
             }
         }

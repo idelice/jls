@@ -6,6 +6,7 @@ import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -15,10 +16,12 @@ import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.lsp.Location;
@@ -30,6 +33,7 @@ public class ReferenceProvider {
     private final CompilerProvider compiler;
     private final Function<Path, CompilerProvider> compilerForFile;
     private final BiPredicate<Path, Path> candidateAllowed;
+    private final java.util.function.Consumer<Path[]> batchResolver;
     private final Path file;
     private final int line, column;
 
@@ -38,7 +42,7 @@ public class ReferenceProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, file, line, column, __ -> compiler, (__, ___) -> true);
+        this(compiler, file, line, column, __ -> compiler, (__, ___) -> true, __ -> {});
     }
 
     public ReferenceProvider(
@@ -48,9 +52,21 @@ public class ReferenceProvider {
             int column,
             Function<Path, CompilerProvider> compilerForFile,
             BiPredicate<Path, Path> candidateAllowed) {
+        this(compiler, file, line, column, compilerForFile, candidateAllowed, __ -> {});
+    }
+
+    public ReferenceProvider(
+            CompilerProvider compiler,
+            Path file,
+            int line,
+            int column,
+            Function<Path, CompilerProvider> compilerForFile,
+            BiPredicate<Path, Path> candidateAllowed,
+            java.util.function.Consumer<Path[]> batchResolver) {
         this.compiler = compiler;
         this.compilerForFile = compilerForFile;
         this.candidateAllowed = candidateAllowed;
+        this.batchResolver = batchResolver;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -68,6 +84,10 @@ public class ReferenceProvider {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
+                // Package-private members can only be referenced within the same package
+                var isPackagePrivate = !element.getModifiers().contains(Modifier.PUBLIC)
+                        && !element.getModifiers().contains(Modifier.PROTECTED)
+                        && !element.getModifiers().contains(Modifier.PRIVATE);
                 var declarationPath = task.trees.getPath(parentClass);
                 var declaration = declarationPath == null
                         ? compiler.findTypeDeclaration(className)
@@ -76,7 +96,7 @@ public class ReferenceProvider {
                 if (memberName.equals("<init>")) {
                     memberName = parentClass.getSimpleName().toString();
                 }
-                // Lombok gate first — skip all Lombok logic when not on classpath
+                // Lombok gate first — private fields with Lombok annotations generate public accessors
                 if (compiler.lombokPresentOnClasspath()) {
                     LOG.fine("[ref] lombokOnClasspath=true");
                     var names = lombokSearchNames(element, memberName, task);
@@ -86,8 +106,13 @@ public class ReferenceProvider {
                     }
                     LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
+                // Private members (non-Lombok) can only be referenced within the same file
+                if (element.getModifiers().contains(Modifier.PRIVATE)) {
+                    LOG.fine(String.format("[ref] private_member kind=%s name=%s — file-only scan", element.getKind(), memberName));
+                    return findReferences(task);
+                }
                 task.close();
-                return findMemberReferences(className, memberName, declaration);
+                return findMemberReferences(className, memberName, declaration, isPackagePrivate);
             }
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(task);
@@ -116,22 +141,51 @@ public class ReferenceProvider {
         return findReferences(files, compiler.findTypeDeclaration(className));
     }
 
-    private List<Location> findMemberReferences(String className, String memberName, Path declaration) {
+    private List<Location> findMemberReferences(String className, String memberName, Path declaration, boolean packagePrivate) {
         var files = compiler.findMemberReferences(className, memberName);
-        LOG.fine(String.format(
-                "[ref] member_scan owner=%s name=%s candidates=%d", className, memberName, files.length));
+        if (packagePrivate && declaration != null) {
+            var declarationPackage = FileStore.packageName(declaration);
+            files = java.util.Arrays.stream(files)
+                    .filter(f -> declarationPackage.equals(FileStore.packageName(f)))
+                    .toArray(Path[]::new);
+            LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", className, memberName, files.length));
+        } else {
+            LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d", className, memberName, files.length));
+        }
         if (files.length == 0) return List.of();
         return findReferences(files, declaration);
     }
 
     private List<Location> findReferences(Path[] files, Path declaration) {
+        // Batch pre-resolve all modules these candidate files belong to.
+        // For multi-module Gradle/Maven: resolves all needed modules in fewer calls.
+        // For single-module: no-op.
+        batchResolver.accept(files);
+        LOG.fine(String.format("[ref] grouping candidates=%d declaration=%s",
+                files.length, declaration == null ? "null" : declaration.getFileName()));
         var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
+        var skippedModules = new HashSet<String>();
         for (var candidate : files) {
             if (!candidateAllowed.test(declaration, candidate)) continue;
-            var candidateCompiler = compilerForFile.apply(candidate);
-            if (!candidateAllowed.test(declaration, candidate)) continue;
+            CompilerProvider candidateCompiler;
+            try {
+                candidateCompiler = compilerForFile.apply(candidate);
+            } catch (RuntimeException e) {
+                var moduleName = candidate.toString();
+                // Extract short module path for dedup
+                var moduleKey = e.getMessage() != null ? e.getMessage() : moduleName;
+                if (skippedModules.add(moduleKey)) {
+                    LOG.warning(String.format(
+                            "[ref] skip_candidate file=%s reason=%s",
+                            candidate.getFileName(), e.getMessage()));
+                }
+                continue;
+            }
             groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>())
                     .add(candidate);
+        }
+        if (!skippedModules.isEmpty()) {
+            LOG.info(String.format("[ref] skipped_modules=%d groups=%d", skippedModules.size(), groups.size()));
         }
         var locations = new LinkedHashMap<String, Location>();
         for (var entry : groups.entrySet()) {
@@ -142,6 +196,7 @@ public class ReferenceProvider {
                 }
             }
         }
+        LOG.fine(String.format("[ref] scan_complete groups=%d total_locations=%d", groups.size(), locations.size()));
         return new ArrayList<>(locations.values());
     }
 

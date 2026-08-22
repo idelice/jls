@@ -1,6 +1,6 @@
 # Java Language Server for Neovim
 
-A Java [Language Server Protocol](https://github.com/Microsoft/vscode-languageserver-protocol) implementation built on the [Java compiler API](https://docs.oracle.com/javase/10/docs/api/jdk.compiler-summary.html), optimized for Neovim.
+A Java [Language Server Protocol](https://github.com/Microsoft/vscode-languageserver-protocol) implementation built on the [Java compiler API](https://docs.oracle.com/en/java/javase/25/docs/api/jdk.compiler/module-summary.html), optimized for Neovim.
 
 Fork of [georgewfraser/java-language-server](https://github.com/georgewfraser/java-language-server).
 
@@ -50,10 +50,13 @@ require('lspconfig').jls.setup({
 - **Inlay hints** — parameter name hints at call sites
 - **Code actions** — refactoring, quick fixes, code generation
 - **Rename** — classes, methods, variables across workspace
+- **Document symbols** — outline view of classes, methods, fields
+- **Folding ranges** — collapse imports, classes, methods, blocks
+- **Formatting** — whole-document formatting
 - **Lombok** — @Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.
 - **Private repositories** — Maven authentication inherited from `~/.m2/settings.xml`
 - **JAR navigation** — go-to-definition into dependency source JARs
-- **Multi Module Gradle/Maven Support (BETA)**
+- **Multi-module Gradle/Maven support** (experimental)
 
 ### Code actions
 
@@ -141,7 +144,35 @@ export JLS_JVM_OPTS="-Xmx1g -Xms256m"
 
 The nvim-jls client exposes a `jvm_args` config field that sets this automatically.
 
-## Multi-Module Maven Projects
+## Multi-Module Support (Experimental)
+
+JLS supports multi-module Maven and Gradle projects. Modules are resolved lazily — only when you open a file or navigate to a reference in another module.
+
+### How it works
+
+1. On startup, JLS reads the project structure (module graph, source directories, inter-module dependencies)
+2. When you open a file, the server resolves that module's classpath on-demand
+3. When you use find-references or go-to-definition across modules, referenced modules are resolved in parallel
+
+### Prerequisites
+
+Multi-module projects require that dependency artifacts are available locally. The server resolves classpaths via `mvn dependency:list` or Gradle tooling — it does **not** compile your project.
+
+**For Maven multi-module projects**, you must build/install the reactor first:
+
+```bash
+mvn install -DskipTests
+```
+
+Without this, modules that depend on sibling modules will fail to resolve (the server cannot find their compiled artifacts).
+
+**For Gradle multi-module projects**, ensure the project builds successfully:
+
+```bash
+./gradlew classes
+```
+
+### Maven Daemon (recommended for Maven)
 
 For large reactors (50+ modules), install the [Maven Daemon](https://github.com/apache/maven-mvnd):
 
@@ -151,9 +182,12 @@ sdk install mvnd
 
 JLS auto-detects `mvnd` on PATH and uses it instead of `mvn`/`mvnw`. The daemon keeps Maven warm in memory, reducing module resolution from seconds to milliseconds after the first run.
 
-**Limitations for very large reactors (500+ modules):**
-- Direct dependency modules are pre-resolved in background after opening a file
+### Limitations
+
+- Module resolution happens on the LSP thread — the server may be briefly unresponsive during first-time resolution of many modules
+- Modules whose dependency resolution fails are skipped for that session (restart the server after fixing build issues)
 - The server does not eagerly resolve all modules — only those you navigate to
+- Very large reactors (500+ modules) are supported but first find-references on widely-used types may take 10-40s while modules resolve in parallel
 
 ## Debugging
 
@@ -217,14 +251,14 @@ dap.configurations.java = {
 
 Features are split across two resolution strategies:
 
-- **Compile-based** (javac attribution): go-to-definition, hover, diagnostics, code actions
-- **Index-based** (parse + workspace index): autocomplete, find-references, signature help
+- **Compile-based** (javac attribution): go-to-definition, hover, diagnostics, code actions, find-references
+- **Index-based** (parse + workspace index): autocomplete, signature help
 
-This avoids full compilation on high-frequency triggers like `(` and reference scans.
+This avoids full compilation on high-frequency triggers like `(` and keystroke-driven completions.
 
 ## Building from source
 
-Prerequisites: Java 25, Maven, protobuf.
+Prerequisites: Java 25, Maven.
 
 ```bash
 ./scripts/build.sh
@@ -235,3 +269,40 @@ Output: `dist/lang_server_{linux|mac|windows}.sh`
 ## Logs
 
 The server logs to stderr. Startup prints the active JDK version.
+
+## Troubleshooting
+
+### Find references returns incomplete results
+
+If find-references shows fewer results than expected, check the server logs for warnings like:
+
+```
+[maven] compiler_failed module=:some-module reason=Maven dependency resolution failed
+[ref] skip_candidate file=SomeFile.java reason=Maven dependency resolution previously failed
+```
+
+This means a module's dependencies couldn't be resolved. Fix: run `mvn install -DskipTests` in the project root, then restart the server.
+
+### Server unresponsive after opening a file
+
+On first open in a multi-module project, the server resolves the module's classpath via Maven/Gradle. This blocks the LSP thread for a few seconds. Subsequent opens of files in the same module are instant (cached).
+
+If the server stays unresponsive for more than 30s, check if Maven/Gradle is hanging (network issues, misconfigured repositories, or missing local artifacts).
+
+### Multi-module: "dependency resolution failed"
+
+The server runs `mvn dependency:list -pl <module> -am` to resolve each module. This fails if:
+
+- Sibling module artifacts aren't installed locally → run `mvn install -DskipTests`
+- A remote repository cached a "not found" result → run `mvn -U install -DskipTests` to force-update
+- The module has a broken pom.xml → fix the pom and restart the server
+
+After fixing the issue, save the pom.xml and the server will retry previously-failed modules on the next request (hover, definition, or references). For other fixes, restart the server.
+
+### Diagnostics show errors that don't exist
+
+If the server reports compilation errors that your build doesn't, the classpath is likely incomplete. Ensure:
+
+- Maven: `mvn install -DskipTests` has been run
+- Gradle: `./gradlew classes` has been run
+- Check that the module's dependencies are all available in your local repository

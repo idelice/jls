@@ -63,6 +63,14 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
         return result;
     }
 
+    /** Collect transitive module project paths for a given module, including itself. */
+    public List<String> transitiveModulePathsIncludingSelf(String projectPath) {
+        var result = new ArrayList<String>();
+        result.add(projectPath);
+        result.addAll(transitiveModuleDependencies(projectPath, false));
+        return result;
+    }
+
     /** Return transitive dependency modules, excluding the selected module. */
     public Set<String> transitiveModuleDependencies(String projectPath, boolean testSources) {
         var result = new LinkedHashSet<String>();

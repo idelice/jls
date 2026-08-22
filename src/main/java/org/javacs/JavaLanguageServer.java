@@ -11,6 +11,7 @@ import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -117,16 +118,17 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
     private final Map<String, ModuleCompiler> mavenModuleCompilers = new ConcurrentHashMap<>();
+    private final Map<String, ModuleCompiler> gradleModuleCompilers = new ConcurrentHashMap<>();
+    /** Tracks which Gradle module project paths have had their classpath resolved. */
+    private final Set<String> resolvedGradleModules = ConcurrentHashMap.newKeySet();
+    /** Tracks Maven module keys whose dependency resolution failed — avoids repeated attempts. */
+    private final Set<String> failedMavenModules = ConcurrentHashMap.newKeySet();
     private InferConfig inferredConfig;
     private boolean moduleScopedMaven;
+    private boolean moduleScopedGradle;
     private Set<String> configuredAddExports = Set.of();
     private List<String> configuredUserCompilerArgs = List.of();
     private volatile Path activeModuleFile;
-
-    // Background executor for async Maven module pre-resolution
-    private final java.util.concurrent.ExecutorService mavenPreResolveExecutor =
-            Executors.newSingleThreadExecutor(
-                    Thread.ofPlatform().daemon().name("javacs-maven-preresolve").factory());
 
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
@@ -193,29 +195,41 @@ class JavaLanguageServer extends LanguageServer {
 
     private String moduleCompilerKey(Path file) {
         var module = moduleGraph.moduleForFile(file).orElse(null);
-        if (module == null) return null;
+        if (module == null) return "";
         var test = module.testSourceDir() != null && file.startsWith(module.testSourceDir());
-        return module.projectPath() + (test ? "#test" : "#main");
+        var prefix = moduleScopedGradle ? "gradle:" : "";
+        return prefix + module.projectPath() + (test ? "#test" : "#main");
     }
 
     private synchronized JavaCompilerService compilerFor(Path file) {
-        if (!moduleScopedMaven) return getOrCreateCompiler();
+        if (!moduleScopedMaven && !moduleScopedGradle) return getOrCreateCompiler();
+        if (moduleScopedGradle) return compilerForGradleModule(file);
         var module = moduleGraph.moduleForFile(file).orElse(null);
         if (module == null) return getOrCreateCompiler();
         var key = moduleCompilerKey(file);
         var existing = mavenModuleCompilers.get(key);
         if (existing != null) return existing.compiler;
+        if (failedMavenModules.contains(key)) {
+            throw new RuntimeException("Maven dependency resolution previously failed for " + module.projectPath());
+        }
         var test = key.endsWith("#test");
         var started = Instant.now();
         var progressToken = beginWorkDoneProgress(
                 "Resolving module",
-                "Resolving classpath for " + module.projectPath());
+                "Resolving " + module.projectPath());
         MavenTooling.MavenDependencies dependencies;
         try {
             dependencies = inferredConfig.mavenModuleDependencies(module, test);
-        } finally {
-            endWorkDoneProgress(progressToken, "Dependencies resolved");
+        } catch (RuntimeException e) {
+            endWorkDoneProgress(progressToken, "Resolution failed");
+            failedMavenModules.add(key);
+            LOG.warning(String.format(
+                    "[maven] compiler_failed module=%s scope=%s reason=%s took=%dms",
+                    module.projectPath(), test ? "test" : "main", e.getMessage(),
+                    Duration.between(started, Instant.now()).toMillis()));
+            throw e;
         }
+        endWorkDoneProgress(progressToken, "Dependencies resolved");
         var args = new ArrayList<>(configuredUserCompilerArgs);
         if (!hasExplicitJavaLevelOverride(args)) args.addAll(module.compilerArgs());
         var next = new JavaCompilerService(
@@ -237,68 +251,237 @@ class JavaLanguageServer extends LanguageServer {
                 module.projectPath(), test ? "test" : "main", dependencies.classpath().size(),
                 sourceRoots.size(), Duration.between(started, Instant.now()).toMillis()));
         // Async pre-resolve direct dependency modules so cross-module jumps are instant
-        preResolveDependencyModules(module, test);
         return next;
     }
 
     /**
-     * Async pre-resolve direct dependency modules so that cross-module navigation
-     * (go-to-definition, find-references) doesn't block on Maven when the user jumps.
+     * Resolve and return a per-module compiler for a Gradle multi-module project.
+     * If the module is not yet resolved, resolves classpath synchronously.
      */
-    private void preResolveDependencyModules(ModuleGraph.ModuleInfo module, boolean test) {
-        var deps = test ? module.testModuleDeps() : module.moduleDeps();
-        if (deps == null || deps.isEmpty()) return;
-        var unresolvedDeps = new ArrayList<String>();
-        for (var dep : deps) {
-            var depModule = moduleGraph.modules().get(dep);
-            if (depModule == null) continue;
-            if (depModule.sourceDirs().isEmpty()) continue;
-            var depKey = depModule.projectPath() + (test ? "#test" : "#main");
-            if (mavenModuleCompilers.containsKey(depKey)) continue;
-            unresolvedDeps.add(dep);
-        }
-        if (unresolvedDeps.isEmpty()) return;
-        LOG.info("[maven] pre-resolving " + unresolvedDeps.size() + " dependency modules in background: " + unresolvedDeps);
-        mavenPreResolveExecutor.submit(() -> {
-            for (var dep : unresolvedDeps) {
-                var depModule = moduleGraph.modules().get(dep);
-                if (depModule == null) continue;
-                var depKey = depModule.projectPath() + (test ? "#test" : "#main");
-                if (mavenModuleCompilers.containsKey(depKey)) continue;
-                try {
-                    var started = Instant.now();
-                    var dependencies = inferredConfig.mavenModuleDependencies(depModule, test);
-                    var args = new ArrayList<>(configuredUserCompilerArgs);
-                    if (!hasExplicitJavaLevelOverride(args)) args.addAll(depModule.compilerArgs());
-                    var depCompiler = new JavaCompilerService(
-                            dependencies.classpath(), dependencies.sources(), configuredAddExports, args);
-                    depCompiler.setModuleGraph(moduleGraph);
-                    var depSourceRoots = dependencies.sourceRoots();
-                    depCompiler.setSourceRoots(depSourceRoots);
-                    mavenModuleCompilers.putIfAbsent(
-                            depKey, new ModuleCompiler(depCompiler, new ExternalBinaryTypeIndex(depCompiler), depSourceRoots));
-                    LOG.info(String.format(
-                            "[maven] pre-resolved module=%s scope=%s classpath=%d took=%dms",
-                            depModule.projectPath(), test ? "test" : "main",
-                            dependencies.classpath().size(),
-                            Duration.between(started, Instant.now()).toMillis()));
-                } catch (Exception e) {
-                    LOG.warning("[maven] pre-resolve failed for " + dep + ": " + e.getMessage());
-                }
+    private JavaCompilerService compilerForGradleModule(Path file) {
+        var module = moduleGraph.moduleForFile(file).orElse(null);
+        if (module == null) return getOrCreateCompiler();
+        var key = moduleCompilerKey(file);
+        var existing = gradleModuleCompilers.get(key);
+        if (existing != null) return existing.compiler;
+        // Module not resolved yet — resolve synchronously
+        resolveGradleModule(module);
+        var resolved = gradleModuleCompilers.get(key);
+        return resolved != null ? resolved.compiler : getOrCreateCompiler();
+    }
+
+    /**
+     * Resolve classpath for a Gradle module and create its compiler.
+     * No-op if already resolved.
+     */
+    private void resolveGradleModule(ModuleGraph.ModuleInfo module) {
+        if (resolvedGradleModules.contains(module.projectPath())) return;
+        var started = Instant.now();
+        var progressToken = beginWorkDoneProgress(
+                "Resolving module",
+                "Resolving classpath for " + module.projectPath());
+        try {
+            var targets = moduleGraph.transitiveModulePathsIncludingSelf(module.projectPath());
+            var resolved = GradleTooling.resolveClasspath(workspaceRoot, targets);
+            if (resolved == GradleTooling.ModuleClasspath.EMPTY || resolved.modules().isEmpty()) {
+                LOG.warning("[gradle] classpath resolution returned empty for " + module.projectPath());
+                resolvedGradleModules.add(module.projectPath());
+                return;
             }
-        });
+            // Create compilers for all resolved modules
+            for (var entry : resolved.modules().entrySet()) {
+                var modulePath = entry.getKey();
+                var moduleClasspath = entry.getValue();
+                var moduleInfo = moduleGraph.modules().get(modulePath);
+                if (moduleInfo == null) continue;
+                resolvedGradleModules.add(modulePath);
+
+                // Build classpath: external JARs + transitive module class output dirs
+                var classpath = new LinkedHashSet<Path>(moduleClasspath.externalClasspath());
+                classpath.addAll(moduleGraph.transitiveClassOutputDirs(modulePath));
+
+                var args = new ArrayList<>(configuredUserCompilerArgs);
+                if (!hasExplicitJavaLevelOverride(args)
+                        && moduleInfo.sourceCompatibility() != null
+                        && !moduleInfo.sourceCompatibility().isBlank()) {
+                    args.add("--release");
+                    args.add(moduleInfo.sourceCompatibility());
+                }
+                var compilerService = new JavaCompilerService(
+                        classpath, Set.of(), configuredAddExports, args);
+                compilerService.setModuleGraph(moduleGraph);
+                var sourceRoots = new LinkedHashSet<>(moduleInfo.sourceDirs());
+                compilerService.setSourceRoots(sourceRoots);
+
+                // Store main compiler
+                var mainKey = "gradle:" + modulePath + "#main";
+                gradleModuleCompilers.putIfAbsent(
+                        mainKey, new ModuleCompiler(compilerService, new ExternalBinaryTypeIndex(compilerService), sourceRoots));
+
+                // Store test compiler if test classpath is available
+                if (!moduleClasspath.testClasspath().isEmpty()) {
+                    var testClasspath = new LinkedHashSet<Path>(moduleClasspath.testClasspath());
+                    testClasspath.addAll(moduleGraph.transitiveClassOutputDirs(modulePath, true));
+                    var testArgs = new ArrayList<>(args);
+                    var testCompiler = new JavaCompilerService(
+                            testClasspath, Set.of(), configuredAddExports, testArgs);
+                    testCompiler.setModuleGraph(moduleGraph);
+                    var testKey = "gradle:" + modulePath + "#test";
+                    gradleModuleCompilers.putIfAbsent(
+                            testKey, new ModuleCompiler(testCompiler, new ExternalBinaryTypeIndex(testCompiler), sourceRoots));
+                }
+
+                LOG.info(String.format(
+                        "[gradle] compiler_ready module=%s classpath=%d source_roots=%d took=%dms",
+                        modulePath, classpath.size(), sourceRoots.size(),
+                        Duration.between(started, Instant.now()).toMillis()));
+            }
+        } catch (Exception e) {
+            LOG.warning("[gradle] module resolution failed for " + module.projectPath() + ": " + e.getMessage());
+            resolvedGradleModules.add(module.projectPath());
+        } finally {
+            endWorkDoneProgress(progressToken, "Module resolved");
+        }
+    }
+
+    /**
+     * Batch pre-resolve modules for a set of candidate files before reference scanning.
+     * Works for both Gradle and Maven multi-module. No-op for single-module projects.
+     * Resolves all needed modules in one batch call instead of one-per-file.
+     */
+    private void batchResolveModulesForFiles(Path[] files) {
+        if (!moduleScopedGradle && !moduleScopedMaven) return;
+        if (moduleGraph == ModuleGraph.EMPTY) return;
+
+        if (moduleScopedGradle) batchResolveGradleModules(files);
+        if (moduleScopedMaven) batchResolveMavenModules(files);
+    }
+
+    private void batchResolveGradleModules(Path[] files) {
+        var unresolved = new LinkedHashSet<String>();
+        for (var f : files) {
+            var module = moduleGraph.moduleForFile(f).orElse(null);
+            if (module != null && !resolvedGradleModules.contains(module.projectPath())) {
+                unresolved.add(module.projectPath());
+            }
+        }
+        if (unresolved.isEmpty()) return;
+        // Resolve without notification first — GradleTooling uses disk cache internally.
+        // Only show notification if it takes significant time (meaning Gradle was invoked).
+        var allTargets = new ArrayList<String>();
+        for (var modulePath : unresolved) {
+            for (var target : moduleGraph.transitiveModulePathsIncludingSelf(modulePath)) {
+                if (!resolvedGradleModules.contains(target)) allTargets.add(target);
+            }
+        }
+        if (allTargets.isEmpty()) return;
+        LOG.info("[gradle] batch pre-resolving " + unresolved.size() + " modules for reference scan");
+        try {
+            // This call uses disk cache — if all modules are cached, it returns instantly
+            GradleTooling.resolveClasspath(workspaceRoot, allTargets);
+            // Create compilers from cached results (fast)
+            for (var modulePath : unresolved) {
+                var module = moduleGraph.modules().get(modulePath);
+                if (module != null) resolveGradleModule(module);
+            }
+        } catch (Exception e) {
+            LOG.warning("[gradle] batch pre-resolution failed: " + e.getMessage());
+        }
+    }
+
+    private void batchResolveMavenModules(Path[] files) {
+        // Collect unique unresolved modules
+        var unresolvedModules = new LinkedHashMap<String, ModuleGraph.ModuleInfo>();
+        var unresolvedFiles = new LinkedHashMap<String, Path>(); // key -> representative file
+        for (var f : files) {
+            var module = moduleGraph.moduleForFile(f).orElse(null);
+            if (module == null) continue;
+            var key = moduleCompilerKey(f);
+            if (key.isEmpty()) continue;
+            if (mavenModuleCompilers.containsKey(key)) continue;
+            if (failedMavenModules.contains(key)) continue;
+            if (!unresolvedModules.containsKey(key)) {
+                unresolvedModules.put(key, module);
+                unresolvedFiles.put(key, f);
+            }
+        }
+        if (unresolvedModules.isEmpty()) return;
+        LOG.info("[maven] batch pre-resolving " + unresolvedModules.size()
+                + " modules for reference scan");
+
+        // Resolve dependencies in parallel (expensive mvn subprocess calls)
+        var futures = new LinkedHashMap<String, CompletableFuture<MavenTooling.MavenDependencies>>();
+        for (var entry : unresolvedModules.entrySet()) {
+            var key = entry.getKey();
+            var module = entry.getValue();
+            var test = key.endsWith("#test");
+            futures.put(key, CompletableFuture.supplyAsync(() ->
+                    inferredConfig.mavenModuleDependencies(module, test)));
+        }
+
+        // Collect results and create compilers
+        for (var entry : futures.entrySet()) {
+            var key = entry.getKey();
+            var module = unresolvedModules.get(key);
+            var test = key.endsWith("#test");
+            var file = unresolvedFiles.get(key);
+            try {
+                var dependencies = entry.getValue().join();
+                synchronized (this) {
+                    if (mavenModuleCompilers.containsKey(key)) continue; // race check
+                    var args = new ArrayList<>(configuredUserCompilerArgs);
+                    if (!hasExplicitJavaLevelOverride(args)) args.addAll(module.compilerArgs());
+                    var compiler = new JavaCompilerService(
+                            dependencies.classpath(), dependencies.sources(),
+                            configuredAddExports, args);
+                    compiler.setModuleGraph(moduleGraph);
+                    var sourceRoots = dependencies.sourceRoots();
+                    compiler.setSourceRoots(sourceRoots);
+                    mavenModuleCompilers.put(key,
+                            new ModuleCompiler(compiler, new ExternalBinaryTypeIndex(compiler),
+                                    sourceRoots));
+                    if (FileStore.activeDocuments().contains(file)) {
+                        completionIndexScheduler.scheduleRefresh(
+                                List.of(file), "moduleCompilerReady", 0,
+                                CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
+                    }
+                }
+                LOG.info("[maven] batch resolved " + module.projectPath()
+                        + " scope=" + (test ? "test" : "main"));
+            } catch (Exception e) {
+                failedMavenModules.add(key);
+                LOG.warning("[maven] batch resolution failed for "
+                        + module.projectPath() + ": " + e.getMessage());
+            }
+        }
     }
 
     private TypeIndexRouter typeIndexFor(Path file) {
         var snapshot = completionSnapshotRef.get();
-        if (!moduleScopedMaven) return snapshot.typeIndex();
-        var context = mavenModuleCompilers.get(moduleCompilerKey(file));
+        if (!moduleScopedMaven && !moduleScopedGradle) return snapshot.typeIndex();
+        var key = moduleCompilerKey(file);
+        if (moduleScopedGradle) {
+            var context = gradleModuleCompilers.get(key);
+            return context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
+        }
+        var context = mavenModuleCompilers.get(key);
         return context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
     }
 
     private ExternalBinaryTypeIndex externalIndexForIndexing(
             Path file, JavaCompilerService parsingCompiler) {
-        if (!moduleScopedMaven) return completionSnapshotRef.get().externalIndex();
+        if (!moduleScopedMaven && !moduleScopedGradle) return completionSnapshotRef.get().externalIndex();
+        if (moduleScopedGradle) {
+            var context = gradleModuleCompilers.get(moduleCompilerKey(file));
+            if (context != null) return context.externalIndex;
+            for (var candidate : gradleModuleCompilers.values()) {
+                if (candidate.compiler == parsingCompiler
+                        && candidate.sourceRoots.stream().anyMatch(file::startsWith)) {
+                    return candidate.externalIndex;
+                }
+            }
+            return ExternalBinaryTypeIndex.EMPTY;
+        }
         var context = mavenModuleCompilers.get(moduleCompilerKey(file));
         if (context != null) return context.externalIndex;
         for (var candidate : mavenModuleCompilers.values()) {
@@ -316,11 +499,16 @@ class JavaLanguageServer extends LanguageServer {
                 return context.compiler;
             }
         }
+        for (var context : gradleModuleCompilers.values()) {
+            if (context.compiler.findTypeDeclaration(className) != CompilerProvider.NOT_FOUND) {
+                return context.compiler;
+            }
+        }
         return getOrCreateCompiler();
     }
 
     private void includeMavenReferenceSources() {
-        if (!moduleScopedMaven) return;
+        if (!moduleScopedMaven && !moduleScopedGradle) return;
         var roots = new LinkedHashSet<>(FileStore.workspaceRoots());
         for (var module : moduleGraph.modules().values()) {
             for (var sourceDir : module.sourceDirs()) {
@@ -331,14 +519,17 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private boolean canReferenceModule(Path declaration, Path candidate) {
-        if (!moduleScopedMaven || declaration == null || candidate == null
+        if ((!moduleScopedMaven && !moduleScopedGradle) || declaration == null || candidate == null
                 || declaration == CompilerProvider.NOT_FOUND) return true;
         var owner = moduleGraph.moduleForFile(declaration).orElse(null);
         var consumer = moduleGraph.moduleForFile(candidate).orElse(null);
         if (owner == null || consumer == null || owner.projectPath().equals(consumer.projectPath())) {
             return true;
         }
-        var context = mavenModuleCompilers.get(moduleCompilerKey(candidate));
+        var key = moduleCompilerKey(candidate);
+        var context = moduleScopedGradle
+                ? gradleModuleCompilers.get(key)
+                : mavenModuleCompilers.get(key);
         if (context != null) {
             return context.sourceRoots.stream().anyMatch(declaration::startsWith);
         }
@@ -540,8 +731,12 @@ class JavaLanguageServer extends LanguageServer {
     private void createCompilers() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
         mavenModuleCompilers.clear();
+        failedMavenModules.clear();
+        gradleModuleCompilers.clear();
+        resolvedGradleModules.clear();
         pendingRewrites.clear();
         moduleScopedMaven = false;
+        moduleScopedGradle = false;
         inferredConfig = null;
         var started = Instant.now();
         var progressToken = beginWorkDoneProgress("Configure javac", "Finding source roots");
@@ -636,7 +831,8 @@ class JavaLanguageServer extends LanguageServer {
             }
             // Gradle keeps using existing build outputs. Maven module outputs are refreshed lazily
             // when the first file from that module is opened.
-            if (isGradleProject) {
+            if (isGradleProject && moduleGraph.modules().size() > 1) {
+                moduleScopedGradle = true;
                 var activeModule = moduleGraph.moduleForFile(workspaceRoot);
                 if (activeModule.isPresent()) {
                     // Scope workspace to active module's own source dirs only.
@@ -648,32 +844,40 @@ class JavaLanguageServer extends LanguageServer {
                     }
                     if (!scopedRoots.isEmpty()) {
                         FileStore.setWorkspaceRoots(scopedRoots);
-                        LOG.info(String.format("[multi-module] scoped workspace to %d source dirs for %s (files=%d)",
+                        LOG.info(String.format("[gradle] scoped workspace to %d source dirs for %s (files=%d)",
                                 scopedRoots.size(), activeModule.get().projectPath(), FileStore.all().size()));
                     }
-                    // don't compile deps on startup (blocks for minutes on large projects).
-                    // Use existing build/classes/java/main if present. Warn if missing.
-                    var depDirs = moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath());
-                    int missingDeps = 0;
-                    for (var dir : depDirs) {
-                        if (!Files.isDirectory(dir)) missingDeps++;
-                    }
-                    if (missingDeps > 0) {
-                        warnUserOnce("gradle_missing_build_output",
-                                String.format("%d module dependencies lack build/classes/java/main. Run './gradlew compileJava' for full cross-module resolution.", missingDeps));
-                    }
-                    // Re-resolve classpath — include compiled module output dirs that exist
-                    var updatedClasspath = new LinkedHashSet<>(classPath);
-                    updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath()));
-                    // Also add class outputs for any other modules that are in the workspace roots
-                    for (var root : FileStore.workspaceRoots()) {
-                        var rootModule = moduleGraph.moduleForFile(root);
-                        if (rootModule.isPresent() && !rootModule.get().projectPath().equals(activeModule.get().projectPath())) {
-                            updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(rootModule.get().projectPath()));
-                            updatedClasspath.addAll(moduleGraph.transitiveClasspath(rootModule.get().projectPath()));
+                    // Phase 2: Resolve classpath for active module + transitive deps
+                    var targets = moduleGraph.transitiveModulePathsIncludingSelf(activeModule.get().projectPath());
+                    var resolved = GradleTooling.resolveClasspath(workspaceRoot, targets);
+                    if (resolved != GradleTooling.ModuleClasspath.EMPTY && !resolved.modules().isEmpty()) {
+                        // Create compiler for active module with its classpath
+                        var activeModuleClasspath = resolved.modules().get(activeModule.get().projectPath());
+                        if (activeModuleClasspath != null) {
+                            var updatedClasspath = new LinkedHashSet<>(activeModuleClasspath.externalClasspath());
+                            updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath()));
+                            classPath = updatedClasspath;
                         }
+                        // Register all resolved modules
+                        for (var entry : resolved.modules().entrySet()) {
+                            var modulePath = entry.getKey();
+                            resolvedGradleModules.add(modulePath);
+                        }
+                    } else {
+                        // Fallback: use existing build outputs like before
+                        var depDirs = moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath());
+                        int missingDeps = 0;
+                        for (var dir : depDirs) {
+                            if (!Files.isDirectory(dir)) missingDeps++;
+                        }
+                        if (missingDeps > 0) {
+                            warnUserOnce("gradle_missing_build_output",
+                                    String.format("%d module dependencies lack build/classes/java/main. Run './gradlew compileJava' for full cross-module resolution.", missingDeps));
+                        }
+                        var updatedClasspath = new LinkedHashSet<>(classPath);
+                        updatedClasspath.addAll(moduleGraph.transitiveClassOutputDirs(activeModule.get().projectPath()));
+                        classPath = updatedClasspath;
                     }
-                    classPath = updatedClasspath;
                 }
             }
         }
@@ -682,6 +886,18 @@ class JavaLanguageServer extends LanguageServer {
 
         compiler = new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs);
         compiler.setModuleGraph(moduleGraph);
+
+        // Register active module compiler in gradleModuleCompilers so compilerFor() finds it
+        if (moduleScopedGradle && moduleGraph != ModuleGraph.EMPTY) {
+            var activeModule = moduleGraph.moduleForFile(workspaceRoot);
+            if (activeModule.isPresent()) {
+                var sourceRoots = new LinkedHashSet<>(activeModule.get().sourceDirs());
+                compiler.setSourceRoots(sourceRoots);
+                var mainKey = "gradle:" + activeModule.get().projectPath() + "#main";
+                gradleModuleCompilers.put(
+                        mainKey, new ModuleCompiler(compiler, new ExternalBinaryTypeIndex(compiler), sourceRoots));
+            }
+        }
 
         // Flush any warnings from Maven resolution (e.g. broken wrapper) to the user
         for (var warning : MavenTooling.flushWarnings()) {
@@ -969,7 +1185,7 @@ class JavaLanguageServer extends LanguageServer {
         } finally {
             notifyWorkspaceInfo();
         }
-        if (!moduleScopedMaven) getOrCreateCompiler().fullCompileWithAP();
+        if (!moduleScopedMaven && !moduleScopedGradle) getOrCreateCompiler().fullCompileWithAP();
     }
 
     @Override
@@ -984,7 +1200,6 @@ class JavaLanguageServer extends LanguageServer {
             pendingCompletionIndexTrigger = null;
         }
         completionIndexExecutor.shutdownNow();
-        mavenPreResolveExecutor.shutdownNow();
         MavenTooling.destroyAllProcesses();
         CacheAudit.logSummary(LOG);
     }
@@ -1093,6 +1308,9 @@ class JavaLanguageServer extends LanguageServer {
             var name = file.getFileName().toString();
             if (isCompilerConfigFile(name)) {
                 LOG.info(String.format("Compiler needs to be re-created because %s has changed", file));
+                if ("pom.xml".equals(name)) {
+                    failedMavenModules.clear();
+                }
                 compilerInputsChanged = true;
             }
         }
@@ -1148,6 +1366,7 @@ class JavaLanguageServer extends LanguageServer {
                 ? null
                 : JsonHelper.GSON.fromJson(unresolved.data, CompletionData.class);
         var context = data == null ? null : mavenModuleCompilers.get(data.compilerId);
+        if (context == null && data != null) context = gradleModuleCompilers.get(data.compilerId);
         var requestCompiler = context == null ? getOrCreateCompiler() : context.compiler;
         var index = context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
         new CompletionProvider(requestCompiler, index, snapshot.version(), data == null ? null : data.compilerId)
@@ -1215,7 +1434,7 @@ class JavaLanguageServer extends LanguageServer {
         var found =
                 new ReferenceProvider(
                                 compilerFor(file), file, line, column, this::compilerFor,
-                                this::canReferenceModule)
+                                this::canReferenceModule, this::batchResolveModulesForFiles)
                         .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
@@ -1446,8 +1665,17 @@ class JavaLanguageServer extends LanguageServer {
             var started = System.nanoTime();
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));
             var requestCompiler = compilerFor(file);
+            String compileProgressToken = null;
+            if (moduleScopedMaven || moduleScopedGradle) {
+                compileProgressToken = beginWorkDoneProgress(
+                        "Compiling", "Compiling " + file.getFileName());
+            }
             try (var task = requestCompiler.compile(sources)) {
                 var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
+                if (compileProgressToken != null) {
+                    endWorkDoneProgress(compileProgressToken, "Compiled");
+                    compileProgressToken = null;
+                }
                 var errorProvider = new ErrorProvider(task, requestCompiler, typeIndexFor(file));
                 var errorReport = errorProvider.errors(Set.of(file.toUri()));
                 LOG.info(String.format(
@@ -1459,6 +1687,10 @@ class JavaLanguageServer extends LanguageServer {
                     }
                 }
                 return new DocumentDiagnosticReport("full", resultId, List.of());
+            } finally {
+                if (compileProgressToken != null) {
+                    endWorkDoneProgress(compileProgressToken, "Compiled");
+                }
             }
         } catch (Exception e) {
             LOG.warning("[diagnostics] pull_compile_failed file=" + file.getFileName()
@@ -1488,19 +1720,28 @@ class JavaLanguageServer extends LanguageServer {
                     var module = moduleOpt.get();
                     var fileInModule = module.sourceDirs().stream().anyMatch(file::startsWith);
                     if (fileInModule) {
+                        // Lazy Gradle module resolution: resolve unresolved modules on first open
+                        if (moduleScopedGradle && !resolvedGradleModules.contains(module.projectPath())) {
+                            resolveGradleModule(module);
+                        }
                         Set<Path> sourceDirs;
                         if (moduleScopedMaven) {
                             compilerFor(file);
                             sourceDirs = mavenModuleCompilers.get(moduleCompilerKey(file)).sourceRoots;
+                        } else if (moduleScopedGradle) {
+                            var gradleContext = gradleModuleCompilers.get(moduleCompilerKey(file));
+                            sourceDirs = gradleContext != null
+                                    ? gradleContext.sourceRoots
+                                    : new LinkedHashSet<>(module.sourceDirs());
                         } else {
                             sourceDirs = new LinkedHashSet<>(module.sourceDirs());
                         }
-                        var expanded = firstModule && moduleScopedMaven
+                        var expanded = firstModule && (moduleScopedMaven || moduleScopedGradle)
                                 ? new LinkedHashSet<Path>()
                                 : new LinkedHashSet<>(FileStore.workspaceRoots());
                         var added = new ArrayList<Path>();
                         for (var srcDir : sourceDirs) {
-                            if ((firstModule && moduleScopedMaven
+                            if ((firstModule && (moduleScopedMaven || moduleScopedGradle)
                                             || !FileStore.isWorkspaceFile(srcDir))
                                     && Files.exists(srcDir)) {
                                 expanded.add(srcDir);
@@ -1528,7 +1769,7 @@ class JavaLanguageServer extends LanguageServer {
                     }
                 }
             }
-            if (moduleScopedMaven) activeModuleFile = file;
+            if (moduleScopedMaven || moduleScopedGradle) activeModuleFile = file;
         } finally {
             FileStore.open(params);
         }

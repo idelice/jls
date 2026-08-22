@@ -203,7 +203,7 @@ public class FileStore {
         return info.modified;
     }
 
-    static String packageName(Path file) {
+    public static String packageName(Path file) {
         // If we've never checked before, look up package name on disk
         if (!javaSources.containsKey(file)) {
             readInfoFromDisk(file);
