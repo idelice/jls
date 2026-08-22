@@ -67,9 +67,47 @@ public final class LombokAnnotations {
 
     private LombokAnnotations() {}
 
+    private static final Pattern STRUCTURAL_SOURCE_PATTERN =
+            Pattern.compile(
+                    "@(?:lombok\\.(?:experimental\\.)?)?"
+                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With)\\b");
+
+    /**
+     * Fast text-based check: returns true if the source file at {@code path} contains
+     * a structural Lombok annotation. Reads from FileStore (buffer content).
+     * Scans the first 100 lines only (annotations are always near the top).
+     */
+    public static boolean sourceHasStructuralAnnotation(Path path) {
+        var contents = FileStore.contents(path);
+        if (contents == null || contents.isEmpty()) return false;
+        int lineCount = 0;
+        int pos = 0;
+        while (pos < contents.length() && lineCount < 100) {
+            int lineEnd = indexOf(contents, '\n', pos);
+            if (lineEnd == -1) lineEnd = contents.length();
+            var line = contents.subSequence(pos, lineEnd);
+            if (STRUCTURAL_SOURCE_PATTERN.matcher(line).find()) return true;
+            pos = lineEnd + 1;
+            lineCount++;
+        }
+        return false;
+    }
+
+    private static int indexOf(CharSequence cs, char c, int from) {
+        for (int i = from; i < cs.length(); i++) {
+            if (cs.charAt(i) == c) return i;
+        }
+        return -1;
+    }
+
     /** Returns whether the modifiers include a Lombok annotation that changes the declared shape. */
     public static boolean hasStructuralLombokAnnotation(ModifiersTree modifiers) {
         return hasAnnotation(modifiers, STRUCTURAL);
+    }
+
+    /** Returns whether the modifiers include a field-level @Getter annotation. */
+    public static boolean hasGetterAnnotation(ModifiersTree modifiers) {
+        return hasAnnotation(modifiers, "Getter");
     }
 
     /** Returns whether this source file currently contains a structural Lombok annotation. */
