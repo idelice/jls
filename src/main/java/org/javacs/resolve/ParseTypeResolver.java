@@ -820,7 +820,31 @@ public final class ParseTypeResolver {
         if (array && qualified.endsWith("[]")) {
             qualified = qualified.substring(0, qualified.length() - 2);
         }
-        return Optional.of(new TypeResolution(qualified, false, array));
+        // Resolve the first type argument in the owner's scope so generic return types
+        // (e.g. Optional<ModuleInfo>) propagate type arguments correctly.
+        String firstTypeArg = null;
+        var argStart = typeName.indexOf('<');
+        var argEnd = typeName.lastIndexOf('>');
+        if (argStart >= 0 && argEnd > argStart) {
+            var argText = typeName.substring(argStart + 1, argEnd).trim();
+            var comma = argText.indexOf(',');
+            if (comma >= 0) argText = argText.substring(0, comma).trim();
+            while (argText.startsWith("? extends ")) argText = argText.substring("? extends ".length()).trim();
+            while (argText.startsWith("? super ")) argText = argText.substring("? super ".length()).trim();
+            if (!argText.isBlank() && !"?".equals(argText)) {
+                var argNormalized = TypeNames.normalize(argText);
+                if (!argNormalized.isEmpty()) {
+                    var argResolved = index.resolveType(argNormalized, ownerRoot)
+                            .map(indexed -> indexed.qualifiedName);
+                    if (argResolved.isPresent()) {
+                        firstTypeArg = argResolved.get();
+                    }
+                }
+            }
+        }
+        return Optional.of(
+                new TypeResolution(qualified, false, array)
+                        .withFirstTypeArgument(firstTypeArg));
     }
 
     private Optional<TypeResolution> resolveDirectMemberType(TypeResolution receiverType, String memberName) {
