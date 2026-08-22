@@ -1518,7 +1518,8 @@ class JavaLanguageServer extends LanguageServer {
                                     if (f.startsWith(srcDir)) newFiles.add(f);
                                 }
                             }
-                            if (!newFiles.isEmpty() && newFiles.size() <= LARGE_WORKSPACE_THRESHOLD) {
+                            if (!newFiles.isEmpty() && newFiles.size() <= LARGE_WORKSPACE_THRESHOLD
+                                    && completionSnapshotRef.get().scope() != CompletionIndexScope.WORKSPACE) {
                                 completionIndexScheduler.scheduleRefresh(
                                         newFiles, "moduleExpand", 0,
                                         CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
@@ -1745,8 +1746,9 @@ class JavaLanguageServer extends LanguageServer {
                 return;
             }
             synchronized (JavaLanguageServer.this) {
-                // Don't re-schedule if a full rebuild is already pending or running
-                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
+                // Only skip if a full rebuild is already pending — merges should be superseded
+                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()
+                        && pendingCompletionIndexMode == CompletionIndexRefreshMode.FULL_REBUILD) {
                     return;
                 }
             }
