@@ -13,6 +13,7 @@ import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import org.javacs.LombokAnnotations;
 
 class WarnUnused extends TreePathScanner<Void, Void> {
     private final Trees trees;
@@ -56,10 +57,27 @@ class WarnUnused extends TreePathScanner<Void, Void> {
                 && (element.getKind() == ElementKind.LOCAL_VARIABLE
                         || (element.getKind() == ElementKind.FIELD
                                 && element.getModifiers().contains(Modifier.PRIVATE)
-                                && element.getEnclosingElement().getKind() != ElementKind.RECORD))) {
+                                && element.getEnclosingElement().getKind() != ElementKind.RECORD
+                                && !isLombokConsumedField(variable)))) {
             declarations.add(element);
         }
         return super.visitVariable(variable, unused);
+    }
+
+    private boolean isLombokConsumedField(VariableTree variable) {
+        var classTree = enclosingClass();
+        if (classTree == null) return false;
+        // Class-level @Data or @Getter → all fields considered used
+        if (LombokAnnotations.hasAnnotation(classTree.getModifiers(), "Data", "Getter", "Value")) return true;
+        // Field-level @Getter → this field is used
+        return LombokAnnotations.hasGetterAnnotation(variable.getModifiers());
+    }
+
+    private ClassTree enclosingClass() {
+        for (var node : getCurrentPath()) {
+            if (node instanceof ClassTree ct) return ct;
+        }
+        return null;
     }
 
     @Override
