@@ -2,25 +2,20 @@ package org.javacs;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
-import javax.lang.model.element.*;
 import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
 import org.javacs.provider.CompletionProvider;
@@ -55,11 +50,11 @@ class JavaLanguageServer extends LanguageServer {
     private static final long COMPLETION_BOOTSTRAP_POLL_MS = 25;
     private static final long NAVIGATION_BOOTSTRAP_WAIT_MS = 1500;
     /** Above this file count, defer full workspace indexing to avoid OOM on large modules. */
-    private static final int LARGE_WORKSPACE_THRESHOLD = 1000;
+    static final int LARGE_WORKSPACE_THRESHOLD = 1000;
 
     private record TypeIndexAvailability(
             long versionBefore, long versionAfter, CompletionIndexScope scopeBefore, CompletionIndexScope scopeAfter, long waitMs) {}
-    private record CompletionSnapshot(
+    record CompletionSnapshot(
             WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
             TypeIndexRouter typeIndex,
@@ -86,75 +81,37 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     // TODO allow multiple workspace roots
-    private Path workspaceRoot;
+    Path workspaceRoot;
     private final LanguageClient client;
-    private final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler();
+    final CompletionIndexScheduler completionIndexScheduler = new CompletionIndexScheduler(this);
 
     // Single compiler — all requests (interactive + diagnostics) run on the main LSP thread.
     // parse() is thread-safe (standalone javac tasks), so background index builds share the instance.
-    private volatile JavaCompilerService compiler;
-    private static final class ModuleCompiler {
-        final JavaCompilerService compiler;
-        final ExternalBinaryTypeIndex externalIndex;
-        final Set<Path> sourceRoots;
-        long indexVersion = -1;
-        WorkspaceTypeIndex workspaceIndex = WorkspaceTypeIndex.EMPTY;
-
-        ModuleCompiler(
-                JavaCompilerService compiler,
-                ExternalBinaryTypeIndex externalIndex,
-                Set<Path> sourceRoots) {
-            this.compiler = compiler;
-            this.externalIndex = externalIndex;
-            this.sourceRoots = sourceRoots;
-        }
-
-        synchronized TypeIndexRouter typeIndex(CompletionSnapshot snapshot) {
-            if (indexVersion != snapshot.version()) {
-                workspaceIndex = snapshot.workspaceIndex().restrictTo(sourceRoots);
-                indexVersion = snapshot.version();
-            }
-            return new TypeIndexRouter(workspaceIndex, externalIndex);
-        }
-    }
-    private final Map<String, ModuleCompiler> mavenModuleCompilers = new ConcurrentHashMap<>();
-    private final Map<String, ModuleCompiler> gradleModuleCompilers = new ConcurrentHashMap<>();
-    /** Tracks which Gradle module project paths have had their classpath resolved. */
-    private final Set<String> resolvedGradleModules = ConcurrentHashMap.newKeySet();
-    /** Tracks Maven module keys whose dependency resolution failed — avoids repeated attempts. */
-    private final Set<String> failedMavenModules = ConcurrentHashMap.newKeySet();
-    private InferConfig inferredConfig;
-    private boolean moduleScopedMaven;
-    private boolean moduleScopedGradle;
-    private Set<String> configuredAddExports = Set.of();
-    private List<String> configuredUserCompilerArgs = List.of();
-    private volatile Path activeModuleFile;
+    volatile JavaCompilerService compiler;
+    final ModuleCompilerRegistry moduleRegistry = new ModuleCompilerRegistry(this);
+    volatile Path activeModuleFile;
 
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
-    private ModuleGraph moduleGraph = ModuleGraph.EMPTY;
+    ModuleGraph moduleGraph = ModuleGraph.EMPTY;
 
     private JsonObject appliedCompilerSettings = new JsonObject();
     private JsonObject settings = new JsonObject();
-    private boolean workDoneProgressSupported;
+    ProgressReporter progress;
 
-    private final ScheduledExecutorService completionIndexExecutor =
+    final ScheduledExecutorService completionIndexExecutor =
             Executors.newSingleThreadScheduledExecutor(
                     Thread.ofPlatform().daemon().name("javacs-completion-index").factory());
 
     /** Monotonic revision for queued completion-index refreshes; newer schedules cancel older runs. */
-    private final AtomicLong completionIndexRevision = new AtomicLong();
+    final AtomicLong completionIndexRevision = new AtomicLong();
     private final AtomicLong diagnosticRevision = new AtomicLong();
-    private final AtomicLong completionIndexVersion = new AtomicLong();
-    private final AtomicReference<CompletionSnapshot> completionSnapshotRef =
+    final AtomicLong completionIndexVersion = new AtomicLong();
+    final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
     /** Serialize completion-index refreshes so one compile/index install owns the refresh lane. */
-    private final Object completionIndexCompileMutex = new Object();
+    final Object completionIndexCompileMutex = new Object();
 
-    private ScheduledFuture<?> pendingCompletionIndex;
-    private CompletionIndexRefreshMode pendingCompletionIndexMode;
-    private final Set<Path> pendingCompletionIndexFiles = new LinkedHashSet<>();
-    private String pendingCompletionIndexTrigger;
 
     private final Set<String> shownWorkspaceWarnings = ConcurrentHashMap.newKeySet();
 
@@ -172,13 +129,13 @@ class JavaLanguageServer extends LanguageServer {
                         }
                     });
 
-    private enum CompletionIndexRefreshMode {
+    enum CompletionIndexRefreshMode {
         ACTIVE_DOCUMENT_BOOTSTRAP,
         FULL_REBUILD,
         WORKSPACE_DECLARATION_MERGE
     }
 
-    private enum CompletionIndexScope {
+    enum CompletionIndexScope {
         EMPTY,
         ACTIVE,
         WORKSPACE
@@ -193,353 +150,21 @@ class JavaLanguageServer extends LanguageServer {
         return compiler;
     }
 
-    private String moduleCompilerKey(Path file) {
-        var module = moduleGraph.moduleForFile(file).orElse(null);
-        if (module == null) return "";
-        var test = module.testSourceDir() != null && file.startsWith(module.testSourceDir());
-        var prefix = moduleScopedGradle ? "gradle:" : "";
-        return prefix + module.projectPath() + (test ? "#test" : "#main");
+    synchronized JavaCompilerService compilerFor(Path file) {
+        return moduleRegistry.compilerFor(file);
     }
 
-    private synchronized JavaCompilerService compilerFor(Path file) {
-        if (!moduleScopedMaven && !moduleScopedGradle) return getOrCreateCompiler();
-        if (moduleScopedGradle) return compilerForGradleModule(file);
-        var module = moduleGraph.moduleForFile(file).orElse(null);
-        if (module == null) return getOrCreateCompiler();
-        var key = moduleCompilerKey(file);
-        var existing = mavenModuleCompilers.get(key);
-        if (existing != null) return existing.compiler;
-        if (failedMavenModules.contains(key)) {
-            throw new RuntimeException("Maven dependency resolution previously failed for " + module.projectPath());
-        }
-        var test = key.endsWith("#test");
-        var started = Instant.now();
-        var progressToken = beginWorkDoneProgress(
-                "Resolving module",
-                "Resolving " + module.projectPath());
-        MavenTooling.MavenDependencies dependencies;
-        try {
-            dependencies = inferredConfig.mavenModuleDependencies(module, test);
-        } catch (RuntimeException e) {
-            endWorkDoneProgress(progressToken, "Resolution failed");
-            failedMavenModules.add(key);
-            LOG.warning(String.format(
-                    "[maven] compiler_failed module=%s scope=%s reason=%s took=%dms",
-                    module.projectPath(), test ? "test" : "main", e.getMessage(),
-                    Duration.between(started, Instant.now()).toMillis()));
-            throw e;
-        }
-        endWorkDoneProgress(progressToken, "Dependencies resolved");
-        var args = new ArrayList<>(configuredUserCompilerArgs);
-        if (!hasExplicitJavaLevelOverride(args)) args.addAll(module.compilerArgs());
-        var next = new JavaCompilerService(
-                dependencies.classpath(), dependencies.sources(), configuredAddExports, args);
-        next.setModuleGraph(moduleGraph);
-        var sourceRoots = dependencies.sourceRoots();
-        next.setSourceRoots(sourceRoots);
-        mavenModuleCompilers.put(
-                key, new ModuleCompiler(next, new ExternalBinaryTypeIndex(next), sourceRoots));
-        if (FileStore.activeDocuments().contains(file)) {
-            completionIndexScheduler.scheduleRefresh(
-                    List.of(file),
-                    "moduleCompilerReady",
-                    0,
-                    CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-        }
-        LOG.info(String.format(
-                "[maven] compiler_ready module=%s scope=%s classpath=%d source_roots=%d took=%dms",
-                module.projectPath(), test ? "test" : "main", dependencies.classpath().size(),
-                sourceRoots.size(), Duration.between(started, Instant.now()).toMillis()));
-        // Async pre-resolve direct dependency modules so cross-module jumps are instant
-        return next;
-    }
-
-    /**
-     * Resolve and return a per-module compiler for a Gradle multi-module project.
-     * If the module is not yet resolved, resolves classpath synchronously.
-     */
-    private JavaCompilerService compilerForGradleModule(Path file) {
-        var module = moduleGraph.moduleForFile(file).orElse(null);
-        if (module == null) return getOrCreateCompiler();
-        var key = moduleCompilerKey(file);
-        var existing = gradleModuleCompilers.get(key);
-        if (existing != null) return existing.compiler;
-        // Module not resolved yet — resolve synchronously
-        resolveGradleModule(module);
-        var resolved = gradleModuleCompilers.get(key);
-        return resolved != null ? resolved.compiler : getOrCreateCompiler();
-    }
-
-    /**
-     * Resolve classpath for a Gradle module and create its compiler.
-     * No-op if already resolved.
-     */
-    private void resolveGradleModule(ModuleGraph.ModuleInfo module) {
-        if (resolvedGradleModules.contains(module.projectPath())) return;
-        var started = Instant.now();
-        var progressToken = beginWorkDoneProgress(
-                "Resolving module",
-                "Resolving classpath for " + module.projectPath());
-        try {
-            var targets = moduleGraph.transitiveModulePathsIncludingSelf(module.projectPath());
-            var resolved = GradleTooling.resolveClasspath(workspaceRoot, targets);
-            if (resolved == GradleTooling.ModuleClasspath.EMPTY || resolved.modules().isEmpty()) {
-                LOG.warning("[gradle] classpath resolution returned empty for " + module.projectPath());
-                resolvedGradleModules.add(module.projectPath());
-                return;
-            }
-            // Create compilers for all resolved modules
-            for (var entry : resolved.modules().entrySet()) {
-                var modulePath = entry.getKey();
-                var moduleClasspath = entry.getValue();
-                var moduleInfo = moduleGraph.modules().get(modulePath);
-                if (moduleInfo == null) continue;
-                resolvedGradleModules.add(modulePath);
-
-                // Build classpath: external JARs + transitive module class output dirs
-                var classpath = new LinkedHashSet<Path>(moduleClasspath.externalClasspath());
-                classpath.addAll(moduleGraph.transitiveClassOutputDirs(modulePath));
-
-                var args = new ArrayList<>(configuredUserCompilerArgs);
-                if (!hasExplicitJavaLevelOverride(args)
-                        && moduleInfo.sourceCompatibility() != null
-                        && !moduleInfo.sourceCompatibility().isBlank()) {
-                    args.add("--release");
-                    args.add(moduleInfo.sourceCompatibility());
-                }
-                var compilerService = new JavaCompilerService(
-                        classpath, Set.of(), configuredAddExports, args);
-                compilerService.setModuleGraph(moduleGraph);
-                var sourceRoots = new LinkedHashSet<>(moduleInfo.sourceDirs());
-                compilerService.setSourceRoots(sourceRoots);
-
-                // Store main compiler
-                var mainKey = "gradle:" + modulePath + "#main";
-                gradleModuleCompilers.putIfAbsent(
-                        mainKey, new ModuleCompiler(compilerService, new ExternalBinaryTypeIndex(compilerService), sourceRoots));
-
-                // Store test compiler if test classpath is available
-                if (!moduleClasspath.testClasspath().isEmpty()) {
-                    var testClasspath = new LinkedHashSet<Path>(moduleClasspath.testClasspath());
-                    testClasspath.addAll(moduleGraph.transitiveClassOutputDirs(modulePath, true));
-                    var testArgs = new ArrayList<>(args);
-                    var testCompiler = new JavaCompilerService(
-                            testClasspath, Set.of(), configuredAddExports, testArgs);
-                    testCompiler.setModuleGraph(moduleGraph);
-                    var testKey = "gradle:" + modulePath + "#test";
-                    gradleModuleCompilers.putIfAbsent(
-                            testKey, new ModuleCompiler(testCompiler, new ExternalBinaryTypeIndex(testCompiler), sourceRoots));
-                }
-
-                LOG.info(String.format(
-                        "[gradle] compiler_ready module=%s classpath=%d source_roots=%d took=%dms",
-                        modulePath, classpath.size(), sourceRoots.size(),
-                        Duration.between(started, Instant.now()).toMillis()));
-            }
-        } catch (Exception e) {
-            LOG.warning("[gradle] module resolution failed for " + module.projectPath() + ": " + e.getMessage());
-            resolvedGradleModules.add(module.projectPath());
-        } finally {
-            endWorkDoneProgress(progressToken, "Module resolved");
-        }
-    }
-
-    /**
-     * Batch pre-resolve modules for a set of candidate files before reference scanning.
-     * Works for both Gradle and Maven multi-module. No-op for single-module projects.
-     * Resolves all needed modules in one batch call instead of one-per-file.
-     */
-    private void batchResolveModulesForFiles(Path[] files) {
-        if (!moduleScopedGradle && !moduleScopedMaven) return;
-        if (moduleGraph == ModuleGraph.EMPTY) return;
-
-        if (moduleScopedGradle) batchResolveGradleModules(files);
-        if (moduleScopedMaven) batchResolveMavenModules(files);
-    }
-
-    private void batchResolveGradleModules(Path[] files) {
-        var unresolved = new LinkedHashSet<String>();
-        for (var f : files) {
-            var module = moduleGraph.moduleForFile(f).orElse(null);
-            if (module != null && !resolvedGradleModules.contains(module.projectPath())) {
-                unresolved.add(module.projectPath());
-            }
-        }
-        if (unresolved.isEmpty()) return;
-        // Resolve without notification first — GradleTooling uses disk cache internally.
-        // Only show notification if it takes significant time (meaning Gradle was invoked).
-        var allTargets = new ArrayList<String>();
-        for (var modulePath : unresolved) {
-            for (var target : moduleGraph.transitiveModulePathsIncludingSelf(modulePath)) {
-                if (!resolvedGradleModules.contains(target)) allTargets.add(target);
-            }
-        }
-        if (allTargets.isEmpty()) return;
-        LOG.info("[gradle] batch pre-resolving " + unresolved.size() + " modules for reference scan");
-        try {
-            // This call uses disk cache — if all modules are cached, it returns instantly
-            GradleTooling.resolveClasspath(workspaceRoot, allTargets);
-            // Create compilers from cached results (fast)
-            for (var modulePath : unresolved) {
-                var module = moduleGraph.modules().get(modulePath);
-                if (module != null) resolveGradleModule(module);
-            }
-        } catch (Exception e) {
-            LOG.warning("[gradle] batch pre-resolution failed: " + e.getMessage());
-        }
-    }
-
-    private void batchResolveMavenModules(Path[] files) {
-        // Collect unique unresolved modules
-        var unresolvedModules = new LinkedHashMap<String, ModuleGraph.ModuleInfo>();
-        var unresolvedFiles = new LinkedHashMap<String, Path>(); // key -> representative file
-        for (var f : files) {
-            var module = moduleGraph.moduleForFile(f).orElse(null);
-            if (module == null) continue;
-            var key = moduleCompilerKey(f);
-            if (key.isEmpty()) continue;
-            if (mavenModuleCompilers.containsKey(key)) continue;
-            if (failedMavenModules.contains(key)) continue;
-            if (!unresolvedModules.containsKey(key)) {
-                unresolvedModules.put(key, module);
-                unresolvedFiles.put(key, f);
-            }
-        }
-        if (unresolvedModules.isEmpty()) return;
-        LOG.info("[maven] batch pre-resolving " + unresolvedModules.size()
-                + " modules for reference scan");
-
-        // Resolve dependencies in parallel (expensive mvn subprocess calls)
-        var futures = new LinkedHashMap<String, CompletableFuture<MavenTooling.MavenDependencies>>();
-        for (var entry : unresolvedModules.entrySet()) {
-            var key = entry.getKey();
-            var module = entry.getValue();
-            var test = key.endsWith("#test");
-            futures.put(key, CompletableFuture.supplyAsync(() ->
-                    inferredConfig.mavenModuleDependencies(module, test)));
-        }
-
-        // Collect results and create compilers
-        for (var entry : futures.entrySet()) {
-            var key = entry.getKey();
-            var module = unresolvedModules.get(key);
-            var test = key.endsWith("#test");
-            var file = unresolvedFiles.get(key);
-            try {
-                var dependencies = entry.getValue().join();
-                synchronized (this) {
-                    if (mavenModuleCompilers.containsKey(key)) continue; // race check
-                    var args = new ArrayList<>(configuredUserCompilerArgs);
-                    if (!hasExplicitJavaLevelOverride(args)) args.addAll(module.compilerArgs());
-                    var compiler = new JavaCompilerService(
-                            dependencies.classpath(), dependencies.sources(),
-                            configuredAddExports, args);
-                    compiler.setModuleGraph(moduleGraph);
-                    var sourceRoots = dependencies.sourceRoots();
-                    compiler.setSourceRoots(sourceRoots);
-                    mavenModuleCompilers.put(key,
-                            new ModuleCompiler(compiler, new ExternalBinaryTypeIndex(compiler),
-                                    sourceRoots));
-                    if (FileStore.activeDocuments().contains(file)) {
-                        completionIndexScheduler.scheduleRefresh(
-                                List.of(file), "moduleCompilerReady", 0,
-                                CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-                    }
-                }
-                LOG.info("[maven] batch resolved " + module.projectPath()
-                        + " scope=" + (test ? "test" : "main"));
-            } catch (Exception e) {
-                failedMavenModules.add(key);
-                LOG.warning("[maven] batch resolution failed for "
-                        + module.projectPath() + ": " + e.getMessage());
-            }
-        }
-    }
-
-    private TypeIndexRouter typeIndexFor(Path file) {
-        var snapshot = completionSnapshotRef.get();
-        if (!moduleScopedMaven && !moduleScopedGradle) return snapshot.typeIndex();
-        var key = moduleCompilerKey(file);
-        if (moduleScopedGradle) {
-            var context = gradleModuleCompilers.get(key);
-            return context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
-        }
-        var context = mavenModuleCompilers.get(key);
-        return context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
-    }
-
-    private ExternalBinaryTypeIndex externalIndexForIndexing(
+    ExternalBinaryTypeIndex externalIndexForIndexing(
             Path file, JavaCompilerService parsingCompiler) {
-        if (!moduleScopedMaven && !moduleScopedGradle) return completionSnapshotRef.get().externalIndex();
-        if (moduleScopedGradle) {
-            var context = gradleModuleCompilers.get(moduleCompilerKey(file));
-            if (context != null) return context.externalIndex;
-            for (var candidate : gradleModuleCompilers.values()) {
-                if (candidate.compiler == parsingCompiler
-                        && candidate.sourceRoots.stream().anyMatch(file::startsWith)) {
-                    return candidate.externalIndex;
-                }
-            }
-            return ExternalBinaryTypeIndex.EMPTY;
-        }
-        var context = mavenModuleCompilers.get(moduleCompilerKey(file));
-        if (context != null) return context.externalIndex;
-        for (var candidate : mavenModuleCompilers.values()) {
-            if (candidate.compiler == parsingCompiler
-                    && candidate.sourceRoots.stream().anyMatch(file::startsWith)) {
-                return candidate.externalIndex;
-            }
-        }
-        return ExternalBinaryTypeIndex.EMPTY;
+        return moduleRegistry.externalIndexForIndexing(file, parsingCompiler);
     }
 
-    private CompilerProvider compilerForClass(String className) {
-        for (var context : mavenModuleCompilers.values()) {
-            if (context.compiler.findTypeDeclaration(className) != CompilerProvider.NOT_FOUND) {
-                return context.compiler;
-            }
-        }
-        for (var context : gradleModuleCompilers.values()) {
-            if (context.compiler.findTypeDeclaration(className) != CompilerProvider.NOT_FOUND) {
-                return context.compiler;
-            }
-        }
-        return getOrCreateCompiler();
-    }
-
-    private void includeMavenReferenceSources() {
-        if (!moduleScopedMaven && !moduleScopedGradle) return;
-        var roots = new LinkedHashSet<>(FileStore.workspaceRoots());
-        for (var module : moduleGraph.modules().values()) {
-            for (var sourceDir : module.sourceDirs()) {
-                if (Files.isDirectory(sourceDir)) roots.add(sourceDir);
-            }
-        }
-        if (!roots.equals(FileStore.workspaceRoots())) FileStore.setWorkspaceRoots(roots);
-    }
-
-    private boolean canReferenceModule(Path declaration, Path candidate) {
-        if ((!moduleScopedMaven && !moduleScopedGradle) || declaration == null || candidate == null
-                || declaration == CompilerProvider.NOT_FOUND) return true;
-        var owner = moduleGraph.moduleForFile(declaration).orElse(null);
-        var consumer = moduleGraph.moduleForFile(candidate).orElse(null);
-        if (owner == null || consumer == null || owner.projectPath().equals(consumer.projectPath())) {
-            return true;
-        }
-        var key = moduleCompilerKey(candidate);
-        var context = moduleScopedGradle
-                ? gradleModuleCompilers.get(key)
-                : mavenModuleCompilers.get(key);
-        if (context != null) {
-            return context.sourceRoots.stream().anyMatch(declaration::startsWith);
-        }
-        var test = consumer.testSourceDir() != null && candidate.startsWith(consumer.testSourceDir());
-        return moduleGraph.transitiveModuleDependencies(consumer.projectPath(), test)
-                .contains(owner.projectPath());
+    boolean canReferenceModule(Path declaration, Path candidate) {
+        return moduleRegistry.canReferenceModule(declaration, candidate);
     }
 
 
-    private void publishCompletionSnapshot(
+    void publishCompletionSnapshot(
             WorkspaceTypeIndex workspaceIndex,
             ExternalBinaryTypeIndex externalIndex,
             long version,
@@ -549,25 +174,7 @@ class JavaLanguageServer extends LanguageServer {
         completionSnapshotRef.set(snapshot);
     }
 
-    private JsonObject compilerSettingsSnapshot(JsonObject source) {
-        var snapshot = new JsonObject();
-        if (source == null) {
-            return snapshot;
-        }
-        copySettingIfPresent(source, snapshot, "externalDependencies");
-        copySettingIfPresent(source, snapshot, "classPath");
-        copySettingIfPresent(source, snapshot, "extraCompilerArgs");
-        copySettingIfPresent(source, snapshot, "docPath");
-        copySettingIfPresent(source, snapshot, "addExports");
-        return snapshot;
-    }
 
-    private void copySettingIfPresent(JsonObject source, JsonObject target, String key) {
-        if (!source.has(key)) {
-            return;
-        }
-        target.add(key, source.get(key).deepCopy());
-    }
 
     private void publishExternalBinaryIndexSnapshot() {
         var currentSnapshot = completionSnapshotRef.get();
@@ -583,16 +190,16 @@ class JavaLanguageServer extends LanguageServer {
 
     private synchronized void initializeCompilers() {
         createCompilers();
-        appliedCompilerSettings = compilerSettingsSnapshot(settings);
+        appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
         publishExternalBinaryIndexSnapshot();
     }
 
     private void notifyWorkspaceInfo() {
         var started = Instant.now();
         var info = new JsonObject();
-        if (inferredConfig != null && moduleGraph != ModuleGraph.EMPTY) {
+        if (moduleRegistry.inferredConfig != null && moduleGraph != ModuleGraph.EMPTY) {
             info.addProperty("buildSystem", "maven");
-            info.addProperty("buildRoot", inferredConfig.buildRoot().toString());
+            info.addProperty("buildRoot", moduleRegistry.inferredConfig.buildRoot().toString());
             var sourceRoots = new JsonArray();
             moduleGraph.modules().values().stream()
                     .flatMap(module -> module.sourceDirs().stream())
@@ -615,7 +222,7 @@ class JavaLanguageServer extends LanguageServer {
         completionIndexScheduler.cancel(trigger);
         try {
             createCompilers();
-            appliedCompilerSettings = compilerSettingsSnapshot(settings);
+            appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
             publishExternalBinaryIndexSnapshot();
             refreshStateForCompilerRecreated();
             refreshDiagnostics();
@@ -627,7 +234,7 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
-    private void refreshDiagnostics() {
+    void refreshDiagnostics() {
         diagnosticRevision.incrementAndGet();
         client.customNotification("workspace/diagnostic/refresh", null);
     }
@@ -663,7 +270,7 @@ class JavaLanguageServer extends LanguageServer {
         }
     }
 
-    private static List<Path> filterJavaFiles(Collection<Path> files) {
+    static List<Path> filterJavaFiles(Collection<Path> files) {
         var javaFiles = new ArrayList<Path>();
         for (var file : files) {
             if (FileStore.isJavaFile(file)) {
@@ -730,30 +337,25 @@ class JavaLanguageServer extends LanguageServer {
      */
     private void createCompilers() {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
-        mavenModuleCompilers.clear();
-        failedMavenModules.clear();
-        gradleModuleCompilers.clear();
-        resolvedGradleModules.clear();
+        moduleRegistry.clear();
         pendingRewrites.clear();
-        moduleScopedMaven = false;
-        moduleScopedGradle = false;
-        inferredConfig = null;
         var started = Instant.now();
-        var progressToken = beginWorkDoneProgress("Configure javac", "Finding source roots");
+        var progressToken = progress.begin("Configure javac", "Finding source roots");
 
-        var externalDependencies = externalDependencies();
-        var classPath = classPath();
-        var userExtraArgs = extraCompilerArgs();
-        var addExports = addExports();
-        configuredUserCompilerArgs = List.copyOf(userExtraArgs);
-        configuredAddExports = Set.copyOf(addExports);
+        var serverSettings = new ServerSettings(workspaceRoot, settings);
+        var externalDependencies = serverSettings.externalDependencies();
+        var classPath = serverSettings.classPath();
+        var userExtraArgs = serverSettings.extraCompilerArgs();
+        var addExports = serverSettings.addExports();
+        moduleRegistry.configuredUserCompilerArgs = List.copyOf(userExtraArgs);
+        moduleRegistry.configuredAddExports = Set.copyOf(addExports);
         List<String> extraArgs = userExtraArgs;
         var settingsLoaded = Instant.now();
         Set<Path> resolvedDocPath;
         InferConfig infer = null;
         // If classpath is specified by the user, don't infer anything
         if (!classPath.isEmpty()) {
-            resolvedDocPath = docPath();
+            resolvedDocPath = serverSettings.docPath();
             LOG.info(String.format(
                     "[perf] compiler_config_inference mode=explicit classpath=%d docpath=%d took=%dms",
                     classPath.size(),
@@ -767,21 +369,21 @@ class JavaLanguageServer extends LanguageServer {
             var isMaven = infer.buildSystem() == InferConfig.BuildSystem.MAVEN;
             if (isMaven) {
                 moduleGraph = infer.moduleGraph();
-                moduleScopedMaven = moduleGraph.modules().size() > 1;
-                inferredConfig = infer;
+                moduleRegistry.moduleScopedMaven = moduleGraph.modules().size() > 1;
+                moduleRegistry.inferredConfig = infer;
             }
 
-            reportWorkDoneProgress(progressToken,
+            progress.report(progressToken,
                     isGradle ? "Resolving Gradle dependencies (may take a minute on first run)"
                     : isMaven ? "Resolving Maven dependencies"
                     : "Resolving dependencies");
             var inferClassPathStarted = Instant.now();
-            classPath = moduleScopedMaven ? Set.of() : infer.classPath();
+            classPath = moduleRegistry.moduleScopedMaven ? Set.of() : infer.classPath();
             var inferredClassPath = Instant.now();
 
-            reportWorkDoneProgress(progressToken, "Inferring doc path");
+            progress.report(progressToken, "Inferring doc path");
             var inferDocPathStarted = Instant.now();
-            resolvedDocPath = moduleScopedMaven ? Set.of() : infer.buildDocPath();
+            resolvedDocPath = moduleRegistry.moduleScopedMaven ? Set.of() : infer.buildDocPath();
             LOG.info(String.format(
                     "[perf] compiler_config_inference mode=inferred build_system=%s external=%d classpath=%d docpath=%d classpath_infer=%dms docpath_infer=%dms total=%dms",
                     isGradle ? "gradle" : isMaven ? "maven" : "unknown",
@@ -794,16 +396,16 @@ class JavaLanguageServer extends LanguageServer {
         }
         var inferenceFinished = Instant.now();
         var inferForGraph = infer != null ? infer : new InferConfig(workspaceRoot, externalDependencies);
-        if (!moduleScopedMaven) {
+        if (!moduleRegistry.moduleScopedMaven) {
             extraArgs = selectCompilerArgs(userExtraArgs, inferForGraph).args();
         }
 
         // Populate module graph and compile inter-module deps before creating compilers.
-        if (inferredConfig == null
+        if (moduleRegistry.inferredConfig == null
                 && inferForGraph.buildSystem() == InferConfig.BuildSystem.MAVEN) {
-            inferredConfig = inferForGraph;
+            moduleRegistry.inferredConfig = inferForGraph;
         }
-        if (!moduleScopedMaven) moduleGraph = inferForGraph.moduleGraph();
+        if (!moduleRegistry.moduleScopedMaven) moduleGraph = inferForGraph.moduleGraph();
         if (moduleGraph != ModuleGraph.EMPTY) {
             var isGradleProject = inferForGraph.buildSystem() == InferConfig.BuildSystem.GRADLE;
             LOG.info(String.format("[module-graph] loaded modules=%d build_system=%s",
@@ -832,7 +434,7 @@ class JavaLanguageServer extends LanguageServer {
             // Gradle keeps using existing build outputs. Maven module outputs are refreshed lazily
             // when the first file from that module is opened.
             if (isGradleProject && moduleGraph.modules().size() > 1) {
-                moduleScopedGradle = true;
+                moduleRegistry.moduleScopedGradle = true;
                 var activeModule = moduleGraph.moduleForFile(workspaceRoot);
                 if (activeModule.isPresent()) {
                     // Scope workspace to active module's own source dirs only.
@@ -861,7 +463,7 @@ class JavaLanguageServer extends LanguageServer {
                         // Register all resolved modules
                         for (var entry : resolved.modules().entrySet()) {
                             var modulePath = entry.getKey();
-                            resolvedGradleModules.add(modulePath);
+                            moduleRegistry.resolvedGradleModules.add(modulePath);
                         }
                     } else {
                         // Fallback: use existing build outputs like before
@@ -882,20 +484,20 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
 
-        endWorkDoneProgress(progressToken, "Configured javac");
+        progress.end(progressToken, "Configured javac");
 
         compiler = new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs);
         compiler.setModuleGraph(moduleGraph);
 
-        // Register active module compiler in gradleModuleCompilers so compilerFor() finds it
-        if (moduleScopedGradle && moduleGraph != ModuleGraph.EMPTY) {
+        // Register active module compiler in moduleRegistry.gradleModuleCompilers so compilerFor() finds it
+        if (moduleRegistry.moduleScopedGradle && moduleGraph != ModuleGraph.EMPTY) {
             var activeModule = moduleGraph.moduleForFile(workspaceRoot);
             if (activeModule.isPresent()) {
                 var sourceRoots = new LinkedHashSet<>(activeModule.get().sourceDirs());
                 compiler.setSourceRoots(sourceRoots);
                 var mainKey = "gradle:" + activeModule.get().projectPath() + "#main";
-                gradleModuleCompilers.put(
-                        mainKey, new ModuleCompiler(compiler, new ExternalBinaryTypeIndex(compiler), sourceRoots));
+                moduleRegistry.gradleModuleCompilers.put(
+                        mainKey, new ModuleCompilerRegistry.ModuleCompiler(compiler, new ExternalBinaryTypeIndex(compiler), sourceRoots));
             }
         }
 
@@ -918,39 +520,6 @@ class JavaLanguageServer extends LanguageServer {
                 Duration.between(started, Instant.now()).toMillis()));
     }
 
-    private Set<String> externalDependencies() {
-        if (!settings.has("externalDependencies")) return Set.of();
-        var array = settings.getAsJsonArray("externalDependencies");
-        var strings = new HashSet<String>();
-        for (var each : array) {
-            strings.add(each.getAsString());
-        }
-        return strings;
-    }
-
-    private Set<Path> classPath() {
-        if (!settings.has("classPath")) return Set.of();
-        var array = settings.getAsJsonArray("classPath");
-        var paths = new HashSet<Path>();
-        for (var each : array) {
-            paths.add(Paths.get(each.getAsString()).toAbsolutePath());
-        }
-        return paths;
-    }
-
-    private List<String> extraCompilerArgs() {
-        var args = new ArrayList<String>();
-        var file = projectSettings();
-        if (file.has("extraCompilerArgs")) {
-            for (var each : file.getAsJsonArray("extraCompilerArgs"))
-                args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
-        }
-        if (settings.has("extraCompilerArgs")) {
-            for (var each : settings.getAsJsonArray("extraCompilerArgs"))
-                args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
-        }
-        return List.copyOf(args);
-    }
 
     private InferConfig.CompilerArgs selectCompilerArgs(List<String> userExtraArgs, InferConfig infer) {
         if (hasExplicitJavaLevelOverride(userExtraArgs)) {
@@ -985,7 +554,7 @@ class JavaLanguageServer extends LanguageServer {
         return new InferConfig.CompilerArgs(merged, inferred.source(), false);
     }
 
-    private static boolean hasExplicitJavaLevelOverride(List<String> extraArgs) {
+    static boolean hasExplicitJavaLevelOverride(List<String> extraArgs) {
         for (var i = 0; i < extraArgs.size(); i++) {
             var arg = extraArgs.get(i);
             if ("--release".equals(arg) || "-source".equals(arg) || "-target".equals(arg)) {
@@ -1006,110 +575,12 @@ class JavaLanguageServer extends LanguageServer {
         LOG.warning(message);
     }
 
-    private Set<Path> docPath() {
-        if (!settings.has("docPath")) return Set.of();
-        var array = settings.getAsJsonArray("docPath");
-        var paths = new HashSet<Path>();
-        for (var each : array) {
-            paths.add(Paths.get(each.getAsString()).toAbsolutePath());
-        }
-        return paths;
-    }
 
-    private Set<String> addExports() {
-        var merged = new HashSet<String>();
-        // Project file first, then client settings override/extend
-        var file = projectSettings();
-        if (file.has("addExports")) {
-            for (var each : file.getAsJsonArray("addExports")) merged.add(each.getAsString());
-        }
-        if (settings.has("addExports")) {
-            for (var each : settings.getAsJsonArray("addExports")) merged.add(each.getAsString());
-        }
-        return merged;
-    }
-
-    /** Read .java-language-server.json from the workspace root, or empty object if absent/invalid. */
-    private JsonObject projectSettings() {
-        if (workspaceRoot == null) return new JsonObject();
-        var file = workspaceRoot.resolve(".java-language-server.json");
-        if (!Files.exists(file)) return new JsonObject();
-        try {
-            var text = Files.readString(file);
-            var parsed = JsonParser.parseString(text);
-            return parsed.isJsonObject() ? parsed.getAsJsonObject() : new JsonObject();
-        } catch (Exception e) {
-            LOG.warning("Failed to read .java-language-server.json: " + e.getMessage());
-            return new JsonObject();
-        }
-    }
-
-    private static boolean supportsWorkDoneProgress(JsonElement capabilities) {
-        if (capabilities == null || !capabilities.isJsonObject()) {
-            return false;
-        }
-        var root = capabilities.getAsJsonObject();
-        if (!root.has("window") || !root.get("window").isJsonObject()) {
-            return false;
-        }
-        var window = root.getAsJsonObject("window");
-        return window.has("workDoneProgress") && window.get("workDoneProgress").getAsBoolean();
-    }
-
-    private String beginWorkDoneProgress(String title, String message) {
-        if (!workDoneProgressSupported) {
-            return null;
-        }
-        var token = UUID.randomUUID().toString();
-        var create = new JsonObject();
-        create.addProperty("token", token);
-        client.sendRequest("window/workDoneProgress/create", create);
-
-        var value = new JsonObject();
-        value.addProperty("kind", "begin");
-        value.addProperty("title", title);
-        value.addProperty("message", message);
-        value.addProperty("cancellable", false);
-        var progress = new JsonObject();
-        progress.addProperty("token", token);
-        progress.add("value", value);
-        client.customNotification("$/progress", progress);
-        return token;
-    }
-
-    private void reportWorkDoneProgress(String token, String message) {
-        if (token == null) {
-            return;
-        }
-        var value = new JsonObject();
-        value.addProperty("kind", "report");
-        value.addProperty("message", message);
-        value.addProperty("cancellable", false);
-        var progress = new JsonObject();
-        progress.addProperty("token", token);
-        progress.add("value", value);
-        client.customNotification("$/progress", progress);
-    }
-
-    private void endWorkDoneProgress(String token, String message) {
-        if (token == null) {
-            return;
-        }
-        var value = new JsonObject();
-        value.addProperty("kind", "end");
-        if (message != null && !message.isBlank()) {
-            value.addProperty("message", message);
-        }
-        var progress = new JsonObject();
-        progress.addProperty("token", token);
-        progress.add("value", value);
-        client.customNotification("$/progress", progress);
-    }
 
     @Override
     public InitializeResult initialize(InitializeParams params) {
         this.workspaceRoot = Paths.get(params.rootUri);
-        this.workDoneProgressSupported = supportsWorkDoneProgress(params.capabilities);
+        this.progress = new ProgressReporter(client, ProgressReporter.supportsWorkDoneProgress(params.capabilities));
         FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
 
         var c = new JsonObject();
@@ -1185,20 +656,12 @@ class JavaLanguageServer extends LanguageServer {
         } finally {
             notifyWorkspaceInfo();
         }
-        if (!moduleScopedMaven && !moduleScopedGradle) getOrCreateCompiler().fullCompileWithAP();
+        if (!moduleRegistry.moduleScopedMaven && !moduleRegistry.moduleScopedGradle) getOrCreateCompiler().fullCompileWithAP();
     }
 
     @Override
     public void shutdown() {
-        synchronized (this) {
-            if (pendingCompletionIndex != null) {
-                pendingCompletionIndex.cancel(false);
-                pendingCompletionIndex = null;
-            }
-            pendingCompletionIndexMode = null;
-            pendingCompletionIndexFiles.clear();
-            pendingCompletionIndexTrigger = null;
-        }
+        completionIndexScheduler.shutdown();
         completionIndexExecutor.shutdownNow();
         MavenTooling.destroyAllProcesses();
         CacheAudit.logSummary(LOG);
@@ -1229,7 +692,7 @@ class JavaLanguageServer extends LanguageServer {
         if (java != null && !java.isJsonNull()) {
             nextSettings = java.getAsJsonObject();
         }
-        var nextCompilerSettings = compilerSettingsSnapshot(nextSettings);
+        var nextCompilerSettings = ServerSettings.compilerSettingsSnapshot(nextSettings);
         settings = nextSettings;
         if (!nextCompilerSettings.equals(appliedCompilerSettings)) {
             recreateCompilersAndRefreshState("didChangeConfiguration");
@@ -1309,7 +772,7 @@ class JavaLanguageServer extends LanguageServer {
             if (isCompilerConfigFile(name)) {
                 LOG.info(String.format("Compiler needs to be re-created because %s has changed", file));
                 if ("pom.xml".equals(name)) {
-                    failedMavenModules.clear();
+                    moduleRegistry.failedMavenModules.clear();
                 }
                 compilerInputsChanged = true;
             }
@@ -1344,7 +807,7 @@ class JavaLanguageServer extends LanguageServer {
         var readiness = ensureTypeIndexReady("completionBootstrap", COMPLETION_BOOTSTRAP_WAIT_MS, false);
         var snapshot = completionSnapshotRef.get();
         var provider = new CompletionProvider(
-                compilerFor(file), typeIndexFor(file), snapshot.version(), moduleCompilerKey(file));
+                compilerFor(file), moduleRegistry.typeIndexFor(file), snapshot.version(), moduleRegistry.moduleCompilerKey(file));
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(String.format(
@@ -1365,8 +828,8 @@ class JavaLanguageServer extends LanguageServer {
         var data = unresolved.data == null
                 ? null
                 : JsonHelper.GSON.fromJson(unresolved.data, CompletionData.class);
-        var context = data == null ? null : mavenModuleCompilers.get(data.compilerId);
-        if (context == null && data != null) context = gradleModuleCompilers.get(data.compilerId);
+        var context = data == null ? null : moduleRegistry.mavenModuleCompilers.get(data.compilerId);
+        if (context == null && data != null) context = moduleRegistry.gradleModuleCompilers.get(data.compilerId);
         var requestCompiler = context == null ? getOrCreateCompiler() : context.compiler;
         var index = context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
         new CompletionProvider(requestCompiler, index, snapshot.version(), data == null ? null : data.compilerId)
@@ -1395,7 +858,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
-        var signatureProvider = new SignatureProvider(compilerFor(file), typeIndexFor(file)).signatureHelp(file, line, column);
+        var signatureProvider = new SignatureProvider(compilerFor(file), moduleRegistry.typeIndexFor(file)).signatureHelp(file, line, column);
         if (signatureProvider == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(signatureProvider);
     }
@@ -1426,7 +889,7 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public Optional<List<Location>> findReferences(ReferenceParams position) {
         if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
-        includeMavenReferenceSources();
+        moduleRegistry.includeMavenReferenceSources();
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
@@ -1434,7 +897,7 @@ class JavaLanguageServer extends LanguageServer {
         var found =
                 new ReferenceProvider(
                                 compilerFor(file), file, line, column, this::compilerFor,
-                                this::canReferenceModule, this::batchResolveModulesForFiles)
+                                this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles)
                         .find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
@@ -1479,171 +942,24 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
         if (compiler == null) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
-        return Optional.of(new InlayHintProvider(compilerFor(file), typeIndexFor(file)).inlayHints(file, params.range));
+        return Optional.of(new InlayHintProvider(compilerFor(file), moduleRegistry.typeIndexFor(file)).inlayHints(file, params.range));
     }
+
+    private final RenameHandler renameHandler = new RenameHandler(this);
 
     @Override
     public Optional<RenameResponse> prepareRename(TextDocumentPositionParams params) {
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
-        LOG.info("Try to rename...");
-        var file = Paths.get(params.textDocument.uri);
-        var requestCompiler = compilerFor(file);
-        try (var task = requestCompiler.compile(file)) {
-            long cursor;
-            try {
-                cursor =
-                        FileStore.offset(
-                                task.root(file).getSourceFile().getCharContent(true).toString(),
-                                params.position.line + 1,
-                                params.position.character + 1);
-            } catch (java.io.IOException e) {
-                throw new RuntimeException(e);
-            }
-            var path = new FindNameAt(task).scan(task.root(file), cursor);
-            if (path == null) {
-                LOG.info("...no element under cursor");
-                return Optional.empty();
-            }
-            var el = task.trees.getElement(path);
-            if (el == null) {
-                LOG.info("...couldn't resolve element");
-                return Optional.empty();
-            }
-            if (!canRename(el)) {
-                LOG.info(String.format("...can't rename %s", el));
-                return Optional.empty();
-            }
-            if (!canFindSource(requestCompiler, el)) {
-                LOG.info(String.format("...can't find source for %s", el));
-                return Optional.empty();
-            }
-            var response = new RenameResponse();
-            response.range = FindHelper.location(task, path, "").range;
-            response.placeholder = el.getSimpleName().toString();
-            return Optional.of(response);
-        }
-    }
-
-    private boolean canRename(Element rename) {
-        return switch (rename.getKind()) {
-            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER, CLASS -> true;
-            default -> false;
-        };
-    }
-
-    private boolean canFindSource(CompilerProvider requestCompiler, Element rename) {
-        if (rename == null) return false;
-        if (rename instanceof TypeElement type) {
-            var name = type.getQualifiedName().toString();
-            return requestCompiler.findTypeDeclaration(name) != CompilerProvider.NOT_FOUND;
-        }
-        return canFindSource(requestCompiler, rename.getEnclosingElement());
+        return renameHandler.prepareRename(params);
     }
 
     @Override
     public WorkspaceEdit rename(RenameParams params) {
-        includeMavenReferenceSources();
-        var file = Paths.get(params.textDocument.uri);
-        var requestCompiler = compilerFor(file);
-        var rw = createRewrite(params, requestCompiler);
-        var response = new WorkspaceEdit();
-        var map = rw instanceof RenameField field
-                ? field.rewrite(requestCompiler, this::compilerFor, this::canReferenceModule)
-                : rw instanceof RenameMethod method
-                        ? method.rewrite(requestCompiler, this::compilerFor, this::canReferenceModule)
-                        : rw.rewrite(requestCompiler);
-        for (var editedFile : map.keySet()) {
-            response.changes.put(editedFile.toUri(), Arrays.asList(map.get(editedFile)));
-        }
-        // For class renames, notify client to rename the file on disk
-        if (rw instanceof RenameClass rc) {
-            var sourceFile = requestCompiler.findTypeDeclaration(rc.oldQualifiedName);
-            if (sourceFile != null && sourceFile != CompilerProvider.NOT_FOUND) {
-                var oldPath = sourceFile.toAbsolutePath().normalize().toString();
-                var parent = sourceFile.getParent();
-                var newFileName = rc.newSimpleName + ".java";
-                var newPath =
-                        parent != null
-                                ? parent.resolve(newFileName).toAbsolutePath().normalize().toString()
-                                : newFileName;
-                var notificationParams = new HashMap<String, String>();
-                notificationParams.put("oldPath", oldPath);
-                notificationParams.put("newPath", newPath);
-                client.customNotification("java/renameFile", new Gson().toJsonTree(notificationParams));
-            }
-        }
-        return response;
+        return renameHandler.rename(params, client);
     }
 
     @Override
     public void renameApplied(DidChangeWatchedFilesParams params) {
-        if (params == null || params.changes == null) return;
-        for (var change : params.changes) {
-            var file = Paths.get(change.uri);
-            if (!FileStore.isWorkspaceJavaFile(change.uri) || !Files.exists(file)) continue;
-            var requestCompiler = compilerFor(file);
-            var parse = requestCompiler.parse(file);
-            if (LombokAnnotations.hasStructuralLombokAnnotation(parse.root())) {
-                requestCompiler.refreshBuildOutput(file);
-            }
-        }
-    }
-
-    private Rewrite createRewrite(RenameParams params, CompilerProvider requestCompiler) {
-        var file = Paths.get(params.textDocument.uri);
-        try (var task = requestCompiler.compile(file)) {
-            long position;
-            try {
-                position =
-                        FileStore.offset(
-                                task.root(file).getSourceFile().getCharContent(true).toString(),
-                                params.position.line + 1,
-                                params.position.character + 1);
-            } catch (java.io.IOException e) {
-                throw new RuntimeException(e);
-            }
-            var path = new FindNameAt(task).scan(task.root(file), position);
-            if (path == null) return Rewrite.NOT_SUPPORTED;
-            var el = task.trees.getElement(path);
-            return switch (el.getKind()) {
-                case METHOD -> renameMethod(task, (ExecutableElement) el, params.newName);
-                case FIELD -> renameField(task, (VariableElement) el, params.newName);
-                case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER ->
-                        renameVariable(task, (VariableElement) el, params.newName);
-                case CLASS -> {
-                    var type = (TypeElement) el;
-                    yield new RenameClass(type.getQualifiedName().toString(), params.newName);
-                }
-                default -> Rewrite.NOT_SUPPORTED;
-            };
-        }
-    }
-
-    private RenameMethod renameMethod(CompileTask task, ExecutableElement method, String newName) {
-        var parent = (TypeElement) method.getEnclosingElement();
-        var className = parent.getQualifiedName().toString();
-        var methodName = method.getSimpleName().toString();
-        var erasedParameterTypes = new String[method.getParameters().size()];
-        for (var i = 0; i < erasedParameterTypes.length; i++) {
-            var type = method.getParameters().get(i).asType();
-            erasedParameterTypes[i] = task.types.erasure(type).toString();
-        }
-        return new RenameMethod(className, methodName, erasedParameterTypes, newName);
-    }
-
-    private RenameField renameField(CompileTask task, VariableElement field, String newName) {
-        var parent = (TypeElement) field.getEnclosingElement();
-        var className = parent.getQualifiedName().toString();
-        var fieldName = field.getSimpleName().toString();
-        return new RenameField(className, fieldName, newName);
-    }
-
-    private RenameVariable renameVariable(CompileTask task, VariableElement variable, String newName) {
-        var trees = task.trees;
-        var path = trees.getPath(variable);
-        var file = Paths.get(path.getCompilationUnit().getSourceFile().toUri());
-        var position = trees.getSourcePositions().getStartPosition(path.getCompilationUnit(), path.getLeaf());
-        return new RenameVariable(file, (int) position, newName);
+        renameHandler.renameApplied(params);
     }
 
     @Override
@@ -1666,17 +982,17 @@ class JavaLanguageServer extends LanguageServer {
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));
             var requestCompiler = compilerFor(file);
             String compileProgressToken = null;
-            if (moduleScopedMaven || moduleScopedGradle) {
-                compileProgressToken = beginWorkDoneProgress(
+            if (moduleRegistry.moduleScopedMaven || moduleRegistry.moduleScopedGradle) {
+                compileProgressToken = progress.begin(
                         "Compiling", "Compiling " + file.getFileName());
             }
             try (var task = requestCompiler.compile(sources)) {
                 var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
                 if (compileProgressToken != null) {
-                    endWorkDoneProgress(compileProgressToken, "Compiled");
+                    progress.end(compileProgressToken, "Compiled");
                     compileProgressToken = null;
                 }
-                var errorProvider = new ErrorProvider(task, requestCompiler, typeIndexFor(file));
+                var errorProvider = new ErrorProvider(task, requestCompiler, moduleRegistry.typeIndexFor(file));
                 var errorReport = errorProvider.errors(Set.of(file.toUri()));
                 LOG.info(String.format(
                         "[diagnostics] pull_compile_done file=%s duration=%dms errors=%d",
@@ -1689,7 +1005,7 @@ class JavaLanguageServer extends LanguageServer {
                 return new DocumentDiagnosticReport("full", resultId, List.of());
             } finally {
                 if (compileProgressToken != null) {
-                    endWorkDoneProgress(compileProgressToken, "Compiled");
+                    progress.end(compileProgressToken, "Compiled");
                 }
             }
         } catch (Exception e) {
@@ -1721,27 +1037,27 @@ class JavaLanguageServer extends LanguageServer {
                     var fileInModule = module.sourceDirs().stream().anyMatch(file::startsWith);
                     if (fileInModule) {
                         // Lazy Gradle module resolution: resolve unresolved modules on first open
-                        if (moduleScopedGradle && !resolvedGradleModules.contains(module.projectPath())) {
-                            resolveGradleModule(module);
+                        if (moduleRegistry.moduleScopedGradle && !moduleRegistry.resolvedGradleModules.contains(module.projectPath())) {
+                            moduleRegistry.resolveGradleModule(module);
                         }
                         Set<Path> sourceDirs;
-                        if (moduleScopedMaven) {
+                        if (moduleRegistry.moduleScopedMaven) {
                             compilerFor(file);
-                            sourceDirs = mavenModuleCompilers.get(moduleCompilerKey(file)).sourceRoots;
-                        } else if (moduleScopedGradle) {
-                            var gradleContext = gradleModuleCompilers.get(moduleCompilerKey(file));
+                            sourceDirs = moduleRegistry.mavenModuleCompilers.get(moduleRegistry.moduleCompilerKey(file)).sourceRoots;
+                        } else if (moduleRegistry.moduleScopedGradle) {
+                            var gradleContext = moduleRegistry.gradleModuleCompilers.get(moduleRegistry.moduleCompilerKey(file));
                             sourceDirs = gradleContext != null
                                     ? gradleContext.sourceRoots
                                     : new LinkedHashSet<>(module.sourceDirs());
                         } else {
                             sourceDirs = new LinkedHashSet<>(module.sourceDirs());
                         }
-                        var expanded = firstModule && (moduleScopedMaven || moduleScopedGradle)
+                        var expanded = firstModule && (moduleRegistry.moduleScopedMaven || moduleRegistry.moduleScopedGradle)
                                 ? new LinkedHashSet<Path>()
                                 : new LinkedHashSet<>(FileStore.workspaceRoots());
                         var added = new ArrayList<Path>();
                         for (var srcDir : sourceDirs) {
-                            if ((firstModule && (moduleScopedMaven || moduleScopedGradle)
+                            if ((firstModule && (moduleRegistry.moduleScopedMaven || moduleRegistry.moduleScopedGradle)
                                             || !FileStore.isWorkspaceFile(srcDir))
                                     && Files.exists(srcDir)) {
                                 expanded.add(srcDir);
@@ -1769,7 +1085,7 @@ class JavaLanguageServer extends LanguageServer {
                     }
                 }
             }
-            if (moduleScopedMaven || moduleScopedGradle) activeModuleFile = file;
+            if (moduleRegistry.moduleScopedMaven || moduleRegistry.moduleScopedGradle) activeModuleFile = file;
         } finally {
             FileStore.open(params);
         }
@@ -1870,7 +1186,7 @@ class JavaLanguageServer extends LanguageServer {
             }
             if (selectedFields.isEmpty() && !"constructor".equals(methodKind)) return null;
             var rewrite = new GenerateMethods(className, methodKind, 0, selectedFields);
-            var edits = rewrite.rewrite(compilerForClass(className));
+            var edits = rewrite.rewrite(moduleRegistry.compilerForClass(className));
             if (edits != null && !edits.isEmpty()) {
                 var workspaceEdit = new WorkspaceEdit();
                 for (var entry : edits.entrySet()) {
@@ -1900,408 +1216,4 @@ class JavaLanguageServer extends LanguageServer {
         compilerFor(file).refreshBuildOutput(file);
     }
 
-    /**
-     * Completion-index refresh/install logic is isolated so compiler recreation, active-document
-     * merges, and full workspace bootstraps share one publication path.
-     */
-    final class CompletionIndexScheduler {
-        CompletionIndexScheduler() {}
-
-        /** Publish a rebuilt workspace index snapshot, replacing the previous workspace view. */
-        void installTypeMemberIndex(
-                WorkspaceTypeIndex nextIndex,
-                long indexVersion,
-                String trigger,
-                Duration took,
-                CompletionIndexScope scope) {
-            var rebuilt = (nextIndex == null || nextIndex.size() == 0) ? WorkspaceTypeIndex.EMPTY : nextIndex;
-            var currentSnapshot = completionSnapshotRef.get();
-            publishCompletionSnapshot(
-                    rebuilt,
-                    currentSnapshot.externalIndex(),
-                    indexVersion,
-                    rebuilt == WorkspaceTypeIndex.EMPTY ? CompletionIndexScope.EMPTY : scope);
-            LOG.fine(String.format(
-                    "[perf] completion_type_index trigger=%s version=%d types=%d took=%dms",
-                    trigger,
-                    indexVersion,
-                    rebuilt.size(),
-                    took.toMillis()));
-        }
-
-        /**
-         * Publish a file-scoped workspace declaration merge, replacing only the declarations from
-         * the supplied files while preserving the rest of the existing workspace snapshot.
-         */
-        void installMergedTypeMemberIndex(
-                WorkspaceTypeIndex deltaIndex,
-                Collection<Path> replacedFiles,
-                long indexVersion,
-                String trigger,
-                Duration took) {
-            var baseSnapshot = completionSnapshotRef.get();
-            var merged =
-                    baseSnapshot
-                            .workspaceIndex()
-                            .replaceWorkspaceDeclarations(
-                                    deltaIndex == null ? WorkspaceTypeIndex.EMPTY : deltaIndex,
-                                    new LinkedHashSet<>(replacedFiles));
-            var nextScope =
-                    merged == WorkspaceTypeIndex.EMPTY
-                            ? CompletionIndexScope.EMPTY
-                            : baseSnapshot.scope() == CompletionIndexScope.EMPTY
-                                    ? CompletionIndexScope.ACTIVE
-                                    : baseSnapshot.scope();
-            publishCompletionSnapshot(merged, baseSnapshot.externalIndex(), indexVersion, nextScope);
-            refreshDiagnostics();
-            LOG.fine(String.format(
-                    "[perf] completion_type_index_merge trigger=%s base_version=%d version=%d types=%d files=%d took=%dms",
-                    trigger,
-                    baseSnapshot.version(),
-                    indexVersion,
-                    merged.size(),
-                    replacedFiles.size(),
-                    took.toMillis()));
-        }
-
-        /** Queue an active-document bootstrap only while the published scope is still empty. */
-        void scheduleActiveBootstrapIfNeeded(String trigger) {
-            if (completionSnapshotRef.get().scope() != CompletionIndexScope.EMPTY) {
-                return;
-            }
-            synchronized (JavaLanguageServer.this) {
-                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()) {
-                    return;
-                }
-            }
-            var active = filterJavaFiles(FileStore.activeDocuments());
-            if (active.isEmpty()) {
-                return;
-            }
-            scheduleRefresh(active, trigger, 0, CompletionIndexRefreshMode.ACTIVE_DOCUMENT_BOOTSTRAP);
-        }
-
-        /** Queue a full workspace bootstrap unless the published scope is already workspace-wide. */
-        void scheduleProjectBootstrapIfNeeded(String trigger) {
-            if (completionSnapshotRef.get().scope() == CompletionIndexScope.WORKSPACE) {
-                return;
-            }
-            synchronized (JavaLanguageServer.this) {
-                // Only skip if a full rebuild is already pending — merges should be superseded
-                if (pendingCompletionIndex != null && !pendingCompletionIndex.isDone()
-                        && pendingCompletionIndexMode == CompletionIndexRefreshMode.FULL_REBUILD) {
-                    return;
-                }
-            }
-            // For Gradle multi-module projects, scope the index to the active module's transitive
-            // source files rather than all workspace files. This avoids parsing 8000+ files when
-            // only the active module and its deps are needed for completion.
-            var files = scopedSourceFiles();
-            scheduleRefresh(files, trigger, 0, CompletionIndexRefreshMode.FULL_REBUILD);
-        }
-
-        /**
-         * Return the set of source files to index for the current context.
-         * FileStore is already scoped to the active module's source dirs for Gradle projects.
-         * Cap at 1000 files to avoid OOM on very large modules.
-         */
-        private Collection<Path> scopedSourceFiles() {
-            var all = FileStore.all();
-            // For multi-module projects, workspace roots include transitive deps for resolution.
-            // But indexing should only cover the active module to stay fast.
-            if (moduleGraph != ModuleGraph.EMPTY) {
-                var moduleFile = activeModuleFile == null ? workspaceRoot : activeModuleFile;
-                var activeModule = moduleGraph.moduleForFile(moduleFile);
-                if (activeModule.isPresent()) {
-                    var info = activeModule.get();
-                    var testSources = info.testSourceDir() != null && moduleFile.startsWith(info.testSourceDir());
-                    var activeSourceDirs = info.sourceDirs().stream()
-                            .filter(dir -> testSources || !dir.equals(info.testSourceDir()))
-                            .toList();
-                    var scoped = all.stream()
-                            .filter(f -> activeSourceDirs.stream().anyMatch(f::startsWith))
-                            .toList();
-                    LOG.info(String.format("[perf] index_scope active_module=%s active_files=%d workspace_files=%d",
-                            activeModule.get().projectPath(), scoped.size(), all.size()));
-                    if (scoped.size() > LARGE_WORKSPACE_THRESHOLD) {
-                        return List.of();
-                    }
-                    return scoped;
-                }
-            }
-            if (all.size() > LARGE_WORKSPACE_THRESHOLD) {
-                LOG.info(String.format("[perf] index_scope workspace_files=%d exceeds_threshold=%d — indexing active docs only",
-                        all.size(), LARGE_WORKSPACE_THRESHOLD));
-                return List.of();
-            }
-            LOG.info(String.format("[perf] index_scope workspace_files=%d", all.size()));
-            return all;
-        }
-
-        /** Debounce completion-index refreshes and collapse newer schedules onto one pending task. */
-        void scheduleRefresh(
-                Collection<Path> files, String trigger, long delayMs, CompletionIndexRefreshMode mode) {
-            var javaFiles = filterJavaFiles(files);
-            if (javaFiles.isEmpty()) {
-                return;
-            }
-            synchronized (JavaLanguageServer.this) {
-                var pending = pendingCompletionIndex != null && !pendingCompletionIndex.isDone();
-                if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                    pendingCompletionIndexFiles.addAll(javaFiles);
-                    if (pendingCompletionIndexTrigger == null
-                            || "didChange".equals(trigger)) {
-                        pendingCompletionIndexTrigger = trigger;
-                    }
-                    if (pending && pendingCompletionIndexMode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                        return;
-                    }
-                    javaFiles = List.copyOf(pendingCompletionIndexFiles);
-                    trigger = pendingCompletionIndexTrigger;
-                } else if (pending
-                        && mode == CompletionIndexRefreshMode.FULL_REBUILD
-                        && pendingCompletionIndexMode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                    return;
-                }
-                if (pending) {
-                    pendingCompletionIndex.cancel(false);
-                }
-                var revision = completionIndexRevision.incrementAndGet();
-                var filesBatch = List.copyOf(javaFiles);
-                var refreshTrigger = trigger;
-                pendingCompletionIndexMode = mode;
-                pendingCompletionIndex =
-                        completionIndexExecutor.schedule(
-                                () -> runRefresh(filesBatch, revision, refreshTrigger, mode),
-                                delayMs,
-                                TimeUnit.MILLISECONDS);
-            }
-        }
-
-        /**
-         * Run one queued completion-index refresh if its revision is still current, then compile,
-         * index, and publish the resulting workspace snapshot.
-         */
-        void runRefresh(List<Path> files, long revision, String trigger, CompletionIndexRefreshMode mode) {
-            if (revision != completionIndexRevision.get()) {
-                return;
-            }
-            synchronized (completionIndexCompileMutex) {
-                var started = Instant.now();
-                String bootstrapProgressToken = null;
-                var completed = false;
-                var indexedFiles = files;
-                try {
-                    var progressLabel = switch (mode) {
-                        case ACTIVE_DOCUMENT_BOOTSTRAP -> "Indexing open files";
-                        case FULL_REBUILD -> "Indexing workspace";
-                        case WORKSPACE_DECLARATION_MERGE -> "Updating index";
-                    };
-                    if (mode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                        bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
-                    }
-                    var compiler = activeModuleFile == null
-                            ? JavaLanguageServer.this.compiler
-                            : compilerFor(activeModuleFile);
-                    if (compiler == null) {
-                        LOG.warning("[completion] index refresh skipped — compiler not yet initialized (trigger=" + trigger + ")");
-                        return;
-                    }
-                    WorkspaceTypeIndex nextIndex;
-                    Instant indexStarted;
-                    if (mode == CompletionIndexRefreshMode.FULL_REBUILD) {
-                        // Parse-only path: ~15x faster than compilation for large workspaces.
-                        reportWorkDoneProgress(bootstrapProgressToken,
-                                "Parsing " + files.size() + " files");
-                        var parseStarted = Instant.now();
-                        var parseTasks = compiler.parseAll(files);
-                        var parseTook = Duration.between(parseStarted, Instant.now()).toMillis();
-                        LOG.info(String.format("[perf] index_parse files=%d took=%dms", files.size(), parseTook));
-                        if (revision != completionIndexRevision.get()) {
-                            LOG.fine(String.format(
-                                    "[perf] completion_index_refresh_skip trigger=%s phase=post_parse expected=%d current=%d",
-                                    trigger, revision, completionIndexRevision.get()));
-                            endWorkDoneProgress(bootstrapProgressToken, null);
-                            return;
-                        }
-                        indexStarted = Instant.now();
-                        nextIndex = WorkspaceTypeIndex.fromParseTrees(
-                                parseTasks,
-                                (source, name) -> externalIndexForIndexing(source, compiler).containsType(name),
-                                (source, declaration) -> canReferenceModule(declaration, source));
-                        LOG.info(String.format("[perf] index_build files=%d types=%d took=%dms",
-                                files.size(), nextIndex.size(),
-                                Duration.between(indexStarted, Instant.now()).toMillis()));
-                    } else {
-                        // WORKSPACE_DECLARATION_MERGE / ACTIVE_DOCUMENT_BOOTSTRAP:
-                        // Use parse-only for index updates — compile (ATTR) hangs on large
-                        // multi-module projects due to javac internal errors.
-                        // Parse captures type declarations and member signatures accurately.
-                        var parseTasks = compiler.parseAll(files);
-                        if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                            var validTasks = new ArrayList<ParseTask>();
-                            var validFiles = new ArrayList<Path>();
-                            for (int i = 0; i < parseTasks.size(); i++) {
-                                if (parseTasks.get(i).hasSyntaxErrors()) {
-                                    LOG.fine(String.format(
-                                            "[perf] completion_index_refresh_skip trigger=%s file=%s reason=syntax_errors",
-                                            trigger, files.get(i).getFileName()));
-                                    continue;
-                                }
-                                validTasks.add(parseTasks.get(i));
-                                validFiles.add(files.get(i));
-                            }
-                            if (validTasks.isEmpty()) {
-                                completed = true;
-                                return;
-                            }
-                            parseTasks = validTasks;
-                            indexedFiles = List.copyOf(validFiles);
-                        }
-                        if (revision != completionIndexRevision.get()) {
-                            LOG.fine(String.format(
-                                    "[perf] completion_index_refresh_skip trigger=%s phase=post_compile expected=%d current=%d",
-                                    trigger, revision, completionIndexRevision.get()));
-                            endWorkDoneProgress(bootstrapProgressToken, null);
-                            return;
-                        }
-                        indexStarted = Instant.now();
-                        if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                            var baseSnapshot = completionSnapshotRef.get();
-                            var replacedFiles = Set.copyOf(indexedFiles);
-                            java.util.function.BiPredicate<Path, String> knownType = (source, name) ->
-                                    baseSnapshot
-                                                    .workspaceIndex()
-                                                    .typeInfo(name)
-                                                    .filter(type -> !replacedFiles.contains(type.sourcePath))
-                                                    .filter(type -> canReferenceModule(type.sourcePath, source))
-                                                    .isPresent()
-                                            || externalIndexForIndexing(source, compiler).containsType(name);
-                            nextIndex = WorkspaceTypeIndex.fromParseTrees(
-                                    parseTasks,
-                                    knownType,
-                                    (source, declaration) -> canReferenceModule(declaration, source));
-                        } else {
-                            nextIndex = WorkspaceTypeIndex.fromParseTrees(
-                                    parseTasks,
-                                    (source, name) -> externalIndexForIndexing(source, compiler).containsType(name),
-                                    (source, declaration) -> canReferenceModule(declaration, source));
-                        }
-                    }
-                    if (revision != completionIndexRevision.get()) {
-                        LOG.fine(String.format(
-                                "[perf] completion_index_refresh_skip trigger=%s phase=post_index expected=%d current=%d",
-                                trigger,
-                                revision,
-                                completionIndexRevision.get()));
-                        endWorkDoneProgress(bootstrapProgressToken, null);
-                        return;
-                    }
-                    if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                            && completionSnapshotRef
-                                    .get()
-                                    .workspaceIndex()
-                                    .hasSameDeclarations(nextIndex, indexedFiles)) {
-                        LOG.fine(String.format(
-                                "[perf] completion_index_refresh_skip trigger=%s reason=unchanged_declarations",
-                                trigger));
-                        completed = true;
-                        return;
-                    }
-                    if (bootstrapProgressToken == null) {
-                        bootstrapProgressToken = beginWorkDoneProgress("Index", progressLabel);
-                    }
-                    reportWorkDoneProgress(
-                            bootstrapProgressToken, "Indexed " + files.size() + " files");
-                    var indexVersion = completionIndexVersion.incrementAndGet();
-                    var installTook = Duration.between(indexStarted, Instant.now());
-                    if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE) {
-                        installMergedTypeMemberIndex(
-                                nextIndex, indexedFiles, indexVersion, "index:" + trigger, installTook);
-                    } else {
-                        var scope =
-                                mode == CompletionIndexRefreshMode.FULL_REBUILD
-                                        ? CompletionIndexScope.WORKSPACE
-                                        : CompletionIndexScope.ACTIVE;
-                        installTypeMemberIndex(
-                                nextIndex, indexVersion, "index:" + trigger, installTook, scope);
-                        if (scope == CompletionIndexScope.ACTIVE) {
-                            completionIndexExecutor.schedule(
-                                    () -> scheduleProjectBootstrapIfNeeded("active-bootstrap-upgrade"),
-                                    0,
-                                    TimeUnit.MILLISECONDS);
-                        }
-                    }
-                    LOG.info(String.format(
-                            "[perf] index installed trigger=%s version=%d types=%d took=%dms",
-                            trigger,
-                            indexVersion,
-                            nextIndex == null ? 0 : nextIndex.size(),
-                            Duration.between(started, Instant.now()).toMillis()));
-                    endWorkDoneProgress(bootstrapProgressToken, "Index ready");
-                    var totalMs = Duration.between(started, Instant.now()).toMillis();
-                    LOG.fine(String.format(
-                            "[perf] completion_index_refresh trigger=%s files=%d version=%d mode=%s compile=%dms total=%dms",
-                            trigger,
-                            files.size(),
-                            indexVersion,
-                            mode.name().toLowerCase(),
-                            Duration.between(started, indexStarted).toMillis(),
-                            totalMs));
-                    completed = true;
-                } catch (RuntimeException e) {
-                    endWorkDoneProgress(bootstrapProgressToken, "Index failed");
-                    LOG.warning(
-                            String.format(
-                                    "[completion] index refresh failed trigger=%s files=%d reason=%s",
-                                    trigger,
-                                    files.size(),
-                                    e.getMessage()));
-                    LOG.fine(e.toString());
-                } finally {
-                    var schedulePendingMerge = false;
-                    synchronized (JavaLanguageServer.this) {
-                        if (revision == completionIndexRevision.get()) {
-                            if (mode == CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                                    && completed) {
-                                pendingCompletionIndexFiles.removeAll(files);
-                                if (pendingCompletionIndexFiles.isEmpty()) {
-                                    pendingCompletionIndexTrigger = null;
-                                }
-                            }
-                            pendingCompletionIndex = null;
-                            pendingCompletionIndexMode = null;
-                            schedulePendingMerge = mode != CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE
-                                    && !pendingCompletionIndexFiles.isEmpty();
-                            if (schedulePendingMerge) {
-                                scheduleRefresh(
-                                        List.copyOf(pendingCompletionIndexFiles),
-                                        pendingCompletionIndexTrigger,
-                                        0,
-                                        CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /** Cancel any queued completion-index refresh and bump the revision so stale work is dropped. */
-        void cancel(String reason) {
-            synchronized (JavaLanguageServer.this) {
-                if (pendingCompletionIndex == null && pendingCompletionIndexFiles.isEmpty()) {
-                    return;
-                }
-                completionIndexRevision.incrementAndGet();
-                if (pendingCompletionIndex != null) {
-                    pendingCompletionIndex.cancel(false);
-                }
-                pendingCompletionIndex = null;
-                pendingCompletionIndexMode = null;
-                pendingCompletionIndexFiles.clear();
-                pendingCompletionIndexTrigger = null;
-            }
-            LOG.fine(String.format("[perf] completion_index_cancel reason=%s", reason));
-        }
-    }
 }
