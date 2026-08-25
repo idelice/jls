@@ -58,6 +58,13 @@ public class CompileBatch implements AutoCloseable {
                         }
                         try {
                             var impl = (JavacTaskImpl) task;
+                            // Inject Lombok stubs before Enter — makes generated members visible to javac
+                            if (parent.lombokPresentOnClasspath) {
+                                var injector = new LombokStubInjector(impl.getContext());
+                                for (var root : holder.roots) {
+                                    injector.inject(root);
+                                }
+                            }
                             impl.enter();
                             var compiler = JavaCompiler.instance(impl.getContext());
                             var attr = compiler.attribute(compiler.todo);
