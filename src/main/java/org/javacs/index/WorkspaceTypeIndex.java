@@ -7,6 +7,7 @@ import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreeScanner;
 import java.util.ArrayDeque;
+import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
@@ -24,7 +25,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.logging.Logger;
 import javax.lang.model.element.Modifier;
 import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
@@ -98,7 +98,6 @@ public class WorkspaceTypeIndex {
     private final Set<String> workspaceOwnedTypeNames;
     private final Map<String, Set<String>> subtypesByType;
     private final Map<Path, SourceFileSnapshot> sourceFiles;
-    private static final Logger LOG = Logger.getLogger("main");
 
     private WorkspaceTypeIndex(
             Map<String, IndexedType> typesByQualifiedName,
@@ -138,6 +137,24 @@ public class WorkspaceTypeIndex {
 
     public int size() {
         return typesByQualifiedName.size();
+    }
+
+    public WorkspaceTypeIndex restrictTo(Set<Path> sourceRoots) {
+        if (sourceRoots == null || sourceRoots.isEmpty()) return EMPTY;
+        var types = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
+        for (var entry : typesByQualifiedName.entrySet()) {
+            var source = entry.getValue().sourcePath;
+            if (source != null && sourceRoots.stream().anyMatch(source::startsWith)) {
+                types.put(entry.getKey(), entry.getValue());
+            }
+        }
+        var files = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+        for (var entry : sourceFiles.entrySet()) {
+            if (sourceRoots.stream().anyMatch(entry.getKey()::startsWith)) {
+                files.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return new WorkspaceTypeIndex(types, files);
     }
 
     public boolean containsType(String qualifiedName) {
@@ -558,7 +575,15 @@ public class WorkspaceTypeIndex {
 
     public static WorkspaceTypeIndex fromParseTrees(
             java.util.List<ParseTask> parseTasks, Predicate<String> knownType) {
-        // === Phase 1: Scan all roots — collect type names, class trees, and file metadata ===
+        return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true);
+    }
+
+    public static WorkspaceTypeIndex fromParseTrees(
+            java.util.List<ParseTask> parseTasks,
+            BiPredicate<Path, String> knownType,
+            BiPredicate<Path, Path> sourceVisible) {
+        // Single-pass: parse each file, extract all metadata + members, discard AST immediately.
+        // Supertype resolution is deferred to a post-pass using collected import/package data.
         var allQualifiedNames = new ObjectOpenHashSet<String>();
         var typeClassTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
         var typeSources = new Object2ObjectOpenHashMap<String, Path>();
@@ -566,54 +591,166 @@ public class WorkspaceTypeIndex {
         var typeKinds = new Object2ObjectOpenHashMap<String, Integer>();
         var typeModifiers = new Object2ObjectOpenHashMap<String, Set<Modifier>>();
         var nestedTypesByOwner = new Object2ObjectOpenHashMap<String, Set<String>>();
-        var typeRoots = new Object2ObjectOpenHashMap<String, CompilationUnitTree>();
         var sourceFileSnapshots = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
+        // Per-type: raw (unresolved) supertype/interface names from parse tree
+        var rawSupertypes = new Object2ObjectOpenHashMap<String, String>();
+        var rawInterfaces = new Object2ObjectOpenHashMap<String, List<String>>();
+        // Per-type: which source file (for import resolution in post-pass)
+        var typeSourceFile = new Object2ObjectOpenHashMap<String, Path>();
+        // Members extracted per type
+        var typeDirectMembers = new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
 
-        for (var parseTask : parseTasks) {
-            collectParseTypeMetadata(parseTask.root(), allQualifiedNames, typeClassTrees,
-                    typeSources, typeSourceUris, typeKinds, typeModifiers,
-                    nestedTypesByOwner, typeRoots, sourceFileSnapshots);
+        for (int i = 0; i < parseTasks.size(); i++) {
+            var parseTask = parseTasks.get(i);
+            var root = parseTask.root();
+            var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
+            Path sourcePath = null;
+            URI sourceUri = null;
+            var sourceUriObj = root.getSourceFile().toUri();
+            if (sourceUriObj != null && "file".equals(sourceUriObj.getScheme())) {
+                sourcePath = Paths.get(sourceUriObj);
+                sourceUri = sourceUriObj;
+            }
+            final var finalSourcePath = sourcePath;
+            final var finalSourceUri = sourceUri;
+
+            var explicitImports = new ArrayList<String>();
+            var staticImports = new ArrayList<String>();
+            for (var importTree : root.getImports()) {
+                var imported = importTree.getQualifiedIdentifier().toString();
+                if (importTree.isStatic()) staticImports.add(imported);
+                else explicitImports.add(imported);
+            }
+
+            var declaredTypesInFile = new ArrayList<String>();
+            var qualifiedNameStack = new ArrayDeque<String>();
+
+            // Extract types, members, raw supertypes — all in one scan
+            new TreeScanner<Void, Void>() {
+                @Override
+                public Void visitClass(ClassTree tree, Void p) {
+                    var simpleName = tree.getSimpleName() == null ? null : tree.getSimpleName().toString();
+                    if (simpleName == null || simpleName.isBlank()) {
+                        return super.visitClass(tree, p);
+                    }
+                    var qualified = qualifiedNameStack.isEmpty()
+                            ? (packageName.isBlank() ? simpleName : packageName + "." + simpleName)
+                            : qualifiedNameStack.peek() + "." + simpleName;
+                    if (!isValidIndexKey(qualified)) {
+                        return super.visitClass(tree, p);
+                    }
+
+                    if (!qualifiedNameStack.isEmpty()) {
+                        var parentName = qualifiedNameStack.peek();
+                        nestedTypesByOwner
+                                .computeIfAbsent(parentName, __ -> new ObjectLinkedOpenHashSet<>())
+                                .add(qualified);
+                    }
+
+                    qualifiedNameStack.push(qualified);
+                    allQualifiedNames.add(qualified);
+                    typeClassTrees.put(qualified, tree);
+                    typeKinds.put(qualified, parseTreeKindToCompletionItemKind(tree.getKind()));
+                    typeModifiers.put(qualified, Set.copyOf(tree.getModifiers().getFlags()));
+                    declaredTypesInFile.add(qualified);
+                    if (finalSourcePath != null) {
+                        typeSources.put(qualified, finalSourcePath);
+                        typeSourceUris.put(qualified, finalSourceUri);
+                        typeSourceFile.put(qualified, finalSourcePath);
+                    }
+
+                    // Store raw supertype/interface strings (resolve later)
+                    if (tree.getExtendsClause() != null) {
+                        var raw = TypeNames.normalize(tree.getExtendsClause().toString());
+                        if (raw != null && !raw.isBlank()) rawSupertypes.put(qualified, raw);
+                    }
+                    var rawIfaceList = new ArrayList<String>();
+                    for (var iface : tree.getImplementsClause()) {
+                        var raw = TypeNames.normalize(iface.toString());
+                        if (raw != null && !raw.isBlank()) rawIfaceList.add(raw);
+                    }
+                    if (!rawIfaceList.isEmpty()) rawInterfaces.put(qualified, rawIfaceList);
+
+                    // Extract members
+                    var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
+                    typeDirectMembers.put(qualified, seen);
+                    var enclosingIsInterface = tree.getKind() == Tree.Kind.INTERFACE
+                            || tree.getKind() == Tree.Kind.ANNOTATION_TYPE;
+                    for (var member : tree.getMembers()) {
+                        if (member instanceof MethodTree method) {
+                            addParseTreeMethod(qualified, method, seen);
+                        } else if (member instanceof VariableTree variable) {
+                            addParseTreeField(qualified, variable, seen, enclosingIsInterface);
+                        }
+                    }
+                    if (tree.getKind() == Tree.Kind.RECORD) {
+                        addRecordComponentAccessorsFromParseTree(qualified, tree, seen);
+                        addRecordCanonicalConstructorFromParseTree(qualified, tree, seen);
+                    }
+
+                    var result = super.visitClass(tree, p);
+                    qualifiedNameStack.pop();
+                    return result;
+                }
+            }.scan(root, null);
+
+            if (finalSourcePath != null) {
+                sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
+                        finalSourcePath, finalSourceUri, packageName,
+                        explicitImports, staticImports, declaredTypesInFile, ""));
+            }
+            // Allow GC to reclaim this file's AST before parsing the next
+            parseTasks.set(i, null);
         }
+        // ASTs are now eligible for GC — only lightweight data structures remain.
 
-        // Resolve against this batch plus types already known by the caller.
-        Predicate<String> workspaceContains =
-                name -> allQualifiedNames.contains(name) || knownType.test(name);
-
-        // === Phase 2: Extract direct members from parse trees ===
-        var typeDirectMembers =
-                new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
+        // === Post-pass: resolve raw supertype/interface names using collected workspace names ===
         var typeSupertypes = new Object2ObjectOpenHashMap<String, String>();
         var typeInterfacesList = new Object2ObjectOpenHashMap<String, java.util.List<String>>();
 
         for (var qualifiedName : allQualifiedNames) {
-            var classTree = typeClassTrees.get(qualifiedName);
-            var root = typeRoots.get(qualifiedName);
-            var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
-            typeDirectMembers.put(qualifiedName, seen);
+            var sourcePath = typeSources.get(qualifiedName);
+            Predicate<String> workspaceContains = name -> {
+                var declaredSource = typeSources.get(name);
+                return declaredSource != null && sourceVisible.test(sourcePath, declaredSource)
+                        || knownType.test(sourcePath, name);
+            };
+            var snapshot = sourcePath != null ? sourceFileSnapshots.get(sourcePath) : null;
 
-            typeSupertypes.put(qualifiedName,
-                    resolveParseSupertypeFromTree(classTree.getExtendsClause(), root, workspaceContains, qualifiedName));
-            typeInterfacesList.put(qualifiedName,
-                    resolveParseInterfacesFromTree(classTree, root, workspaceContains, qualifiedName));
-
-            var enclosingIsInterface = classTree.getKind() == Tree.Kind.INTERFACE
-                    || classTree.getKind() == Tree.Kind.ANNOTATION_TYPE;
-            for (var member : classTree.getMembers()) {
-                if (member instanceof MethodTree method) {
-                    addParseTreeMethod(qualifiedName, method, seen);
-                } else if (member instanceof VariableTree variable) {
-                    addParseTreeField(qualifiedName, variable, seen, enclosingIsInterface);
+            // Resolve supertype
+            var rawSupertype = rawSupertypes.get(qualifiedName);
+            if (rawSupertype != null) {
+                if (rawSupertype.contains(".")) {
+                    typeSupertypes.put(qualifiedName, rawSupertype);
+                } else {
+                    var resolved = resolveInEnclosingScopes(rawSupertype, qualifiedName, workspaceContains);
+                    if (resolved == null && snapshot != null) {
+                        resolved = resolveSimpleTypeNameFromSnapshot(rawSupertype, snapshot, workspaceContains);
+                    }
+                    if (resolved != null) typeSupertypes.put(qualifiedName, resolved);
                 }
             }
 
-            // Synthesize record component accessors without attribution
-            if (classTree.getKind() == Tree.Kind.RECORD) {
-                addRecordComponentAccessorsFromParseTree(qualifiedName, classTree, seen);
-                addRecordCanonicalConstructorFromParseTree(qualifiedName, classTree, seen);
+            // Resolve interfaces
+            var rawIfaceList = rawInterfaces.get(qualifiedName);
+            if (rawIfaceList != null) {
+                var resolved = new ArrayList<String>();
+                for (var rawIface : rawIfaceList) {
+                    if (rawIface.contains(".")) {
+                        resolved.add(rawIface);
+                    } else {
+                        var r = resolveInEnclosingScopes(rawIface, qualifiedName, workspaceContains);
+                        if (r == null && snapshot != null) {
+                            r = resolveSimpleTypeNameFromSnapshot(rawIface, snapshot, workspaceContains);
+                        }
+                        if (r != null) resolved.add(r);
+                    }
+                }
+                typeInterfacesList.put(qualifiedName, Collections.unmodifiableList(resolved));
             }
         }
 
-        // === Phase 3: Synthetics + build IndexedType entries ===
+        // === Build IndexedType entries with synthetics ===
         var typeEntries = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
 
         for (var qualifiedName : allQualifiedNames) {
@@ -657,85 +794,35 @@ public class WorkspaceTypeIndex {
                         Collections.unmodifiableMap(finalizedSourceFiles));
     }
 
-    /** First-pass scanner: collects all qualified type names and per-file metadata from a single root. */
-    private static void collectParseTypeMetadata(
-            CompilationUnitTree root,
-            Set<String> allQualifiedNames,
-            Map<String, ClassTree> typeClassTrees,
-            Map<String, Path> typeSources,
-            Map<String, URI> typeSourceUris,
-            Map<String, Integer> typeKinds,
-            Map<String, Set<Modifier>> typeModifiers,
-            Map<String, Set<String>> nestedTypesByOwner,
-            Map<String, CompilationUnitTree> typeRoots,
-            Map<Path, SourceFileSnapshot> sourceFileSnapshots) {
-        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-        Path sourcePath = null;
-        URI sourceUri = null;
-        var sourceUriObj = root.getSourceFile().toUri();
-        if (sourceUriObj != null && "file".equals(sourceUriObj.getScheme())) {
-            sourcePath = Paths.get(sourceUriObj);
-            sourceUri = sourceUriObj;
-        }
-        final var finalSourcePath = sourcePath;
-        final var finalSourceUri = sourceUri;
-
-        var explicitImports = new ArrayList<String>();
-        var staticImports = new ArrayList<String>();
-        for (var importTree : root.getImports()) {
-            var imported = importTree.getQualifiedIdentifier().toString();
-            if (importTree.isStatic()) staticImports.add(imported);
-            else explicitImports.add(imported);
-        }
-
-        var declaredTypesInFile = new ArrayList<String>();
-        var qualifiedNameStack = new ArrayDeque<String>();
-
-        new TreeScanner<Void, Void>() {
-            @Override
-            public Void visitClass(ClassTree tree, Void p) {
-                var simpleName = tree.getSimpleName() == null ? null : tree.getSimpleName().toString();
-                if (simpleName == null || simpleName.isBlank()) {
-                    return super.visitClass(tree, p); // anonymous class — skip
-                }
-                var qualified = qualifiedNameStack.isEmpty()
-                        ? (packageName.isBlank() ? simpleName : packageName + "." + simpleName)
-                        : qualifiedNameStack.peek() + "." + simpleName;
-                if (!isValidIndexKey(qualified)) {
-                    return super.visitClass(tree, p);
-                }
-
-                // Record nesting relationship before pushing
-                if (!qualifiedNameStack.isEmpty()) {
-                    var parentName = qualifiedNameStack.peek();
-                    nestedTypesByOwner
-                            .computeIfAbsent(parentName, __ -> new ObjectLinkedOpenHashSet<>())
-                            .add(qualified);
-                }
-
-                qualifiedNameStack.push(qualified);
-                allQualifiedNames.add(qualified);
-                typeClassTrees.put(qualified, tree);
-                typeRoots.put(qualified, root);
-                typeKinds.put(qualified, parseTreeKindToCompletionItemKind(tree.getKind()));
-                typeModifiers.put(qualified, Set.copyOf(tree.getModifiers().getFlags()));
-                declaredTypesInFile.add(qualified);
-                if (finalSourcePath != null) {
-                    typeSources.put(qualified, finalSourcePath);
-                    typeSourceUris.put(qualified, finalSourceUri);
-                }
-
-                var result = super.visitClass(tree, p);
-                qualifiedNameStack.pop();
-                return result;
+    /** Resolve a simple type name using import/package data from a SourceFileSnapshot. */
+    private static String resolveSimpleTypeNameFromSnapshot(
+            String simpleName, SourceFileSnapshot snapshot, Predicate<String> containsType) {
+        if (simpleName == null || simpleName.isBlank()) return null;
+        if (Character.isLowerCase(simpleName.charAt(0)) && simpleName.indexOf('.') < 0) return null;
+        // Check explicit imports
+        for (var imported : snapshot.imports) {
+            if (!imported.endsWith(".*") && imported.endsWith("." + simpleName) && containsType.test(imported)) {
+                return imported;
             }
-        }.scan(root, null);
-
-        if (finalSourcePath != null) {
-            sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
-                    finalSourcePath, finalSourceUri, packageName,
-                    explicitImports, staticImports, declaredTypesInFile, ""));
         }
+        // Check same package
+        var candidates = new ObjectLinkedOpenHashSet<String>();
+        if (snapshot.packageName != null && !snapshot.packageName.isBlank()) {
+            var samePackage = snapshot.packageName + "." + simpleName;
+            if (containsType.test(samePackage)) candidates.add(samePackage);
+        }
+        // Check wildcard imports
+        for (var imported : snapshot.imports) {
+            if (imported.endsWith(".*")) {
+                var candidate = imported.substring(0, imported.length() - 1) + simpleName;
+                if (containsType.test(candidate)) candidates.add(candidate);
+            }
+        }
+        // Check java.lang
+        var javaLang = "java.lang." + simpleName;
+        if (containsType.test(javaLang)) candidates.add(javaLang);
+        if (candidates.size() == 1) return candidates.iterator().next();
+        return null;
     }
 
     private static Map<Path, SourceFileSnapshot> finalizeSourceFiles(
@@ -840,39 +927,6 @@ public class WorkspaceTypeIndex {
             case ENUM -> CompletionItemKind.Enum;
             default -> CompletionItemKind.Class; // CLASS, RECORD
         };
-    }
-
-    private static String resolveParseSupertypeFromTree(
-            Tree extendsClause, CompilationUnitTree root, Predicate<String> containsType,
-            String ownerQualifiedName) {
-        if (extendsClause == null) return null;
-        var baseName = TypeNames.normalize(extendsClause.toString());
-        if (baseName == null || baseName.isBlank()) return null;
-        if (baseName.contains(".")) return baseName; // already qualified
-        // Try sibling/ancestor inner-class scopes before import-based resolution.
-        // e.g. "Sub extends Super" inside CompleteMembers — Super resolves to
-        // org.javacs.example.CompleteMembers.Super, not a top-level import.
-        var enclosingCandidate = resolveInEnclosingScopes(baseName, ownerQualifiedName, containsType);
-        if (enclosingCandidate != null) return enclosingCandidate;
-        return TypeNames.resolveSimpleName(baseName, root, containsType).orElse(null);
-    }
-
-    private static List<String> resolveParseInterfacesFromTree(
-            ClassTree classTree, CompilationUnitTree root, Predicate<String> containsType,
-            String ownerQualifiedName) {
-        var result = new ArrayList<String>();
-        for (var iface : classTree.getImplementsClause()) {
-            var baseName = TypeNames.normalize(iface.toString());
-            if (baseName == null || baseName.isBlank()) continue;
-            if (baseName.contains(".")) {
-                result.add(baseName);
-            } else {
-                var enclosing = resolveInEnclosingScopes(baseName, ownerQualifiedName, containsType);
-                if (enclosing != null) result.add(enclosing);
-                else TypeNames.resolveSimpleName(baseName, root, containsType).ifPresent(result::add);
-            }
-        }
-        return Collections.unmodifiableList(result);
     }
 
     /**

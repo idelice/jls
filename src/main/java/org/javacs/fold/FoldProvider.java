@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
+import org.javacs.LspPosition;
 import org.javacs.ParseTask;
 import org.javacs.lsp.*;
 
@@ -92,15 +93,14 @@ public class FoldProvider {
     private FoldingRange asFoldingRange(ParseTask task, TreePath t, String kind) {
         var trees = Trees.instance(task.task());
         var pos = trees.getSourcePositions();
-        var lines = t.getCompilationUnit().getLineMap();
         var start = (int) pos.getStartPosition(t.getCompilationUnit(), t.getLeaf());
         var end = (int) pos.getEndPosition(t.getCompilationUnit(), t.getLeaf());
 
-        return rangeFromPositions(lines, start, end, t.getLeaf(), t.getCompilationUnit(), kind);
+        return rangeFromPositions(start, end, t.getLeaf(), t.getCompilationUnit(), kind);
     }
 
     private static FoldingRange rangeFromPositions(
-            LineMap lines, int start, int end, Tree leaf, CompilationUnitTree root, String kind) {
+            int start, int end, Tree leaf, CompilationUnitTree root, String kind) {
         if (start < 0 || end < 0) {
             LOG.fine(
                     String.format(
@@ -125,17 +125,19 @@ public class FoldProvider {
             }
         }
 
-        // Convert offset to 0-based line and character
-        var startLine = (int) lines.getLineNumber(start) - 1;
-        var startChar = (int) lines.getColumnNumber(start) - 1;
-        var endLine = (int) lines.getLineNumber(end) - 1;
-        var endChar = (int) lines.getColumnNumber(end) - 1;
+        var startPosition = LspPosition.position(root, start);
+        var endPosition = LspPosition.position(root, end);
 
         // If this is a block, move end position back one line so we don't fold the '}'
         if (leaf instanceof ClassTree || leaf instanceof BlockTree) {
-            endLine--;
+            endPosition.line--;
         }
 
-        return new FoldingRange(startLine, startChar, endLine, endChar, kind);
+        return new FoldingRange(
+                startPosition.line,
+                startPosition.character,
+                endPosition.line,
+                endPosition.character,
+                kind);
     }
 }

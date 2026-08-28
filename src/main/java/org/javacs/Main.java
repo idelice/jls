@@ -28,6 +28,10 @@ public class Main {
             Logger.getLogger("java.lang.ProcessBuilder").setLevel(Level.INFO);
             // Logger.getLogger("").addHandler(new FileHandler("javacs.%u.log", false));
             setRootFormat();
+
+            // Safety net: kill orphaned Maven subprocesses on JVM exit
+            Runtime.getRuntime().addShutdownHook(new Thread(MavenTooling::destroyAllProcesses, "jls-shutdown-cleanup"));
+
             LOG.info(
                     String.format(
                             "Starting JLS java.version=%s java.runtime.version=%s java.home=%s",

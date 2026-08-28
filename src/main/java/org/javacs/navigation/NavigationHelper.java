@@ -6,7 +6,6 @@ import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -17,15 +16,15 @@ import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import org.javacs.CompileTask;
 import org.javacs.FindNameAt;
+import org.javacs.LspPosition;
+import org.javacs.lsp.Position;
 
 public class NavigationHelper {
-    private static final Logger LOG = Logger.getLogger("main");
-
     public static Element findElement(CompileTask task, Path file, int line, int column) {
         for (var root : task.roots) {
             if (root.getSourceFile().toUri().equals(file.toUri())) {
                 var trees = task.trees;
-                var cursor = root.getLineMap().getPosition(line, column);
+                var cursor = LspPosition.offset(root, new Position(line - 1, column - 1));
                 var path = new FindNameAt(task).scan(root, cursor);
                 if (path == null) return null;
                 var element = trees.getElement(path);

@@ -417,6 +417,13 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
+                    case "textDocument/documentSymbol":
+                        {
+                            var params = gson.fromJson(r.params, DocumentSymbolParams.class);
+                            var response = server.documentSymbol(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
                     case "textDocument/codeAction":
                         {
                             var params = gson.fromJson(r.params, CodeActionParams.class);

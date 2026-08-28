@@ -1,5 +1,6 @@
 package org.javacs.provider;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Logger;
@@ -34,6 +35,11 @@ public class SymbolProvider {
         }
 
         return result;
+    }
+
+    public List<SymbolInformation> documentSymbols(Path file) {
+        var task = compiler.parse(file);
+        return findSymbolsMatching(task, "");
     }
 
     private List<SymbolInformation> findSymbolsMatching(ParseTask task, String query) {

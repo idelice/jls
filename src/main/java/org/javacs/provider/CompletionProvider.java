@@ -94,6 +94,7 @@ public class CompletionProvider {
     private final CompilerProvider compiler;
     private final TypeIndexRouter typeIndexRouter;
     private final long completionIndexVersion;
+    private final String compilerId;
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
@@ -167,9 +168,18 @@ public class CompletionProvider {
     };
 
     public CompletionProvider(CompilerProvider compiler, TypeIndexRouter typeIndexRouter, long completionIndexVersion) {
+        this(compiler, typeIndexRouter, completionIndexVersion, null);
+    }
+
+    public CompletionProvider(
+            CompilerProvider compiler,
+            TypeIndexRouter typeIndexRouter,
+            long completionIndexVersion,
+            String compilerId) {
         this.compiler = compiler;
         this.typeIndexRouter = typeIndexRouter == null ? TypeIndexRouter.EMPTY : typeIndexRouter;
         this.completionIndexVersion = Math.max(0L, completionIndexVersion);
+        this.compilerId = compilerId;
     }
 
     public void resolveCompletionItem(CompletionItem item) {
@@ -590,6 +600,7 @@ public class CompletionProvider {
         var data = new CompletionData();
         data.className = member.ownerType;
         data.memberName = member.name;
+        data.compilerId = compilerId;
         item.data = JsonHelper.GSON.toJsonTree(data);
         return item;
     }
@@ -620,6 +631,7 @@ public class CompletionProvider {
         data.memberName = first.name;
         data.erasedParameterTypes = first.erasedParameterTypes == null ? new String[0] : first.erasedParameterTypes;
         data.plusOverloads = Math.max(0, overloads.size() - 1);
+        data.compilerId = compilerId;
         item.data = JsonHelper.GSON.toJsonTree(data);
         return item;
     }
@@ -1828,6 +1840,7 @@ public class CompletionProvider {
         i.sortText = sortKey(Priority.IMPORTED_CLASS, i.label);
         var data = new CompletionData();
         data.className = className;
+        data.compilerId = compilerId;
         i.data = JsonHelper.GSON.toJsonTree(data);
         return i;
     }

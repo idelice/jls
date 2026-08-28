@@ -1,0 +1,86 @@
+// JLS Gradle init script — Phase 1: extracts module graph structure (no classpath resolution).
+// Invoked via: ./gradlew --no-daemon --init-script <this-file> -q jlsModuleGraph
+
+rootProject {
+    task jlsModuleGraph {
+        doLast {
+            def modules = []
+
+            rootProject.allprojects { proj ->
+                def info = [:]
+                info.projectPath = proj.path
+                info.projectDir = proj.projectDir.absolutePath
+
+                def hasJavaPlugin = proj.plugins.hasPlugin('java') || proj.plugins.hasPlugin('java-library')
+
+                // Source directories
+                def srcDirs = []
+                if (hasJavaPlugin) {
+                    proj.sourceSets.each { ss ->
+                        ss.java.srcDirs.each { dir ->
+                            if (dir.exists()) {
+                                srcDirs.add(dir.absolutePath)
+                            }
+                        }
+                    }
+                }
+                info.sourceDirs = srcDirs
+
+                // Inter-module (project) dependencies
+                // Uses allDependencies (walks configuration hierarchy: api/implementation → compileClasspath)
+                // Uses dep.path (Gradle 9.x removed dep.dependencyProject)
+                def moduleDeps = []
+                try {
+                    def config = proj.configurations.findByName('compileClasspath')
+                    if (config != null) {
+                        config.allDependencies.each { dep ->
+                            if (dep instanceof org.gradle.api.artifacts.ProjectDependency) {
+                                try {
+                                    moduleDeps.add(dep.path)
+                                } catch (Exception pathEx) {
+                                    // Gradle < 8.11 fallback
+                                    try { moduleDeps.add(dep.dependencyProject.path) } catch (Exception ignored) {}
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    System.err.println("[jls-gradle] ERROR reading moduleDeps for ${proj.path}: ${e.message}")
+                }
+                info.moduleDeps = moduleDeps
+
+                // Build output directory
+                def buildDir
+                try {
+                    buildDir = proj.layout.buildDirectory.get().asFile
+                } catch (Exception e) {
+                    buildDir = proj.buildDir
+                }
+                info.classOutputDir = new File(buildDir, 'classes/java/main').absolutePath
+
+                // Source compatibility
+                info.sourceCompatibility = null
+                if (proj.plugins.hasPlugin('java')) {
+                    try {
+                        def javaExt = proj.extensions.findByName('java')
+                        if (javaExt != null && javaExt.sourceCompatibility != null) {
+                            info.sourceCompatibility = javaExt.sourceCompatibility.toString()
+                        }
+                    } catch (Exception e) {
+                        // ignore
+                    }
+                }
+
+                // Phase 1 does NOT resolve classpath
+                info.externalClasspath = []
+
+                modules.add(info)
+            }
+
+            def json = groovy.json.JsonOutput.toJson([modules: modules])
+            println "___JLS_MODULE_GRAPH_START___"
+            println json
+            println "___JLS_MODULE_GRAPH_END___"
+        }
+    }
+}

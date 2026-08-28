@@ -108,7 +108,8 @@ public class WarningsTest {
                         "unused_local(7)",
                         "unused_field(10)",
                         "unused_local(13)",
-                        "unused_local(43)"));
+                        "unused_local(43)",
+                        "unused_class(24)"));
     }
 
     @Test
@@ -132,6 +133,30 @@ public class WarningsTest {
                 .filter(d -> "unused_import".equals(d.code) && d.message.contains("Map"))
                 .findFirst();
         assertTrue("expected unused_import diagnostic for 'Map'", importDiag.isPresent());
+    }
+
+    @Test
+    public void recordFieldsDoNotWarnUnused() {
+        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedRecordFields.java")));
+        var fieldWarnings = errors.stream().filter(e -> e.startsWith("unused_field")).toList();
+        // Only the private class field should warn, not the record components
+        assertThat(fieldWarnings, containsInAnyOrder("unused_field(8)"));
+    }
+
+    @Test
+    public void unusedPrivateTypesWarn() {
+        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedPrivateTypes.java")));
+        var classWarnings = errors.stream().filter(e -> e.startsWith("unused_class")).toList();
+        assertThat(classWarnings, containsInAnyOrder("unused_class(5)", "unused_class(8)"));
+    }
+
+    @Test
+    public void usedPrivateTypesDoNotWarn() {
+        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedPrivateTypes.java")));
+        var classWarnings = errors.stream().filter(e -> e.startsWith("unused_class")).toList();
+        // UsedRecord and UsedInner should NOT appear
+        assertThat(classWarnings, not(hasItem(containsString("11"))));
+        assertThat(classWarnings, not(hasItem(containsString("14"))));
     }
 
     @Test

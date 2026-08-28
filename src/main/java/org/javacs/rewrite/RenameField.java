@@ -8,6 +8,8 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
 import java.util.logging.Logger;
 import org.javacs.CompilerProvider;
 import org.javacs.LombokAnnotations;
@@ -24,6 +26,13 @@ public class RenameField implements Rewrite {
 
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
+        return rewrite(compiler, __ -> compiler, (__, ___) -> true);
+    }
+
+    public Map<Path, TextEdit[]> rewrite(
+            CompilerProvider compiler,
+            Function<Path, CompilerProvider> compilerForFile,
+            BiPredicate<Path, Path> candidateAllowed) {
         LOG.info("Rewrite " + className + "#" + fieldName + " to " + newName + "...");
         var accessorRenames = lombokAccessorRenames(compiler);
         var paths = new LinkedHashSet<Path>();
@@ -36,12 +45,23 @@ public class RenameField implements Rewrite {
             return Map.of();
         }
         LOG.info("...check " + paths.size() + " files for references");
-        try (var compile = compiler.compile(paths.toArray(Path[]::new))) {
-            var helper = new RenameHelper(compile);
-            var edits = helper.renameField(
-                    compile.roots, className, fieldName, newName, accessorRenames);
-            return edits;
+        var declaration = compiler.findTypeDeclaration(className);
+        var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
+        for (var path : paths) {
+            if (!candidateAllowed.test(declaration, path)) continue;
+            var candidateCompiler = compilerForFile.apply(path);
+            if (!candidateAllowed.test(declaration, path)) continue;
+            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>()).add(path);
         }
+        var edits = new LinkedHashMap<Path, TextEdit[]>();
+        for (var entry : groups.entrySet()) {
+            if (declaration != CompilerProvider.NOT_FOUND) entry.getValue().add(declaration);
+            try (var compile = entry.getKey().compile(entry.getValue().toArray(Path[]::new))) {
+                edits.putAll(new RenameHelper(compile).renameField(
+                        compile.roots, className, fieldName, newName, accessorRenames));
+            }
+        }
+        return edits;
     }
 
     private Map<String, String> lombokAccessorRenames(CompilerProvider compiler) {

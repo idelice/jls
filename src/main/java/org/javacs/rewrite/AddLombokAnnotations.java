@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import java.util.*;
 import org.javacs.CompilerProvider;
 import org.javacs.LombokAnnotations;
+import org.javacs.LspPosition;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
@@ -59,7 +60,6 @@ public class AddLombokAnnotations implements Rewrite {
             var startClass = (int) pos.getStartPosition(root, classTree);
             var lines = root.getLineMap();
             var classLine = (int) lines.getLineNumber(startClass);
-            var classColumn = (int) lines.getColumnNumber(startClass);
             var startLinePos = (int) lines.getStartPosition(classLine);
             var indent = startClass - startLinePos;
 
@@ -71,7 +71,7 @@ public class AddLombokAnnotations implements Rewrite {
             }
             annotationText.append(" ".repeat(indent));
 
-            var insertPoint = new Position(classLine - 1, classColumn - 1);
+            var insertPoint = LspPosition.position(root, startClass);
             edits.add(new TextEdit(new Range(insertPoint, insertPoint), annotationText.toString()));
 
             var hasWildcard = false;

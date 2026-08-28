@@ -26,14 +26,13 @@ public class FoldProviderTest {
         Method rangeFromPositions =
                 FoldProvider.class.getDeclaredMethod(
                         "rangeFromPositions",
-                        com.sun.source.tree.LineMap.class,
                         int.class,
                         int.class,
                         com.sun.source.tree.Tree.class,
                         com.sun.source.tree.CompilationUnitTree.class,
                         String.class);
         rangeFromPositions.setAccessible(true);
-        var range = rangeFromPositions.invoke(null, null, -1, 72, null, null, "region");
+        var range = rangeFromPositions.invoke(null, -1, 72, null, null, "region");
         assertThat(range, nullValue());
     }
 }

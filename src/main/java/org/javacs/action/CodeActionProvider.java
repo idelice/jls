@@ -50,15 +50,14 @@ public class CodeActionProvider {
             var elapsed = Duration.between(started, Instant.now()).toMillis();
             LOG.info(String.format("...compiled in %d ms", elapsed));
             var root = task.root(file);
-            var lines = root.getLineMap();
-            var cursor = lines.getPosition(params.range.start.line + 1, params.range.start.character + 1);
+            var cursor = LspPosition.offset(root, params.range.start);
 
             rewrites.putAll(overrideInheritedMethods(task, file, cursor));
 
             var hasSelection = params.range.start.line != params.range.end.line
                     || params.range.start.character != params.range.end.character;
             if (hasSelection) {
-                var selectionEnd = lines.getPosition(params.range.end.line + 1, params.range.end.character + 1);
+                var selectionEnd = LspPosition.offset(root, params.range.end);
                 var methodAtEnd = new FindMethodDeclarationAt(task.trees).scan(root, selectionEnd);
                 var methodAtStart = new FindMethodDeclarationAt(task.trees).scan(root, cursor);
                 var insideMethod = (methodAtEnd != null || methodAtStart != null);
@@ -67,16 +66,8 @@ public class CodeActionProvider {
                     var classTree = new FindTypeDeclarationAt(task.trees).scan(root, methodDetectPos);
                     if (classTree != null) {
                         var className = qualifiedName(task, root, classTree);
-                        var rangeStart =
-                                (int)
-                                        lines.getPosition(
-                                                params.range.start.line + 1,
-                                                params.range.start.character + 1);
-                        var rangeEnd =
-                                (int)
-                                        lines.getPosition(
-                                                params.range.end.line + 1,
-                                                params.range.end.character + 1);
+                        var rangeStart = (int) LspPosition.offset(root, params.range.start);
+                        var rangeEnd = (int) LspPosition.offset(root, params.range.end);
 
                         variedActions.add(
                                 new VariedAction(
@@ -331,7 +322,7 @@ public class CodeActionProvider {
         // TODO this should be done asynchronously using executeCommand
         switch (d.code) {
             case "unused_local":
-                var toStatement = new ConvertVariableToStatement(file, findPosition(task, root, d.range.start));
+                var toStatement = new ConvertVariableToStatement(file, findPosition(root, d.range.start));
                 return createQuickFix("Convert to statement", toStatement);
             case "compiler.warn.unchecked.call.mbr.of.raw.type":
                 var warnedMethod = findMethod(task, root, d.range);
@@ -371,16 +362,15 @@ public class CodeActionProvider {
                 var implementAbstracts = new ImplementAbstractMethods(missingAbstracts);
                 return createQuickFix("Implement abstract methods", implementAbstracts);
             case "compiler.err.cant.resolve.location.args":
-                var missingMethod = new CreateMissingMethod(file, findPosition(task, root, d.range.start));
+                var missingMethod = new CreateMissingMethod(file, findPosition(root, d.range.start));
                 return createQuickFix("Create missing method", missingMethod);
             default:
                 return List.of();
         }
     }
 
-    private int findPosition(CompileTask task, CompilationUnitTree root, Position position) {
-        var lines = root.getLineMap();
-        return (int) lines.getPosition(position.line + 1, position.character + 1);
+    private int findPosition(CompilationUnitTree root, Position position) {
+        return (int) LspPosition.offset(root, position);
     }
 
     private String findClassNeedingConstructor(CompileTask task, CompilationUnitTree root, Range range) {
@@ -396,7 +386,7 @@ public class CodeActionProvider {
     }
 
     private ClassTree findClassTree(CompileTask task, CompilationUnitTree root, Range range) {
-        var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
+        var position = LspPosition.offset(root, range.start);
         return new FindTypeDeclarationAt(task.trees).scan(root, position);
     }
 
@@ -429,7 +419,7 @@ public class CodeActionProvider {
 
     private MethodPtr findMethod(CompileTask task, CompilationUnitTree root, Range range) {
         var trees = task.trees;
-        var position = root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
+        var position = LspPosition.offset(root, range.start);
         var tree = new FindMethodDeclarationAt(task.trees).scan(root, position);
         var path = trees.getPath(root, tree);
         var method = (ExecutableElement) trees.getElement(path);
@@ -472,8 +462,8 @@ public class CodeActionProvider {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        var start = (int) root.getLineMap().getPosition(range.start.line + 1, range.start.character + 1);
-        var end = (int) root.getLineMap().getPosition(range.end.line + 1, range.end.character + 1);
+        var start = (int) LspPosition.offset(root, range.start);
+        var end = (int) LspPosition.offset(root, range.end);
         return contents.subSequence(start, end);
     }
 

@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Map;
 import org.javacs.CompilerProvider;
+import org.javacs.LspPosition;
 import org.javacs.lsp.Position;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
@@ -72,15 +73,7 @@ public class ExtractVariable implements Rewrite {
             var declaration = indent + typeName + " " + varName + " = " + expressionText + ";\n";
             TextEdit edit1 = new TextEdit(new Range(insertPos, insertPos), declaration);
 
-            var exprStartLine = (int) root.getLineMap().getLineNumber(adjStart);
-            var exprStartCol = (int) root.getLineMap().getColumnNumber(adjStart);
-            var exprEndLine = (int) root.getLineMap().getLineNumber(endPosition);
-            var exprEndCol = (int) root.getLineMap().getColumnNumber(endPosition);
-            var exprRange =
-                    new Range(
-                            new Position(exprStartLine - 1, exprStartCol - 1),
-                            new Position(exprEndLine - 1, exprEndCol - 1));
-            TextEdit edit2 = new TextEdit(exprRange, varName);
+            TextEdit edit2 = new TextEdit(LspPosition.range(root, adjStart, endPosition), varName);
 
             // edit1 is at the statement line (lower offset), edit2 at the expression
             // (higher offset). Apply in reverse order: edit2 first, then edit1, so that

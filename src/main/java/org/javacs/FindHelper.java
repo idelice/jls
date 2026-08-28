@@ -267,6 +267,7 @@ public class FindHelper {
         int firstMatch = -1;
         while (matcher.find()) {
             var nameStart = matcher.start();
+            if (isInsideComment(contents, nameStart)) continue;
             if (firstMatch < 0) firstMatch = nameStart;
             var nameEnd = matcher.end();
             if (nameStart <= cursor && cursor <= nameEnd) {
@@ -274,5 +275,42 @@ public class FindHelper {
             }
         }
         return firstMatch;
+    }
+
+    /**
+     * Returns true if {@code position} falls inside a line comment ({@code //}) or
+     * block comment ({@code /* ... * /}). Uses backward scanning — no full parse needed.
+     */
+    static boolean isInsideComment(CharSequence contents, int position) {
+        // Check line comment: scan backward to start of line, look for //
+        int lineStart = position;
+        while (lineStart > 0 && contents.charAt(lineStart - 1) != '\n') {
+            lineStart--;
+        }
+        for (int i = lineStart; i < position - 1; i++) {
+            char c = contents.charAt(i);
+            if (c == '/' && contents.charAt(i + 1) == '/') {
+                return true; // position is after // on same line
+            }
+            // Skip string literals to avoid false positives on "//" inside strings
+            if (c == '"') {
+                i++;
+                while (i < position && contents.charAt(i) != '"') {
+                    if (contents.charAt(i) == '\\') i++; // skip escaped char
+                    i++;
+                }
+            }
+        }
+        // Check block comment: scan backward from position for /* without closing */
+        for (int i = position - 1; i > 0; i--) {
+            char c = contents.charAt(i);
+            if (c == '/' && contents.charAt(i - 1) == '*') {
+                return false; // found */ before any /*, so we're outside
+            }
+            if (c == '*' && contents.charAt(i - 1) == '/') {
+                return true; // found /* without prior */, so we're inside
+            }
+        }
+        return false;
     }
 }

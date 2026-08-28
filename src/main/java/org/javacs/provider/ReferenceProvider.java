@@ -1,20 +1,27 @@
 package org.javacs.provider;
+
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
+import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.lsp.Location;
@@ -24,6 +31,9 @@ import org.javacs.navigation.NavigationHelper;
 
 public class ReferenceProvider {
     private final CompilerProvider compiler;
+    private final Function<Path, CompilerProvider> compilerForFile;
+    private final BiPredicate<Path, Path> candidateAllowed;
+    private final java.util.function.Consumer<Path[]> batchResolver;
     private final Path file;
     private final int line, column;
 
@@ -32,7 +42,31 @@ public class ReferenceProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
+        this(compiler, file, line, column, __ -> compiler, (__, ___) -> true, __ -> {});
+    }
+
+    public ReferenceProvider(
+            CompilerProvider compiler,
+            Path file,
+            int line,
+            int column,
+            Function<Path, CompilerProvider> compilerForFile,
+            BiPredicate<Path, Path> candidateAllowed) {
+        this(compiler, file, line, column, compilerForFile, candidateAllowed, __ -> {});
+    }
+
+    public ReferenceProvider(
+            CompilerProvider compiler,
+            Path file,
+            int line,
+            int column,
+            Function<Path, CompilerProvider> compilerForFile,
+            BiPredicate<Path, Path> candidateAllowed,
+            java.util.function.Consumer<Path[]> batchResolver) {
         this.compiler = compiler;
+        this.compilerForFile = compilerForFile;
+        this.candidateAllowed = candidateAllowed;
+        this.batchResolver = batchResolver;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -50,11 +84,19 @@ public class ReferenceProvider {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
+                // Package-private members can only be referenced within the same package
+                var isPackagePrivate = !element.getModifiers().contains(Modifier.PUBLIC)
+                        && !element.getModifiers().contains(Modifier.PROTECTED)
+                        && !element.getModifiers().contains(Modifier.PRIVATE);
+                var declarationPath = task.trees.getPath(parentClass);
+                var declaration = declarationPath == null
+                        ? compiler.findTypeDeclaration(className)
+                        : Path.of(declarationPath.getCompilationUnit().getSourceFile().toUri());
                 LOG.fine(String.format("[ref] isMember kind=%s name=%s in=%s", element.getKind(), memberName, className));
                 if (memberName.equals("<init>")) {
                     memberName = parentClass.getSimpleName().toString();
                 }
-                // Lombok gate first — skip all Lombok logic when not on classpath
+                // Lombok gate first — private fields with Lombok annotations generate public accessors
                 if (compiler.lombokPresentOnClasspath()) {
                     LOG.fine("[ref] lombokOnClasspath=true");
                     var names = lombokSearchNames(element, memberName, task);
@@ -64,8 +106,13 @@ public class ReferenceProvider {
                     }
                     LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
+                // Private members (non-Lombok) can only be referenced within the same file
+                if (element.getModifiers().contains(Modifier.PRIVATE)) {
+                    LOG.fine(String.format("[ref] private_member kind=%s name=%s — file-only scan", element.getKind(), memberName));
+                    return findReferences(task);
+                }
                 task.close();
-                return findMemberReferences(className, memberName);
+                return findMemberReferences(className, memberName, declaration, isPackagePrivate);
             }
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(task);
@@ -91,26 +138,73 @@ public class ReferenceProvider {
         var files = compiler.findTypeReferences(className);
         LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d", className, files.length));
         if (files.length == 0) return List.of();
-        try (var task = compiler.compileFresh(files)) {
-            return findReferences(task);
-        }
+        return findReferences(files, compiler.findTypeDeclaration(className));
     }
 
-    private List<Location> findMemberReferences(String className, String memberName) {
+    private List<Location> findMemberReferences(String className, String memberName, Path declaration, boolean packagePrivate) {
         var files = compiler.findMemberReferences(className, memberName);
-        LOG.fine(String.format(
-                "[ref] member_scan owner=%s name=%s candidates=%d", className, memberName, files.length));
-        if (files.length == 0) return List.of();
-        try (var task = compiler.compileFresh(files)) {
-            return findReferences(task);
+        if (packagePrivate && declaration != null) {
+            var declarationPackage = FileStore.packageName(declaration);
+            files = java.util.Arrays.stream(files)
+                    .filter(f -> declarationPackage.equals(FileStore.packageName(f)))
+                    .toArray(Path[]::new);
+            LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", className, memberName, files.length));
+        } else {
+            LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d", className, memberName, files.length));
         }
+        if (files.length == 0) return List.of();
+        return findReferences(files, declaration);
+    }
+
+    private List<Location> findReferences(Path[] files, Path declaration) {
+        // Batch pre-resolve all modules these candidate files belong to.
+        // For multi-module Gradle/Maven: resolves all needed modules in fewer calls.
+        // For single-module: no-op.
+        batchResolver.accept(files);
+        LOG.fine(String.format("[ref] grouping candidates=%d declaration=%s",
+                files.length, declaration == null ? "null" : declaration.getFileName()));
+        var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
+        var skippedModules = new HashSet<String>();
+        for (var candidate : files) {
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            CompilerProvider candidateCompiler;
+            try {
+                candidateCompiler = compilerForFile.apply(candidate);
+            } catch (RuntimeException e) {
+                var moduleName = candidate.toString();
+                // Extract short module path for dedup
+                var moduleKey = e.getMessage() != null ? e.getMessage() : moduleName;
+                if (skippedModules.add(moduleKey)) {
+                    LOG.warning(String.format(
+                            "[ref] skip_candidate file=%s reason=%s",
+                            candidate.getFileName(), e.getMessage()));
+                }
+                continue;
+            }
+            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>())
+                    .add(candidate);
+        }
+        if (!skippedModules.isEmpty()) {
+            LOG.info(String.format("[ref] skipped_modules=%d groups=%d", skippedModules.size(), groups.size()));
+        }
+        var locations = new LinkedHashMap<String, Location>();
+        for (var entry : groups.entrySet()) {
+            entry.getValue().add(file);
+            try (var task = entry.getKey().compileFresh(entry.getValue().toArray(Path[]::new))) {
+                for (var location : findReferences(task)) {
+                    locations.put(location.uri + ":" + location.range, location);
+                }
+            }
+        }
+        LOG.fine(String.format("[ref] scan_complete groups=%d total_locations=%d", groups.size(), locations.size()));
+        return new ArrayList<>(locations.values());
     }
 
     private List<Location> findReferences(CompileTask task) {
         var element = NavigationHelper.findElement(task, file, line, column);
         var paths = new ArrayList<TreePath>();
         for (var root : task.roots) {
-                new FindReferences(task, element).scan(root, paths);
+            new FindReferences(task, element).scan(root, paths);
         }
         var locations = new ArrayList<Location>();
         for (var p : paths) {
@@ -162,20 +256,10 @@ public class ReferenceProvider {
         var names = new LinkedHashSet<String>();
         names.add(fieldName);
         if (accessors.get().hasGetter()) {
-            var getterName = accessors.get().getterName();
-            var declared = declaration.getMembers().stream()
-                    .anyMatch(member -> member instanceof MethodTree method
-                            && method.getName().contentEquals(getterName)
-                            && method.getParameters().isEmpty());
-            if (!declared) names.add(getterName);
+            names.add(accessors.get().getterName());
         }
         if (accessors.get().hasSetter()) {
-            var setterName = accessors.get().setterName();
-            var declared = declaration.getMembers().stream()
-                    .anyMatch(member -> member instanceof MethodTree method
-                            && method.getName().contentEquals(setterName)
-                            && method.getParameters().size() == 1);
-            if (!declared) names.add(setterName);
+            names.add(accessors.get().setterName());
         }
         return names;
     }
@@ -194,26 +278,41 @@ public class ReferenceProvider {
                     className, names, System.currentTimeMillis() - start));
             return List.of();
         }
-        try (var task = compiler.compileFresh(files.toArray(Path[]::new))) {
-            var paths = new ArrayList<TreePath>();
-            for (var root : task.roots) {
-                new FindLombokReferences(task, names, className).scan(root, paths);
-            }
-            var locations = new ArrayList<Location>();
-            for (var p : paths) {
-                locations.add(FindHelper.location(task, p));
-            }
-            var errors = task.diagnostics.stream().filter(d -> d.getKind() == Diagnostic.Kind.ERROR).count();
-            LOG.fine(String.format(
-                    "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d total=%dms",
-                    className,
-                    names,
-                    files.size(),
-                    task.roots.size(),
-                    errors,
-                    locations.size(),
-                    System.currentTimeMillis() - start));
-            return locations;
+        var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
+        var declaration = compiler.findTypeDeclaration(className);
+        for (var candidate : files) {
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            var candidateCompiler = compilerForFile.apply(candidate);
+            if (!candidateAllowed.test(declaration, candidate)) continue;
+            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>())
+                    .add(candidate);
         }
+        var locations = new LinkedHashMap<String, Location>();
+        var roots = 0;
+        long errors = 0;
+        for (var entry : groups.entrySet()) {
+            try (var task = entry.getKey().compileFresh(entry.getValue().toArray(Path[]::new))) {
+                var paths = new ArrayList<TreePath>();
+                for (var root : task.roots) {
+                    new FindLombokReferences(task, names, className).scan(root, paths);
+                }
+                for (var path : paths) {
+                    var location = FindHelper.location(task, path);
+                    locations.put(location.uri + ":" + location.range, location);
+                }
+                roots += task.roots.size();
+                errors += task.diagnostics.stream().filter(d -> d.getKind() == Diagnostic.Kind.ERROR).count();
+            }
+        }
+        LOG.fine(String.format(
+                "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d total=%dms",
+                className,
+                names,
+                files.size(),
+                roots,
+                errors,
+                locations.size(),
+                System.currentTimeMillis() - start));
+        return new ArrayList<>(locations.values());
     }
 }

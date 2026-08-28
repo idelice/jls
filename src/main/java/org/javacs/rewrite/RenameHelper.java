@@ -23,8 +23,7 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import org.javacs.CompileTask;
 import org.javacs.FindHelper;
-import org.javacs.lsp.Position;
-import org.javacs.lsp.Range;
+import org.javacs.LspPosition;
 import org.javacs.lsp.TextEdit;
 import org.javacs.navigation.FindLombokReferences;
 
@@ -144,7 +143,6 @@ class RenameHelper {
         var i = 0;
         for (var f : found) {
             var root = f.getCompilationUnit();
-            var lines = root.getLineMap();
             var startPos = pos.getStartPosition(root, f.getLeaf());
             var endPos = pos.getEndPosition(root, f.getLeaf());
             if (f.getLeaf() instanceof VariableTree) {
@@ -170,13 +168,7 @@ class RenameHelper {
                 startPos = findName(root, startPos, select.getIdentifier());
                 endPos = startPos + select.getIdentifier().length();
             }
-            var startLine = (int) lines.getLineNumber(startPos);
-            var startColumn = (int) lines.getColumnNumber(startPos);
-            var endLine = (int) lines.getLineNumber(endPos);
-            var endColumn = (int) lines.getColumnNumber(endPos);
-            var range =
-                    new Range(new Position(startLine - 1, startColumn - 1), new Position(endLine - 1, endColumn - 1));
-            edits[i++] = new TextEdit(range, newName);
+            edits[i++] = new TextEdit(LspPosition.range(root, startPos, endPos), newName);
         }
         return edits;
     }

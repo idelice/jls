@@ -5,7 +5,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
-import org.javacs.lsp.Position;
+import org.javacs.LspPosition;
 import org.javacs.lsp.Range;
 import org.javacs.lsp.TextEdit;
 
@@ -32,11 +32,8 @@ public class AddException implements Rewrite {
             var methodElement = FindHelper.findMethod(task, className, methodName, erasedParameterTypes);
             var methodTree = trees.getTree(methodElement);
             var pos = trees.getSourcePositions();
-            var lines = task.root(file).getLineMap();
             var startBody = pos.getStartPosition(task.root(file), methodTree.getBody());
-            var line = (int) lines.getLineNumber(startBody);
-            var column = (int) lines.getColumnNumber(startBody);
-            var insertPos = new Position(line - 1, column - 1);
+            var insertPos = LspPosition.position(task.root(file), startBody);
             var packageName = "";
             var simpleName = exceptionType;
             var lastDot = simpleName.lastIndexOf('.');

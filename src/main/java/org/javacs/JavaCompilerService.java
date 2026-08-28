@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
+import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -28,6 +29,8 @@ class JavaCompilerService implements CompilerProvider {
     final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
     final SourceFileManager fileManager;
     final SourceFileManager docsFileManager;
+    private ModuleGraph moduleGraph = ModuleGraph.EMPTY;
+    private Set<Path> sourceRoots = Set.of();
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
         this.classPath = Collections.unmodifiableSet(classPath);
@@ -79,6 +82,18 @@ class JavaCompilerService implements CompilerProvider {
         }
     }
 
+    void setModuleGraph(ModuleGraph moduleGraph) {
+        this.moduleGraph = moduleGraph;
+    }
+
+    void setSourceRoots(Set<Path> sourceRoots) {
+        this.sourceRoots = Set.copyOf(sourceRoots);
+    }
+
+    private boolean isSourceVisible(Path file) {
+        return sourceRoots.isEmpty() || sourceRoots.stream().anyMatch(file::startsWith);
+    }
+
     // --- Small LRU compile cache ---
     // Invalidation: content revision or classpath extension.
     // Eviction: LRU, max 4 entries. No cross-file tracking needed.
@@ -101,6 +116,9 @@ class JavaCompilerService implements CompilerProvider {
         } catch (RuntimeException e) {
             firstAttempt.close();
             throw e;
+        }
+        if (!sourceRoots.isEmpty()) {
+            addFiles.removeIf(file -> sourceRoots.stream().noneMatch(file::startsWith));
         }
 
         if (addFiles.isEmpty()) return firstAttempt;
@@ -278,12 +296,16 @@ class JavaCompilerService implements CompilerProvider {
     // Find the output directory owned by this source file's nearest module.
     Path findBuildOutputDir(Path source) {
         var normalizedSource = source.toAbsolutePath().normalize();
+        var moduleInfo = moduleGraph.moduleForFile(normalizedSource);
+        if (moduleInfo.isPresent()) {
+            var info = moduleInfo.get();
+            return info.testSourceDir() != null && normalizedSource.startsWith(info.testSourceDir())
+                    ? info.testOutputDir()
+                    : info.mainOutputDir();
+        }
         for (var module = normalizedSource; module != null; module = module.getParent()) {
-            var testSource = normalizedSource.startsWith(module.resolve("src/test"));
             Path outputDir;
-            if (Files.exists(module.resolve("pom.xml"))) {
-                outputDir = testSource ? module.resolve("target/test-classes") : MavenTooling.outputDirectory(module);
-            } else if (Files.exists(module.resolve("build.gradle"))
+            if (Files.exists(module.resolve("build.gradle"))
                     || Files.exists(module.resolve("build.gradle.kts"))) {
                 var relativeSource = module.relativize(normalizedSource);
                 var sourceSet = "main";
@@ -378,6 +400,7 @@ class JavaCompilerService implements CompilerProvider {
     public Set<String> imports() {
         var all = new HashSet<String>();
         for (var f : FileStore.all()) {
+            if (!isSourceVisible(f)) continue;
             all.addAll(readImports(f));
         }
         return all;
@@ -387,6 +410,7 @@ class JavaCompilerService implements CompilerProvider {
     public List<String> publicTopLevelTypes() {
         var all = new ArrayList<String>();
         for (var file : FileStore.all()) {
+            if (!isSourceVisible(file)) continue;
             var fileName = file.getFileName().toString();
             if (!fileName.endsWith(".java")) continue;
             var className = fileName.substring(0, fileName.length() - ".java".length());
@@ -409,7 +433,7 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public Iterable<Path> search(String query) {
         Predicate<Path> test = f -> StringSearch.containsWordMatching(f, query);
-        return () -> FileStore.all().stream().filter(test).iterator();
+        return () -> FileStore.all().stream().filter(this::isSourceVisible).filter(test).iterator();
     }
 
     @Override
@@ -464,6 +488,7 @@ class JavaCompilerService implements CompilerProvider {
         var pkg = packageName(className);
         var simple = simpleName(className);
         for (var f : FileStore.list(pkg)) {
+            if (!isSourceVisible(f)) continue;
             if (containsWord(f, simple) && containsType(f, className)) {
                 return f;
             }
@@ -482,6 +507,7 @@ class JavaCompilerService implements CompilerProvider {
         if (source == null) return NOT_FOUND;
         if (!source.toUri().getScheme().equals("file")) return NOT_FOUND;
         var file = Paths.get(source.toUri());
+        if (!isSourceVisible(file)) return NOT_FOUND;
         if (!containsType(file, className)) return NOT_FOUND;
         return file;
     }
@@ -501,9 +527,10 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Path[] findMemberReferences(String className, String memberName) {
+        var pkg = packageName(className);
         var candidates = new ArrayList<Path>();
         for (var f : FileStore.all()) {
-            if (containsWord(f, memberName)) {
+            if (containsWord(f, memberName) && (pkg.equals(FileStore.packageName(f)) || containsImport(f, className))) {
                 candidates.add(f);
             }
         }
@@ -544,7 +571,7 @@ class JavaCompilerService implements CompilerProvider {
                     }
                 }
             } else if (root.toString().endsWith(".jar") && Files.exists(root)) {
-                try (var jar = new java.util.jar.JarFile(root.toFile())) {
+                try (var jar = new JarFile(root.toFile())) {
                     var entry = jar.getEntry(relative);
                     if (entry != null) {
                         try (var in = jar.getInputStream(entry)) {
