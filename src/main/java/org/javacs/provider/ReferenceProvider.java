@@ -256,20 +256,10 @@ public class ReferenceProvider {
         var names = new LinkedHashSet<String>();
         names.add(fieldName);
         if (accessors.get().hasGetter()) {
-            var getterName = accessors.get().getterName();
-            var declared = declaration.getMembers().stream()
-                    .anyMatch(member -> member instanceof MethodTree method
-                            && method.getName().contentEquals(getterName)
-                            && method.getParameters().isEmpty());
-            if (!declared) names.add(getterName);
+            names.add(accessors.get().getterName());
         }
         if (accessors.get().hasSetter()) {
-            var setterName = accessors.get().setterName();
-            var declared = declaration.getMembers().stream()
-                    .anyMatch(member -> member instanceof MethodTree method
-                            && method.getName().contentEquals(setterName)
-                            && method.getParameters().size() == 1);
-            if (!declared) names.add(setterName);
+            names.add(accessors.get().setterName());
         }
         return names;
     }
