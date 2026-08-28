@@ -488,7 +488,7 @@ public final class ExternalBinaryTypeIndex {
             var superclass =
                     binaryClass.getSuperclass() == null ? null : canonicalTypeName(binaryClass.getSuperclass());
             var interfaces =
-                    java.util.Arrays.stream(binaryClass.getInterfaces())
+                    Arrays.stream(binaryClass.getInterfaces())
                             .map(this::canonicalTypeName)
                             .collect(Collectors.toList());
             var linked =
@@ -1237,6 +1237,6 @@ public final class ExternalBinaryTypeIndex {
     private record BinaryClassModel(
             String qualifiedName, String simpleName, List<IndexedMember> members) {}
     private record SourceLombokMetadata(
-            java.util.Map<String, String> accessorToField,
+            Map<String, String> accessorToField,
             List<IndexedMember> syntheticAccessors) {}
 }
