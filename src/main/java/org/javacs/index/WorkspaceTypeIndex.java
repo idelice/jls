@@ -569,17 +569,17 @@ public class WorkspaceTypeIndex {
      * <p>Record component accessors are synthesized from the parse tree without attribution.
      * Lombok synthetics use the same parse-tree-based path as the compiled index.
      */
-    public static WorkspaceTypeIndex fromParseTrees(java.util.List<ParseTask> parseTasks) {
+    public static WorkspaceTypeIndex fromParseTrees(List<ParseTask> parseTasks) {
         return fromParseTrees(parseTasks, __ -> false);
     }
 
     public static WorkspaceTypeIndex fromParseTrees(
-            java.util.List<ParseTask> parseTasks, Predicate<String> knownType) {
+            List<ParseTask> parseTasks, Predicate<String> knownType) {
         return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true);
     }
 
     public static WorkspaceTypeIndex fromParseTrees(
-            java.util.List<ParseTask> parseTasks,
+            List<ParseTask> parseTasks,
             BiPredicate<Path, String> knownType,
             BiPredicate<Path, Path> sourceVisible) {
         // Single-pass: parse each file, extract all metadata + members, discard AST immediately.
@@ -706,7 +706,7 @@ public class WorkspaceTypeIndex {
 
         // === Post-pass: resolve raw supertype/interface names using collected workspace names ===
         var typeSupertypes = new Object2ObjectOpenHashMap<String, String>();
-        var typeInterfacesList = new Object2ObjectOpenHashMap<String, java.util.List<String>>();
+        var typeInterfacesList = new Object2ObjectOpenHashMap<String, List<String>>();
 
         for (var qualifiedName : allQualifiedNames) {
             var sourcePath = typeSources.get(qualifiedName);
@@ -1101,9 +1101,9 @@ public class WorkspaceTypeIndex {
      */
     private static void addRecordCanonicalConstructorFromParseTree(
             String ownerQualifiedName, ClassTree classTree, Map<String, IndexedMember> seen) {
-        var paramNames = new java.util.ArrayList<String>();
-        var erasedParamTypes = new java.util.ArrayList<String>();
-        var declaredParamTypes = new java.util.ArrayList<String>();
+        var paramNames = new ArrayList<String>();
+        var erasedParamTypes = new ArrayList<String>();
+        var declaredParamTypes = new ArrayList<String>();
         for (var member : classTree.getMembers()) {
             if (!(member instanceof VariableTree vt)) continue;
             if (!(vt instanceof JCVariableDecl jcVar)) continue;
