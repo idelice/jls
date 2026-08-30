@@ -25,6 +25,8 @@ public class FileStore {
     private static final Set<Path> workspaceRoots = ConcurrentHashMap.newKeySet();
 
     private static final Map<Path, VersionedContent> activeDocuments = new ConcurrentHashMap<>();
+    /** Content hash last observed on disk for each open document. */
+    private static final Map<Path, Integer> savedContentHashes = new ConcurrentHashMap<>();
     private static final Set<Path> dirtyDocuments = ConcurrentHashMap.newKeySet();
     private static final AtomicLong contentRevision = new AtomicLong();
 
@@ -130,6 +132,7 @@ public class FileStore {
 
     static void reset() {
         activeDocuments.clear();
+        savedContentHashes.clear();
         LOG.info("[dirty] reset() clearing ALL dirty flags");
         dirtyDocuments.clear();
         workspaceRoots.clear();
@@ -246,19 +249,42 @@ public class FileStore {
     }
 
     static void externalCreate(Path file) {
+        if (activeDocuments.containsKey(file)) dirtyDocuments.add(file);
         readInfoFromDisk(file);
+        refreshSavedBaseline(file);
         bumpContentRevision();
     }
 
     static void externalChange(Path file) {
+        if (activeDocuments.containsKey(file)) dirtyDocuments.add(file);
         readInfoFromDisk(file);
+        refreshSavedBaseline(file);
         bumpContentRevision();
     }
 
     static void externalDelete(Path file) {
+        if (activeDocuments.containsKey(file)) {
+            dirtyDocuments.add(file);
+            LOG.info("[dirty] externalDelete() marking active document dirty: " + file.getFileName());
+        }
         removeFromPackageIndex(file);
         javaSources.remove(file);
+        savedContentHashes.remove(file);
         bumpContentRevision();
+    }
+
+    private static void refreshSavedBaseline(Path file) {
+        var active = activeDocuments.get(file);
+        if (active == null) return;
+        var diskHash = diskContentHash(file);
+        if (diskHash == null) {
+            savedContentHashes.remove(file);
+            dirtyDocuments.add(file);
+        } else {
+            savedContentHashes.put(file, diskHash);
+            if (active.contentHash == diskHash) dirtyDocuments.remove(file);
+            else dirtyDocuments.add(file);
+        }
     }
 
     private static void readInfoFromDisk(Path file) {
@@ -291,21 +317,24 @@ public class FileStore {
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
         var newContent = new VersionedContent(document.text, document.version);
-        activeDocuments.put(file, newContent);
-        // Only invalidate caches if the content actually changed (not just opened)
-        var contentChanged = existing != null && existing.contentHash != newContent.contentHash;
+        // Read disk once per open document; subsequent changes compare against this baseline.
         if (existing == null) {
-            try {
-                contentChanged = !Files.readString(file).equals(document.text);
-            } catch (IOException e) {
-                contentChanged = true;
-            }
+            var diskHash = diskContentHash(file);
+            if (diskHash == null) savedContentHashes.remove(file);
+            else savedContentHashes.put(file, diskHash);
+        }
+        var contentChanged = existing != null && existing.contentHash != newContent.contentHash;
+        if (existing == null) contentChanged = !sameAsSaved(file, newContent.contentHash);
+        var matchesSaved = sameAsSaved(file, newContent.contentHash);
+        if (!matchesSaved) {
+            dirtyDocuments.add(file);
+            activeDocuments.put(file, newContent);
+        } else {
+            activeDocuments.put(file, newContent);
+            dirtyDocuments.remove(file);
         }
         if (contentChanged) {
-            dirtyDocuments.add(file);
             bumpContentRevision();
-        } else if (existing == null) {
-            dirtyDocuments.remove(file);
         }
     }
 
@@ -315,51 +344,41 @@ public class FileStore {
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
         if (existing == null) return;
-        // Always mark dirty — the user attempted to edit this file
-        LOG.info("[dirty] change() marking dirty: " + file.getFileName() + " (version=" + document.version + " existing=" + existing.version + ")");
-        dirtyDocuments.add(file);
         if (document.version <= existing.version) {
             LOG.warning("Ignored change with version " + document.version + " <= " + existing.version);
             return;
         }
+        LOG.info("[dirty] change() applying version=" + document.version + " over " + existing.version);
         var newText = existing.content;
         for (var change : params.contentChanges) {
             if (change.range == null) newText = change.text;
             else newText = patch(newText, change);
         }
-        activeDocuments.put(file, new VersionedContent(newText, document.version));
-        bumpContentRevision();
+        var newContent = new VersionedContent(newText, document.version);
         // If content now matches disk (e.g. undo), clear dirty flag — no cross-file errors needed
-        var diskInfo = javaSources.get(file);
-        if (diskInfo != null) {
-            try {
-                var diskContent = Files.readString(file);
-                if (diskContent.equals(newText)) {
-                    dirtyDocuments.remove(file);
-                    LOG.info("[dirty] change() content matches disk — clearing dirty: " + file.getFileName());
-                } else {
-                    dirtyDocuments.add(file);
-                }
-            } catch (IOException ignored) {
-                dirtyDocuments.add(file);
-            }
+        if (sameAsSaved(file, newContent.contentHash)) {
+            activeDocuments.put(file, newContent);
+            dirtyDocuments.remove(file);
+            LOG.info("[dirty] change() content matches disk — clearing dirty: " + file.getFileName());
         } else {
             dirtyDocuments.add(file);
+            activeDocuments.put(file, newContent);
         }
+        bumpContentRevision();
     }
 
     static void close(DidCloseTextDocumentParams params) {
         if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         var removed = activeDocuments.remove(file);
+        savedContentHashes.remove(file);
         // If the in-memory content differed from disk, caches are stale.
         if (removed != null) {
             // Closing discards the editor buffer, so any unsaved dirty state no longer applies.
             dirtyDocuments.remove(file);
             readInfoFromDisk(file);
-            var diskHash = javaSources.containsKey(file)
-                    ? Long.hashCode(javaSources.get(file).modified.toEpochMilli()) : 0;
-            if (diskHash != removed.contentHash) {
+            var diskHash = diskContentHash(file);
+            if (!Objects.equals(diskHash, removed.contentHash)) {
                 bumpContentRevision();
             }
         }
@@ -370,8 +389,10 @@ public class FileStore {
             return;
         }
         LOG.info("[dirty] save() clearing dirty: " + file.getFileName());
-        bumpContentRevision();
+        var active = activeDocuments.get(file);
+        if (active != null) savedContentHashes.put(file, active.contentHash);
         dirtyDocuments.remove(file);
+        bumpContentRevision();
     }
 
     static Set<Path> activeDocuments() {
@@ -390,6 +411,19 @@ public class FileStore {
 
     private static void bumpContentRevision() {
         contentRevision.incrementAndGet();
+    }
+
+    private static boolean sameAsSaved(Path file, int contentHash) {
+        var savedHash = savedContentHashes.get(file);
+        return savedHash != null && savedHash == contentHash;
+    }
+
+    private static Integer diskContentHash(Path file) {
+        try {
+            return Files.readString(file).hashCode();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     static VersionedContent activeDocument(Path file) {

@@ -78,6 +78,7 @@ public class CompileBatch implements AutoCloseable {
                                             if (ex instanceof VirtualMachineError
                                                     || ex instanceof ThreadDeath
                                                     || ex instanceof LinkageError) throw (Error) ex;
+                                            throw new RuntimeException("Lombok stub injection failed", ex);
                                         }
                                     }
                                 }

@@ -876,7 +876,7 @@ public final class ExternalBinaryTypeIndex {
                 var fieldType = field.getType() == null ? "" : field.getType().toString();
                 var accessors =
                         LombokAnnotations.accessorInfo(
-                                declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
+                                parse.root(), declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
                 if (accessors.isEmpty()) {
                     continue;
                 }

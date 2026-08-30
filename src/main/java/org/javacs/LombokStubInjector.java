@@ -6,6 +6,7 @@ import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.TypeTag;
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.tree.JCTree.*;
+import com.sun.tools.javac.tree.TreeCopier;
 import com.sun.tools.javac.tree.TreeMaker;
 import com.sun.tools.javac.util.Context;
 import com.sun.tools.javac.util.List;
@@ -28,6 +29,11 @@ public class LombokStubInjector {
 
     private final TreeMaker make;
     private final Names names;
+    private CompilationUnitTree root;
+
+    private boolean hasAnnotation(ModifiersTree modifiers, String... names) {
+        return LombokAnnotations.hasAnnotation(root, modifiers, names);
+    }
 
     LombokStubInjector(Context context) {
         this.make = TreeMaker.instance(context);
@@ -45,6 +51,7 @@ public class LombokStubInjector {
     }
 
     void inject(CompilationUnitTree root) {
+        this.root = root;
         if (!LombokAnnotations.hasStructuralLombokAnnotation(root)
                 && !LombokAnnotations.hasLogAnnotation(root)) return;
         var unit = (JCCompilationUnit) root;
@@ -59,13 +66,13 @@ public class LombokStubInjector {
         make.at(classDecl.pos);
         var loggerCount = injectLogger(classDecl);
         var mods = classDecl.getModifiers();
-        var structural = LombokAnnotations.hasStructuralLombokAnnotation(mods);
-        var hasData = LombokAnnotations.hasAnnotation(mods, "Data");
-        var hasValue = LombokAnnotations.hasAnnotation(mods, "Value");
-        var hasNoArgs = LombokAnnotations.hasAnnotation(mods, "NoArgsConstructor");
-        var hasAllArgs = LombokAnnotations.hasAnnotation(mods, "AllArgsConstructor");
-        var hasRequiredArgs = LombokAnnotations.hasAnnotation(mods, "RequiredArgsConstructor");
-        var hasBuilder = LombokAnnotations.hasAnnotation(mods, "Builder");
+        var structural = LombokAnnotations.hasStructuralLombokAnnotation(root, mods);
+        var hasData = hasAnnotation(mods, "Data");
+        var hasValue = hasAnnotation(mods, "Value");
+        var hasNoArgs = hasAnnotation(mods, "NoArgsConstructor");
+        var hasAllArgs = hasAnnotation(mods, "AllArgsConstructor");
+        var hasRequiredArgs = hasAnnotation(mods, "RequiredArgsConstructor");
+        var hasBuilder = hasAnnotation(mods, "Builder");
 
         if (classDecl.getKind() == Tree.Kind.INTERFACE
                 || classDecl.getKind() == Tree.Kind.ANNOTATION_TYPE) {
@@ -104,7 +111,7 @@ public class LombokStubInjector {
 
     private int injectLogger(JCClassDecl classDecl) {
         if ((classDecl.getKind() == Tree.Kind.INTERFACE || classDecl.getKind() == Tree.Kind.ANNOTATION_TYPE)
-                || !LombokAnnotations.hasLoggingOnlyLombokAnnotation(classDecl.getModifiers())
+                || !LombokAnnotations.hasLoggingOnlyLombokAnnotation(root, classDecl.getModifiers())
                 || hasField(classDecl, LombokAnnotations.DEFAULT_LOG_FIELD_NAME)) {
             return 0;
         }
@@ -127,21 +134,82 @@ public class LombokStubInjector {
             var fieldName = field.getName().toString();
             if (fieldName.isBlank()) continue;
             var accessorInfo = LombokAnnotations.accessorInfo(
-                    classModifiers, field.getModifiers(), fieldName, field.vartype.toString());
+                    root, classModifiers, field.getModifiers(), fieldName, field.vartype.toString());
             if (accessorInfo.isEmpty()) continue;
             var info = accessorInfo.get();
             if (info.hasGetter() && !hasExplicitMethod(classDecl, info.getterName(), 0)) {
                 classDecl.defs = classDecl.defs.append(
-                        createGetter(info.getterName(), field.vartype, fieldName));
+                        createGetter(
+                                info.getterName(), field.vartype, fieldName,
+                                accessorFlags(classModifiers, field.getModifiers(), "Getter")));
                 injected++;
             }
             if (info.hasSetter() && !hasExplicitMethod(classDecl, info.setterName(), 1)) {
                 classDecl.defs = classDecl.defs.append(
-                        createSetter(info.setterName(), field.vartype, fieldName));
+                        createSetter(
+                                info.setterName(), field.vartype, fieldName,
+                                accessorFlags(classModifiers, field.getModifiers(), "Setter")));
                 injected++;
             }
         }
         return injected;
+    }
+
+    private long accessorFlags(
+            ModifiersTree classModifiers, ModifiersTree fieldModifiers, String annotationName) {
+        var fieldAccess = declaredAccessFlags(fieldModifiers, annotationName, "value");
+        if (fieldAccess != null) return fieldAccess;
+        var classAccess = declaredAccessFlags(classModifiers, annotationName, "value");
+        return classAccess == null ? Flags.PUBLIC : classAccess;
+    }
+
+    private Long declaredAccessFlags(
+            ModifiersTree modifiers, String annotationName, String argumentName) {
+        for (var annotation : modifiers.getAnnotations()) {
+            if (!LombokAnnotations.isLombokAnnotation(root, annotation)
+                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                            .equals(annotationName)) {
+                continue;
+            }
+            for (var argument : annotation.getArguments()) {
+                ExpressionTree value = argument;
+                if (argument instanceof AssignmentTree assignment) {
+                    if (!assignment.getVariable().toString().equals(argumentName)) continue;
+                    value = assignment.getExpression();
+                } else if (!argumentName.equals("value")) {
+                    continue;
+                }
+                var access = LombokAnnotations.simpleName(value.toString());
+                return switch (access) {
+                    case "PROTECTED" -> (long) Flags.PROTECTED;
+                    case "PACKAGE", "MODULE" -> 0L;
+                    case "PRIVATE" -> (long) Flags.PRIVATE;
+                    default -> (long) Flags.PUBLIC;
+                };
+            }
+            return (long) Flags.PUBLIC;
+        }
+        return null;
+    }
+
+    private Long constructorFlags(ModifiersTree modifiers, String annotationName) {
+        for (var annotation : modifiers.getAnnotations()) {
+            if (!LombokAnnotations.isLombokAnnotation(root, annotation)
+                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                            .equals(annotationName)) {
+                continue;
+            }
+            for (var argument : annotation.getArguments()) {
+                if (argument instanceof AssignmentTree assignment
+                        && assignment.getVariable().toString().equals("access")
+                        && LombokAnnotations.simpleName(assignment.getExpression().toString())
+                                .equals("NONE")) {
+                    return null;
+                }
+            }
+        }
+        var access = declaredAccessFlags(modifiers, annotationName, "access");
+        return access == null ? (long) Flags.PUBLIC : access;
     }
 
     private int injectConstructors(
@@ -155,9 +223,19 @@ public class LombokStubInjector {
             boolean builderAllArgs) {
         var injected = 0;
         var isEnum = classDecl.getKind() == Tree.Kind.ENUM;
-        if (hasNoArgs && !hasExplicitConstructor(classDecl, 0)) {
-            classDecl.defs = classDecl.defs.append(createConstructor(List.nil(), isEnum));
-            injected++;
+        if (hasNoArgs) {
+            var accessFlags = constructorFlags(classDecl.getModifiers(), "NoArgsConstructor");
+            if (accessFlags != null) {
+                var factoryName = stringLiteralArgument(
+                        classDecl.getModifiers(), "NoArgsConstructor", "staticName");
+                classDecl.defs = classDecl.defs.append(
+                        createConstructor(
+                                List.nil(), isEnum,
+                                factoryName == null ? accessFlags : Flags.PRIVATE));
+                injected++;
+                injected += injectStaticConstructorFactory(
+                        classDecl, factoryName, List.nil(), accessFlags);
+            }
         }
         var writtenConstructor = hasExplicitConstructorAny(classDecl);
         var explicitConstructorAnnotation = hasNoArgs || hasRequiredArgs || hasAllArgsAnnotation;
@@ -166,23 +244,55 @@ public class LombokStubInjector {
             var allArgsFields = instanceFields.stream()
                     .filter(f -> !((f.mods.flags & Flags.FINAL) != 0 && f.init != null))
                     .filter(f -> !(hasValue && f.init != null
-                            && !LombokAnnotations.hasAnnotation(f.getModifiers(), "NonFinal")))
+                            && !hasAnnotation(f.getModifiers(), "NonFinal")))
                     .collect(List.collector());
-            if (!hasExplicitConstructor(classDecl, allArgsFields.size())) {
-                classDecl.defs = classDecl.defs.append(
-                        createConstructor(allArgsFields, isEnum, builderAllArgs));
-                injected++;
+            if (hasAllArgsAnnotation || !hasExplicitConstructor(classDecl, allArgsFields.size())) {
+                Long accessFlags;
+                if (builderAllArgs) {
+                    accessFlags = 0L;
+                } else if (hasAllArgsAnnotation) {
+                    accessFlags = constructorFlags(classDecl.getModifiers(), "AllArgsConstructor");
+                } else {
+                    accessFlags = (long) Flags.PUBLIC;
+                }
+                if (accessFlags != null) {
+                    var factoryName = builderAllArgs
+                            ? null
+                            : hasAllArgsAnnotation
+                            ? stringLiteralArgument(
+                                    classDecl.getModifiers(), "AllArgsConstructor", "staticName")
+                            : valueAllArgs
+                                    ? stringLiteralArgument(
+                                            classDecl.getModifiers(), "Value", "staticConstructor")
+                                    : null;
+                    classDecl.defs = classDecl.defs.append(
+                            createConstructor(
+                                    allArgsFields, isEnum,
+                                    factoryName == null ? accessFlags : Flags.PRIVATE));
+                    injected++;
+                    injected += injectStaticConstructorFactory(
+                            classDecl, factoryName, allArgsFields, accessFlags);
+                }
             }
         }
         if (hasRequiredArgs) {
             var requiredFields = instanceFields.stream()
                     .filter(f -> f.init == null
                             && ((f.mods.flags & Flags.FINAL) != 0
-                            || LombokAnnotations.hasAnnotation(f.getModifiers(), "NonNull")))
+                            || hasAnnotation(f.getModifiers(), "NonNull")))
                     .collect(List.collector());
-            if (!hasExplicitConstructor(classDecl, requiredFields.size())) {
-                classDecl.defs = classDecl.defs.append(createConstructor(requiredFields, isEnum));
+            var accessFlags = constructorFlags(
+                    classDecl.getModifiers(), "RequiredArgsConstructor");
+            if (accessFlags != null) {
+                var factoryName = stringLiteralArgument(
+                        classDecl.getModifiers(), "RequiredArgsConstructor", "staticName");
+                classDecl.defs = classDecl.defs.append(
+                        createConstructor(
+                                requiredFields, isEnum,
+                                factoryName == null ? accessFlags : Flags.PRIVATE));
                 injected++;
+                injected += injectStaticConstructorFactory(
+                        classDecl, factoryName, requiredFields, accessFlags);
             }
         }
         if (hasData && !hasNoArgs && !hasAllArgsAnnotation && !hasRequiredArgs
@@ -190,12 +300,86 @@ public class LombokStubInjector {
             var requiredFields = instanceFields.stream()
                     .filter(f -> f.init == null
                             && ((f.mods.flags & Flags.FINAL) != 0
-                            || LombokAnnotations.hasAnnotation(f.getModifiers(), "NonNull")))
+                            || hasAnnotation(f.getModifiers(), "NonNull")))
                     .collect(List.collector());
-            classDecl.defs = classDecl.defs.append(createConstructor(requiredFields, isEnum));
+            var factoryName = stringLiteralArgument(
+                    classDecl.getModifiers(), "Data", "staticConstructor");
+            classDecl.defs = classDecl.defs.append(createConstructor(
+                    requiredFields, isEnum,
+                    factoryName == null ? Flags.PUBLIC : Flags.PRIVATE));
             injected++;
+            injected += injectStaticConstructorFactory(
+                    classDecl, factoryName, requiredFields, Flags.PUBLIC);
         }
         return injected;
+    }
+
+    private String stringLiteralArgument(
+            ModifiersTree modifiers, String annotationName, String argumentName) {
+        for (var annotation : modifiers.getAnnotations()) {
+            if (!LombokAnnotations.isLombokAnnotation(root, annotation)
+                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                            .equals(annotationName)) {
+                continue;
+            }
+            for (var argument : annotation.getArguments()) {
+                if (argument instanceof AssignmentTree assignment
+                        && assignment.getVariable().toString().equals(argumentName)
+                        && assignment.getExpression() instanceof LiteralTree literal
+                        && literal.getValue() instanceof String value
+                        && !value.isEmpty()) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    private int injectStaticConstructorFactory(
+            JCClassDecl owner, String factoryName, List<JCVariableDecl> fields, long accessFlags) {
+        if (factoryName == null) return 0;
+        owner.defs = owner.defs.append(
+                createStaticConstructorFactory(owner, factoryName, fields, accessFlags));
+        return 1;
+    }
+
+    private JCMethodDecl createStaticConstructorFactory(
+            JCClassDecl owner, String factoryName, List<JCVariableDecl> fields, long accessFlags) {
+        var copier = new TreeCopier<Void>(make);
+        var typeParameters = owner.typarams.stream()
+                .map(parameter -> make.TypeParameter(
+                        parameter.name, copier.copy(parameter.bounds)))
+                .collect(List.collector());
+        var params = fields.stream()
+                .map(field -> make.VarDef(
+                        make.Modifiers(Flags.PARAMETER),
+                        field.name,
+                        copier.copy(field.vartype),
+                        null))
+                .collect(List.collector());
+        var arguments = fields.stream()
+                .<JCExpression>map(field -> make.Ident(field.name))
+                .collect(List.collector());
+        var body = make.Block(0L, List.of(make.Return(make.NewClass(
+                null, List.nil(), ownerType(owner), arguments, null))));
+        return make.MethodDef(
+                make.Modifiers(accessFlags | Flags.STATIC | Flags.GENERATED_MEMBER),
+                names.fromString(factoryName),
+                ownerType(owner),
+                typeParameters,
+                params,
+                List.nil(),
+                body,
+                null);
+    }
+
+    private JCExpression ownerType(JCClassDecl owner) {
+        var type = make.Ident(owner.name);
+        if (owner.typarams.isEmpty()) return type;
+        var arguments = owner.typarams.stream()
+                .<JCExpression>map(parameter -> make.Ident(parameter.name))
+                .collect(List.collector());
+        return make.TypeApply(type, arguments);
     }
 
     private int injectBuilder(
@@ -207,20 +391,21 @@ public class LombokStubInjector {
                     + " reason=unsupported-class-kind");
             return 0;
         }
-        if (LombokAnnotations.hasAnnotation(classDecl.getModifiers(), "SuperBuilder")) {
+        if (hasAnnotation(classDecl.getModifiers(), "SuperBuilder")) {
             LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=super-builder");
             return 0;
         }
         for (var field : fields) {
-            if (LombokAnnotations.hasAnnotation(field.getModifiers(), "Singular")) {
+            if (hasAnnotation(field.getModifiers(), "Singular")) {
                 LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                         + " reason=singular-field");
                 return 0;
             }
         }
         for (var annotation : classDecl.getModifiers().getAnnotations()) {
-            if (LombokAnnotations.simpleName(annotation.getAnnotationType().toString()).equals("Builder")
+            if (LombokAnnotations.isLombokAnnotation(root, annotation)
+                    && LombokAnnotations.simpleName(annotation.getAnnotationType().toString()).equals("Builder")
                     && !annotation.getArguments().isEmpty()) {
                 LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                         + " reason=builder-options");
@@ -234,9 +419,9 @@ public class LombokStubInjector {
         }
         var constructorFields = fields.stream()
                 .filter(f -> !((f.mods.flags & Flags.FINAL) != 0 && f.init != null))
-                .filter(f -> !(LombokAnnotations.hasAnnotation(classDecl.getModifiers(), "Value")
+                .filter(f -> !(hasAnnotation(classDecl.getModifiers(), "Value")
                         && f.init != null
-                        && !LombokAnnotations.hasAnnotation(f.getModifiers(), "NonFinal")))
+                        && !hasAnnotation(f.getModifiers(), "NonFinal")))
                 .collect(List.collector());
         if (!hasExplicitConstructor(classDecl, constructorFields.size())) {
             LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
@@ -290,14 +475,15 @@ public class LombokStubInjector {
         if (classDecl.getKind() == Tree.Kind.ENUM
                 || classDecl.getKind() == Tree.Kind.RECORD
                 || (classDecl.mods.flags & Flags.ABSTRACT) != 0
-                || LombokAnnotations.hasAnnotation(classDecl.getModifiers(), "SuperBuilder")) {
+                || hasAnnotation(classDecl.getModifiers(), "SuperBuilder")) {
             return false;
         }
         for (var field : fields) {
-            if (LombokAnnotations.hasAnnotation(field.getModifiers(), "Singular")) return false;
+            if (hasAnnotation(field.getModifiers(), "Singular")) return false;
         }
         for (var annotation : classDecl.getModifiers().getAnnotations()) {
-            if (LombokAnnotations.simpleName(annotation.getAnnotationType().toString()).equals("Builder")
+            if (LombokAnnotations.isLombokAnnotation(root, annotation)
+                    && LombokAnnotations.simpleName(annotation.getAnnotationType().toString()).equals("Builder")
                     && !annotation.getArguments().isEmpty()) {
                 return false;
             }
@@ -387,11 +573,12 @@ public class LombokStubInjector {
         return false;
     }
 
-    private JCMethodDecl createGetter(String methodName, JCExpression fieldType, String fieldName) {
+    private JCMethodDecl createGetter(
+            String methodName, JCExpression fieldType, String fieldName, long accessFlags) {
         var body = make.Block(0L, List.of(
                 make.Return(make.Select(make.Ident(names.fromString("this")), names.fromString(fieldName)))));
         return make.MethodDef(
-                make.Modifiers(Flags.PUBLIC | Flags.GENERATED_MEMBER),
+                make.Modifiers(accessFlags | Flags.GENERATED_MEMBER),
                 names.fromString(methodName),
                 cloneType(fieldType),
                 List.nil(),  // type params
@@ -401,7 +588,8 @@ public class LombokStubInjector {
                 null);
     }
 
-    private JCMethodDecl createSetter(String methodName, JCExpression fieldType, String fieldName) {
+    private JCMethodDecl createSetter(
+            String methodName, JCExpression fieldType, String fieldName, long accessFlags) {
         var param = make.VarDef(
                 make.Modifiers(Flags.PARAMETER),
                 names.fromString(fieldName),
@@ -412,7 +600,7 @@ public class LombokStubInjector {
                         make.Select(make.Ident(names.fromString("this")), names.fromString(fieldName)),
                         make.Ident(names.fromString(fieldName))))));
         return make.MethodDef(
-                make.Modifiers(Flags.PUBLIC | Flags.GENERATED_MEMBER),
+                make.Modifiers(accessFlags | Flags.GENERATED_MEMBER),
                 names.fromString(methodName),
                 make.TypeIdent(TypeTag.VOID),
                 List.nil(),
@@ -422,12 +610,8 @@ public class LombokStubInjector {
                 null);
     }
 
-    private JCMethodDecl createConstructor(List<JCVariableDecl> fields, boolean isEnum) {
-        return createConstructor(fields, isEnum, false);
-    }
-
     private JCMethodDecl createConstructor(
-            List<JCVariableDecl> fields, boolean isEnum, boolean builderGenerated) {
+            List<JCVariableDecl> fields, boolean isEnum, long accessFlags) {
         var params = fields.stream()
                 .map(f -> make.VarDef(
                         make.Modifiers(Flags.PARAMETER),
@@ -442,9 +626,7 @@ public class LombokStubInjector {
                 .<JCStatement>map(s -> s)
                 .collect(List.collector());
         var body = make.Block(0L, assignments);
-        // Enum constructors must be private; Lombok's implicit builder constructor is package
-        // private, while explicit constructor annotations retain the existing public behavior.
-        long accessFlag = isEnum ? Flags.PRIVATE : (builderGenerated ? 0L : Flags.PUBLIC);
+        long accessFlag = isEnum ? Flags.PRIVATE : accessFlags;
         accessFlag |= Flags.GENERATED_MEMBER;
         return make.MethodDef(
                 make.Modifiers(accessFlag),
@@ -474,6 +656,7 @@ public class LombokStubInjector {
 
     private String loggingType(ModifiersTree mods) {
         for (var annotation : mods.getAnnotations()) {
+            if (!LombokAnnotations.isLombokAnnotation(root, annotation)) continue;
             var name = LombokAnnotations.simpleName(annotation.getAnnotationType().toString());
             switch (name) {
                 case "XSlf4j": return "org.slf4j.ext.XLogger";
@@ -517,8 +700,7 @@ public class LombokStubInjector {
                     .collect(List.collector());
             return make.TypeApply(cloneType(apply.clazz), clonedArgs);
         }
-        // Fallback: use the type's string form as an identifier
-        return make.Ident(names.fromString(type.toString()));
+        return new TreeCopier<Void>(make).copy(type);
     }
 
     private List<JCVariableDecl> collectInstanceFields(JCClassDecl classDecl) {

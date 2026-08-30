@@ -75,13 +75,17 @@ public class RenameField implements Rewrite {
             if (owner == null || !(task.trees.getTree(owner) instanceof ClassTree declaration)) {
                 return Map.of();
             }
+            var root = task.root(sourceFile);
+            if (root == null) return Map.of();
             for (var member : declaration.getMembers()) {
                 if (!(member instanceof VariableTree field)
                         || !field.getName().contentEquals(fieldName)) continue;
                 var oldAccessors = LombokAnnotations.accessorInfo(
-                        declaration.getModifiers(), field.getModifiers(), fieldName, field.getType().toString());
+                        root, declaration.getModifiers(), field.getModifiers(), fieldName,
+                        field.getType().toString());
                 var newAccessors = LombokAnnotations.accessorInfo(
-                        declaration.getModifiers(), field.getModifiers(), newName, field.getType().toString());
+                        root, declaration.getModifiers(), field.getModifiers(), newName,
+                        field.getType().toString());
                 if (oldAccessors.isEmpty() || newAccessors.isEmpty()) return Map.of();
                 var result = new LinkedHashMap<String, String>();
                 if (oldAccessors.get().hasGetter()

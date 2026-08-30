@@ -537,10 +537,7 @@ class JavaLanguageServer extends LanguageServer {
             LOG.info("[lombok-source-only] disabled reason=workspace_has_no_lombok_source");
             return false;
         }
-        var lombokJar = classPath.stream().anyMatch(path -> {
-            var name = path.getFileName() == null ? "" : path.getFileName().toString().toLowerCase();
-            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
-        });
+        var lombokJar = JavaCompilerService.lombokPresentOnClasspath(classPath);
         if (!lombokJar) {
             LOG.info("[lombok-source-only] disabled reason=lombok_not_on_classpath");
             return false;

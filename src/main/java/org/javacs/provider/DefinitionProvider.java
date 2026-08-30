@@ -290,7 +290,8 @@ public class DefinitionProvider {
         var accessor = LombokAnnotations.accessorFieldName(memberName);
         if (accessor.isPresent()) {
             var info = LombokAnnotations.accessorInfo(
-                    classTree.getModifiers(), fieldTree.getModifiers(), fieldName, fieldTree.getType().toString());
+                    parse.root(), classTree.getModifiers(), fieldTree.getModifiers(), fieldName,
+                    fieldTree.getType().toString());
             if (info.isEmpty()
                     || (!memberName.equals(info.get().getterName()) && !memberName.equals(info.get().setterName()))) {
                 return List.of();

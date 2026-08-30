@@ -678,7 +678,7 @@ public class WorkspaceTypeIndex {
                             || tree.getKind() == Tree.Kind.ANNOTATION_TYPE;
                     for (var member : tree.getMembers()) {
                         if (member instanceof MethodTree method) {
-                            addParseTreeMethod(qualified, method, seen, tree, isGeneratedClass(tree));
+                            addParseTreeMethod(qualified, method, seen, tree, root, isGeneratedClass(tree));
                         } else if (member instanceof VariableTree variable) {
                             addParseTreeField(
                                     qualified,
@@ -967,6 +967,7 @@ public class WorkspaceTypeIndex {
             MethodTree method,
             Map<String, IndexedMember> seen,
             ClassTree declaration,
+            CompilationUnitTree root,
             boolean enclosingIsGenerated) {
         var name = method.getName() == null ? null : method.getName().toString();
         if (name == null || name.isBlank()) return;
@@ -1024,7 +1025,7 @@ public class WorkspaceTypeIndex {
         var declarationOwnerType = (String) null;
         var targetDeclarationKey = (String) null;
         if (generated && !isConstructor && !enclosingIsGenerated && !"builder".equals(name)) {
-            var accessorField = generatedAccessorFieldName(name, declaration);
+            var accessorField = generatedAccessorFieldName(name, declaration, root);
             if (accessorField != null) {
                 backingFieldName = accessorField;
                 logicalKey = IndexedMember.canonicalKey(
@@ -1061,7 +1062,8 @@ public class WorkspaceTypeIndex {
         seen.putIfAbsent(memberStorageKey(next), next);
     }
 
-    private static String generatedAccessorFieldName(String methodName, ClassTree declaration) {
+    private static String generatedAccessorFieldName(
+            String methodName, ClassTree declaration, CompilationUnitTree root) {
         for (var member : declaration.getMembers()) {
             if (!(member instanceof VariableTree field)
                     || field.getName() == null
@@ -1075,7 +1077,7 @@ public class WorkspaceTypeIndex {
             var fieldName = field.getName().toString();
             var fieldType = field.getType() == null ? "Object" : field.getType().toString();
             var accessorInfo = LombokAnnotations.accessorInfo(
-                    declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
+                    root, declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
             if (accessorInfo.isPresent()) {
                 var info = accessorInfo.get();
                 if (methodName.equals(info.getterName()) || methodName.equals(info.setterName())) {

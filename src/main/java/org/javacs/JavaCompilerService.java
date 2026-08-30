@@ -39,10 +39,7 @@ class JavaCompilerService implements CompilerProvider {
         this.extraArgs = List.copyOf(extraArgs);
         this.jdkClasses = ScanClassPath.jdkTopLevelClasses();
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
-        this.lombokPresentOnClasspath = classPath.stream().anyMatch(p -> {
-            var name = p.getFileName().toString().toLowerCase();
-            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
-        }) && workspaceUsesLombok();
+        this.lombokPresentOnClasspath = lombokPresentOnClasspath(classPath);
         this.fileManager = new SourceFileManager();
         if (this.lombokPresentOnClasspath) configureSourcePath(FileStore.sourceRoots());
         this.docsFileManager = new Docs(docPath).createFileManager();
@@ -70,6 +67,13 @@ class JavaCompilerService implements CompilerProvider {
             } catch (Exception ignored) {}
         }
         return false;
+    }
+
+    static boolean lombokPresentOnClasspath(Collection<Path> classPath) {
+        return classPath.stream().anyMatch(path -> {
+            var name = path.getFileName() == null ? "" : path.getFileName().toString().toLowerCase();
+            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
+        });
     }
 
     /** Atomically extend the classpath with new entries (e.g. compiled module output dirs). */

@@ -247,8 +247,13 @@ public class ReferenceProvider {
         if (field == null) {
             return Set.of();
         }
+        var parentPath = task.trees.getPath(parentType);
+        if (parentPath == null) {
+            return Set.of();
+        }
         var accessors = LombokAnnotations.accessorInfo(
-                declaration.getModifiers(), field.getModifiers(), fieldName, field.getType().toString());
+                parentPath.getCompilationUnit(), declaration.getModifiers(),
+                field.getModifiers(), fieldName, field.getType().toString());
         if (accessors.isEmpty()) {
             return Set.of();
         }
