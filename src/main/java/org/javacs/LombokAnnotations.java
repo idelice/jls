@@ -4,19 +4,14 @@ import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ModifiersTree;
-import com.sun.source.util.TreePath;
 import com.sun.source.util.TreeScanner;
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
-import javax.lang.model.element.Element;
 import javax.lang.model.element.Modifier;
-import javax.lang.model.element.TypeElement;
-import org.javacs.lsp.Location;
 
 /**
  * Centralized Lombok annotation semantics used across compiler, indexing, completion, and
@@ -27,7 +22,7 @@ import org.javacs.lsp.Location;
  */
 public final class LombokAnnotations {
     private static final Set<String> LOGGING_ONLY = Set.of("Slf4j", "Log", "Log4j", "Log4j2", "CommonsLog", "Flogger", "JBossLog", "XSlf4j", "CustomLog");
-    private static final Set<String> ACCESSOR_RELATED = Set.of("Data", "Getter", "Setter", "Value");
+    static final String DEFAULT_LOG_FIELD_NAME = "log";
     public static final Set<String> KNOWN =
             Set.of(
                     "Data",
@@ -67,39 +62,6 @@ public final class LombokAnnotations {
 
     private LombokAnnotations() {}
 
-    private static final Pattern STRUCTURAL_SOURCE_PATTERN =
-            Pattern.compile(
-                    "@(?:lombok\\.(?:experimental\\.)?)?"
-                            + "(Data|Getter|Setter|Builder|Value|SuperBuilder|RequiredArgsConstructor|AllArgsConstructor|NoArgsConstructor|EqualsAndHashCode|ToString|With)\\b");
-
-    /**
-     * Fast text-based check: returns true if the source file at {@code path} contains
-     * a structural Lombok annotation. Reads from FileStore (buffer content).
-     * Scans the first 100 lines only (annotations are always near the top).
-     */
-    public static boolean sourceHasStructuralAnnotation(Path path) {
-        var contents = FileStore.contents(path);
-        if (contents == null || contents.isEmpty()) return false;
-        int lineCount = 0;
-        int pos = 0;
-        while (pos < contents.length() && lineCount < 100) {
-            int lineEnd = indexOf(contents, '\n', pos);
-            if (lineEnd == -1) lineEnd = contents.length();
-            var line = contents.subSequence(pos, lineEnd);
-            if (STRUCTURAL_SOURCE_PATTERN.matcher(line).find()) return true;
-            pos = lineEnd + 1;
-            lineCount++;
-        }
-        return false;
-    }
-
-    private static int indexOf(CharSequence cs, char c, int from) {
-        for (int i = from; i < cs.length(); i++) {
-            if (cs.charAt(i) == c) return i;
-        }
-        return -1;
-    }
-
     /** Returns whether the modifiers include a Lombok annotation that changes the declared shape. */
     public static boolean hasStructuralLombokAnnotation(ModifiersTree modifiers) {
         return hasAnnotation(modifiers, STRUCTURAL);
@@ -128,11 +90,6 @@ public final class LombokAnnotations {
     /** Returns whether the modifiers include Lombok annotations that only add logging helpers. */
     public static boolean hasLoggingOnlyLombokAnnotation(ModifiersTree modifiers) {
         return hasAnnotation(modifiers, LOGGING_ONLY);
-    }
-
-    /** Returns whether Lombok accessor generation may apply to the declaration. */
-    public static boolean hasAccessorLombokAnnotation(ModifiersTree modifiers) {
-        return hasAnnotation(modifiers, ACCESSOR_RELATED);
     }
 
     /** Returns whether Lombok builder generation may apply to the declaration. */
@@ -282,8 +239,6 @@ public final class LombokAnnotations {
         return "boolean".equals(fieldType);
     }
 
-    // ---- Navigation helpers -------------------------------------------------
-
     /**
      * Lowercases first char unless first two chars are uppercase (to preserve "URLParser" style).
      *
@@ -322,124 +277,15 @@ public final class LombokAnnotations {
         return Optional.empty();
     }
 
-    /**
-     * If element is inside a Lombok Builder inner class, returns the outer (source) class.
-     *
-     * @param owner the element to check
-     * @return the enclosing (non-Builder) type if the element lives inside a Builder
-     */
-    public static Optional<TypeElement> builderOwner(TypeElement owner) {
-        TypeElement current = owner;
-        while (true) {
-            var ownerName = current.getSimpleName().toString();
-            if ((ownerName.endsWith("Builder") || ownerName.equals("builder"))
-                    && current.getEnclosingElement() instanceof TypeElement enclosingType) {
-                return Optional.of(enclosingType);
-            }
-            if (current.getEnclosingElement() instanceof TypeElement enclosingType) {
-                current = enclosingType;
-            } else {
-                return Optional.empty();
-            }
-        }
-    }
-
-    /**
-     * Returns the enclosing TypeElement that owns this element.
-     *
-     * @param element the element to find the owner of
-     * @return the owning TypeElement, or empty if none found
-     */
-    public static Optional<TypeElement> fieldOwner(Element element) {
-        if (element.getEnclosingElement() instanceof TypeElement owner) {
-            return Optional.of(owner);
-        }
-        if (element instanceof TypeElement owner) {
-            return Optional.of(owner);
-        }
-        return Optional.empty();
-    }
-
-    /**
-     * Returns true if the TreePath points to a Lombok annotation node.
-     *
-     * @param path the tree path to inspect
-     * @return true if the leaf is a Lombok annotation
-     */
-    public static boolean isLombokAnnotationTree(TreePath path) {
-        if (path == null || !(path.getLeaf() instanceof AnnotationTree annotation)) {
-            return false;
-        }
-        var name = annotation.getAnnotationType().toString();
-        if (name.startsWith("lombok.")) {
-            return true;
-        }
-        return switch (name) {
-            case "Getter", "Setter", "Data", "Builder", "Value", "With",
-                 "NoArgsConstructor", "AllArgsConstructor", "RequiredArgsConstructor" -> true;
-            default -> false;
-        };
-    }
-
-    /**
-     * Returns true if the text at the Location range contains the given name string.
-     *
-     * @param location the LSP location to check
-     * @param name the name to search for
-     * @return true if the range text contains the name
-     */
-    public static boolean locationContainsName(Location location, String name) {
-        if (location == null || location.uri == null || name == null || name.isEmpty()) {
-            return false;
-        }
-        try {
-            var lines = Files.readString(Path.of(location.uri)).split("\n", -1);
-            var start = location.range.start;
-            var end = location.range.end;
-            if (start.line < 0 || start.line >= lines.length || end.line != start.line) {
-                return false;
-            }
-            var lineText = lines[start.line];
-            if (start.character < 0
-                    || end.character > lineText.length()
-                    || end.character < start.character) {
-                return false;
-            }
-            return lineText.substring(start.character, end.character).contains(name);
-        } catch (RuntimeException | java.io.IOException e) {
-            return false;
-        }
-    }
-
-    // reads lombok.config for custom log field name. Default is "log".
-    public static String logFieldName(Path workspaceRoot) {
-        if (workspaceRoot == null) return "log";
-        var configFile = workspaceRoot.resolve("lombok.config");
-        if (!Files.exists(configFile)) return "log";
-        try {
-            for (var line : Files.readAllLines(configFile)) {
-                var trimmed = line.trim();
-                if (trimmed.startsWith("#") || trimmed.isEmpty()) continue;
-                if (!trimmed.startsWith("lombok.log.fieldName")) continue;
-                var eq = trimmed.indexOf('=');
-                if (eq < 0) continue;
-                var value = trimmed.substring(eq + 1).trim();
-                if (!value.isEmpty()) return value;
-            }
-        } catch (IOException e) {
-            // silently fall back to default
-        }
-        return "log";
-    }
-
     // uses parsed CST — annotations already resolved, no file I/O
     public static boolean hasLogAnnotation(CompilationUnitTree root) {
-        for (var decl : root.getTypeDecls()) {
-            if (decl instanceof ClassTree cls
-                    && hasAnnotation(cls.getModifiers(), LOGGING_ONLY)) {
-                return true;
+        var found = new boolean[1];
+        new TreeScanner<Void, Void>() {
+            @Override public Void visitClass(ClassTree cls, Void unused) {
+                if (hasAnnotation(cls.getModifiers(), LOGGING_ONLY)) found[0] = true;
+                return found[0] ? null : super.visitClass(cls, unused);
             }
-        }
-        return false;
+        }.scan(root, null);
+        return found[0];
     }
 }

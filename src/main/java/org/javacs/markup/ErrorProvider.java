@@ -17,21 +17,16 @@ import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
-import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
-import org.javacs.LombokAnnotations;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.*;
-import org.javacs.resolve.TypeNames;
 
 public class ErrorProvider {
     final CompileTask task;
-    private final CompilerProvider compiler;
-    private final TypeIndexRouter typeIndex;
     private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
@@ -55,17 +50,17 @@ public class ErrorProvider {
             long warningMs) {}
 
     public ErrorProvider(CompileTask task) {
-        this(task, null, null);
-    }
-
-    public ErrorProvider(CompileTask task, CompilerProvider compiler) {
-        this(task, compiler, null);
-    }
-
-    public ErrorProvider(CompileTask task, CompilerProvider compiler, TypeIndexRouter typeIndex) {
         this.task = task;
-        this.compiler = compiler;
-        this.typeIndex = typeIndex;
+    }
+
+    /** Compatibility overload for existing callers; diagnostics now come directly from javac. */
+    public ErrorProvider(CompileTask task, CompilerProvider compiler) {
+        this(task);
+    }
+
+    /** Compatibility overload for existing callers; diagnostics now come directly from javac. */
+    public ErrorProvider(CompileTask task, CompilerProvider compiler, TypeIndexRouter typeIndex) {
+        this(task);
     }
 
     public ErrorReport errors(Set<URI> requestedUris) {
@@ -97,7 +92,6 @@ public class ErrorProvider {
             params.diagnostics.addAll(filteredDiagnostics);
             compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
-                params.diagnostics.addAll(staleWorkspaceAccessorErrors(root));
                 var warningStarted = System.nanoTime();
                 var unused = unusedWarnings(root);
                 warningNanos += System.nanoTime() - warningStarted;
@@ -114,75 +108,6 @@ public class ErrorProvider {
                 warningDiagnosticsCount,
                 convertNanos / 1_000_000,
                 warningNanos / 1_000_000);
-    }
-
-    private List<Diagnostic> staleWorkspaceAccessorErrors(CompilationUnitTree root) {
-        if (typeIndex == null) return List.of();
-
-        var result = new ArrayList<Diagnostic>();
-        var positions = task.trees.getSourcePositions();
-        new TreePathScanner<Void, Void>() {
-            @Override
-            public Void visitMethodInvocation(MethodInvocationTree invocation, Void unused) {
-                var methodPath = new TreePath(getCurrentPath(), invocation.getMethodSelect());
-                var element = task.trees.getElement(methodPath);
-                if (!(element instanceof ExecutableElement method) || task.trees.getPath(method) != null) {
-                    return super.visitMethodInvocation(invocation, unused);
-                }
-                if (!(method.getEnclosingElement() instanceof TypeElement owner)) {
-                    return super.visitMethodInvocation(invocation, unused);
-                }
-
-                var ownerName = owner.getQualifiedName().toString();
-                var liveOwner = typeIndex.workspace().typeInfo(ownerName).orElse(null);
-                if (liveOwner == null) {
-                    return super.visitMethodInvocation(invocation, unused);
-                }
-
-                var methodName = method.getSimpleName().toString();
-                var fieldName = LombokAnnotations.accessorFieldName(methodName).orElse(null);
-                if (fieldName == null) {
-                    return super.visitMethodInvocation(invocation, unused);
-                }
-
-                var parameterTypes = method.getParameters().stream()
-                        .map(parameter -> task.types.erasure(parameter.asType()).toString())
-                        .toArray(String[]::new);
-                var methodStillExists = false;
-                for (var member : liveOwner.members) {
-                    if (member.kind != CompletionItemKind.Method
-                            || !member.name.equals(methodName)
-                            || member.erasedParameterTypes.length != parameterTypes.length) continue;
-                    methodStillExists = true;
-                    for (var i = 0; i < parameterTypes.length; i++) {
-                        if (!TypeNames.simpleName(member.erasedParameterTypes[i])
-                                .equals(TypeNames.simpleName(parameterTypes[i]))) {
-                            methodStillExists = false;
-                            break;
-                        }
-                    }
-                    if (methodStillExists) break;
-                }
-                if (methodStillExists) {
-                    return super.visitMethodInvocation(invocation, unused);
-                }
-
-                var end = positions.getEndPosition(root, invocation.getMethodSelect());
-                var start = end - methodName.length();
-                if (start < 0 || end < start) {
-                    return super.visitMethodInvocation(invocation, unused);
-                }
-
-                var diagnostic = new Diagnostic();
-                diagnostic.range = RangeHelper.range(root, start, end);
-                diagnostic.severity = DiagnosticSeverity.Error;
-                diagnostic.code = "compiler.err.cant.resolve.location.args";
-                diagnostic.message = "cannot resolve symbol '" + methodName + "()'";
-                result.add(diagnostic);
-                return super.visitMethodInvocation(invocation, unused);
-            }
-        }.scan(root, null);
-        return result;
     }
 
     private boolean isJarOrCachedSource(URI uri) {

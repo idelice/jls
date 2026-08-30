@@ -29,6 +29,11 @@ public class CompileBatch implements AutoCloseable {
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
         this.parent = parent;
         LOG.info("[compile] CompileBatch — starting compile of " + files.size() + " file(s)");
+        if (parent.lombokPresentOnClasspath)
+            LOG.info("[lombok-source-compile] task requested=" + files.size() + " sources="
+                    + files.stream().map(JavaFileObject::getName).collect(Collectors.joining(",")));
+        var requestedUris = files.stream().map(f -> f.toUri()).collect(Collectors.toSet());
+        var parsedUris = new HashSet<java.net.URI>();
         parent.diags.clear();
         var options = options(parent.classPath, parent.addExports, parent.extraArgs);
 
@@ -53,18 +58,35 @@ public class CompileBatch implements AutoCloseable {
                     holder.types = task.getTypes();
                     holder.roots = new ArrayList<>();
                     try {
+                        var impl = (JavacTaskImpl) task;
+                        if (parent.lombokPresentOnClasspath) {
+                            var injector = new LombokStubInjector(impl.getContext());
+                            task.addTaskListener(new TaskListener() {
+                                public void started(TaskEvent e) {}
+                                public void finished(TaskEvent e) {
+                                    if (e.getKind() == TaskEvent.Kind.PARSE && e.getCompilationUnit() != null) {
+                                        try {
+                                            var path = e.getCompilationUnit().getSourceFile().toUri();
+                                            if (!parsedUris.add(path)) return;
+                                            var implicit = !requestedUris.contains(path);
+                                            var dirty = "unknown";
+                                            if ("file".equalsIgnoreCase(path.getScheme())) dirty = Boolean.toString(FileStore.isDirty(Paths.get(path)));
+                                            LOG.info("[lombok-source-compile] phase=parse source=" + path + " implicit=" + implicit + " dirty=" + dirty);
+                                            injector.inject(e.getCompilationUnit());
+                                        } catch (Throwable ex) {
+                                            LOG.warning("[lombok-source-compile] injection failed: " + ex);
+                                            if (ex instanceof VirtualMachineError
+                                                    || ex instanceof ThreadDeath
+                                                    || ex instanceof LinkageError) throw (Error) ex;
+                                        }
+                                    }
+                                }
+                            });
+                        }
                         for (var t : task.parse()) {
                             holder.roots.add(t);
                         }
                         try {
-                            var impl = (JavacTaskImpl) task;
-                            // Inject Lombok stubs before Enter — makes generated members visible to javac
-                            if (parent.lombokPresentOnClasspath) {
-                                var injector = new LombokStubInjector(impl.getContext());
-                                for (var root : holder.roots) {
-                                    injector.inject(root);
-                                }
-                            }
                             impl.enter();
                             var compiler = JavaCompiler.instance(impl.getContext());
                             var attr = compiler.attribute(compiler.todo);

@@ -44,6 +44,7 @@ class JavaCompilerService implements CompilerProvider {
             return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
         }) && workspaceUsesLombok();
         this.fileManager = new SourceFileManager();
+        if (this.lombokPresentOnClasspath) configureSourcePath(FileStore.sourceRoots());
         this.docsFileManager = new Docs(docPath).createFileManager();
     }
 
@@ -52,7 +53,7 @@ class JavaCompilerService implements CompilerProvider {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
     }
 
-    private static boolean workspaceUsesLombok() {
+    static boolean workspaceUsesLombok() {
         for (var file : FileStore.all()) {
             // Skip test fixtures/resources/examples (not actual project source)
             var path = file.toString();
@@ -88,6 +89,15 @@ class JavaCompilerService implements CompilerProvider {
 
     void setSourceRoots(Set<Path> sourceRoots) {
         this.sourceRoots = Set.copyOf(sourceRoots);
+        if (lombokPresentOnClasspath) configureSourcePath(this.sourceRoots);
+    }
+
+    private void configureSourcePath(Collection<Path> sourceRoots) {
+        try {
+            fileManager.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourceRoots);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private boolean isSourceVisible(Path file) {

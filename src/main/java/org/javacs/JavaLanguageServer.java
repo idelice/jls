@@ -91,6 +91,9 @@ class JavaLanguageServer extends LanguageServer {
     final ModuleCompilerRegistry moduleRegistry = new ModuleCompilerRegistry(this);
     volatile Path activeModuleFile;
 
+    /** Temporary, opt-in experiment: resolve Lombok workspace types from source instead of output. */
+    private boolean lombokSourceOnly;
+
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
     ModuleGraph moduleGraph = ModuleGraph.EMPTY;
@@ -339,6 +342,7 @@ class JavaLanguageServer extends LanguageServer {
         Objects.requireNonNull(workspaceRoot, "Can't create compiler because workspaceRoot has not been initialized");
         moduleRegistry.clear();
         pendingRewrites.clear();
+        lombokSourceOnly = false;
         var started = Instant.now();
         var progressToken = progress.begin("Configure javac", "Finding source roots");
 
@@ -484,6 +488,9 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
 
+        classPath = new LinkedHashSet<>(classPath);
+        lombokSourceOnly = configureLombokSourceOnly(classPath);
+
         progress.end(progressToken, "Configured javac");
 
         compiler = new JavaCompilerService(classPath, resolvedDocPath, addExports, extraArgs);
@@ -518,6 +525,55 @@ class JavaLanguageServer extends LanguageServer {
                 Duration.between(started, settingsLoaded).toMillis(),
                 Duration.between(settingsLoaded, inferenceFinished).toMillis(),
                 Duration.between(started, Instant.now()).toMillis()));
+    }
+
+    /**
+     * Enable the source-only experiment only when the workspace is unambiguously one Lombok
+     * module. The classpath still contains Lombok, external jars, and dependency outputs.
+     */
+    private boolean configureLombokSourceOnly(Set<Path> classPath) {
+        if (!Boolean.getBoolean("jls.lombok.sourceOnly")) return false;
+        if (!JavaCompilerService.workspaceUsesLombok()) {
+            LOG.info("[lombok-source-only] disabled reason=workspace_has_no_lombok_source");
+            return false;
+        }
+        var lombokJar = classPath.stream().anyMatch(path -> {
+            var name = path.getFileName() == null ? "" : path.getFileName().toString().toLowerCase();
+            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
+        });
+        if (!lombokJar) {
+            LOG.info("[lombok-source-only] disabled reason=lombok_not_on_classpath");
+            return false;
+        }
+        if (moduleGraph == ModuleGraph.EMPTY || moduleGraph.modules().size() != 1) {
+            LOG.info("[lombok-source-only] disabled reason=module_identity_ambiguous modules="
+                    + moduleGraph.modules().size());
+            return false;
+        }
+        var module = moduleGraph.moduleForFile(workspaceRoot).orElse(null);
+        if (module == null) {
+            LOG.info("[lombok-source-only] disabled reason=workspace_not_in_single_module");
+            return false;
+        }
+        var excluded = new LinkedHashSet<Path>();
+        if (module.mainOutputDir() != null) excluded.add(module.mainOutputDir());
+        if (module.testOutputDir() != null) excluded.add(module.testOutputDir());
+        if (excluded.isEmpty()) {
+            LOG.info("[lombok-source-only] disabled reason=module_has_no_output_directory");
+            return false;
+        }
+        var normalizedExcluded = excluded.stream()
+                .map(path -> path.toAbsolutePath().normalize())
+                .collect(java.util.stream.Collectors.toSet());
+        classPath.removeIf(path -> normalizedExcluded.contains(path.toAbsolutePath().normalize()));
+        lombokSourceOnly = true;
+        LOG.info("[lombok-source-only] enabled");
+        LOG.info("[lombok-source-only] excluded_outputs=" + normalizedExcluded);
+        return true;
+    }
+
+    boolean lombokSourceOnlyEnabled() {
+        return lombokSourceOnly;
     }
 
 
@@ -656,7 +712,13 @@ class JavaLanguageServer extends LanguageServer {
         } finally {
             notifyWorkspaceInfo();
         }
-        if (!moduleRegistry.moduleScopedMaven && !moduleRegistry.moduleScopedGradle) getOrCreateCompiler().fullCompileWithAP();
+        if (!moduleRegistry.moduleScopedMaven && !moduleRegistry.moduleScopedGradle) {
+            if (lombokSourceOnlyEnabled()) {
+                LOG.info("[lombok-source-only] skipped startup AP generation");
+            } else {
+                getOrCreateCompiler().fullCompileWithAP();
+            }
+        }
     }
 
     @Override
@@ -992,7 +1054,7 @@ class JavaLanguageServer extends LanguageServer {
                     progress.end(compileProgressToken, "Compiled");
                     compileProgressToken = null;
                 }
-                var errorProvider = new ErrorProvider(task, requestCompiler, moduleRegistry.typeIndexFor(file));
+                var errorProvider = new ErrorProvider(task);
                 var errorReport = errorProvider.errors(Set.of(file.toUri()));
                 LOG.info(String.format(
                         "[diagnostics] pull_compile_done file=%s duration=%dms errors=%d",
@@ -1213,7 +1275,11 @@ class JavaLanguageServer extends LanguageServer {
                     0,
                     CompletionIndexRefreshMode.WORKSPACE_DECLARATION_MERGE);
         }
-        compilerFor(file).refreshBuildOutput(file);
+        if (lombokSourceOnlyEnabled()) {
+            LOG.info("[lombok-source-only] skipped save AP generation file=" + file);
+        } else {
+            compilerFor(file).refreshBuildOutput(file);
+        }
     }
 
 }

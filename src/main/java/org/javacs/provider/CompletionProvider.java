@@ -54,7 +54,6 @@ import org.javacs.CompletionData;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.JsonHelper;
-import org.javacs.LombokAnnotations;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
 import org.javacs.StringSearch;
@@ -701,7 +700,6 @@ public class CompletionProvider {
                 addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
                 addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
                 addEnclosingInstanceKeywords(path, list);
-                addSlf4jLoggerIfAnnotated(parseTask, path, cursor, partial, list);
                 addStaticImportsFromIndex(parseTask.root(), partial, false, list);
                 addImportedTypeNames(parseTask.root(), partial, list);
                 if (!list.isIncomplete && !partial.isEmpty() && Character.isUpperCase(partial.charAt(0))) {
@@ -1159,35 +1157,6 @@ public class CompletionProvider {
             return;
         }
         list.items.add(syntacticType(name, nested.getKind(), ownerType));
-    }
-
-    private void addSlf4jLoggerIfAnnotated(
-            ParseTask parseTask, TreePath path, long cursor, String partial, CompletionList list) {
-        if (!matchesCompletionPrefix("log", partial)) {
-            return;
-        }
-        if (containsCompletionLabel(list, "log")) {
-            return;
-        }
-        var classPath = enclosingClassPath(path);
-        if (classPath == null) {
-            classPath = enclosingClassPath(parseTask, cursor);
-        }
-        if (classPath == null) {
-            return;
-        }
-        var classTree = (ClassTree) classPath.getLeaf();
-        if (!LombokAnnotations.hasLoggingOnlyLombokAnnotation(classTree.getModifiers())) {
-            return;
-        }
-        var logger = new CompletionItem();
-        logger.label = "log";
-        logger.kind = CompletionItemKind.Field;
-        logger.detail = "org.slf4j.Logger log";
-        logger.insertText = "log";
-        logger.insertTextFormat = InsertTextFormat.PlainText;
-        logger.sortText = sortKey(Priority.FIELD, logger.label);
-        list.items.add(logger);
     }
 
     private TreePath enclosingClassPath(ParseTask parseTask, long cursor) {

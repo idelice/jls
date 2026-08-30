@@ -5,6 +5,8 @@ import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.util.TreePathScanner;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Symbol;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -72,14 +74,33 @@ public class InlayHintProvider {
 
                 @Override
                 public Void visitMethodInvocation(MethodInvocationTree invocation, Void unused) {
+                    if (isInsideGeneratedMember()) return null;
                     emitHints(invocation.getArguments());
                     return super.visitMethodInvocation(invocation, unused);
                 }
 
                 @Override
                 public Void visitNewClass(NewClassTree constructor, Void unused) {
+                    if (isInsideGeneratedMember()) return null;
                     emitHints(constructor.getArguments());
                     return super.visitNewClass(constructor, unused);
+                }
+
+                private boolean isInsideGeneratedMember() {
+                    // Generated builder bodies are positioned at the owning source class. Do not
+                    // expose their implementation details as hints on the class declaration.
+                    // Start at the parent so a source-written call to a generated constructor or
+                    // method still gets its normal inlay hints.
+                    var path = getCurrentPath().getParentPath();
+                    while (path != null) {
+                        var element = task.trees.getElement(path);
+                        if (element instanceof Symbol symbol
+                                && (symbol.flags() & Flags.GENERATED_MEMBER) != 0) {
+                            return true;
+                        }
+                        path = path.getParentPath();
+                    }
+                    return false;
                 }
 
                 private void emitHints(List<? extends ExpressionTree> arguments) {

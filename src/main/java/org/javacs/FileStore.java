@@ -302,7 +302,10 @@ public class FileStore {
             }
         }
         if (contentChanged) {
+            dirtyDocuments.add(file);
             bumpContentRevision();
+        } else if (existing == null) {
+            dirtyDocuments.remove(file);
         }
     }
 
@@ -351,6 +354,8 @@ public class FileStore {
         var removed = activeDocuments.remove(file);
         // If the in-memory content differed from disk, caches are stale.
         if (removed != null) {
+            // Closing discards the editor buffer, so any unsaved dirty state no longer applies.
+            dirtyDocuments.remove(file);
             readInfoFromDisk(file);
             var diskHash = javaSources.containsKey(file)
                     ? Long.hashCode(javaSources.get(file).modified.toEpochMilli()) : 0;
@@ -376,6 +381,8 @@ public class FileStore {
     static Set<Path> dirtyDocuments() {
         return Set.copyOf(dirtyDocuments);
     }
+
+    static boolean isDirty(Path file) { return dirtyDocuments.contains(file); }
 
     public static long contentRevision() {
         return contentRevision.get();

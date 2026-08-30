@@ -106,7 +106,11 @@ final class RenameHandler {
             var requestCompiler = server.compilerFor(file);
             var parse = requestCompiler.parse(file);
             if (LombokAnnotations.hasStructuralLombokAnnotation(parse.root())) {
-                requestCompiler.refreshBuildOutput(file);
+                if (server.lombokSourceOnlyEnabled()) {
+                    LOG.info("[lombok-source-only] skipped rename AP generation file=" + file);
+                } else {
+                    requestCompiler.refreshBuildOutput(file);
+                }
             }
         }
     }
