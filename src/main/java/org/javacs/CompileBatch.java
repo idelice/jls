@@ -3,7 +3,6 @@ package org.javacs;
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import com.sun.tools.javac.api.JavacTaskImpl;
-import com.sun.tools.javac.main.JavaCompiler;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -19,6 +18,7 @@ public class CompileBatch implements AutoCloseable {
 
     final JavaCompilerService parent;
     boolean closed;
+    private AutoCloseable borrow;
 
     final JavacTask task;
     final Trees trees;
@@ -46,7 +46,7 @@ public class CompileBatch implements AutoCloseable {
             List<CompilationUnitTree> roots;
         };
 
-        parent.compiler.compile(
+        this.borrow = parent.compiler.compile(
                 parent.fileManager,
                 parent.diags::add,
                 options,
@@ -89,7 +89,7 @@ public class CompileBatch implements AutoCloseable {
                         }
                         try {
                             impl.enter();
-                            var compiler = JavaCompiler.instance(impl.getContext());
+                            var compiler = com.sun.tools.javac.main.JavaCompiler.instance(impl.getContext());
                             var attr = compiler.attribute(compiler.todo);
                             compiler.flow(attr);
                         } catch (Throwable e) {
@@ -210,7 +210,15 @@ public class CompileBatch implements AutoCloseable {
 
     @Override
     public void close() {
+        if (closed) return;
         closed = true;
+        if (borrow != null) {
+            try {
+                borrow.close();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {

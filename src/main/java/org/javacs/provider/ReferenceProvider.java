@@ -107,7 +107,9 @@ public class ReferenceProvider {
                     LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
                 // Private members (non-Lombok) can only be referenced within the same file
-                if (element.getModifiers().contains(Modifier.PRIVATE)) {
+                // Exception: record components are private fields but have public accessors
+                if (element.getModifiers().contains(Modifier.PRIVATE)
+                        && parentClass.getKind() != ElementKind.RECORD) {
                     LOG.fine(String.format("[ref] private_member kind=%s name=%s — file-only scan", element.getKind(), memberName));
                     return findReferences(task);
                 }

@@ -2,7 +2,6 @@ package org.javacs;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -82,7 +81,6 @@ class JavaCompilerService implements CompilerProvider {
         var updated = new LinkedHashSet<>(this.classPath);
         if (updated.addAll(entries)) {
             this.classPath = Collections.unmodifiableSet(updated);
-            cachedRevision = -1;
             LOG.info(String.format("[compiler] classpath_extended added=%d total=%d", entries.size(), updated.size()));
         }
     }
@@ -108,18 +106,7 @@ class JavaCompilerService implements CompilerProvider {
         return sourceRoots.isEmpty() || sourceRoots.stream().anyMatch(file::startsWith);
     }
 
-    // --- Small LRU compile cache ---
-    // Invalidation: content revision or classpath extension.
-    // Eviction: LRU, max 4 entries. No cross-file tracking needed.
-    private final Map<List<URI>, CompileBatch> compileCache = new LinkedHashMap<>(4, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<List<URI>, CompileBatch> eldest) {
-            return size() > 4;
-        }
-    };
-    private volatile long cachedRevision = -1;
-
-    private CompileBatch doCompile(Collection<? extends JavaFileObject> sources) {
+    private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
         if (sources.isEmpty()) throw new RuntimeException("empty sources");
 
         var firstAttempt = new CompileBatch(this, sources);
@@ -145,25 +132,6 @@ class JavaCompilerService implements CompilerProvider {
             moreSources.add(new SourceFileObject(add));
         }
         return new CompileBatch(this, moreSources);
-    }
-
-    private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
-        LOG.info("[cache] compileBatch " + sources.size() + " source(s)");
-        var key = sources.stream().map(JavaFileObject::toUri).toList();
-        var revision = FileStore.contentRevision();
-        if (revision != cachedRevision) {
-            compileCache.clear();
-            cachedRevision = revision;
-        }
-        var cached = compileCache.get(key);
-        if (cached != null) {
-            LOG.info("[cache] HIT");
-            return cached;
-        }
-        LOG.info("[cache] MISS revision=" + revision);
-        var compiled = doCompile(sources);
-        compileCache.put(key, compiled);
-        return compiled;
     }
 
     @Override
