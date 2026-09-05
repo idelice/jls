@@ -16,6 +16,7 @@ import java.util.logging.Logger;
 
 public class LSP {
     private static final Gson gson = new Gson();
+    private static final int INPUT_BUFFER_SIZE = 8192;
 
     private static String readHeader(InputStream client) {
         var line = new StringBuilder();
@@ -58,9 +59,19 @@ public class LSP {
     }
 
     private static String readLength(InputStream client, int byteLength) {
-        // Eat whitespace
+        if (byteLength < 0) {
+            throw new RuntimeException("Missing or invalid Content-Length header");
+        }
         try {
-            return new String(client.readNBytes(byteLength), StandardCharsets.UTF_8).stripLeading();
+            var bytes = client.readNBytes(byteLength);
+            if (bytes.length != byteLength) {
+                LOG.warning(String.format(
+                        "Truncated LSP body: expected %d bytes, received %d",
+                        byteLength, bytes.length));
+                throw new EndOfStream();
+            }
+            // Eat whitespace only after the complete byte-counted body has been read.
+            return new String(bytes, StandardCharsets.UTF_8).stripLeading();
         } catch (IOException e) {
             throw new RuntimeException("An error occurred during the reading of client data", e);
         }
@@ -189,6 +200,9 @@ public class LSP {
     public static void connect(
             Function<LanguageClient, LanguageServer> serverFactory, InputStream receive, OutputStream send) {
         var server = serverFactory.apply(new RealClient(send));
+        InputStream bufferedReceive = receive instanceof BufferedInputStream
+                ? receive
+                : new BufferedInputStream(receive, INPUT_BUFFER_SIZE);
         var pending = new ArrayBlockingQueue<Message>(10);
         var endOfStream = new Message();
 
@@ -220,7 +234,7 @@ public class LSP {
 
                 while (true) {
                     try {
-                        var token = nextToken(receive);
+                        var token = nextToken(bufferedReceive);
                         var message = parseMessage(token);
                         peek(message);
                         pending.put(message);
@@ -407,6 +421,20 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
                             var response = server.gotoDefinition(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/implementation":
+                        {
+                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
+                            var response = server.implementation(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/typeDefinition":
+                        {
+                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
+                            var response = server.typeDefinition(params);
                             respond(send, r.id, response);
                             break;
                         }

@@ -31,7 +31,9 @@ import org.javacs.lsp.*;
 import org.javacs.markup.ErrorProvider;
 import org.javacs.provider.DefinitionProvider;
 import org.javacs.provider.InlayHintProvider;
+import org.javacs.provider.ImplementationProvider;
 import org.javacs.provider.ReferenceProvider;
+import org.javacs.provider.TypeDefinitionProvider;
 import org.javacs.rewrite.*;
 
 /**
@@ -653,6 +655,8 @@ class JavaLanguageServer extends LanguageServer {
         c.add("signatureHelpProvider", signatureHelpOptions);
         c.addProperty("referencesProvider", true);
         c.addProperty("definitionProvider", true);
+        c.addProperty("implementationProvider", true);
+        c.addProperty("typeDefinitionProvider", true);
         c.addProperty("workspaceSymbolProvider", true);
         c.addProperty("documentSymbolProvider", true);
         c.addProperty("documentFormattingProvider", true);
@@ -943,6 +947,55 @@ class JavaLanguageServer extends LanguageServer {
             return Optional.empty();
         }
         return Optional.of(found);
+    }
+
+    @Override
+    public Optional<List<Location>> implementation(TextDocumentPositionParams position) {
+        if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        moduleRegistry.includeMavenReferenceSources();
+        var file = Paths.get(position.textDocument.uri);
+        var line = position.position.line + 1;
+        var column = position.position.character + 1;
+        try {
+            var found = new ImplementationProvider(
+                            compilerFor(file),
+                            file,
+                            line,
+                            column,
+                            this::compilerFor,
+                            this::canReferenceModule,
+                            moduleRegistry::batchResolveModulesForFiles)
+                    .find();
+            return found == ImplementationProvider.NOT_SUPPORTED
+                    ? Optional.empty()
+                    : Optional.of(found);
+        } catch (RuntimeException e) {
+            LOG.warning(String.format(
+                    "[implementation] compiler_error file=%s type=%s message=%s",
+                    file.getFileName(), e.getClass().getSimpleName(), e.getMessage()));
+            return Optional.empty();
+        }
+    }
+
+    @Override
+    public Optional<List<Location>> typeDefinition(TextDocumentPositionParams position) {
+        if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        var file = Paths.get(position.textDocument.uri);
+        var line = position.position.line + 1;
+        var column = position.position.character + 1;
+        try {
+            var found = new TypeDefinitionProvider(
+                            compilerFor(file), moduleRegistry.typeIndexFor(file), file, line, column)
+                    .find();
+            return found == TypeDefinitionProvider.NOT_SUPPORTED
+                    ? Optional.empty()
+                    : Optional.of(found);
+        } catch (RuntimeException e) {
+            LOG.warning(String.format(
+                    "[type-definition] compiler_error file=%s type=%s message=%s",
+                    file.getFileName(), e.getClass().getSimpleName(), e.getMessage()));
+            return Optional.empty();
+        }
     }
 
     @Override

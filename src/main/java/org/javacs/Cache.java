@@ -7,6 +7,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 /** Cache maps a file + an arbitrary key to a value. When the file is modified, the mapping expires. */
@@ -121,6 +123,33 @@ class Cache<K, V> {
         indexKey(key);
         CacheAudit.load(name);
         CacheAudit.store(name);
+    }
+
+    V getOrLoad(Path file, K k, Supplier<? extends V> loader) {
+        var key = new Key<K>(file, k);
+        while (true) {
+            var contentHash = FileStore.contentHash(file);
+            var cached = cache.getIfPresent(key);
+            if (cached != null && cached.contentHash == contentHash) {
+                CacheAudit.hit(name);
+                return cached.value;
+            }
+            if (cached != null) invalidateFile(file);
+            CacheAudit.miss(name);
+
+            var computed = new AtomicBoolean();
+            cached = cache.get(key, __ -> {
+                computed.set(true);
+                return new Value<>(loader.get(), contentHash);
+            });
+            indexKey(key);
+            if (computed.get()) {
+                CacheAudit.load(name);
+                CacheAudit.store(name);
+            }
+            if (cached.contentHash == FileStore.contentHash(file)) return cached.value;
+            invalidateFile(file);
+        }
     }
 
     V get(Path file, K k) {

@@ -5,13 +5,13 @@ import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collections;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import org.javacs.CompileTask;
@@ -20,23 +20,29 @@ import org.javacs.LspPosition;
 import org.javacs.lsp.Position;
 
 public class NavigationHelper {
-    public static Element findElement(CompileTask task, Path file, int line, int column) {
+    public static TreePath findPath(CompileTask task, Path file, int line, int column) {
         for (var root : task.roots) {
             if (root.getSourceFile().toUri().equals(file.toUri())) {
-                var trees = task.trees;
                 var cursor = LspPosition.offset(root, new Position(line - 1, column - 1));
-                var path = new FindNameAt(task).scan(root, cursor);
-                if (path == null) return null;
-                var element = trees.getElement(path);
-                if (element != null && element.asType().getKind() == TypeKind.ERROR
-                        && path.getLeaf() instanceof MemberSelectTree select) {
-                    var resolved = resolveChain(task, path, select);
-                    if (resolved != null) element = resolved;
-                }
-                return element;
+                return new FindNameAt(task).scan(root, cursor);
             }
         }
         throw new RuntimeException("file not found");
+    }
+
+    public static Element findElement(CompileTask task, Path file, int line, int column) {
+        return findElement(task, findPath(task, file, line, column));
+    }
+
+    public static Element findElement(CompileTask task, TreePath path) {
+        if (path == null) return null;
+        var element = task.trees.getElement(path);
+        if (element != null && element.asType().getKind() == TypeKind.ERROR
+                && path.getLeaf() instanceof MemberSelectTree select) {
+            var resolved = resolveChain(task, path, select);
+            if (resolved != null) element = resolved;
+        }
+        return element;
     }
 
     /**
@@ -59,8 +65,6 @@ public class NavigationHelper {
                 break;
             }
         }
-        Collections.reverse(chain);
-
         // Resolve the root expression's type
         var rootPath = TreePath.getPath(path.getCompilationUnit(), expr);
         if (rootPath == null) return null;
@@ -68,10 +72,12 @@ public class NavigationHelper {
         if (type == null || type.getKind() != TypeKind.DECLARED) return null;
 
         // Walk forward through the chain, resolving each method's return type
-        for (var methodName : chain) {
+        for (var methodName : chain.reversed()) {
             var method = findMethod(task, type, methodName);
             if (method == null) return null;
-            type = method.getReturnType();
+            var memberType = task.types.asMemberOf((DeclaredType) type, method);
+            if (!(memberType instanceof ExecutableType executable)) return null;
+            type = executable.getReturnType();
             if (type == null || type.getKind() != TypeKind.DECLARED) return null;
         }
 
@@ -82,12 +88,14 @@ public class NavigationHelper {
     private static ExecutableElement findMethod(CompileTask task, TypeMirror type, String name) {
         if (type.getKind() != TypeKind.DECLARED) return null;
         var typeEl = (TypeElement) ((DeclaredType) type).asElement();
+        ExecutableElement found = null;
         for (var m : task.elements.getAllMembers(typeEl)) {
             if (m.getKind() == ElementKind.METHOD && m.getSimpleName().contentEquals(name)) {
-                return (ExecutableElement) m;
+                if (found != null) return null;
+                found = (ExecutableElement) m;
             }
         }
-        return null;
+        return found;
     }
 
     public static boolean isLocal(Element element) {

@@ -187,36 +187,30 @@ class JavaCompilerService implements CompilerProvider {
     private static final Cache<String, Boolean> cacheContainsWord = new Cache<>("helper.contains_word");
 
     private boolean containsWord(Path file, String word) {
-        if (cacheContainsWord.needs(file, word)) {
-            cacheContainsWord.load(file, word, StringSearch.containsWord(file, word));
-        }
-        return cacheContainsWord.get(file, word);
+        return cacheContainsWord.getOrLoad(
+                file, word, () -> StringSearch.containsWord(file, word));
     }
 
     private static final Cache<Void, List<String>> cacheContainsType = new Cache<>("helper.contains_type");
 
     private boolean containsType(Path file, String className) {
-        if (cacheContainsType.needs(file, null)) {
+        return cacheContainsType.getOrLoad(file, null, () -> {
             var root = parse(file).root();
             var types = new ArrayList<String>();
             new FindTypeDeclarations().scan(root, types);
-            cacheContainsType.load(file, null, types);
-        }
-        return cacheContainsType.get(file, null).contains(className);
+            return types;
+        }).contains(className);
     }
 
     private final Cache<Void, List<String>> cacheFileImports = new Cache<>("helper.file_imports");
 
     private List<String> readImports(Path file) {
-        if (cacheFileImports.needs(file, null)) {
-            loadImports(file);
-        }
-        return cacheFileImports.get(file, null);
+        return cacheFileImports.getOrLoad(file, null, () -> loadImports(file));
     }
 
     private static final Pattern CLASS_DECLARATION_PATTERN = Pattern.compile("\\b(class|interface|enum|record)\\b");
 
-    private void loadImports(Path file) {
+    private List<String> loadImports(Path file) {
         var list = new ArrayList<String>();
         try (var lines = FileStore.lines(file)) {
             for (var line = lines.readLine(); line != null; line = lines.readLine()) {
@@ -234,17 +228,22 @@ class JavaCompilerService implements CompilerProvider {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        cacheFileImports.load(file, null, list);
+        return list;
     }
 
     private boolean containsImport(Path file, String className) {
         var pkg = packageName(className);
         if (pkg.equals(FileStore.packageName(file))) return true;
+        if (pkg.equals("java.lang")) return true;
         var packageStar = pkg + ".*";
         var staticStar = className + ".*";
         var staticMemberPrefix = className + ".";
         for (var i : readImports(file)) {
-            if (i.equals(className) || i.equals(packageStar) || i.equals(staticStar) || i.startsWith(staticMemberPrefix))
+            if (i.equals(className)
+                    || className.startsWith(i + ".")
+                    || i.equals(packageStar)
+                    || i.equals(staticStar)
+                    || i.startsWith(staticMemberPrefix))
                 return true;
         }
         return false;
@@ -496,15 +495,43 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Path[] findTypeReferences(String className) {
-        var pkg = packageName(className);
-        var simple = simpleName(className);
         var candidates = new ArrayList<Path>();
-        for (var f : FileStore.all()) {
-            if (containsWord(f, pkg) && containsImport(f, className) && containsWord(f, simple)) {
-                candidates.add(f);
+        for (var file : FileStore.all()) {
+            if (referencesType(file, className)) candidates.add(file);
+        }
+        return candidates.toArray(Path[]::new);
+    }
+
+    @Override
+    public Path[] findTypeReferences(Collection<String> classNames) {
+        var names = classNames.stream().filter(name -> name != null && !name.isBlank()).distinct().toList();
+        if (names.size() == 1) return findTypeReferences(names.getFirst());
+        if (names.isEmpty()) return new Path[0];
+
+        var simpleNames = names.stream()
+                .map(this::simpleName)
+                .filter(name -> !name.isBlank())
+                .distinct()
+                .map(StringSearch::new)
+                .toList();
+        var candidates = new ArrayList<Path>();
+        for (var file : FileStore.all()) {
+            if (!StringSearch.containsAnyWord(file, simpleNames)) continue;
+            for (var className : names) {
+                if (referencesType(file, className)) {
+                    candidates.add(file);
+                    break;
+                }
             }
         }
         return candidates.toArray(Path[]::new);
+    }
+
+    private boolean referencesType(Path file, String className) {
+        var pkg = packageName(className);
+        return (pkg.isEmpty() || containsWord(file, pkg))
+                && (containsImport(file, className) || containsWord(file, className))
+                && containsWord(file, simpleName(className));
     }
 
     @Override
