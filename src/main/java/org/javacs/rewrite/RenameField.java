@@ -49,14 +49,12 @@ public class RenameField implements Rewrite {
         var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
         for (var path : paths) {
             if (!candidateAllowed.test(declaration, path)) continue;
-            var candidateCompiler = compilerForFile.apply(path);
-            if (!candidateAllowed.test(declaration, path)) continue;
-            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>()).add(path);
+            groups.computeIfAbsent(compilerForFile.apply(path), __ -> new LinkedHashSet<>()).add(path);
         }
         var edits = new LinkedHashMap<Path, TextEdit[]>();
         for (var entry : groups.entrySet()) {
             if (declaration != CompilerProvider.NOT_FOUND) entry.getValue().add(declaration);
-            try (var compile = entry.getKey().compile(entry.getValue().toArray(Path[]::new))) {
+            try (var compile = entry.getKey().compileScan(entry.getValue().toArray(Path[]::new))) {
                 edits.putAll(new RenameHelper(compile).renameField(
                         compile.roots, className, fieldName, newName, accessorRenames));
             }
@@ -105,8 +103,15 @@ public class RenameField implements Rewrite {
     private boolean declaresMethod(ClassTree declaration, String name, int parameters) {
         return declaration.getMembers().stream()
                 .anyMatch(member -> member instanceof MethodTree method
+                        && !isGenerated(method)
                         && method.getName().contentEquals(name)
                         && method.getParameters().size() == parameters);
+    }
+
+    /** Lombok-injected accessors carry this flag; they are not user-written declarations. */
+    private static boolean isGenerated(MethodTree method) {
+        return method instanceof com.sun.tools.javac.tree.JCTree.JCMethodDecl decl
+                && (decl.getModifiers().flags & com.sun.tools.javac.code.Flags.GENERATED_MEMBER) != 0;
     }
 
     private static final Logger LOG = Logger.getLogger("main");

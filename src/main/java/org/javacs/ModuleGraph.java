@@ -16,7 +16,7 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
             String projectPath,
             Path projectDir,
             List<Path> sourceDirs,
-            Path testSourceDir,
+            List<Path> testSourceDirs,
             Path mainOutputDir,
             Path testOutputDir,
             List<Path> externalClasspath,
@@ -25,7 +25,13 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
             String sourceCompatibility,
             List<String> compilerArgs,
             String artifactId,
-            String coordinates) {}
+            String coordinates) {
+        public boolean isTestSource(Path file) { return testSourceDirs.stream().anyMatch(file::startsWith); }
+
+        public List<Path> sources(boolean includeTests) {
+            return includeTests ? sourceDirs : sourceDirs.stream().filter(dir -> !testSourceDirs.contains(dir)).toList();
+        }
+    }
 
     /** Return the module that contains {@code file}, or empty. */
     public Optional<ModuleInfo> moduleForFile(Path file) {
@@ -40,27 +46,34 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
         return Optional.ofNullable(best);
     }
 
-    /** Return the union of external JARs for {@code projectPath} and all transitive inter-module deps. */
-    public Set<Path> transitiveClasspath(String projectPath) {
+    /** Build outputs describe ownership only; they are never compiler inputs. */
+    public Set<Path> externalClasspath(Collection<Path> candidates) {
         var result = new LinkedHashSet<Path>();
-        var visited = new HashSet<String>();
-        collectClasspath(projectPath, result, visited);
-        for (var dir : transitiveClassOutputDirs(projectPath)) {
-            if (Files.exists(dir)) result.add(dir);
+        for (var candidate : candidates) {
+            var path = candidate.toAbsolutePath().normalize();
+            if (Files.exists(path) && modules.values().stream().noneMatch(module -> ownsBinary(module, path))) {
+                result.add(path);
+            }
         }
-        return result;
+        return Set.copyOf(result);
     }
 
-    /** Return the main class output directory for each transitive inter-module dependency. */
-    public Set<Path> transitiveClassOutputDirs(String projectPath) {
-        return transitiveClassOutputDirs(projectPath, false);
-    }
-
-    public Set<Path> transitiveClassOutputDirs(String projectPath, boolean testSources) {
-        var result = new LinkedHashSet<Path>();
-        var visited = new HashSet<String>();
-        collectClassOutputDirs(projectPath, result, visited, testSources);
-        return result;
+    private boolean ownsBinary(ModuleInfo module, Path path) {
+        if (module.mainOutputDir() != null && path.startsWith(module.mainOutputDir())) return true;
+        if (module.testOutputDir() != null && path.startsWith(module.testOutputDir())) return true;
+        // Packaged reactor artifacts and their local-repository copies also belong to sources.
+        if (path.startsWith(module.projectDir()) && path.toString().endsWith(".jar")) {
+            if (path.startsWith(module.projectDir().resolve("target"))
+                    || path.startsWith(module.projectDir().resolve("build"))) return true;
+        }
+        if (module.coordinates() == null) return false;
+        var coordinates = module.coordinates().split(":");
+        if (coordinates.length != 3) return false;
+        var base = coordinates[1] + "-" + coordinates[2];
+        var name = path.getFileName().toString();
+        if (!name.equals(base + ".jar") && !name.equals(base + "-tests.jar")) return false;
+        var repositoryPath = Path.of(coordinates[0].replace('.', '/'), coordinates[1], coordinates[2], name);
+        return path.endsWith(repositoryPath);
     }
 
     /** Collect transitive module project paths for a given module, including itself. */
@@ -77,7 +90,7 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
         var module = modules.get(projectPath);
         if (module == null) return result;
         var dependencies = testSources ? module.testModuleDeps() : module.moduleDeps();
-        for (var dependency : dependencies) collectModuleDependencies(dependency, result, testSources);
+        for (var dependency : dependencies) collectModuleDependencies(dependency, result, false);
         return result;
     }
 
@@ -89,18 +102,6 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
         return result;
     }
 
-    private void collectClassOutputDirs(
-            String projectPath, Set<Path> result, Set<String> visited, boolean testSources) {
-        if (!visited.add(projectPath)) return;
-        var info = modules.get(projectPath);
-        if (info == null) return;
-        if (info.mainOutputDir() != null) result.add(info.mainOutputDir());
-        var dependencies = testSources ? info.testModuleDeps() : info.moduleDeps();
-        for (var dep : dependencies) {
-            if (modules.containsKey(dep)) collectClassOutputDirs(dep, result, visited, false);
-        }
-    }
-
     private void collectModuleDependencies(String projectPath, Set<String> result, boolean testSources) {
         if (!result.add(projectPath)) return;
         var info = modules.get(projectPath);
@@ -109,24 +110,12 @@ public record ModuleGraph(Map<String, ModuleInfo> modules) {
         for (var dependency : dependencies) collectModuleDependencies(dependency, result, false);
     }
 
-    private void collectClasspath(String projectPath, Set<Path> result, Set<String> visited) {
-        if (!visited.add(projectPath)) return;
-        var info = modules.get(projectPath);
-        if (info == null) return;
-        result.addAll(info.externalClasspath());
-        for (var dep : info.moduleDeps()) {
-            collectClasspath(dep, result, visited);
-        }
-    }
-
     private void collectSourceDirs(
             String projectPath, Set<Path> result, Set<String> visited, boolean includeTests) {
         if (!visited.add(projectPath)) return;
         var info = modules.get(projectPath);
         if (info == null) return;
-        for (var sourceDir : info.sourceDirs()) {
-            if (includeTests || !sourceDir.equals(info.testSourceDir())) result.add(sourceDir);
-        }
+        result.addAll(info.sources(includeTests));
         var dependencies = includeTests ? info.testModuleDeps() : info.moduleDeps();
         for (var dep : dependencies) {
             collectSourceDirs(dep, result, visited, false);

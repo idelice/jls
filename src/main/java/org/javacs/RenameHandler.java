@@ -1,6 +1,8 @@
 package org.javacs;
 
 import com.google.gson.Gson;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Symbol;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -53,6 +55,10 @@ final class RenameHandler {
                 LOG.info(String.format("...can't rename %s", el));
                 return Optional.empty();
             }
+            if (isGenerated(el)) {
+                LOG.info(String.format("...can't rename generated member %s", el));
+                return Optional.empty();
+            }
             if (!canFindSource(requestCompiler, el)) {
                 LOG.info(String.format("...can't find source for %s", el));
                 return Optional.empty();
@@ -65,7 +71,7 @@ final class RenameHandler {
     }
 
     WorkspaceEdit rename(RenameParams params, LanguageClient client) {
-        server.moduleRegistry.includeMavenReferenceSources();
+        server.moduleRegistry.includeReferenceSources();
         var file = Paths.get(params.textDocument.uri);
         var requestCompiler = server.compilerFor(file);
         var rw = createRewrite(params, requestCompiler);
@@ -98,26 +104,11 @@ final class RenameHandler {
         return response;
     }
 
-    void renameApplied(DidChangeWatchedFilesParams params) {
-        if (params == null || params.changes == null) return;
-        for (var change : params.changes) {
-            var file = Paths.get(change.uri);
-            if (!FileStore.isWorkspaceJavaFile(change.uri) || !Files.exists(file)) continue;
-            var requestCompiler = server.compilerFor(file);
-            var parse = requestCompiler.parse(file);
-            if (LombokAnnotations.hasStructuralLombokAnnotation(parse.root())) {
-                if (server.lombokSourceOnlyEnabled()) {
-                    LOG.info("[lombok-source-only] skipped rename AP generation file=" + file);
-                } else {
-                    requestCompiler.refreshBuildOutput(file);
-                }
-            }
-        }
-    }
-
     private boolean canRename(Element rename) {
         return switch (rename.getKind()) {
-            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER, CLASS -> true;
+            case METHOD, FIELD, LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER,
+                            RESOURCE_VARIABLE, BINDING_VARIABLE, CLASS ->
+                    true;
             default -> false;
         };
     }
@@ -147,10 +138,14 @@ final class RenameHandler {
             var path = new FindNameAt(task).scan(task.root(file), position);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = task.trees.getElement(path);
+            if (isGenerated(el)) {
+                LOG.info("[rename] unsupported target=" + el + " reason=generated_member_has_no_source");
+                return Rewrite.NOT_SUPPORTED;
+            }
             return switch (el.getKind()) {
                 case METHOD -> renameMethod(task, (ExecutableElement) el, params.newName);
                 case FIELD -> renameField(task, (VariableElement) el, params.newName);
-                case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER ->
+                case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER, RESOURCE_VARIABLE, BINDING_VARIABLE ->
                         renameVariable(task, (VariableElement) el, params.newName);
                 case CLASS -> {
                     var type = (TypeElement) el;
@@ -159,6 +154,11 @@ final class RenameHandler {
                 default -> Rewrite.NOT_SUPPORTED;
             };
         }
+    }
+
+    /** Lombok-generated members are injected declarations: they carry no editable source range. */
+    private boolean isGenerated(Element element) {
+        return element instanceof Symbol symbol && (symbol.flags() & Flags.GENERATED_MEMBER) != 0;
     }
 
     private RenameMethod renameMethod(CompileTask task, ExecutableElement method, String newName) {

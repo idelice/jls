@@ -1,0 +1,19 @@
+<component-set>
+  <components>
+    <component>
+      <role>org.apache.maven.AbstractMavenLifecycleParticipant</role>
+      <role-hint>jls-source-dependencies</role-hint>
+      <implementation>org.javacs.maven.SourceDependencies</implementation>
+      <requirements>
+        <requirement>
+          <role>org.apache.maven.project.ProjectDependenciesResolver</role>
+          <field-name>projectResolver</field-name>
+        </requirement>
+        <requirement>
+          <role>org.eclipse.aether.RepositorySystem</role>
+          <field-name>repositorySystem</field-name>
+        </requirement>
+      </requirements>
+    </component>
+  </components>
+</component-set>

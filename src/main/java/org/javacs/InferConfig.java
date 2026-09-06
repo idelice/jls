@@ -81,7 +81,8 @@ class InferConfig {
 
     private BuildSystem detectBuildSystem() {
         var root = buildRoot();
-        if (Files.exists(root.resolve("settings.gradle")) || Files.exists(root.resolve("settings.gradle.kts")))
+        if (Files.exists(root.resolve("settings.gradle")) || Files.exists(root.resolve("settings.gradle.kts"))
+                || Files.exists(root.resolve("build.gradle")) || Files.exists(root.resolve("build.gradle.kts")))
             return BuildSystem.GRADLE;
         if (Files.exists(root.resolve("pom.xml")))
             return BuildSystem.MAVEN;
@@ -118,40 +119,16 @@ class InferConfig {
         var graph = moduleGraph();
         var modulePath = MavenTooling.modulePath(graph, buildRoot(), workspaceRoot);
         cachedMavenDeps = MavenTooling.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath);
-        var classPath = new HashSet<>(cachedMavenDeps.classpath());
-        if (graph != ModuleGraph.EMPTY) {
-            for (var info : graph.modules().values()) {
-                if (info.mainOutputDir() != null && Files.isDirectory(info.mainOutputDir())) {
-                    LOG.info("[classpath] Adding Maven build output: " + info.mainOutputDir());
-                    classPath.add(info.mainOutputDir());
-                }
-            }
-        }
-        return classPath;
+        return graph.externalClasspath(cachedMavenDeps.classpath());
     }
 
     private Set<Path> gradleClasspath() {
-        LOG.info("[gradle] Resolving classpath via Gradle Tooling API — this may take a minute for large projects.");
         var graph = moduleGraph();
-        if (graph != ModuleGraph.EMPTY) {
-            var activeModule = graph.moduleForFile(workspaceRoot);
-            if (activeModule.isPresent()) {
-                var classPath = new HashSet<>(activeModule.get().externalClasspath());
-                for (var dir : graph.transitiveClassOutputDirs(activeModule.get().projectPath())) {
-                    if (Files.isDirectory(dir)) classPath.add(dir);
-                }
-                return classPath;
-            }
-            var rootModule = graph.modules().get(":");
-            if (rootModule != null) {
-                var classPath = new HashSet<>(rootModule.externalClasspath());
-                for (var dir : graph.transitiveClassOutputDirs(rootModule.projectPath())) {
-                    if (Files.isDirectory(dir)) classPath.add(dir);
-                }
-                return classPath;
-            }
-        }
-        return Collections.emptySet();
+        var active = graph.moduleForFile(workspaceRoot).orElse(null);
+        if (active == null) return Set.of();
+        var resolved = GradleTooling.resolveClasspath(buildRoot(), List.of(active.projectPath()));
+        var inputs = resolved.modules().get(active.projectPath());
+        return inputs == null ? Set.of() : graph.externalClasspath(inputs.externalClasspath());
     }
 
     private Set<Path> resolveExternalDependencies(boolean source) {
@@ -214,6 +191,9 @@ class InferConfig {
                     || Files.exists(dir.resolve("settings.gradle.kts"))) {
                 return dir;
             }
+        }
+        for (var dir = workspaceRoot; dir != null; dir = dir.getParent()) {
+            if (Files.exists(dir.resolve("build.gradle")) || Files.exists(dir.resolve("build.gradle.kts"))) return dir;
         }
         return MavenTooling.findBuildRoot(workspaceRoot);
     }

@@ -330,13 +330,14 @@ public class StringSearch {
         return parts[parts.length - 1];
     }
 
+    private static final Pattern PACKAGE_LINE = Pattern.compile("^package +(.*);");
+    private static final Pattern CLASS_START = Pattern.compile("^[\\w ]*class +\\w+");
+
     static String packageName(Path file) throws CharacterCodingException {
-        var packagePattern = Pattern.compile("^package +(.*);");
-        var startOfClass = Pattern.compile("^[\\w ]*class +\\w+");
         try (var lines = FileStore.lines(file)) {
             for (var line = lines.readLine(); line != null; line = lines.readLine()) {
-                if (startOfClass.matcher(line).find()) return "";
-                var matchPackage = packagePattern.matcher(line);
+                if (CLASS_START.matcher(line).find()) return "";
+                var matchPackage = PACKAGE_LINE.matcher(line);
                 if (matchPackage.matches()) {
                     var id = matchPackage.group(1);
                     return id;

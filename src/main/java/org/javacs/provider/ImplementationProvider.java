@@ -155,7 +155,7 @@ public final class ImplementationProvider {
         if (candidates.isEmpty()) return Set.of();
         var discovered = new LinkedHashSet<String>();
         for (var group : compilerGroups(candidates).entrySet()) {
-            try (var task = group.getKey().compileFresh(group.getValue().toArray(Path[]::new))) {
+            try (var task = group.getKey().compileScan(group.getValue().toArray(Path[]::new))) {
                 discovered.addAll(scanCandidates(task, target, group.getValue(), locations));
             } catch (RuntimeException e) {
                 LOG.warning(String.format(

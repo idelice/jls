@@ -570,17 +570,22 @@ public class WorkspaceTypeIndex {
      * <p>Record component accessors are synthesized from the parse tree without attribution.
      * Lombok members are read from the same injected AST used by the compiler.
      */
-    public static WorkspaceTypeIndex fromParseTrees(List<ParseTask> parseTasks) {
+    public static WorkspaceTypeIndex fromParseTrees(Iterable<ParseTask> parseTasks) {
         return fromParseTrees(parseTasks, __ -> false);
     }
 
     public static WorkspaceTypeIndex fromParseTrees(
-            List<ParseTask> parseTasks, Predicate<String> knownType) {
+            Iterable<ParseTask> parseTasks, Predicate<String> knownType) {
         return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true);
     }
 
+    /**
+     * @param parseTasks iterated once and never retained: pass a lazy sequence so only one syntax
+     *     tree is alive at a time. Materialising every tree first exhausts the heap on a large
+     *     module closure.
+     */
     public static WorkspaceTypeIndex fromParseTrees(
-            List<ParseTask> parseTasks,
+            Iterable<ParseTask> parseTasks,
             BiPredicate<Path, String> knownType,
             BiPredicate<Path, Path> sourceVisible) {
         // Single-pass: parse each file, extract all metadata + members, discard AST immediately.
@@ -600,8 +605,7 @@ public class WorkspaceTypeIndex {
         // Members extracted per type
         var typeDirectMembers = new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
 
-        for (int i = 0; i < parseTasks.size(); i++) {
-            var parseTask = parseTasks.get(i);
+        for (var parseTask : parseTasks) {
             var root = parseTask.root();
             LombokStubInjector.injectParseTask(parseTask);
             var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
@@ -704,10 +708,9 @@ public class WorkspaceTypeIndex {
                         finalSourcePath, finalSourceUri, packageName,
                         explicitImports, staticImports, declaredTypesInFile, ""));
             }
-            // Allow GC to reclaim this file's AST before parsing the next
-            parseTasks.set(i, null);
         }
-        // ASTs are now eligible for GC — only lightweight data structures remain.
+        // Each syntax tree became garbage as soon as its iteration ended; only the collected
+        // declaration data below is retained.
 
         // === Post-pass: resolve raw supertype/interface names using collected workspace names ===
         var typeSupertypes = new Object2ObjectOpenHashMap<String, String>();
@@ -999,12 +1002,23 @@ public class WorkspaceTypeIndex {
                 ownerQualifiedName, kind, name, erasedParamTypes);
         var generated = method instanceof com.sun.tools.javac.tree.JCTree.JCMethodDecl jcMethod
                 && (jcMethod.mods.flags & Flags.GENERATED_MEMBER) != 0;
-        if (generated && "builder".equals(name) && !enclosingIsGenerated) {
+        // A generated factory/toBuilder on the outer class returns the (generated) builder type;
+        // qualify its simple name to the nested type so completion chains resolve. Detected
+        // structurally by return-type name so custom @Builder(builderClassName/...) names work too.
+        var returnsGeneratedBuilder = generated && !enclosingIsGenerated && !isConstructor
+                && returnsGeneratedNestedClass(declaration, returnTypeStr);
+        // A generated build method inside the builder returns the enclosing (outer) type.
+        var separatorIdx = ownerQualifiedName.lastIndexOf('.');
+        var outerSimpleName = separatorIdx > 0
+                ? TypeNames.simpleName(ownerQualifiedName.substring(0, separatorIdx)) : null;
+        var isBuildMethod = generated && enclosingIsGenerated && params.isEmpty()
+                && outerSimpleName != null && outerSimpleName.equals(returnTypeStr);
+        if (returnsGeneratedBuilder) {
             returnTypeStr = ownerQualifiedName + "." + returnTypeStr;
         } else if (generated && enclosingIsGenerated) {
             var separator = ownerQualifiedName.lastIndexOf('.');
             if (separator > 0) {
-                returnTypeStr = "build".equals(name) && params.isEmpty()
+                returnTypeStr = isBuildMethod
                         ? ownerQualifiedName.substring(0, separator)
                         : ownerQualifiedName;
             }
@@ -1016,7 +1030,7 @@ public class WorkspaceTypeIndex {
         var origin = generated
                 ? (isConstructor
                         ? IndexedMember.Origin.LOMBOK_CONSTRUCTOR
-                        : enclosingIsGenerated || "builder".equals(name)
+                        : enclosingIsGenerated || returnsGeneratedBuilder
                                 ? IndexedMember.Origin.LOMBOK_BUILDER
                                 : IndexedMember.Origin.LOMBOK_ACCESSOR)
                 : IndexedMember.Origin.DECLARED;
@@ -1024,7 +1038,7 @@ public class WorkspaceTypeIndex {
         var backingFieldName = (String) null;
         var declarationOwnerType = (String) null;
         var targetDeclarationKey = (String) null;
-        if (generated && !isConstructor && !enclosingIsGenerated && !"builder".equals(name)) {
+        if (generated && !isConstructor && !enclosingIsGenerated && !returnsGeneratedBuilder) {
             var accessorField = generatedAccessorFieldName(name, declaration, root);
             if (accessorField != null) {
                 backingFieldName = accessorField;
@@ -1037,7 +1051,7 @@ public class WorkspaceTypeIndex {
             var separator = ownerQualifiedName.lastIndexOf('.');
             if (separator > 0) {
                 var outerOwner = ownerQualifiedName.substring(0, separator);
-                if (!("build".equals(name) && params.isEmpty())) {
+                if (!isBuildMethod) {
                     backingFieldName = params.isEmpty() ? name : params.get(0).getName().toString();
                     logicalKey = IndexedMember.canonicalKey(
                             outerOwner, CompletionItemKind.Field, backingFieldName, null);
@@ -1060,6 +1074,24 @@ public class WorkspaceTypeIndex {
         }
 
         seen.putIfAbsent(memberStorageKey(next), next);
+    }
+
+    /**
+     * True if {@code returnTypeSimpleName} names a generated nested class of {@code declaration}.
+     * Used to recognise a Lombok builder factory / toBuilder method (which returns the builder
+     * type) regardless of its method name, so custom {@code @Builder} names resolve.
+     */
+    private static boolean returnsGeneratedNestedClass(ClassTree declaration, String returnTypeSimpleName) {
+        if (returnTypeSimpleName == null || returnTypeSimpleName.indexOf('.') >= 0) return false;
+        for (var member : declaration.getMembers()) {
+            if (member instanceof ClassTree nested
+                    && nested instanceof com.sun.tools.javac.tree.JCTree.JCClassDecl jc
+                    && (jc.mods.flags & Flags.GENERATED_MEMBER) != 0
+                    && nested.getSimpleName().contentEquals(returnTypeSimpleName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String generatedAccessorFieldName(

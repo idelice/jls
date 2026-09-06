@@ -125,7 +125,7 @@ public class ReferenceProvider {
                 task.close();
                 return findTypeReferences(className);
             }
-            LOG.fine(String.format(
+            LOG.info(String.format(
                     "[ref] unsupported_target kind=%s name=%s",
                     element.getKind(), element.getSimpleName()));
             return NOT_SUPPORTED;
@@ -192,7 +192,7 @@ public class ReferenceProvider {
         var locations = new LinkedHashMap<String, Location>();
         for (var entry : groups.entrySet()) {
             entry.getValue().add(file);
-            try (var task = entry.getKey().compileFresh(entry.getValue().toArray(Path[]::new))) {
+            try (var task = entry.getKey().compileScan(entry.getValue().toArray(Path[]::new))) {
                 for (var location : findReferences(task)) {
                     locations.put(location.uri + ":" + location.range, location);
                 }
@@ -298,7 +298,7 @@ public class ReferenceProvider {
         var roots = 0;
         long errors = 0;
         for (var entry : groups.entrySet()) {
-            try (var task = entry.getKey().compileFresh(entry.getValue().toArray(Path[]::new))) {
+            try (var task = entry.getKey().compileScan(entry.getValue().toArray(Path[]::new))) {
                 var paths = new ArrayList<TreePath>();
                 for (var root : task.roots) {
                     new FindLombokReferences(task, names, className).scan(root, paths);

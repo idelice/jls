@@ -42,14 +42,12 @@ public class RenameMethod implements Rewrite {
         var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
         for (var path : paths) {
             if (!candidateAllowed.test(declaration, path)) continue;
-            var candidateCompiler = compilerForFile.apply(path);
-            if (!candidateAllowed.test(declaration, path)) continue;
-            groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>()).add(path);
+            groups.computeIfAbsent(compilerForFile.apply(path), __ -> new LinkedHashSet<>()).add(path);
         }
         var edits = new LinkedHashMap<Path, TextEdit[]>();
         for (var entry : groups.entrySet()) {
             if (declaration != CompilerProvider.NOT_FOUND) entry.getValue().add(declaration);
-            try (var compile = entry.getKey().compile(entry.getValue().toArray(Path[]::new))) {
+            try (var compile = entry.getKey().compileScan(entry.getValue().toArray(Path[]::new))) {
                 edits.putAll(new RenameHelper(compile).renameMethod(
                         compile.roots, className, methodName, erasedParameterTypes, newName));
             }

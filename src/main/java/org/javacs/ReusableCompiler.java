@@ -11,143 +11,236 @@
  */
 package org.javacs;
 
-import com.sun.source.util.JavacTask;
-import com.sun.source.util.TaskEvent;
-import com.sun.source.util.TaskListener;
+import com.sun.source.tree.*;
+import com.sun.source.util.*;
 import com.sun.tools.javac.api.*;
+import com.sun.tools.javac.code.Preview;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.comp.*;
 import com.sun.tools.javac.main.Arguments;
 import com.sun.tools.javac.main.JavaCompiler;
 import com.sun.tools.javac.model.JavacElements;
 import com.sun.tools.javac.platform.PlatformDescription;
-import com.sun.tools.javac.util.Context;
-import com.sun.tools.javac.util.DefinedBy;
-import com.sun.tools.javac.util.DefinedBy.Api;
-import com.sun.tools.javac.util.Log;
-import com.sun.tools.javac.util.Options;
-import java.lang.reflect.InvocationTargetException;
+import com.sun.tools.javac.tree.JCTree.JCClassDecl;
+import com.sun.tools.javac.util.*;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.function.Function;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
-import javax.tools.Diagnostic;
-import javax.tools.DiagnosticListener;
-import javax.tools.JavaFileManager;
-import javax.tools.JavaFileObject;
+import javax.tools.*;
 
-/**
- * Reuses a single warm javac Context across compiles. Reuse works by replacing Log and
- * JavaCompiler with reusable counterparts and cleaning up leftovers ({@link ReusableContext#clear})
- * on each return. A fresh context is created whenever the options change. The context is checked
- * out for the duration of one worker call (serial, single-threaded) — same model as upstream
- * java-language-server.
- *
- * <p><b>Not part of any supported API.</b>
- */
-class ReusableCompiler {
+/** JDK 25 context cleanup, adapted to an explicit borrow covering all Trees/Elements consumers. */
+final class ReusableCompiler {
     private static final Logger LOG = Logger.getLogger("main");
-    private static final JavacTool systemProvider = JavacTool.create();
-
-    private List<String> currentOptions = new ArrayList<>();
-    private ReusableContext currentContext;
+    private static final JavacTool JAVAC = JavacTool.create();
+    private static final Method CLEANUP = cleanupMethod();
+    private static final AtomicLong IDS = new AtomicLong();
+    private static final LinkedHashMap<ReusableCompiler, Boolean> IDLE = new LinkedHashMap<>();
+    private static final int MAX_IDLE_CONTEXTS = 4;
+    private static final int MAX_USES = 64;
+    private ReusableContext context;
     private boolean checkedOut;
 
     /**
-     * Runs {@code worker} with a task backed by a (possibly reused) warm context, then returns an
-     * {@link AutoCloseable} that the caller MUST close once it has finished consuming the task's
-     * Trees/Elements. Closing clears the context and makes it available for the next compile.
-     * The task and anything derived from it are only valid until that close.
+     * @param oneShot the caller consumes the result once (a workspace-wide scan). A context created
+     *     for a one-shot borrow is retired instead of competing for the idle pool with the modules
+     *     the user is editing. An already warm context stays warm.
      */
-    <T> AutoCloseable compile(
-            JavaFileManager fileManager,
-            DiagnosticListener<? super JavaFileObject> diagnosticListener,
-            List<String> options,
-            Collection<? extends JavaFileObject> compilationUnits,
-            Function<JavacTask, T> worker) {
-        var started = System.nanoTime();
-        Borrow borrow;
-        try {
-            borrow = getTask(fileManager, diagnosticListener, options, null, compilationUnits);
-        } catch (RuntimeException | Error e) {
-            // getTask failed (e.g. invalid options) after setting checkedOut=true.
-            // Clear partial registrations from the context so it's reusable, but keep it warm.
-            checkedOut = false;
-            if (currentContext != null) {
-                currentContext.clear();
-            }
-            LOG.warning("[warm-context] getTask failed, context cleared: " + e.getMessage());
-            throw e;
+    Borrow borrow(JavaFileManager files, DiagnosticListener<? super JavaFileObject> diagnostics,
+            List<String> options, Collection<? extends JavaFileObject> sources, boolean oneShot) {
+        if (checkedOut) throw new IllegalStateException("Compiler is already in use");
+        if (!options.contains("-proc:none") || options.stream().anyMatch(option ->
+                option.startsWith("-proc:") && !option.equals("-proc:none"))) {
+            throw new IllegalArgumentException("Semantic analysis requires -proc:none");
         }
-        try {
-            worker.apply(borrow.task);
-        } catch (RuntimeException | Error e) {
-            borrow.close();
-            throw e;
+        synchronized (IDLE) { IDLE.remove(this); }
+        var revision = FileStore.contentRevision();
+        var reused = context != null && context.options.equals(options) && context.stillValid(sources, revision);
+        if (!reused) {
+            discard("source_changed");
+            context = new ReusableContext(options);
         }
-        LOG.info("[warm-context] reused files=" + compilationUnits.size()
-                + " taskMs=" + ((System.nanoTime() - started) / 1_000_000L));
-        return borrow;
-    }
-
-    private Borrow getTask(
-            JavaFileManager fileManager,
-            DiagnosticListener<? super JavaFileObject> diagnosticListener,
-            Iterable<String> options,
-            Iterable<String> classes,
-            Iterable<? extends JavaFileObject> compilationUnits) {
-        if (checkedOut) {
-            throw new RuntimeException("Compiler is already in-use!");
-        }
+        context.revision = revision;
         checkedOut = true;
-        var opts = new ArrayList<String>();
-        options.forEach(opts::add);
-        if (!opts.equals(currentOptions)) {
-            currentOptions = opts;
-            currentContext = new ReusableContext(opts);
-        }
-        var task = (JavacTaskImpl) systemProvider.getTask(
-                null, fileManager, diagnosticListener, opts, classes, compilationUnits, currentContext);
-        task.addTaskListener(currentContext);
-        return new Borrow(task);
-    }
-
-    class Borrow implements AutoCloseable {
-        final JavacTask task;
-        boolean closed;
-
-        Borrow(JavacTask task) {
-            this.task = task;
-        }
-
-        @Override
-        public void close() {
-            if (closed) return;
-            currentContext.clear();
-            try {
-                var method = JavacTaskImpl.class.getDeclaredMethod("cleanup");
-                method.setAccessible(true);
-                method.invoke(task);
-            } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-                throw new RuntimeException(e);
-            }
+        try {
+            var task = (JavacTaskImpl) JAVAC.getTask(null, files, diagnostics, options, null, sources, context);
+            task.setProcessors(List.of());
+            task.addTaskListener(context);
+            context.uses++;
+            context.capturePlatform();
+            return new Borrow(task, context, reused, oneShot && !reused);
+        } catch (RuntimeException | Error failure) {
             checkedOut = false;
-            closed = true;
+            discard();
+            throw failure;
         }
     }
 
-    static class ReusableContext extends Context implements TaskListener {
-        List<String> arguments;
+    boolean isWarm() {
+        return context != null;
+    }
 
-        ReusableContext(List<String> arguments) {
-            super();
-            this.arguments = arguments;
-            put(Log.logKey, ReusableLog.factory);
-            put(JavaCompiler.compilerKey, ReusableJavaCompiler.factory);
+    void discard() {
+        discard("owner_request");
+    }
+
+    void discard(String reason) {
+        if (checkedOut) throw new IllegalStateException("Cannot discard a borrowed compiler");
+        synchronized (IDLE) { IDLE.remove(this); }
+        if (context != null) {
+            LOG.info("[analysis] retire context=" + context.id + " reason=" + reason
+                    + " uses=" + context.uses
+                    + " release_managers=" + context.platforms.size() + " polluted=" + context.polluted);
+            context.dispose();
+            context = null;
+        }
+    }
+
+    private void retain() {
+        synchronized (IDLE) {
+            IDLE.remove(this);
+            IDLE.put(this, Boolean.TRUE);
+            while (IDLE.size() > MAX_IDLE_CONTEXTS) IDLE.firstEntry().getKey().discard("idle_evicted");
+        }
+    }
+
+    private static Method cleanupMethod() {
+        try {
+            var method = JavacTaskImpl.class.getDeclaredMethod("cleanup");
+            method.setAccessible(true);
+            return method;
+        } catch (ReflectiveOperationException e) { throw new ExceptionInInitializerError(e); }
+    }
+
+    final class Borrow implements AutoCloseable {
+        final JavacTaskImpl task;
+        final boolean reused;
+        private final ReusableContext borrowed;
+        private final boolean oneShot;
+        private boolean valid = true;
+        private boolean closed;
+
+        Borrow(JavacTaskImpl task, ReusableContext borrowed, boolean reused, boolean oneShot) {
+            this.task = task;
+            this.borrowed = borrowed;
+            this.reused = reused;
+            this.oneShot = oneShot;
+        }
+
+        long id() { return borrowed.id; }
+        void invalidate() { valid = false; }
+
+        @Override public void close() {
+            if (closed) return;
+            closed = true;
+            try {
+                borrowed.clear();
+                CLEANUP.invoke(task);
+            } catch (ReflectiveOperationException | RuntimeException | AssertionError | LinkageError failure) {
+                valid = false;
+                LOG.warning("[analysis] cleanup_failed context=" + id() + " cause=" + failure);
+            } finally {
+                checkedOut = false;
+                if (!valid) discard("analysis_failed");
+                else if (oneShot) discard("one_shot_scan");
+                else if (borrowed.polluted) discard("polluted");
+                else if (borrowed.uses >= MAX_USES) discard("use_limit");
+                else retain();
+            }
+        }
+    }
+
+    private static final class ReusableContext extends Context implements TaskListener {
+        final long id = IDS.incrementAndGet();
+        final List<String> options;
+        final List<CompilationUnitTree> roots = new ArrayList<>();
+        final List<PlatformDescription> platforms = new ArrayList<>();
+        /** Every source this context has entered, including files javac loaded implicitly. */
+        final Set<Path> parsed = new HashSet<>();
+        long revision;
+        int uses;
+        boolean polluted;
+
+        ReusableContext(List<String> options) {
+            this.options = List.copyOf(options);
+            put(Log.logKey, (Factory<Log>) ReusableLog::new);
+            put(JavaCompiler.compilerKey, (Factory<JavaCompiler>) ReusableJavaCompiler::new);
+        }
+
+        void capturePlatform() {
+            var platform = get(PlatformDescription.class);
+            if (platform != null && !platforms.contains(platform)) platforms.add(platform);
+        }
+
+        /**
+         * A retained source symbol is correct while its file is unchanged, and also when this task
+         * parses the file again: javac re-enters the declarations it parses. Only a changed file
+         * that stays implicit is stale, because javac never re-lists a completed package.
+         *
+         * <p>The re-entry invariant is javac implementation behaviour, verified against JDK 25.0.2.
+         * If a future compiler stops re-entering re-parsed sources, reuse must be narrowed to
+         * borrows whose requested files are unchanged.
+         */
+        boolean stillValid(Collection<? extends JavaFileObject> requested, long revision) {
+            if (revision == this.revision) return true;
+            var changed = FileStore.changedSince(this.revision);
+            if (changed.isEmpty()) return true;
+            var reparsed = new HashSet<Path>();
+            for (var source : requested) {
+                var path = filePath(source.toUri());
+                if (path != null) reparsed.add(path);
+            }
+            for (var file : changed) {
+                if (parsed.contains(file) && !reparsed.contains(file)) {
+                    LOG.info("[analysis] retire context=" + id + " reason=implicit_source_changed file="
+                            + file.getFileName());
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static Path filePath(java.net.URI uri) {
+            if (!"file".equalsIgnoreCase(uri.getScheme())) return null;
+            return Path.of(uri).toAbsolutePath().normalize();
         }
 
         void clear() {
+            capturePlatform();
+            var files = get(JavaFileManager.class);
+            polluted |= files != null && files.hasLocation(StandardLocation.PATCH_MODULE_PATH);
+            new TreeScanner<Void, Void>() {
+                @Override public Void scan(Tree tree, Void unused) {
+                    if (tree instanceof com.sun.tools.javac.tree.JCTree.LetExpr expression) {
+                        scan(expression.defs, unused);
+                        return scan(expression.expr, unused);
+                    }
+                    return super.scan(tree, unused);
+                }
+                @Override public Void visitClass(ClassTree tree, Void unused) {
+                    // Source symbols stay in the symbol table: this context is only reused while
+                    // every source is unchanged, and javac re-enters the sources it parses again.
+                    var symbol = ((JCClassDecl) tree).sym;
+                    if (symbol != null) {
+                        polluted |= symbol.flatName().toString().startsWith("java.");
+                        if (symbol.type instanceof com.sun.tools.javac.code.Type.ClassType type
+                                && type.supertype_field != null) {
+                            var parent = type.supertype_field.tsym;
+                            polluted |= parent != null && parent.flatName().toString().startsWith("java.")
+                                    && parent.kind != com.sun.tools.javac.code.Kinds.Kind.TYP;
+                        }
+                    }
+                    return super.visitClass(tree, unused);
+                }
+            }.scan(roots, null);
+            roots.clear();
             drop(Arguments.argsKey);
             drop(DiagnosticListener.class);
             drop(Log.outKey);
@@ -156,103 +249,58 @@ class ReusableCompiler {
             drop(JavacTask.class);
             drop(JavacTrees.class);
             drop(JavacElements.class);
-            // --release installs a PlatformDescription and a DelegatingJavaFileManager; drop the
-            // stale platform so it isn't reused across rounds.
             drop(PlatformDescription.class);
-            if (ht.get(Log.logKey) instanceof ReusableLog) {
-                // log already inited - not first round
-                ((ReusableLog) Log.instance(this)).clear();
-                Enter.instance(this).newRound();
-                ((ReusableJavaCompiler) ReusableJavaCompiler.instance(this)).clear();
-                Types.instance(this).newRound();
-                Check.instance(this).newRound();
-                Modules.instance(this).newRound();
-                Annotate.instance(this).newRound();
-                CompileStates.instance(this).clear();
-                MultiTaskListener.instance(this).clear();
-                // Essential for --release reuse: javac's handleReleaseOptions() writes implicit
-                // -source/-target entries into the shared Options when --release is processed. If
-                // Options is not cleared, the second compile sees a leftover -source and throws
-                // "option --source cannot be used together with --release". Matches the JDK's own
-                // JavacTaskPool.ReusableContext.clear().
-                Options.instance(this).clear();
-            }
+            Log.instance(this).clear();
+            Enter.instance(this).newRound();
+            ((ReusableJavaCompiler) JavaCompiler.instance(this)).newRound();
+            Types.instance(this).newRound();
+            Check.instance(this).newRound();
+            Check.instance(this).clear();
+            Preview.instance(this).clear();
+            Modules.instance(this).newRound();
+            Annotate.instance(this).newRound();
+            CompileStates.instance(this).clear();
+            MultiTaskListener.instance(this).clear();
+            Options.instance(this).clear();
         }
 
-        @Override
-        @DefinedBy(Api.COMPILER_TREE)
-        public void finished(TaskEvent e) {
-            // do nothing
+        void dispose() {
+            capturePlatform();
+            // Warm components can retain any release file manager. Close them only on retirement.
+            for (var platform : platforms) {
+                try { platform.close(); } catch (IOException e) { LOG.fine(e.getMessage()); }
+            }
+            platforms.clear();
+            roots.clear();
+            parsed.clear();
+            ht.clear();
         }
 
-        @Override
-        @DefinedBy(Api.COMPILER_TREE)
-        public void started(TaskEvent e) {
-            // do nothing
+        @Override public void finished(TaskEvent event) {
+            if (event.getKind() != TaskEvent.Kind.PARSE) return;
+            roots.add(event.getCompilationUnit());
+            var path = filePath(event.getCompilationUnit().getSourceFile().toUri());
+            if (path != null) parsed.add(path);
         }
+        private <T> void drop(Key<T> key) { ht.remove(key); }
+        private <T> void drop(Class<T> type) { ht.remove(key(type)); }
+    }
 
-        <T> void drop(Key<T> k) {
-            ht.remove(k);
-        }
+    private static final class ReusableJavaCompiler extends JavaCompiler {
+        ReusableJavaCompiler(Context context) { super(context); }
+        @Override public void close() { }
+        @Override protected void checkReusable() { }
+    }
 
-        <T> void drop(Class<T> c) {
-            ht.remove(key(c));
-        }
-
-        /** Reusable JavaCompiler; cleans up leftovers from previous compilations. */
-        static class ReusableJavaCompiler extends JavaCompiler {
-            static final Factory<JavaCompiler> factory = ReusableJavaCompiler::new;
-
-            ReusableJavaCompiler(Context context) {
-                super(context);
-            }
-
-            @Override
-            public void close() {
-                // do nothing
-            }
-
-            void clear() {
-                newRound();
-            }
-
-            @Override
-            protected void checkReusable() {
-                // do nothing - it's ok to reuse the compiler
-            }
-        }
-
-        /** Reusable Log; cleans up leftovers from previous compilations. */
-        static class ReusableLog extends Log {
-            static final Factory<Log> factory = ReusableLog::new;
-            Context context;
-
-            ReusableLog(Context context) {
-                super(context);
-                this.context = context;
-            }
-
-            public void clear() {
-                recorded.clear();
-                sourceMap.clear();
-                nerrors = 0;
-                nwarnings = 0;
-                // Lazily look up the 'real' listener from the context on each report. This field is
-                // never updated when a new task is created, so we cannot simply reset or keep it.
-                diagListener = new DiagnosticListener<>() {
-                    DiagnosticListener<JavaFileObject> cachedListener;
-
-                    @Override
-                    @DefinedBy(Api.COMPILER)
-                    @SuppressWarnings("unchecked")
-                    public void report(Diagnostic<? extends JavaFileObject> diagnostic) {
-                        if (cachedListener == null) {
-                            cachedListener = context.get(DiagnosticListener.class);
-                        }
-                        cachedListener.report(diagnostic);
-                    }
-                };
-            }
+    private static final class ReusableLog extends Log {
+        private final Context context;
+        ReusableLog(Context context) { super(context); this.context = context; }
+        @Override public void clear() {
+            super.clear();
+            diagListener = diagnostic -> {
+                var listener = context.get(DiagnosticListener.class);
+                if (listener != null) listener.report(diagnostic);
+            };
         }
     }
 }

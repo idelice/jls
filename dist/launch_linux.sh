@@ -30,9 +30,11 @@ LOGGING_CONFIG="$DIR/linux/conf/logging.properties"
 JLS_JVM_DEFAULT_MEM="-Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRatio=20 -XX:+UseStringDeduplication"
 
 # AOT cache: pre-warm JIT profiles for faster startup and peak performance.
+# Keyed on the server jar: an archived cache from another build must never be loaded.
 AOT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jls"
-AOT_CACHE_FILE="$AOT_CACHE_DIR/jls.aot"
-AOT_CONF_FILE="$AOT_CACHE_DIR/jls.aotconf"
+AOT_ID=`cksum "$DIR/classpath/jls.jar" 2>/dev/null | cut -d' ' -f1`
+AOT_CACHE_FILE="$AOT_CACHE_DIR/jls-$AOT_ID.aot"
+AOT_CONF_FILE="$AOT_CACHE_DIR/jls-$AOT_ID.aotconf"
 AOT_OPTS=""
 if [ -f "$AOT_CACHE_FILE" ]; then
     AOT_OPTS="-XX:AOTCache=$AOT_CACHE_FILE"
@@ -46,6 +48,7 @@ elif [ -f "$AOT_CONF_FILE" ]; then
     fi
 else
     mkdir -p "$AOT_CACHE_DIR"
+    rm -f "$AOT_CACHE_DIR"/jls-*.aot "$AOT_CACHE_DIR"/jls-*.aotconf "$AOT_CACHE_DIR"/jls.aot "$AOT_CACHE_DIR"/jls.aotconf
     AOT_OPTS="-XX:AOTMode=record -XX:AOTConfiguration=$AOT_CONF_FILE"
 fi
 

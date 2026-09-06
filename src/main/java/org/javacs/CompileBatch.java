@@ -1,225 +1,72 @@
 package org.javacs;
 
-import com.sun.source.tree.*;
+import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.util.*;
-import com.sun.tools.javac.api.JavacTaskImpl;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import javax.lang.model.util.*;
 import javax.tools.*;
 
-public class CompileBatch implements AutoCloseable {
+/** One attributed source analysis. The borrowed context lives until the result closes. */
+public final class CompileBatch implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
-
-    final JavaCompilerService parent;
-    boolean closed;
-    private AutoCloseable borrow;
-
+    private final ReusableCompiler.Borrow borrow;
     final JavacTask task;
     final Trees trees;
     final Elements elements;
     final Types types;
-    final List<CompilationUnitTree> roots;
-    final List<Diagnostic<? extends JavaFileObject>> diagnostics;
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
-        this.parent = parent;
-        LOG.info("[compile] CompileBatch — starting compile of " + files.size() + " file(s)");
-        if (parent.lombokPresentOnClasspath)
-            LOG.info("[lombok-source-compile] task requested=" + files.size() + " sources="
-                    + files.stream().map(JavaFileObject::getName).collect(Collectors.joining(",")));
-        var requestedUris = files.stream().map(f -> f.toUri()).collect(Collectors.toSet());
-        var parsedUris = new HashSet<java.net.URI>();
-        parent.diags.clear();
-        var options = options(parent.classPath, parent.addExports, parent.extraArgs);
+    final List<CompilationUnitTree> roots = new ArrayList<>();
+    final List<Diagnostic<? extends JavaFileObject>> diagnostics = new ArrayList<>();
 
-        // single mutable holder to extract result from worker lambda
-        var holder = new Object() {
-            JavacTask task;
-            Trees trees;
-            Elements elements;
-            Types types;
-            List<CompilationUnitTree> roots;
-        };
-
-        this.borrow = parent.compiler.compile(
-                parent.fileManager,
-                parent.diags::add,
-                options,
-                files,
-                task -> {
-                    holder.task = task;
-                    holder.trees = Trees.instance(task);
-                    holder.elements = task.getElements();
-                    holder.types = task.getTypes();
-                    holder.roots = new ArrayList<>();
-                    try {
-                        var impl = (JavacTaskImpl) task;
-                        if (parent.lombokPresentOnClasspath) {
-                            var injector = new LombokStubInjector(impl.getContext());
-                            task.addTaskListener(new TaskListener() {
-                                public void started(TaskEvent e) {}
-                                public void finished(TaskEvent e) {
-                                    if (e.getKind() == TaskEvent.Kind.PARSE && e.getCompilationUnit() != null) {
-                                        try {
-                                            var path = e.getCompilationUnit().getSourceFile().toUri();
-                                            if (!parsedUris.add(path)) return;
-                                            var implicit = !requestedUris.contains(path);
-                                            var dirty = "unknown";
-                                            if ("file".equalsIgnoreCase(path.getScheme())) dirty = Boolean.toString(FileStore.isDirty(Paths.get(path)));
-                                            LOG.info("[lombok-source-compile] phase=parse source=" + path + " implicit=" + implicit + " dirty=" + dirty);
-                                            injector.inject(e.getCompilationUnit());
-                                        } catch (Throwable ex) {
-                                            LOG.warning("[lombok-source-compile] injection failed: " + ex);
-                                            if (ex instanceof VirtualMachineError
-                                                    || ex instanceof ThreadDeath
-                                                    || ex instanceof LinkageError) throw (Error) ex;
-                                            throw new RuntimeException("Lombok stub injection failed", ex);
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        for (var t : task.parse()) {
-                            holder.roots.add(t);
-                        }
-                        try {
-                            impl.enter();
-                            var compiler = com.sun.tools.javac.main.JavaCompiler.instance(impl.getContext());
-                            var attr = compiler.attribute(compiler.todo);
-                            compiler.flow(attr);
-                        } catch (Throwable e) {
-                            LOG.warning("[compiler] analyze failed: "
-                                    + e.getClass().getName() + ": " + e.getMessage());
-                        }
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                    return null;
-                });
-
-        this.task = holder.task;
-        this.trees = holder.trees;
-        this.elements = holder.elements;
-        this.types = holder.types;
-        this.roots = holder.roots;
-        this.diagnostics = new ArrayList<>(parent.diags);
-    }
-
-    Set<Path> needsAdditionalSources() {
-        var addFiles = new HashSet<Path>();
-        for (var err : parent.diags) {
-            var code = err.getCode();
-            if (code.equals("compiler.err.cant.resolve.location")) {
-                if (!isValidFileRange(err)) continue;
-                var className = errorText(err);
-                var pkg = packageName(err);
-                if (pkg != null) {
-                    var location = findPackagePrivateClass(pkg, className);
-                    if (location != FILE_NOT_FOUND) {
-                        addFiles.add(location);
-                    }
-                }
+    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean oneShot) {
+        if (files.isEmpty()) throw new IllegalArgumentException("No source files to analyze");
+        parent.prepareFileManager();
+        borrow = parent.compiler.borrow(parent.fileManager, diagnostics::add,
+                options(parent.classPath, parent.addExports, parent.extraArgs), files, oneShot);
+        task = borrow.task;
+        trees = Trees.instance(task);
+        elements = task.getElements();
+        types = task.getTypes();
+        var started = System.nanoTime();
+        var parsed = new HashSet<java.net.URI>();
+        var injector = new LombokStubInjector(borrow.task.getContext());
+        task.addTaskListener(new TaskListener() {
+            @Override public void finished(TaskEvent event) {
+                var unit = event.getCompilationUnit();
+                if (event.getKind() == TaskEvent.Kind.PARSE && unit != null
+                        && parsed.add(unit.getSourceFile().toUri())) injector.inject(unit);
             }
-            // Handle general missing symbols (stale .class files from edited dependencies)
-            if (code.equals("compiler.err.cant.resolve")) {
-                var symbolName = extractSymbolName(err);
-                if (symbolName != null && !symbolName.isEmpty()) {
-                    var location = findSourceFile(symbolName);
-                    if (location != FILE_NOT_FOUND) {
-                        LOG.info("[compile] stale-classfile: adding source for " + symbolName + " at " + location);
-                        addFiles.add(location);
-                    }
-                }
-            }
+        });
+        try {
+            task.parse().forEach(roots::add);
+            analyze();
+        } catch (IOException | RuntimeException | Error failure) {
+            borrow.invalidate();
+            borrow.close();
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
+            throw new RuntimeException(failure);
         }
-        return addFiles;
+        LOG.info("[analysis] context=" + borrow.id() + " reused=" + borrow.reused
+                + " proc=none requested=" + files.size() + " parsed=" + parsed.size()
+                + " diagnostics=" + diagnostics.size() + " ms=" + (System.nanoTime() - started) / 1_000_000);
     }
 
-    private String errorText(Diagnostic<? extends JavaFileObject> err) {
-        var file = Paths.get(err.getSource().toUri());
-        var contents = FileStore.contents(file);
-        var begin = (int) err.getStartPosition();
-        var end = (int) err.getEndPosition();
-        return contents.substring(begin, end);
-    }
-
-    private String packageName(Diagnostic<? extends JavaFileObject> err) {
-        var file = Paths.get(err.getSource().toUri());
-        return FileStore.packageName(file);
-    }
-
-    private static final Path FILE_NOT_FOUND = Paths.get("");
-
-    private Path findPackagePrivateClass(String packageName, String className) {
-        for (var file : FileStore.list(packageName)) {
-            var parse = Parser.parseJavaFileObject(new SourceFileObject(file));
-            for (var declaration : parse.root.getTypeDecls()) {
-                if (!(declaration instanceof ClassTree cls)) continue;
-                if (cls.getSimpleName().contentEquals(className)) {
-                    return file;
-                }
-            }
-        }
-        return FILE_NOT_FOUND;
-    }
-
-    /** Extract the missing symbol name from a "cannot resolve symbol" diagnostic.
-     *  The error message format is: "cannot find symbol\n  symbol:   method foo()\n  location: class Bar"
-     *  We extract the symbol name (without trailing () for methods). */
-    private String extractSymbolName(Diagnostic<? extends JavaFileObject> err) {
-        var msg = err.getMessage(java.util.Locale.US);
-        if (msg == null) return null;
-        var symbolPattern = java.util.regex.Pattern.compile("symbol:\\s+\\w+\\s+(\\S+)");
-        var matcher = symbolPattern.matcher(msg);
-        if (matcher.find()) {
-            var name = matcher.group(1);
-            if (name.endsWith("()")) name = name.substring(0, name.length() - 2);
-            return name;
-        }
-        return null;
-    }
-
-    /** Find a workspace source file that defines a type with the given simple name.
-     *  Searches all packages. Returns FILE_NOT_FOUND if nothing matches. */
-    private Path findSourceFile(String simpleName) {
-        for (var file : FileStore.all()) {
-            var fileName = file.getFileName().toString();
-            if (!fileName.endsWith(".java")) continue;
-            var fileBaseName = fileName.substring(0, fileName.length() - ".java".length());
-            if (!fileBaseName.equals(simpleName)) continue;
-            try {
-                var source = new SourceFileObject(file);
-                var parser = Parser.parseJavaFileObject(source);
-                for (var decl : parser.root.getTypeDecls()) {
-                    if (decl instanceof ClassTree cls) {
-                        if (cls.getSimpleName().toString().equals(simpleName)) {
-                            return file;
-                        }
-                    }
-                }
-            } catch (Exception ignored) {
-            }
-        }
-        return FILE_NOT_FOUND;
-    }
-
-    @Override
-    public void close() {
-        if (closed) return;
-        closed = true;
-        if (borrow != null) {
-            try {
-                borrow.close();
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
+    private void analyze() throws IOException {
+        try {
+            task.analyze();
+        } catch (RuntimeException | AssertionError failure) {
+            // Retain partial trees for navigation, but never reuse an internally failed context.
+            borrow.invalidate();
+            LOG.warning("[analysis] partial context=" + borrow.id() + " cause=" + failure);
         }
     }
+
+    @Override public void close() { borrow.close(); }
 
     static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();
@@ -229,11 +76,8 @@ public class CompileBatch implements AutoCloseable {
             Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         }
 
-        // Lombok AP intentionally disabled — types resolve from .class build output on classpath
-        Collections.addAll(list, "-proc:none");
         Collections.addAll(list, "-XDshould-stop.ifError=FLOW");
 
-        Collections.addAll(list, "-g");
         Collections.addAll(list, "-Xmaxerrs", "9999");
         Collections.addAll(list, "-Xmaxwarns", "9999");
         Collections.addAll(
@@ -247,14 +91,17 @@ public class CompileBatch implements AutoCloseable {
                 "-Xlint:unchecked",
                 "-Xlint:varargs",
                 "-Xlint:static");
-        list.addAll(extraArgs);
-        var sortedExports = new ArrayList<>(addExports);
-        Collections.sort(sortedExports);
-        for (var export : sortedExports) {
-            list.add("--add-exports");
-            list.add(export + "=ALL-UNNAMED");
+        list.addAll(analysisArguments(extraArgs));
+        // javac rejects --add-exports for system modules together with --release.
+        var release = extraArgs.stream().anyMatch(arg -> arg.equals("--release") || arg.startsWith("--release="));
+        if (!release) {
+            for (var export : new TreeSet<>(addExports)) {
+                list.add("--add-exports");
+                list.add(export + "=ALL-UNNAMED");
+            }
         }
 
+        Collections.addAll(list, "-proc:none", "-implicit:none", "-Xprefer:source");
         return list;
     }
 
@@ -281,10 +128,20 @@ public class CompileBatch implements AutoCloseable {
         try { return Integer.parseInt(value); } catch (NumberFormatException e) { return -1; }
     }
 
-    private boolean isValidFileRange(Diagnostic<? extends JavaFileObject> d) {
-        return d.getSource().toUri().getScheme().equals("file")
-                && d.getStartPosition() >= 0
-                && d.getEndPosition() >= 0;
+    /** Discard build-only options so settings cannot enable processors or class emission. */
+    private static List<String> analysisArguments(List<String> arguments) {
+        var result = new ArrayList<String>();
+        var operands = Set.of("-processor", "-processorpath", "--processor-path", "--processor-module-path", "-d", "-s", "-h");
+        for (int i = 0; i < arguments.size(); i++) {
+            var argument = arguments.get(i);
+            var name = argument.contains("=") ? argument.substring(0, argument.indexOf('=')) : argument;
+            if (operands.contains(name)) {
+                if (argument.equals(name) && i + 1 < arguments.size()) i++;
+            } else if (!argument.startsWith("-proc:") && !argument.startsWith("-A")
+                    && !argument.startsWith("-implicit:") && !argument.startsWith("-Xprefer:")) {
+                result.add(argument);
+            }
+        }
+        return result;
     }
-
 }

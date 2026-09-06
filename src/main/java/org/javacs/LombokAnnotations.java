@@ -4,15 +4,22 @@ import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ModifiersTree;
+import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.ImportTree;
+import com.sun.source.tree.AssignmentTree;
 import com.sun.source.util.TreeScanner;
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import javax.lang.model.element.Modifier;
 
 /**
@@ -39,6 +46,7 @@ public final class LombokAnnotations {
             Map.entry("Singular", "lombok"),
             Map.entry("CustomLog", "lombok"),
             Map.entry("SuperBuilder", "lombok.experimental"),
+            Map.entry("Accessors", "lombok.experimental"),
             Map.entry("NonFinal", "lombok.experimental"),
             Map.entry("Slf4j", "lombok.extern.slf4j"),
             Map.entry("XSlf4j", "lombok.extern.slf4j"),
@@ -58,8 +66,9 @@ public final class LombokAnnotations {
     public static final Set<String> KNOWN = ANNOTATION_PACKAGES.keySet().stream()
             .filter(name -> !name.equals("Singular")
                     && !name.equals("NonFinal")
+                    && !name.equals("Accessors")
                     && !name.equals("CustomLog"))
-            .collect(java.util.stream.Collectors.toUnmodifiableSet());
+            .collect(Collectors.toUnmodifiableSet());
 
     private static final Set<String> STRUCTURAL =
             Set.of(
@@ -174,6 +183,108 @@ public final class LombokAnnotations {
     }
 
     /**
+     * Resolved subset of {@code lombok.config} that JLS models. Only the keys listed below are
+     * honoured; everything else in the file is ignored. See README for the documented gaps.
+     */
+    public record LombokConfig(
+            List<String> accessorPrefixes,
+            boolean fluent,
+            boolean chain,
+            boolean capitalizeBeanFirst,
+            String logFieldName,
+            String customLogType) {
+        static final LombokConfig DEFAULT =
+                new LombokConfig(List.of(), false, false, false, DEFAULT_LOG_FIELD_NAME, null);
+    }
+
+    private static final ConcurrentHashMap<Path, LombokConfig> CONFIG_CACHE = new ConcurrentHashMap<>();
+    private static final Pattern CONFIG_LINE =
+            Pattern.compile("^\\s*([\\w.]+)\\s*(\\+=|=)\\s*(.*?)\\s*$");
+
+    /** Resolves the effective {@code lombok.config} for a source file, walking parent dirs. */
+    public static LombokConfig configFor(CompilationUnitTree root) {
+        if (root == null || root.getSourceFile() == null) return LombokConfig.DEFAULT;
+        try {
+            var uri = root.getSourceFile().toUri();
+            if (uri == null || !"file".equalsIgnoreCase(uri.getScheme())) return LombokConfig.DEFAULT;
+            var dir = Path.of(uri).toAbsolutePath().getParent();
+            return dir == null ? LombokConfig.DEFAULT : configForDir(dir);
+        } catch (RuntimeException e) {
+            return LombokConfig.DEFAULT;
+        }
+    }
+
+    private static LombokConfig configForDir(Path dir) {
+        var cached = CONFIG_CACHE.get(dir);
+        if (cached != null) return cached;
+        // Collect config files from the given directory upward, honouring config.stopBubbling.
+        var chain = new ArrayList<Path>();
+        for (var d = dir; d != null; d = d.getParent()) {
+            var file = d.resolve("lombok.config");
+            if (Files.isRegularFile(file)) {
+                chain.add(file);
+                if (stopsBubbling(file)) break;
+            }
+        }
+        // Apply nearest-last so nearer directories override farther ones for '=' assignments.
+        var prefixes = new ArrayList<String>();
+        var fluent = false;
+        var chained = false;
+        var capitalize = false;
+        var logField = DEFAULT_LOG_FIELD_NAME;
+        String customLogType = null;
+        for (int i = chain.size() - 1; i >= 0; i--) {
+            for (var line : readLines(chain.get(i))) {
+                var m = CONFIG_LINE.matcher(line);
+                if (!m.matches()) continue;
+                var key = m.group(1).toLowerCase();
+                var append = m.group(2).equals("+=");
+                var value = m.group(3);
+                switch (key) {
+                    case "lombok.accessors.prefix" -> {
+                        if (!append) prefixes.clear();
+                        for (var p : value.split("\\s+")) if (!p.isBlank()) prefixes.add(p.trim());
+                    }
+                    case "lombok.accessors.fluent" -> fluent = Boolean.parseBoolean(value);
+                    case "lombok.accessors.chain" -> chained = Boolean.parseBoolean(value);
+                    case "lombok.accessors.capitalization" ->
+                            capitalize = value.equalsIgnoreCase("beanspec");
+                    case "lombok.log.fieldname" -> {
+                        if (!value.isBlank()) logField = value;
+                    }
+                    case "lombok.log.custom.declaration" -> {
+                        var space = value.indexOf(' ');
+                        if (space > 0) customLogType = value.substring(0, space).trim();
+                    }
+                    default -> {}
+                }
+            }
+        }
+        var result = new LombokConfig(List.copyOf(prefixes), fluent, chained, capitalize, logField, customLogType);
+        CONFIG_CACHE.put(dir, result);
+        return result;
+    }
+
+    private static boolean stopsBubbling(Path file) {
+        for (var line : readLines(file)) {
+            var m = CONFIG_LINE.matcher(line);
+            if (m.matches() && m.group(1).equalsIgnoreCase("config.stopBubbling")
+                    && Boolean.parseBoolean(m.group(3))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static List<String> readLines(Path file) {
+        try {
+            return Files.readAllLines(file);
+        } catch (IOException e) {
+            return List.of();
+        }
+    }
+
+    /**
      * Resolves Lombok-generated accessor names for a field.
      *
      * <p>The caller supplies the class and field modifiers plus the field type/name. The result
@@ -220,24 +331,88 @@ public final class LombokAnnotations {
         if (!getterEnabled && !setterEnabled) {
             return Optional.empty();
         }
+
+        var config = configFor(root);
+        // Resolve the effective field name after stripping a configured accessor prefix. When any
+        // prefix is configured, Lombok gives NO accessors to fields that lack a listed prefix.
+        var baseName = fieldName;
+        if (!config.accessorPrefixes().isEmpty()) {
+            String stripped = null;
+            for (var prefix : config.accessorPrefixes()) {
+                if (fieldName.length() > prefix.length() && fieldName.startsWith(prefix)) {
+                    stripped = fieldName.substring(prefix.length());
+                    break;
+                }
+            }
+            if (stripped == null) return Optional.empty();
+            baseName = stripped;
+        }
+
+        // @Accessors(fluent/chain) on the class overrides config; fluent implies chain.
+        var fluent = config.fluent();
+        var chain = config.chain();
+        for (var annotation : classModifiers.getAnnotations()) {
+            if (!isLombokAnnotation(root, annotation)
+                    || !simpleName(annotation.getAnnotationType().toString()).equals("Accessors")) {
+                continue;
+            }
+            for (var argument : annotation.getArguments()) {
+                if (argument instanceof AssignmentTree assignment) {
+                    var arg = assignment.getVariable().toString();
+                    var val = Boolean.parseBoolean(assignment.getExpression().toString());
+                    if (arg.equals("fluent")) fluent = val;
+                    if (arg.equals("chain")) chain = val;
+                }
+            }
+        }
+        if (fluent) chain = true;
+
         var normalizedType = fieldType == null ? "" : fieldType.trim();
         var booleanField = isBooleanType(normalizedType);
-        var booleanPrefix = booleanField
-                && fieldName.length() > 2
-                && fieldName.startsWith("is")
-                && Character.isUpperCase(fieldName.charAt(2));
+        var booleanPrefix = !fluent
+                && booleanField
+                && baseName.length() > 2
+                && baseName.startsWith("is")
+                && Character.isUpperCase(baseName.charAt(2));
         var suffix = booleanPrefix
-                ? fieldName.substring(2)
-                : Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1);
+                ? baseName.substring(2)
+                : capitalize(baseName, config.capitalizeBeanFirst());
+        String getterName;
+        String setterName;
+        if (fluent) {
+            getterName = decapitalize(baseName);
+            setterName = decapitalize(baseName);
+        } else {
+            getterName = booleanPrefix ? baseName : (booleanField ? "is" : "get") + suffix;
+            setterName = "set" + suffix;
+        }
         return Optional.of(
                 new AccessorInfo(
                         fieldName,
                         normalizedType,
-                        getterEnabled ? (booleanPrefix ? fieldName : (booleanField ? "is" : "get") + suffix) : null,
-                        setterEnabled ? "set" + suffix : null));
+                        getterEnabled ? getterName : null,
+                        setterEnabled ? setterName : null,
+                        chain));
     }
 
-    public record AccessorInfo(String fieldName, String fieldType, String getterName, String setterName) {
+    /** Capitalizes the first letter for bean-style accessors, honouring beanspec capitalization. */
+    /** Default (basic) capitalisation, as used for generated member names. */
+    public static String capitalize(String name) {
+        return capitalize(name, false);
+    }
+
+    private static String capitalize(String name, boolean beanSpec) {
+        if (name.isEmpty()) return name;
+        // beanspec keeps a lowercase second-uppercase name (e.g. "uName" -> "getuName"); the
+        // default (basic) always uppercases the first char.
+        if (beanSpec && name.length() > 1 && Character.isUpperCase(name.charAt(1))) {
+            return name;
+        }
+        return Character.toUpperCase(name.charAt(0)) + name.substring(1);
+    }
+
+    public record AccessorInfo(
+            String fieldName, String fieldType, String getterName, String setterName, boolean chain) {
         public boolean hasGetter() {
             return getterName != null && !getterName.isBlank();
         }
@@ -245,6 +420,75 @@ public final class LombokAnnotations {
         public boolean hasSetter() {
             return setterName != null && !setterName.isBlank();
         }
+    }
+
+    /**
+     * Resolved {@code @Builder} naming options. Defaults match Lombok: {@code builder()} factory,
+     * {@code build()} terminal, {@code <Type>Builder} class, no setter prefix, no {@code toBuilder}.
+     * Only the naming/toBuilder arguments are modelled; other arguments keep Lombok's defaults.
+     */
+    public record BuilderOptions(
+            String builderMethodName,
+            String buildMethodName,
+            String builderClassName,
+            String setterPrefix,
+            boolean toBuilder) {}
+
+    /**
+     * Resolves the {@code @Builder} options declared on a class. {@code ownerSimpleName} is used to
+     * derive the default builder class name ({@code <Owner>Builder}).
+     */
+    public static BuilderOptions builderOptions(
+            CompilationUnitTree root, ModifiersTree classModifiers, String ownerSimpleName) {
+        var builderMethod = "builder";
+        var buildMethod = "build";
+        var builderClass = ownerSimpleName + "Builder";
+        var setterPrefix = "";
+        var toBuilder = false;
+        for (var annotation : classModifiers.getAnnotations()) {
+            if (!isLombokAnnotation(root, annotation)
+                    || !simpleName(annotation.getAnnotationType().toString()).equals("Builder")) {
+                continue;
+            }
+            for (var argument : annotation.getArguments()) {
+                if (!(argument instanceof AssignmentTree assignment)) continue;
+                var arg = assignment.getVariable().toString();
+                var expr = assignment.getExpression();
+                var literal = expr instanceof LiteralTree lit && lit.getValue() instanceof String s ? s : null;
+                switch (arg) {
+                    case "builderMethodName" -> { if (literal != null && !literal.isBlank()) builderMethod = literal; }
+                    case "buildMethodName" -> { if (literal != null && !literal.isBlank()) buildMethod = literal; }
+                    case "builderClassName" -> { if (literal != null && !literal.isBlank()) builderClass = literal; }
+                    case "setterPrefix" -> { if (literal != null) setterPrefix = literal; }
+                    case "toBuilder" -> toBuilder = Boolean.parseBoolean(expr.toString());
+                    default -> {}
+                }
+            }
+        }
+        return new BuilderOptions(builderMethod, buildMethod, builderClass, setterPrefix, toBuilder);
+    }
+
+    /**
+     * Applies a builder setter prefix to a base name, matching Lombok: with no prefix the base name
+     * is used verbatim; with a prefix the base name is capitalized and appended
+     * (e.g. prefix {@code with} + {@code id} → {@code withId}).
+     */
+    public static String prefixedBuilderName(String prefix, String baseName) {
+        if (prefix == null || prefix.isEmpty()) return baseName;
+        return prefix + capitalize(baseName, false);
+    }
+
+    /**
+     * Singular form for a {@code @Singular} field. An explicit {@code @Singular("name")} value wins;
+     * otherwise Lombok strips a trailing {@code "es"} or {@code "s"} (common cases only — no full
+     * English singularisation).
+     */
+    public static String singularName(String explicitValue, String fieldName) {
+        if (explicitValue != null && !explicitValue.isBlank()) return explicitValue;
+        if (fieldName.endsWith("ies") && fieldName.length() > 3) return fieldName.substring(0, fieldName.length() - 3) + "y";
+        if (fieldName.endsWith("es") && fieldName.length() > 2) return fieldName.substring(0, fieldName.length() - 2);
+        if (fieldName.endsWith("s") && fieldName.length() > 1) return fieldName.substring(0, fieldName.length() - 1);
+        return fieldName;
     }
 
     private static boolean hasAnnotation(ModifiersTree modifiers, Set<String> allowedSimpleNames) {

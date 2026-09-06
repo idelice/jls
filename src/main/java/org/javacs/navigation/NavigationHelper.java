@@ -103,9 +103,11 @@ public class NavigationHelper {
             return true;
         }
         switch (element.getKind()) {
+            case BINDING_VARIABLE:
             case EXCEPTION_PARAMETER:
             case LOCAL_VARIABLE:
             case PARAMETER:
+            case RESOURCE_VARIABLE:
             case TYPE_PARAMETER:
                 return true;
             default:

@@ -43,6 +43,31 @@ public class LSP {
 
     static class EndOfStream extends RuntimeException {}
 
+    /** Grace period for the dispatch thread to notice the closed stream and return normally. */
+    private static final long EXIT_GRACE_MS = 2000;
+
+    /**
+     * The editor is gone, so nothing in flight matters any more. The dispatch thread only sees the
+     * kill message when it polls the queue, which never happens while it is inside a long request,
+     * so exit on a timer instead of leaving an orphaned JVM holding its heap and child processes.
+     * {@code System.exit} runs the shutdown hooks, which destroy the build-tool subprocesses.
+     */
+    private static void forceExitAfterGrace() {
+        var watchdog = new Thread(
+                () -> {
+                    try {
+                        Thread.sleep(EXIT_GRACE_MS);
+                    } catch (InterruptedException interrupted) {
+                        return;
+                    }
+                    LOG.severe("Client disconnected while a request was running, exiting.");
+                    System.exit(1);
+                },
+                "jls-force-exit");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
     // TODO this seems like it's probably really inefficient. Read in bulk?
     private static char read(InputStream client) {
         try {
@@ -219,6 +244,7 @@ public class LSP {
 
             private boolean kill() {
                 LOG.info("Read stream has been closed, putting kill message onto queue...");
+                forceExitAfterGrace();
                 try {
                     pending.put(endOfStream);
                     return true;

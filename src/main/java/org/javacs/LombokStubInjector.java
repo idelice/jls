@@ -12,6 +12,7 @@ import com.sun.tools.javac.util.Context;
 import com.sun.tools.javac.util.List;
 import com.sun.tools.javac.util.Name;
 import com.sun.tools.javac.util.Names;
+import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
@@ -72,7 +73,7 @@ public class LombokStubInjector {
         var hasNoArgs = hasAnnotation(mods, "NoArgsConstructor");
         var hasAllArgs = hasAnnotation(mods, "AllArgsConstructor");
         var hasRequiredArgs = hasAnnotation(mods, "RequiredArgsConstructor");
-        var hasBuilder = hasAnnotation(mods, "Builder");
+        var hasBuilder = hasAnnotation(mods, "Builder") || hasAnnotation(mods, "SuperBuilder");
 
         if (classDecl.getKind() == Tree.Kind.INTERFACE
                 || classDecl.getKind() == Tree.Kind.ANNOTATION_TYPE) {
@@ -80,13 +81,15 @@ public class LombokStubInjector {
             return;
         }
 
+        if (hasValue) applyValueModifiers(classDecl);
+
         var accessorCount = injectAccessors(classDecl);
         var constructorCount = 0;
         var builderCount = 0;
         if (structural) {
             var instanceFields = collectInstanceFields(classDecl);
             var explicitConstructorWritten = hasExplicitConstructorAny(classDecl);
-            var simpleBuilder = hasBuilder && supportsSimpleBuilder(classDecl, instanceFields);
+            var simpleBuilder = hasBuilder && supportsSimpleBuilder(classDecl);
             constructorCount = injectConstructors(
                     classDecl,
                     instanceFields,
@@ -101,23 +104,20 @@ public class LombokStubInjector {
                 builderCount = injectBuilder(classDecl, instanceFields, explicitConstructorWritten);
             }
         }
-        if (structural || loggerCount > 0 || accessorCount > 0) {
-            LOG.info("[lombok-source-compile] class=" + classDecl.getSimpleName()
-                    + " accessors=" + accessorCount + " loggers=" + loggerCount
-                    + " constructors=" + constructorCount + " builders=" + builderCount);
-        }
         recurseNested(classDecl);
     }
 
     private int injectLogger(JCClassDecl classDecl) {
+        var config = LombokAnnotations.configFor(root);
+        var fieldName = config.logFieldName();
         if ((classDecl.getKind() == Tree.Kind.INTERFACE || classDecl.getKind() == Tree.Kind.ANNOTATION_TYPE)
                 || !LombokAnnotations.hasLoggingOnlyLombokAnnotation(root, classDecl.getModifiers())
-                || hasField(classDecl, LombokAnnotations.DEFAULT_LOG_FIELD_NAME)) {
+                || hasField(classDecl, fieldName)) {
             return 0;
         }
-        var loggerType = loggingType(classDecl.getModifiers());
+        var loggerType = loggingType(classDecl.getModifiers(), config);
         if (loggerType == null) return 0;
-        classDecl.defs = classDecl.defs.append(createLogField(loggerType));
+        classDecl.defs = classDecl.defs.append(createLogField(loggerType, fieldName));
         return 1;
     }
 
@@ -148,7 +148,8 @@ public class LombokStubInjector {
                 classDecl.defs = classDecl.defs.append(
                         createSetter(
                                 info.setterName(), field.vartype, fieldName,
-                                accessorFlags(classModifiers, field.getModifiers(), "Setter")));
+                                accessorFlags(classModifiers, field.getModifiers(), "Setter"),
+                                info.chain() ? classDecl : null));
                 injected++;
             }
         }
@@ -387,33 +388,15 @@ public class LombokStubInjector {
         if (classDecl.getKind() == Tree.Kind.ENUM
                 || classDecl.getKind() == Tree.Kind.RECORD
                 || (classDecl.mods.flags & Flags.ABSTRACT) != 0) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=unsupported-class-kind");
             return 0;
         }
         if (hasAnnotation(classDecl.getModifiers(), "SuperBuilder")) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
-                    + " reason=super-builder");
-            return 0;
-        }
-        for (var field : fields) {
-            if (hasAnnotation(field.getModifiers(), "Singular")) {
-                LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
-                        + " reason=singular-field");
-                return 0;
-            }
-        }
-        for (var annotation : classDecl.getModifiers().getAnnotations()) {
-            if (LombokAnnotations.isLombokAnnotation(root, annotation)
-                    && LombokAnnotations.simpleName(annotation.getAnnotationType().toString()).equals("Builder")
-                    && !annotation.getArguments().isEmpty()) {
-                LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
-                        + " reason=builder-options");
-                return 0;
-            }
+            return injectSuperBuilder(classDecl, fields);
         }
         if (explicitConstructorWritten) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=explicit-constructor");
             return 0;
         }
@@ -424,135 +407,369 @@ public class LombokStubInjector {
                         && !hasAnnotation(f.getModifiers(), "NonFinal")))
                 .collect(List.collector());
         if (!hasExplicitConstructor(classDecl, constructorFields.size())) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=no-all-args-constructor");
             return 0;
         }
         if (!classDecl.typarams.isEmpty()) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=generic-type");
             return 0;
         }
-        var builderName = classDecl.getSimpleName().toString() + "Builder";
+        var options = LombokAnnotations.builderOptions(
+                root, classDecl.getModifiers(), classDecl.getSimpleName().toString());
+        var builderName = options.builderClassName();
         if (hasNestedClass(classDecl, builderName)) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=explicit-builder-type");
             return 0;
         }
-        if (hasExplicitMethod(classDecl, "builder", 0)) {
-            LOG.info("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+        if (hasExplicitMethod(classDecl, options.builderMethodName(), 0)) {
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
                     + " reason=explicit-builder-method");
             return 0;
         }
 
         var builderType = names.fromString(builderName);
-        var builderFields = fields.stream()
-                .map(field -> make.VarDef(
+        var members = new java.util.ArrayList<JCTree>();
+        var injected = 0;
+        for (var field : fields) {
+            var singular = singularValue(field);
+            if (singular.isPresent()) {
+                // @Singular: add per-element adder(s), a bulk setter and a clear method.
+                var typeArgs = typeArguments(field.vartype);
+                var adder = LombokAnnotations.prefixedBuilderName(
+                        options.setterPrefix(),
+                        LombokAnnotations.singularName(singular.get(), field.name.toString()));
+                if (typeArgs.size() == 2) {
+                    members.add(createMapAdder(builderType, adder, typeArgs.get(0), typeArgs.get(1)));
+                    members.add(createBulkSetter(builderType, prefixed(options, field.name.toString()),
+                            field.name, wildcardMap(typeArgs.get(0), typeArgs.get(1))));
+                } else {
+                    var element = typeArgs.isEmpty() ? objectType() : typeArgs.get(0);
+                    members.add(createElementAdder(builderType, adder, element));
+                    members.add(createBulkSetter(builderType, prefixed(options, field.name.toString()),
+                            field.name, wildcardCollection(element)));
+                }
+                members.add(createClearMethod(builderType, "clear" + LombokAnnotations.capitalize(field.name.toString())));
+                injected += 3;
+            } else {
+                members.add(make.VarDef(
                         make.Modifiers(Flags.PRIVATE | Flags.GENERATED_MEMBER),
-                        field.name,
-                        cloneType(field.vartype),
-                        null))
-                .<JCTree>map(field -> field)
-                .collect(List.collector());
-        var builderMethods = fields.stream()
-                .map(field -> createBuilderSetter(builderType, field))
-                .<JCTree>map(method -> method)
-                .collect(List.collector());
-        builderMethods = builderMethods.append(createBuilderBuildMethod(classDecl, constructorFields));
+                        field.name, cloneType(field.vartype), null));
+                members.add(createBuilderSetter(builderType, prefixed(options, field.name.toString()), field));
+                injected += 2;
+            }
+        }
+        members.add(createBuilderBuildMethod(classDecl, options.buildMethodName()));
         var builderClass = make.ClassDef(
                 make.Modifiers(Flags.PUBLIC | Flags.STATIC | Flags.GENERATED_MEMBER),
                 builderType,
                 List.nil(),
                 null,
                 List.nil(),
-                builderFields.appendList(builderMethods));
+                List.from(members));
         classDecl.defs = classDecl.defs.append(builderClass);
-        classDecl.defs = classDecl.defs.append(createBuilderFactory(builderType));
-        return fields.size() + 2;
+        classDecl.defs = classDecl.defs.append(
+                createBuilderFactory(options.builderMethodName(), builderType));
+        injected += 2;
+        if (options.toBuilder()) {
+            classDecl.defs = classDecl.defs.append(createToBuilder(builderType));
+            injected++;
+        }
+        return injected;
     }
 
-    private boolean supportsSimpleBuilder(JCClassDecl classDecl, List<JCVariableDecl> fields) {
-        if (classDecl.getKind() == Tree.Kind.ENUM
-                || classDecl.getKind() == Tree.Kind.RECORD
-                || (classDecl.mods.flags & Flags.ABSTRACT) != 0
-                || hasAnnotation(classDecl.getModifiers(), "SuperBuilder")) {
-            return false;
+    /**
+     * Models {@code @SuperBuilder}. Reproduces Lombok's self-referencing builder shape so the
+     * consumer resolves: an abstract nested {@code <Owner>Builder<C extends Owner, B extends
+     * <Owner>Builder<C,B>>} whose per-field setters return {@code B}, a {@code builder()} factory
+     * returning {@code <Owner>Builder<?,?>}, and abstract {@code self()}/{@code build()}. When the
+     * class extends another type the builder extends {@code <Super>.<Super>Builder<C,B>}, so the
+     * parent's setters are inherited without any cross-file lookup (Lombok requires the parent to
+     * also be {@code @SuperBuilder}, which supplies that nested type on the source path).
+     *
+     * <p>Only naming options that also apply to {@code @SuperBuilder} would matter here; the fixture
+     * needs none, so this uses Lombok's defaults ({@code builder}/{@code build}, {@code <Type>Builder},
+     * no setter prefix). If custom options are ever needed, extend via {@link
+     * LombokAnnotations#builderOptions}.
+     */
+    private int injectSuperBuilder(JCClassDecl classDecl, List<JCVariableDecl> fields) {
+        var options = LombokAnnotations.builderOptions(
+                root, classDecl.getModifiers(), classDecl.getSimpleName().toString());
+        var builderName = options.builderClassName();
+        if (hasNestedClass(classDecl, builderName)
+                || hasExplicitMethod(classDecl, options.builderMethodName(), 0)) {
+            LOG.fine("[lombok-source-compile] builder=skipped class=" + classDecl.getSimpleName()
+                    + " reason=explicit-super-builder");
+            return 0;
         }
+        var owner = classDecl.getSimpleName().toString();
+        var builderType = names.fromString(builderName);
+        var cName = names.fromString("C");
+        var bName = names.fromString("B");
+
+        // <C extends Owner, B extends OwnerBuilder<C,B>>
+        var cParam = make.TypeParameter(cName, List.of(make.Ident(classDecl.name)));
+        var bParam = make.TypeParameter(
+                bName,
+                List.of(make.TypeApply(
+                        make.Ident(builderType), List.of(make.Ident(cName), make.Ident(bName)))));
+
+        // extends Super.SuperBuilder<C,B> when there is a (non-Object) superclass.
+        JCExpression extendsClause = null;
+        var superName = superclassSimpleName(classDecl);
+        if (superName != null) {
+            var superBuilder = make.Select(
+                    make.Ident(names.fromString(superName)),
+                    names.fromString(superName + "Builder"));
+            extendsClause = make.TypeApply(
+                    superBuilder, List.of(make.Ident(cName), make.Ident(bName)));
+        }
+
+        var members = new java.util.ArrayList<JCTree>();
+        var injected = 0;
+        // Per-field setters returning B (the concrete builder subtype).
         for (var field : fields) {
-            if (hasAnnotation(field.getModifiers(), "Singular")) return false;
+            var param = make.VarDef(
+                    make.Modifiers(Flags.PARAMETER), field.name, cloneType(field.vartype), null);
+            var body = make.Block(0L, List.of(
+                    make.Return(make.Apply(
+                            List.nil(), make.Ident(names.fromString("self")), List.nil()))));
+            members.add(make.MethodDef(
+                    make.Modifiers(Flags.PUBLIC | Flags.GENERATED_MEMBER),
+                    names.fromString(prefixed(options, field.name.toString())),
+                    make.Ident(bName),
+                    List.nil(), List.of(param), List.nil(),
+                    body, null));
+            injected++;
         }
-        for (var annotation : classDecl.getModifiers().getAnnotations()) {
-            if (LombokAnnotations.isLombokAnnotation(root, annotation)
-                    && LombokAnnotations.simpleName(annotation.getAnnotationType().toString()).equals("Builder")
-                    && !annotation.getArguments().isEmpty()) {
-                return false;
-            }
-        }
-        return true;
+        // protected abstract B self();
+        members.add(make.MethodDef(
+                make.Modifiers(Flags.PROTECTED | Flags.ABSTRACT | Flags.GENERATED_MEMBER),
+                names.fromString("self"),
+                make.Ident(bName),
+                List.nil(), List.nil(), List.nil(),
+                null, null));
+        // public abstract C build();
+        members.add(make.MethodDef(
+                make.Modifiers(Flags.PUBLIC | Flags.ABSTRACT | Flags.GENERATED_MEMBER),
+                names.fromString(options.buildMethodName()),
+                make.Ident(cName),
+                List.nil(), List.nil(), List.nil(),
+                null, null));
+
+        var builderClass = make.ClassDef(
+                make.Modifiers(Flags.PUBLIC | Flags.STATIC | Flags.ABSTRACT | Flags.GENERATED_MEMBER),
+                builderType,
+                List.of(cParam, bParam),
+                extendsClause,
+                List.nil(),
+                List.from(members));
+        classDecl.defs = classDecl.defs.append(builderClass);
+        injected++;
+
+        // public static OwnerBuilder<?,?> builder() { return null; }
+        var wildcardBuilder = make.TypeApply(
+                make.Ident(builderType),
+                List.of(make.Wildcard(make.TypeBoundKind(com.sun.tools.javac.code.BoundKind.UNBOUND), null),
+                        make.Wildcard(make.TypeBoundKind(com.sun.tools.javac.code.BoundKind.UNBOUND), null)));
+        classDecl.defs = classDecl.defs.append(make.MethodDef(
+                make.Modifiers(Flags.PUBLIC | Flags.STATIC | Flags.GENERATED_MEMBER),
+                names.fromString(options.builderMethodName()),
+                wildcardBuilder,
+                List.nil(), List.nil(), List.nil(),
+                make.Block(0L, List.of(make.Return(make.Literal(TypeTag.BOT, null)))),
+                null));
+        injected++;
+
+        LOG.fine("[lombok-source-compile] super-builder class=" + owner
+                + " super=" + (superName == null ? "-" : superName)
+                + " setters=" + fields.size());
+        return injected;
     }
 
-    private JCMethodDecl createBuilderFactory(Name builderType) {
+    /** Simple name of the extends clause, or null when the class extends Object/nothing. */
+    private String superclassSimpleName(JCClassDecl classDecl) {
+        var extending = classDecl.extending;
+        if (extending == null) return null;
+        var name = simpleTypeName(extending);
+        return name == null || name.equals("Object") ? null : name;
+    }
+
+    private String simpleTypeName(JCExpression type) {
+        if (type instanceof JCTypeApply apply) return simpleTypeName(apply.clazz);
+        if (type instanceof JCFieldAccess select) return select.name.toString();
+        if (type instanceof JCIdent ident) return ident.name.toString();
+        return null;
+    }
+
+    private String prefixed(LombokAnnotations.BuilderOptions options, String fieldName) {
+        return LombokAnnotations.prefixedBuilderName(options.setterPrefix(), fieldName);
+    }
+
+    /** Returns the {@code @Singular} explicit value ("" if none), or empty if not @Singular. */
+    private java.util.Optional<String> singularValue(JCVariableDecl field) {
+        for (var annotation : field.getModifiers().getAnnotations()) {
+            if (!LombokAnnotations.isLombokAnnotation(root, annotation)
+                    || !LombokAnnotations.simpleName(annotation.getAnnotationType().toString())
+                            .equals("Singular")) {
+                continue;
+            }
+            for (var argument : annotation.getArguments()) {
+                if (argument instanceof LiteralTree literal
+                        && literal.getValue() instanceof String value) {
+                    return java.util.Optional.of(value);
+                }
+                if (argument instanceof AssignmentTree assignment
+                        && assignment.getVariable().toString().equals("value")
+                        && assignment.getExpression() instanceof LiteralTree literal
+                        && literal.getValue() instanceof String value) {
+                    return java.util.Optional.of(value);
+                }
+            }
+            return Optional.of("");
+        }
+        return Optional.empty();
+    }
+
+    private List<JCExpression> typeArguments(JCExpression type) {
+        if (type instanceof JCTypeApply apply) return apply.arguments;
+        return List.nil();
+    }
+
+    private JCExpression objectType() {
+        return make.Ident(names.fromString("Object"));
+    }
+
+    /** {@code java.util.Collection<? extends E>}. */
+    private JCExpression wildcardCollection(JCExpression element) {
+        return make.TypeApply(qualifiedType("java.util.Collection"), List.of(extendsWildcard(element)));
+    }
+
+    /** {@code java.util.Map<? extends K, ? extends V>}. */
+    private JCExpression wildcardMap(JCExpression key, JCExpression value) {
+        return make.TypeApply(
+                qualifiedType("java.util.Map"),
+                List.of(extendsWildcard(key), extendsWildcard(value)));
+    }
+
+    private JCExpression extendsWildcard(JCExpression bound) {
+        return make.Wildcard(
+                make.TypeBoundKind(com.sun.tools.javac.code.BoundKind.EXTENDS), cloneType(bound));
+    }
+
+    /** Lombok itself rejects a plain @Builder on these; @SuperBuilder is generated separately. */
+    private boolean supportsSimpleBuilder(JCClassDecl classDecl) {
+        return classDecl.getKind() != Tree.Kind.ENUM
+                && classDecl.getKind() != Tree.Kind.RECORD
+                && (classDecl.mods.flags & Flags.ABSTRACT) == 0
+                && !hasAnnotation(classDecl.getModifiers(), "SuperBuilder");
+    }
+
+    private JCMethodDecl createBuilderFactory(String factoryName, Name builderType) {
         var body = make.Block(0L, List.of(
-                make.Return(make.NewClass(
-                        null, List.nil(), make.Ident(builderType), List.nil(), null))));
+                make.Return(make.NewClass(null, List.nil(), make.Ident(builderType), List.nil(), null))));
         return make.MethodDef(
                 make.Modifiers(Flags.PUBLIC | Flags.STATIC | Flags.GENERATED_MEMBER),
-                names.fromString("builder"),
+                names.fromString(factoryName),
                 make.Ident(builderType),
-                List.nil(),
-                List.nil(),
-                List.nil(),
-                body,
-                null);
+                List.nil(), List.nil(), List.nil(),
+                body, null);
     }
 
-    private JCMethodDecl createBuilderSetter(Name builderType, JCVariableDecl field) {
+    /** Instance {@code toBuilder()} returning the builder type. */
+    private JCMethodDecl createToBuilder(Name builderType) {
+        var body = make.Block(0L, List.of(
+                make.Return(make.NewClass(null, List.nil(), make.Ident(builderType), List.nil(), null))));
+        return make.MethodDef(
+                make.Modifiers(Flags.PUBLIC | Flags.GENERATED_MEMBER),
+                names.fromString("toBuilder"),
+                make.Ident(builderType),
+                List.nil(), List.nil(), List.nil(),
+                body, null);
+    }
+
+    private JCMethodDecl createBuilderSetter(Name builderType, String methodName, JCVariableDecl field) {
         var param = make.VarDef(
-                make.Modifiers(Flags.PARAMETER),
-                field.name,
-                cloneType(field.vartype),
-                null);
-        var body = make.Block(0L, List.of(
-                make.Exec(make.Assign(
-                        make.Select(make.Ident(names.fromString("this")), field.name),
-                        make.Ident(field.name))),
-                make.Return(make.Ident(names.fromString("this")))));
+                make.Modifiers(Flags.PARAMETER), field.name, cloneType(field.vartype), null);
+        return builderReturningMethod(builderType, methodName, List.of(param));
+    }
+
+    /** Singular collection adder: {@code Builder withElement(E element)}. */
+    private JCMethodDecl createElementAdder(Name builderType, String methodName, JCExpression element) {
+        var param = make.VarDef(
+                make.Modifiers(Flags.PARAMETER), names.fromString("item"), cloneType(element), null);
+        return builderReturningMethod(builderType, methodName, List.of(param));
+    }
+
+    /** Singular map adder: {@code Builder withEntry(K key, V value)}. */
+    private JCMethodDecl createMapAdder(
+            Name builderType, String methodName, JCExpression key, JCExpression value) {
+        var keyParam = make.VarDef(
+                make.Modifiers(Flags.PARAMETER), names.fromString("key"), cloneType(key), null);
+        var valueParam = make.VarDef(
+                make.Modifiers(Flags.PARAMETER), names.fromString("value"), cloneType(value), null);
+        return builderReturningMethod(builderType, methodName, List.of(keyParam, valueParam));
+    }
+
+    /** Bulk setter accepting a wildcard Collection/Map. */
+    private JCMethodDecl createBulkSetter(
+            Name builderType, String methodName, Name paramName, JCExpression paramType) {
+        var param = make.VarDef(make.Modifiers(Flags.PARAMETER), paramName, paramType, null);
+        return builderReturningMethod(builderType, methodName, List.of(param));
+    }
+
+    private JCMethodDecl createClearMethod(Name builderType, String methodName) {
+        return builderReturningMethod(builderType, methodName, List.nil());
+    }
+
+    /** A builder method returning {@code this} (the builder), with the given params. */
+    private JCMethodDecl builderReturningMethod(
+            Name builderType, String methodName, List<JCVariableDecl> params) {
+        var body = make.Block(0L, List.of(make.Return(make.Ident(names.fromString("this")))));
         return make.MethodDef(
                 make.Modifiers(Flags.PUBLIC | Flags.GENERATED_MEMBER),
-                field.name,
+                names.fromString(methodName),
                 make.Ident(builderType),
-                List.nil(),
-                List.of(param),
-                List.nil(),
-                body,
-                null);
+                List.nil(), params, List.nil(),
+                body, null);
     }
 
-    private JCMethodDecl createBuilderBuildMethod(JCClassDecl owner, List<JCVariableDecl> fields) {
-        var arguments = fields.stream()
-                .<JCExpression>map(field -> make.Select(
-                        make.Ident(names.fromString("this")), field.name))
-                .collect(List.collector());
-        var body = make.Block(0L, List.of(
-                make.Return(make.NewClass(
-                        null,
-                        List.nil(),
-                        make.Ident(owner.name),
-                        arguments,
-                        null))));
+    private JCMethodDecl createBuilderBuildMethod(JCClassDecl owner, String buildMethodName) {
+        var body = make.Block(0L, List.of(make.Return(make.Literal(TypeTag.BOT, null))));
         return make.MethodDef(
                 make.Modifiers(Flags.PUBLIC | Flags.GENERATED_MEMBER),
-                names.fromString("build"),
+                names.fromString(buildMethodName),
                 make.Ident(owner.name),
-                List.nil(),
-                List.nil(),
-                List.nil(),
-                body,
-                null);
+                List.nil(), List.nil(), List.nil(),
+                body, null);
     }
 
-    private void recurseNested(JCClassDecl classDecl) {
+    /**
+     * Applies the implicit modifiers Lombok's {@code @Value} adds: the class becomes {@code final}
+     * and every non-static instance field becomes {@code private final} (unless {@code @NonFinal}).
+     * This only affects diagnostics (e.g. reassigning a value field is an error).
+     */
+    private void applyValueModifiers(JCClassDecl classDecl) {
+        if (!hasAnnotation(classDecl.getModifiers(), "NonFinal")) {
+            classDecl.mods.flags |= Flags.FINAL;
+        }
         for (var member : classDecl.defs) {
+            if (!(member instanceof JCVariableDecl field)
+                    || (field.mods.flags & Flags.STATIC) != 0
+                    || (field.mods.flags & Flags.ENUM) != 0
+                    || hasAnnotation(field.getModifiers(), "NonFinal")) {
+                continue;
+            }
+            field.mods.flags |= Flags.FINAL;
+            if ((field.mods.flags & (Flags.PUBLIC | Flags.PROTECTED | Flags.PRIVATE)) == 0) {
+                field.mods.flags |= Flags.PRIVATE;
+            }
+        }
+    }
+
+    private void recurseNested(JCClassDecl classDecl) {        for (var member : classDecl.defs) {
             if (member instanceof JCClassDecl nested) {
                 injectClass(nested);
             }
@@ -589,24 +806,30 @@ public class LombokStubInjector {
     }
 
     private JCMethodDecl createSetter(
-            String methodName, JCExpression fieldType, String fieldName, long accessFlags) {
+            String methodName, JCExpression fieldType, String fieldName, long accessFlags,
+            JCClassDecl chainOwner) {
         var param = make.VarDef(
                 make.Modifiers(Flags.PARAMETER),
                 names.fromString(fieldName),
                 cloneType(fieldType),
                 null);
-        var body = make.Block(0L, List.of(
-                make.Exec(make.Assign(
-                        make.Select(make.Ident(names.fromString("this")), names.fromString(fieldName)),
-                        make.Ident(names.fromString(fieldName))))));
+        var assign = make.Exec(make.Assign(
+                make.Select(make.Ident(names.fromString("this")), names.fromString(fieldName)),
+                make.Ident(names.fromString(fieldName))));
+        var statements = chainOwner == null
+                ? List.<JCStatement>of(assign)
+                : List.<JCStatement>of(assign, make.Return(make.Ident(names.fromString("this"))));
+        var returnType = chainOwner == null
+                ? make.TypeIdent(TypeTag.VOID)
+                : ownerType(chainOwner);
         return make.MethodDef(
                 make.Modifiers(accessFlags | Flags.GENERATED_MEMBER),
                 names.fromString(methodName),
-                make.TypeIdent(TypeTag.VOID),
+                returnType,
                 List.nil(),
                 List.of(param),
                 List.nil(),
-                body,
+                make.Block(0L, statements),
                 null);
     }
 
@@ -639,10 +862,10 @@ public class LombokStubInjector {
                 null);
     }
 
-    private JCVariableDecl createLogField(String typeName) {
+    private JCVariableDecl createLogField(String typeName, String fieldName) {
         return make.VarDef(
                 make.Modifiers(Flags.PRIVATE | Flags.STATIC | Flags.FINAL | Flags.GENERATED_MEMBER),
-                names.fromString(LombokAnnotations.DEFAULT_LOG_FIELD_NAME),
+                names.fromString(fieldName),
                 qualifiedType(typeName),
                 make.Literal(TypeTag.BOT, null));
     }
@@ -654,7 +877,7 @@ public class LombokStubInjector {
         return result;
     }
 
-    private String loggingType(ModifiersTree mods) {
+    private String loggingType(ModifiersTree mods, LombokAnnotations.LombokConfig config) {
         for (var annotation : mods.getAnnotations()) {
             if (!LombokAnnotations.isLombokAnnotation(root, annotation)) continue;
             var name = LombokAnnotations.simpleName(annotation.getAnnotationType().toString());
@@ -668,7 +891,8 @@ public class LombokStubInjector {
                 case "JBossLog": return "org.jboss.logging.Logger";
                 case "Log": return "java.util.logging.Logger";
                 case "CustomLog":
-                    LOG.info("[lombok-source-compile] logger=unsupported CustomLog");
+                    if (config.customLogType() != null) return config.customLogType();
+                    LOG.fine("[lombok-source-compile] logger=unsupported CustomLog (no lombok.log.custom.declaration)");
                     return null;
                 default: continue;
             }
