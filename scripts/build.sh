@@ -73,6 +73,6 @@ fi
 
 JAVA_HOME="$JAVA_HOME" PATH="$JAVA_HOME/bin:$PATH" \
   MAVEN_OPTS="-Djava.util.logging.config.file=$LOGGING_CONFIG ${MAVEN_OPTS:-}" \
-  mvn package -DskipTests
+  mvn package -Dmaven.test.skip=true
 
 echo "JLS build completed with Java $JDK_VERSION_FULL"
