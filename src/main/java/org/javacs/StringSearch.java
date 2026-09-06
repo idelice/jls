@@ -3,7 +3,6 @@ package org.javacs;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.CharacterCodingException;
 import java.nio.file.*;
@@ -197,70 +196,35 @@ public class StringSearch {
         }
     }
 
-    private static final ByteBuffer SEARCH_BUFFER = ByteBuffer.allocateDirect(1024 * 1024);
-
     // TODO cache the progress made by searching shorter queries
     static boolean containsWordMatching(Path java, String query) {
-        if (FileStore.activeDocuments().contains(java)) {
-            var text = FileStore.contents(java);
-            return matchesTitleCase(text, query);
-        }
-        try (var channel = FileChannel.open(java)) {
-            // Read up to 1 MB of data from file
-            var limit = Math.min((int) channel.size(), SEARCH_BUFFER.capacity());
-            SEARCH_BUFFER.position(0);
-            SEARCH_BUFFER.limit(limit);
-            channel.read(SEARCH_BUFFER);
-            SEARCH_BUFFER.position(0);
-            var chars = StandardCharsets.UTF_8.decode(SEARCH_BUFFER);
-            return matchesTitleCase(chars, query);
-        } catch (NoSuchFileException e) {
-            LOG.warning(e.getMessage());
-            return false;
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        return matchesTitleCase(new String(readBytes(java), StandardCharsets.UTF_8), query);
     }
 
     static boolean containsWord(Path java, String query) {
-        var search = new StringSearch(query);
-        if (FileStore.activeDocuments().contains(java)) {
-            var text = FileStore.contents(java).getBytes();
-            return search.nextWord(text) != -1;
-        }
-        try (var channel = FileChannel.open(java)) {
-            // Read up to 1 MB of data from file
-            var limit = Math.min((int) channel.size(), SEARCH_BUFFER.capacity());
-            SEARCH_BUFFER.position(0);
-            SEARCH_BUFFER.limit(limit);
-            channel.read(SEARCH_BUFFER);
-            SEARCH_BUFFER.position(0);
-            return search.nextWord(SEARCH_BUFFER) != -1;
-        } catch (NoSuchFileException e) {
-            LOG.warning(e.getMessage());
-            return false;
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        return containsAnyWord(java, List.of(new StringSearch(query)));
+    }
+
+    static boolean containsAnyWord(Path java, Collection<StringSearch> searches) {
+        if (searches.isEmpty()) return false;
+        var text = readBytes(java);
+        return searches.stream().anyMatch(search -> search.nextWord(text) != -1);
     }
 
     private static boolean containsString(Path java, String query) {
         var search = new StringSearch(query);
+        return search.next(readBytes(java)) != -1;
+    }
+
+    private static byte[] readBytes(Path java) {
         if (FileStore.activeDocuments().contains(java)) {
-            var text = FileStore.contents(java).getBytes();
-            return search.next(text) != -1;
+            return FileStore.contents(java).getBytes(StandardCharsets.UTF_8);
         }
-        try (var channel = FileChannel.open(java)) {
-            // Read up to 1 MB of data from file
-            var limit = Math.min((int) channel.size(), SEARCH_BUFFER.capacity());
-            SEARCH_BUFFER.position(0);
-            SEARCH_BUFFER.limit(limit);
-            channel.read(SEARCH_BUFFER);
-            SEARCH_BUFFER.position(0);
-            return search.next(SEARCH_BUFFER) != -1;
+        try {
+            return Files.readAllBytes(java);
         } catch (NoSuchFileException e) {
             LOG.warning(e.getMessage());
-            return false;
+            return new byte[0];
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -334,21 +298,17 @@ public class StringSearch {
     private static Cache<String, Boolean> cacheContainsClass = new Cache<>("string_search.contains_class");
 
     private static boolean containsClass(Path file, String simpleName) {
-        if (cacheContainsClass.needs(file, simpleName)) {
-            cacheContainsClass.load(file, simpleName, containsString(file, "class " + simpleName));
-            // TODO verify this by actually parsing the file
-        }
-        return cacheContainsClass.get(file, simpleName);
+        // TODO verify this by actually parsing the file
+        return cacheContainsClass.getOrLoad(
+                file, simpleName, () -> containsString(file, "class " + simpleName));
     }
 
     private static Cache<String, Boolean> cacheContainsInterface = new Cache<>("string_search.contains_interface");
 
     private static boolean containsInterface(Path file, String simpleName) {
-        if (cacheContainsInterface.needs(file, simpleName)) {
-            cacheContainsInterface.load(file, simpleName, containsString(file, "interface " + simpleName));
-            // TODO verify this by actually parsing the file
-        }
-        return cacheContainsInterface.get(file, simpleName);
+        // TODO verify this by actually parsing the file
+        return cacheContainsInterface.getOrLoad(
+                file, simpleName, () -> containsString(file, "interface " + simpleName));
     }
 
     // TODO this doesn't work for inner classes, eliminate
@@ -370,13 +330,14 @@ public class StringSearch {
         return parts[parts.length - 1];
     }
 
+    private static final Pattern PACKAGE_LINE = Pattern.compile("^package +(.*);");
+    private static final Pattern CLASS_START = Pattern.compile("^[\\w ]*class +\\w+");
+
     static String packageName(Path file) throws CharacterCodingException {
-        var packagePattern = Pattern.compile("^package +(.*);");
-        var startOfClass = Pattern.compile("^[\\w ]*class +\\w+");
         try (var lines = FileStore.lines(file)) {
             for (var line = lines.readLine(); line != null; line = lines.readLine()) {
-                if (startOfClass.matcher(line).find()) return "";
-                var matchPackage = packagePattern.matcher(line);
+                if (CLASS_START.matcher(line).find()) return "";
+                var matchPackage = PACKAGE_LINE.matcher(line);
                 if (matchPackage.matches()) {
                     var id = matchPackage.group(1);
                     return id;

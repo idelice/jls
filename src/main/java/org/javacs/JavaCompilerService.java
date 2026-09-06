@@ -1,8 +1,6 @@
 package org.javacs;
 
-import java.io.File;
 import java.io.IOException;
-import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,36 +12,31 @@ import java.util.stream.Collectors;
 import javax.tools.*;
 import org.javacs.completion.ExternalBinaryDecompiler;
 
-class JavaCompilerService implements CompilerProvider {
+class JavaCompilerService implements CompilerProvider, AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
 
-    // classpath is effectively immutable per compiler instance.
-    // Upgrade: addClassPathEntries() for multi-module support.
-    volatile Set<Path> classPath;
+    final Set<Path> classPath;
     final Set<Path> docPath;
     final Set<String> addExports;
     final List<String> extraArgs;
     final ReusableCompiler compiler = new ReusableCompiler();
     final Set<String> jdkClasses, classPathClasses;
     final boolean lombokPresentOnClasspath;
-    final List<Diagnostic<? extends JavaFileObject>> diags = new ArrayList<>();
-    final SourceFileManager fileManager;
+    SourceFileManager fileManager;
+    private long sourceRevision = -1;
     final SourceFileManager docsFileManager;
-    private ModuleGraph moduleGraph = ModuleGraph.EMPTY;
     private Set<Path> sourceRoots = Set.of();
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
-        this.classPath = Collections.unmodifiableSet(classPath);
-        this.docPath = Collections.unmodifiableSet(docPath);
-        this.addExports = Collections.unmodifiableSet(addExports);
+        this.classPath = Set.copyOf(classPath);
+        this.docPath = Set.copyOf(docPath);
+        this.addExports = Set.copyOf(addExports);
         this.extraArgs = List.copyOf(extraArgs);
         this.jdkClasses = ScanClassPath.jdkTopLevelClasses();
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
-        this.lombokPresentOnClasspath = classPath.stream().anyMatch(p -> {
-            var name = p.getFileName().toString().toLowerCase();
-            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
-        }) && workspaceUsesLombok();
-        this.fileManager = new SourceFileManager();
+        this.lombokPresentOnClasspath = lombokPresentOnClasspath(classPath);
+        this.fileManager = new SourceFileManager(this::ownsSourceType);
+        setSourceRoots(FileStore.sourceRoots());
         this.docsFileManager = new Docs(docPath).createFileManager();
     }
 
@@ -52,104 +45,38 @@ class JavaCompilerService implements CompilerProvider {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
     }
 
-    private static boolean workspaceUsesLombok() {
-        for (var file : FileStore.all()) {
-            // Skip test fixtures/resources/examples (not actual project source)
-            var path = file.toString();
-            // TODO: jls.test is temporary — needs proper multi-workspace support
-            // to separate test fixtures from main workspace without breaking Lombok detection
-            if (System.getProperty("jls.test") == null
-                    && (path.contains("/test/resources/") || path.contains("/test/examples/")
-                    || path.contains("/test-resources/"))) continue;
-            try (var reader = FileStore.lines(file)) {
-                for (var line = reader.readLine(); line != null; line = reader.readLine()) {
-                    if (line.startsWith("import lombok")) return true;
-                    if (line.contains("class ") || line.contains("interface ") || line.contains("enum ")) break;
-                }
-            } catch (Exception ignored) {}
-        }
-        return false;
-    }
-
-    /** Atomically extend the classpath with new entries (e.g. compiled module output dirs). */
-    synchronized void addClassPathEntries(Set<Path> entries) {
-        if (entries.isEmpty()) return;
-        var updated = new LinkedHashSet<>(this.classPath);
-        if (updated.addAll(entries)) {
-            this.classPath = Collections.unmodifiableSet(updated);
-            cachedRevision = -1;
-            LOG.info(String.format("[compiler] classpath_extended added=%d total=%d", entries.size(), updated.size()));
-        }
-    }
-
-    void setModuleGraph(ModuleGraph moduleGraph) {
-        this.moduleGraph = moduleGraph;
+    static boolean lombokPresentOnClasspath(Collection<Path> classPath) {
+        return classPath.stream().anyMatch(path -> {
+            var name = path.getFileName() == null ? "" : path.getFileName().toString().toLowerCase();
+            return name.startsWith("lombok") && (name.endsWith(".jar") || name.endsWith("-all.jar"));
+        });
     }
 
     void setSourceRoots(Set<Path> sourceRoots) {
         this.sourceRoots = Set.copyOf(sourceRoots);
+        configureSourcePath(this.sourceRoots);
+        compiler.discard("source_roots_changed");
+    }
+
+    private void configureSourcePath(Collection<Path> sourceRoots) {
+        try {
+            fileManager.setLocationFromPaths(StandardLocation.SOURCE_PATH, sourceRoots);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    void prepareFileManager() {
+        if (sourceRevision == FileStore.sourceRevision()) return;
+        compiler.discard("source_inventory_changed");
+        try { fileManager.close(); } catch (IOException e) { LOG.fine(e.getMessage()); }
+        fileManager = new SourceFileManager(this::ownsSourceType);
+        configureSourcePath(sourceRoots);
+        sourceRevision = FileStore.sourceRevision();
     }
 
     private boolean isSourceVisible(Path file) {
         return sourceRoots.isEmpty() || sourceRoots.stream().anyMatch(file::startsWith);
-    }
-
-    // --- Small LRU compile cache ---
-    // Invalidation: content revision or classpath extension.
-    // Eviction: LRU, max 4 entries. No cross-file tracking needed.
-    private final Map<List<URI>, CompileBatch> compileCache = new LinkedHashMap<>(4, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<List<URI>, CompileBatch> eldest) {
-            return size() > 4;
-        }
-    };
-    private volatile long cachedRevision = -1;
-
-    private CompileBatch doCompile(Collection<? extends JavaFileObject> sources) {
-        if (sources.isEmpty()) throw new RuntimeException("empty sources");
-
-        var firstAttempt = new CompileBatch(this, sources);
-
-        Set<Path> addFiles;
-        try {
-            addFiles = firstAttempt.needsAdditionalSources();
-        } catch (RuntimeException e) {
-            firstAttempt.close();
-            throw e;
-        }
-        if (!sourceRoots.isEmpty()) {
-            addFiles.removeIf(file -> sourceRoots.stream().noneMatch(file::startsWith));
-        }
-
-        if (addFiles.isEmpty()) return firstAttempt;
-
-        LOG.info("...need to recompile with " + addFiles);
-        firstAttempt.close();
-
-        var moreSources = new ArrayList<JavaFileObject>(sources);
-        for (var add : addFiles) {
-            moreSources.add(new SourceFileObject(add));
-        }
-        return new CompileBatch(this, moreSources);
-    }
-
-    private CompileBatch compileBatch(Collection<? extends JavaFileObject> sources) {
-        LOG.info("[cache] compileBatch " + sources.size() + " source(s)");
-        var key = sources.stream().map(JavaFileObject::toUri).toList();
-        var revision = FileStore.contentRevision();
-        if (revision != cachedRevision) {
-            compileCache.clear();
-            cachedRevision = revision;
-        }
-        var cached = compileCache.get(key);
-        if (cached != null) {
-            LOG.info("[cache] HIT");
-            return cached;
-        }
-        LOG.info("[cache] MISS revision=" + revision);
-        var compiled = doCompile(sources);
-        compileCache.put(key, compiled);
-        return compiled;
     }
 
     @Override
@@ -161,22 +88,29 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
-        var batch = compileBatch(sources);
+        return compile(sources, false);
+    }
+
+    @Override
+    public CompileTask compileScan(Path... files) {
+        var sources = new ArrayList<JavaFileObject>(files.length);
+        for (var f : files) sources.add(new SourceFileObject(f));
+        return compile(sources, true);
+    }
+
+    private CompileTask compile(Collection<? extends JavaFileObject> sources, boolean oneShot) {
+        var batch = new CompileBatch(this, sources, oneShot);
         return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, batch.diagnostics, batch::close);
+    }
+
+    boolean hasWarmContext() {
+        return compiler.isWarm();
     }
 
     @Override
     public ParseTask parse(Path file) {
         var parser = Parser.parseJavaFileObject(new SourceFileObject(file));
         return new ParseTask(parser.task, parser.root, parser.hasSyntaxErrors);
-    }
-
-    @Override
-    public CompileTask compileFresh(Path... files) {
-        var sources = new ArrayList<JavaFileObject>(files.length);
-        for (var f : files) sources.add(new SourceFileObject(f));
-        var batch = new CompileBatch(this, sources);
-        return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, batch.diagnostics, batch::close);
     }
 
     @Override
@@ -205,36 +139,38 @@ class JavaCompilerService implements CompilerProvider {
     private static final Cache<String, Boolean> cacheContainsWord = new Cache<>("helper.contains_word");
 
     private boolean containsWord(Path file, String word) {
-        if (cacheContainsWord.needs(file, word)) {
-            cacheContainsWord.load(file, word, StringSearch.containsWord(file, word));
-        }
-        return cacheContainsWord.get(file, word);
+        return cacheContainsWord.getOrLoad(
+                file, word, () -> StringSearch.containsWord(file, word));
     }
 
     private static final Cache<Void, List<String>> cacheContainsType = new Cache<>("helper.contains_type");
 
     private boolean containsType(Path file, String className) {
-        if (cacheContainsType.needs(file, null)) {
-            var root = parse(file).root();
+        return declaredTypes(file).contains(className);
+    }
+
+    static List<String> declaredTypes(Path file) {
+        return cacheContainsType.getOrLoad(file, null, () -> {
+            var root = Parser.parseJavaFileObject(new SourceFileObject(file)).root;
             var types = new ArrayList<String>();
             new FindTypeDeclarations().scan(root, types);
-            cacheContainsType.load(file, null, types);
-        }
-        return cacheContainsType.get(file, null).contains(className);
+            return types;
+        });
+    }
+
+    private boolean ownsSourceType(String name) {
+        return findTypeDeclaration(name.replace('$', '.')) != NOT_FOUND;
     }
 
     private final Cache<Void, List<String>> cacheFileImports = new Cache<>("helper.file_imports");
 
     private List<String> readImports(Path file) {
-        if (cacheFileImports.needs(file, null)) {
-            loadImports(file);
-        }
-        return cacheFileImports.get(file, null);
+        return cacheFileImports.getOrLoad(file, null, () -> loadImports(file));
     }
 
     private static final Pattern CLASS_DECLARATION_PATTERN = Pattern.compile("\\b(class|interface|enum|record)\\b");
 
-    private void loadImports(Path file) {
+    private List<String> loadImports(Path file) {
         var list = new ArrayList<String>();
         try (var lines = FileStore.lines(file)) {
             for (var line = lines.readLine(); line != null; line = lines.readLine()) {
@@ -252,17 +188,22 @@ class JavaCompilerService implements CompilerProvider {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        cacheFileImports.load(file, null, list);
+        return list;
     }
 
     private boolean containsImport(Path file, String className) {
         var pkg = packageName(className);
         if (pkg.equals(FileStore.packageName(file))) return true;
+        if (pkg.equals("java.lang")) return true;
         var packageStar = pkg + ".*";
         var staticStar = className + ".*";
         var staticMemberPrefix = className + ".";
         for (var i : readImports(file)) {
-            if (i.equals(className) || i.equals(packageStar) || i.equals(staticStar) || i.startsWith(staticMemberPrefix))
+            if (i.equals(className)
+                    || className.startsWith(i + ".")
+                    || i.equals(packageStar)
+                    || i.equals(staticStar)
+                    || i.startsWith(staticMemberPrefix))
                 return true;
         }
         return false;
@@ -273,127 +214,6 @@ class JavaCompilerService implements CompilerProvider {
     @Override
     public boolean lombokPresentOnClasspath() {
         return lombokPresentOnClasspath;
-    }
-
-    // Find one unambiguous output directory for startup generation.
-    Path findBuildOutputDir() {
-        Path outputDir = null;
-        for (var root : FileStore.workspaceRoots()) {
-            var nameCount = root.getNameCount();
-            // Startup generation only writes main-source classes.
-            if (nameCount >= 3
-                    && root.getName(nameCount - 3).toString().equals("src")
-                    && !root.getName(nameCount - 2).toString().equals("main")
-                    && root.getName(nameCount - 1).toString().equals("java")) continue;
-            var candidate = findBuildOutputDir(root);
-            if (candidate == null) return null;
-            if (outputDir != null && !outputDir.equals(candidate)) return null;
-            outputDir = candidate;
-        }
-        return outputDir;
-    }
-
-    // Find the output directory owned by this source file's nearest module.
-    Path findBuildOutputDir(Path source) {
-        var normalizedSource = source.toAbsolutePath().normalize();
-        var moduleInfo = moduleGraph.moduleForFile(normalizedSource);
-        if (moduleInfo.isPresent()) {
-            var info = moduleInfo.get();
-            return info.testSourceDir() != null && normalizedSource.startsWith(info.testSourceDir())
-                    ? info.testOutputDir()
-                    : info.mainOutputDir();
-        }
-        for (var module = normalizedSource; module != null; module = module.getParent()) {
-            Path outputDir;
-            if (Files.exists(module.resolve("build.gradle"))
-                    || Files.exists(module.resolve("build.gradle.kts"))) {
-                var relativeSource = module.relativize(normalizedSource);
-                var sourceSet = "main";
-                if (relativeSource.getNameCount() > 1
-                        && relativeSource.getName(0).toString().equals("src")) {
-                    sourceSet = relativeSource.getName(1).toString();
-                }
-                outputDir = module.resolve("build/classes/java").resolve(sourceSet);
-            } else {
-                continue;
-            }
-            return outputDir;
-        }
-        return null;
-    }
-
-    // startup full compile with AP — populates build output once
-    void fullCompileWithAP() {
-        if (!lombokPresentOnClasspath) return;
-        var outputDir = findBuildOutputDir();
-        if (outputDir == null) return;
-        try {
-            Files.createDirectories(outputDir);
-        } catch (IOException e) {
-            return;
-        }
-        addClassPathEntries(Set.of(outputDir));
-        var sources = FileStore.all().stream()
-                .filter(FileStore::isJavaFile)
-                .filter(file -> outputDir.equals(findBuildOutputDir(file)))
-                .map(SourceFileObject::new)
-                .toList();
-        if (sources.isEmpty()) return;
-        var options = CompileBatch.options(classPath, addExports, extraArgs);
-        options.remove("-proc:none");
-        options.addAll(List.of("-d", outputDir.toString()));
-        var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
-        options.addAll(List.of("-processorpath", cp));
-        compiler.compile(
-                fileManager,
-                diags::add,
-                options,
-                sources,
-                task -> {
-                    try {
-                        task.analyze();
-                        task.generate();
-                    } catch (IOException e) {
-                        LOG.warning("[build] fullCompileWithAP failed: " + e.getMessage());
-                    }
-                    return null;
-                });
-        LOG.info("[build] fullCompileWithAP complete");
-    }
-
-    // recompile on save — updates .class in build output for cross-file resolution
-    void refreshBuildOutput(Path file) {
-        var outputDir = findBuildOutputDir(file);
-        if (outputDir == null) return;
-        try {
-            Files.createDirectories(outputDir);
-        } catch (IOException e) {
-            return;
-        }
-        addClassPathEntries(Set.of(outputDir));
-        var options = CompileBatch.options(classPath, addExports, extraArgs);
-        options.addAll(List.of("-d", outputDir.toString()));
-        if (lombokPresentOnClasspath) {
-            options.remove("-proc:none");
-            var cp = classPath.stream().map(Path::toString).collect(Collectors.joining(File.pathSeparator));
-            options.addAll(List.of("-processorpath", cp));
-        }
-        compiler.compile(
-                fileManager,
-                diags::add,
-                options,
-                List.of(new SourceFileObject(file)),
-                task -> {
-                    try {
-                        task.analyze();
-                        task.generate();
-                    } catch (IOException e) {
-                        LOG.warning(String.format("[build] refreshBuildOutput failed for %s: %s",
-                                file.getFileName(), e.getMessage()));
-                    }
-                    return null;
-                });
-        LOG.info(String.format("[build] refreshBuildOutput compiled %s", file.getFileName()));
     }
 
     @Override
@@ -438,12 +258,12 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Optional<JavaFileObject> findAnywhere(String className) {
+        var fromSource = findTypeDeclaration(className);
+        if (fromSource != NOT_FOUND) return Optional.of(new SourceFileObject(fromSource));
         var fromDocs = findPublicTypeDeclarationInDocPath(className);
         if (fromDocs.isPresent()) return fromDocs;
         var fromJdk = findPublicTypeDeclarationInJdk(className);
         if (fromJdk.isPresent()) return fromJdk;
-        var fromSource = findTypeDeclaration(className);
-        if (fromSource != NOT_FOUND) return Optional.of(new SourceFileObject(fromSource));
         return Optional.empty();
     }
 
@@ -514,15 +334,43 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Path[] findTypeReferences(String className) {
-        var pkg = packageName(className);
-        var simple = simpleName(className);
         var candidates = new ArrayList<Path>();
-        for (var f : FileStore.all()) {
-            if (containsWord(f, pkg) && containsImport(f, className) && containsWord(f, simple)) {
-                candidates.add(f);
+        for (var file : FileStore.all()) {
+            if (referencesType(file, className)) candidates.add(file);
+        }
+        return candidates.toArray(Path[]::new);
+    }
+
+    @Override
+    public Path[] findTypeReferences(Collection<String> classNames) {
+        var names = classNames.stream().filter(name -> name != null && !name.isBlank()).distinct().toList();
+        if (names.size() == 1) return findTypeReferences(names.getFirst());
+        if (names.isEmpty()) return new Path[0];
+
+        var simpleNames = names.stream()
+                .map(this::simpleName)
+                .filter(name -> !name.isBlank())
+                .distinct()
+                .map(StringSearch::new)
+                .toList();
+        var candidates = new ArrayList<Path>();
+        for (var file : FileStore.all()) {
+            if (!StringSearch.containsAnyWord(file, simpleNames)) continue;
+            for (var className : names) {
+                if (referencesType(file, className)) {
+                    candidates.add(file);
+                    break;
+                }
             }
         }
         return candidates.toArray(Path[]::new);
+    }
+
+    private boolean referencesType(Path file, String className) {
+        var pkg = packageName(className);
+        return (pkg.isEmpty() || containsWord(file, pkg))
+                && (containsImport(file, className) || containsWord(file, className))
+                && containsWord(file, simpleName(className));
     }
 
     @Override
@@ -541,6 +389,7 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Optional<Path> decompileClass(String qualifiedName) {
+        if (ownsSourceType(qualifiedName)) return Optional.empty();
         if (decompiler == null) {
             synchronized (this) {
                 if (decompiler == null) {
@@ -559,6 +408,7 @@ class JavaCompilerService implements CompilerProvider {
 
     @Override
     public Optional<byte[]> findClassFile(String qualifiedName) {
+        if (ownsSourceType(qualifiedName)) return Optional.empty();
         var relative = qualifiedName.replace('.', '/') + ".class";
         for (var root : classPath) {
             if (Files.isDirectory(root)) {
@@ -584,5 +434,15 @@ class JavaCompilerService implements CompilerProvider {
             }
         }
         return Optional.empty();
+    }
+    @Override
+    public void close() {
+        compiler.discard("compiler_closed");
+        try {
+            fileManager.close();
+            docsFileManager.close();
+        } catch (IOException e) {
+            LOG.fine("Closing compiler file managers: " + e.getMessage());
+        }
     }
 }

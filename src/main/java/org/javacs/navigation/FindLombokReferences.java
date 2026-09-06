@@ -2,6 +2,8 @@ package org.javacs.navigation;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Symbol;
 import java.util.List;
 import java.util.Set;
 import javax.lang.model.element.TypeElement;
@@ -65,8 +67,19 @@ public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> 
         var element = trees.getElement(path);
         if (element != null && element.asType().getKind() != TypeKind.ERROR) {
             var enclosing = element.getEnclosingElement();
-            return enclosing instanceof TypeElement te
-                    && te.getQualifiedName().contentEquals(targetClassName);
+            if (!(enclosing instanceof TypeElement te)) return false;
+            if (te.getQualifiedName().contentEquals(targetClassName)) return true;
+
+            if (!(element instanceof Symbol symbol)
+                    || (symbol.flags() & Flags.GENERATED_MEMBER) == 0) return false;
+
+            // A Lombok @Builder accessor is declared on the generated nested
+            // FooBuilder type, not on Foo. Treat that one generated owner as
+            // belonging to Foo so field references include fluent builder calls.
+            var builderOwner = te.getEnclosingElement();
+            return builderOwner instanceof TypeElement owner
+                    && owner.getQualifiedName().contentEquals(targetClassName)
+                    && te.getSimpleName().contentEquals(owner.getSimpleName() + "Builder");
         }
 
         // Element didn't resolve — check the receiver or enclosing class type.

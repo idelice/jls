@@ -7,13 +7,14 @@ import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.Trees;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Symbol;
 import java.util.HashSet;
 import java.util.Set;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
-import org.javacs.LombokAnnotations;
 
 class WarnUnused extends TreePathScanner<Void, Void> {
     private final Trees trees;
@@ -54,30 +55,19 @@ class WarnUnused extends TreePathScanner<Void, Void> {
     public Void visitVariable(VariableTree variable, Void unused) {
         var element = trees.getElement(getCurrentPath());
         if (element != null
+                && !isGeneratedMember(element)
                 && (element.getKind() == ElementKind.LOCAL_VARIABLE
                         || (element.getKind() == ElementKind.FIELD
                                 && element.getModifiers().contains(Modifier.PRIVATE)
-                                && element.getEnclosingElement().getKind() != ElementKind.RECORD
-                                && !isLombokConsumedField(variable)))) {
+                                && element.getEnclosingElement().getKind() != ElementKind.RECORD))) {
             declarations.add(element);
         }
         return super.visitVariable(variable, unused);
     }
 
-    private boolean isLombokConsumedField(VariableTree variable) {
-        var classTree = enclosingClass();
-        if (classTree == null) return false;
-        // Class-level @Data or @Getter → all fields considered used
-        if (LombokAnnotations.hasAnnotation(classTree.getModifiers(), "Data", "Getter", "Value")) return true;
-        // Field-level @Getter → this field is used
-        return LombokAnnotations.hasGetterAnnotation(variable.getModifiers());
-    }
-
-    private ClassTree enclosingClass() {
-        for (var node : getCurrentPath()) {
-            if (node instanceof ClassTree ct) return ct;
-        }
-        return null;
+    private boolean isGeneratedMember(Element element) {
+        return element instanceof Symbol symbol
+                && (symbol.flags() & Flags.GENERATED_MEMBER) != 0;
     }
 
     @Override

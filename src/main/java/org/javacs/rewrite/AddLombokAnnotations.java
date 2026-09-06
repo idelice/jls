@@ -48,8 +48,10 @@ public class AddLombokAnnotations implements Rewrite {
 
             var toAdd = new LinkedHashSet<String>();
             for (var ann : annotations) {
-                if (LombokAnnotations.isLombokAnnotationType(ann) && !existingAnnotations.contains(ann)) {
-                    toAdd.add(ann);
+                var simpleName = LombokAnnotations.simpleName(ann);
+                if (LombokAnnotations.isLombokAnnotationType(ann)
+                        && !existingAnnotations.contains(simpleName)) {
+                    toAdd.add(simpleName);
                 }
             }
 
@@ -74,27 +76,18 @@ public class AddLombokAnnotations implements Rewrite {
             var insertPoint = LspPosition.position(root, startClass);
             edits.add(new TextEdit(new Range(insertPoint, insertPoint), annotationText.toString()));
 
-            var hasWildcard = false;
-            Set<String> importedSimpleNames = new HashSet<>();
+            Set<String> imports = new HashSet<>();
             for (var imp : root.getImports()) {
-                var qid = imp.getQualifiedIdentifier().toString();
-                if (qid.equals("lombok.*")) {
-                    hasWildcard = true;
-                    break;
-                }
-                if (qid.startsWith("lombok.")) {
-                    importedSimpleNames.add(qid.substring("lombok.".length()));
-                }
+                if (!imp.isStatic()) imports.add(imp.getQualifiedIdentifier().toString());
             }
 
-            if (!hasWildcard) {
-                for (var ann : toAdd) {
-                    if (!importedSimpleNames.contains(ann)) {
-                        var importName = ann.equals("Slf4j") ? "lombok.extern.slf4j.Slf4j" : "lombok." + ann;
-                        var text = "import " + importName + ";\n";
-                        var point = importInsertPosition(root, pos, importName);
-                        edits.add(new TextEdit(new Range(point, point), text));
-                    }
+            for (var ann : toAdd) {
+                var importName = LombokAnnotations.qualifiedAnnotationName(ann).orElseThrow();
+                var wildcardImport = importName.substring(0, importName.lastIndexOf('.')) + ".*";
+                if (!imports.contains(importName) && !imports.contains(wildcardImport)) {
+                    var text = "import " + importName + ";\n";
+                    var point = importInsertPosition(root, pos, importName);
+                    edits.add(new TextEdit(new Range(point, point), text));
                 }
             }
 

@@ -16,6 +16,7 @@ import java.util.logging.Logger;
 
 public class LSP {
     private static final Gson gson = new Gson();
+    private static final int INPUT_BUFFER_SIZE = 8192;
 
     private static String readHeader(InputStream client) {
         var line = new StringBuilder();
@@ -42,6 +43,31 @@ public class LSP {
 
     static class EndOfStream extends RuntimeException {}
 
+    /** Grace period for the dispatch thread to notice the closed stream and return normally. */
+    private static final long EXIT_GRACE_MS = 2000;
+
+    /**
+     * The editor is gone, so nothing in flight matters any more. The dispatch thread only sees the
+     * kill message when it polls the queue, which never happens while it is inside a long request,
+     * so exit on a timer instead of leaving an orphaned JVM holding its heap and child processes.
+     * {@code System.exit} runs the shutdown hooks, which destroy the build-tool subprocesses.
+     */
+    private static void forceExitAfterGrace() {
+        var watchdog = new Thread(
+                () -> {
+                    try {
+                        Thread.sleep(EXIT_GRACE_MS);
+                    } catch (InterruptedException interrupted) {
+                        return;
+                    }
+                    LOG.severe("Client disconnected while a request was running, exiting.");
+                    System.exit(1);
+                },
+                "jls-force-exit");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
     // TODO this seems like it's probably really inefficient. Read in bulk?
     private static char read(InputStream client) {
         try {
@@ -58,9 +84,19 @@ public class LSP {
     }
 
     private static String readLength(InputStream client, int byteLength) {
-        // Eat whitespace
+        if (byteLength < 0) {
+            throw new RuntimeException("Missing or invalid Content-Length header");
+        }
         try {
-            return new String(client.readNBytes(byteLength), StandardCharsets.UTF_8).stripLeading();
+            var bytes = client.readNBytes(byteLength);
+            if (bytes.length != byteLength) {
+                LOG.warning(String.format(
+                        "Truncated LSP body: expected %d bytes, received %d",
+                        byteLength, bytes.length));
+                throw new EndOfStream();
+            }
+            // Eat whitespace only after the complete byte-counted body has been read.
+            return new String(bytes, StandardCharsets.UTF_8).stripLeading();
         } catch (IOException e) {
             throw new RuntimeException("An error occurred during the reading of client data", e);
         }
@@ -189,6 +225,9 @@ public class LSP {
     public static void connect(
             Function<LanguageClient, LanguageServer> serverFactory, InputStream receive, OutputStream send) {
         var server = serverFactory.apply(new RealClient(send));
+        InputStream bufferedReceive = receive instanceof BufferedInputStream
+                ? receive
+                : new BufferedInputStream(receive, INPUT_BUFFER_SIZE);
         var pending = new ArrayBlockingQueue<Message>(10);
         var endOfStream = new Message();
 
@@ -205,6 +244,7 @@ public class LSP {
 
             private boolean kill() {
                 LOG.info("Read stream has been closed, putting kill message onto queue...");
+                forceExitAfterGrace();
                 try {
                     pending.put(endOfStream);
                     return true;
@@ -220,7 +260,7 @@ public class LSP {
 
                 while (true) {
                     try {
-                        var token = nextToken(receive);
+                        var token = nextToken(bufferedReceive);
                         var message = parseMessage(token);
                         peek(message);
                         pending.put(message);
@@ -407,6 +447,20 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
                             var response = server.gotoDefinition(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/implementation":
+                        {
+                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
+                            var response = server.implementation(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/typeDefinition":
+                        {
+                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
+                            var response = server.typeDefinition(params);
                             respond(send, r.id, response);
                             break;
                         }

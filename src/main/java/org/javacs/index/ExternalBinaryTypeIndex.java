@@ -55,7 +55,7 @@ import org.javacs.resolve.TypeNames;
  * {@link IndexedMember.Provenance#EXTERNAL_BINARY}. Vineflower support here is only for
  * read-only dependency inspection and navigation.
  */
-public final class ExternalBinaryTypeIndex {
+public final class ExternalBinaryTypeIndex implements AutoCloseable {
     public static final ExternalBinaryTypeIndex EMPTY = new ExternalBinaryTypeIndex();
 
     private static final Logger LOG = Logger.getLogger("main");
@@ -153,6 +153,17 @@ public final class ExternalBinaryTypeIndex {
                         .expireAfterAccess(Duration.ofMinutes(30))
                         .build();
         this.decompiler = new ExternalBinaryDecompiler(this.classPathRoots, this.classPathFingerprint, this.classLoader);
+    }
+
+    @Override public void close() {
+        if (this == EMPTY) return;
+        rawTypeCache.invalidateAll();
+        typeCache.invalidateAll();
+        decompiledSourceCache.invalidateAll();
+        classFileCache.invalidateAll();
+        if (classLoader instanceof URLClassLoader loader) {
+            try { loader.close(); } catch (IOException failure) { LOG.fine(failure.getMessage()); }
+        }
     }
 
     public Optional<IndexedType> typeInfo(String qualifiedName) {
@@ -876,7 +887,7 @@ public final class ExternalBinaryTypeIndex {
                 var fieldType = field.getType() == null ? "" : field.getType().toString();
                 var accessors =
                         LombokAnnotations.accessorInfo(
-                                declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
+                                parse.root(), declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
                 if (accessors.isEmpty()) {
                     continue;
                 }

@@ -32,7 +32,7 @@ import org.w3c.dom.NodeList;
 public final class MavenTooling {
     private static final Logger LOG = Logger.getLogger("main");
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-    private static final int CACHE_VERSION = 4;
+    private static final int CACHE_VERSION = 5;
 
     static final Path NOT_FOUND = Paths.get("");
 
@@ -82,7 +82,7 @@ public final class MavenTooling {
             String projectPath,
             String projectDir,
             List<String> sourceDirs,
-            String testSourceDir,
+            List<String> testSourceDirs,
             String mainOutputDir,
             String testOutputDir,
             List<String> moduleDeps,
@@ -138,10 +138,6 @@ public final class MavenTooling {
             String coordinates, String type, String classifier, String scope, Path path) {
         boolean onMainClasspath() {
             return "compile".equals(scope) || "provided".equals(scope) || "system".equals(scope);
-        }
-
-        boolean isTestArtifact() {
-            return "test-jar".equals(type) || "tests".equals(classifier);
         }
     }
     static final record MavenWorkspace(Path buildRoot, ModuleGraph graph) {}
@@ -244,7 +240,7 @@ public final class MavenTooling {
                     entry.getKey(),
                     module.directory,
                     sourceDirs,
-                    project.testSourceDir,
+                    project.testSourceDir == null ? List.of() : List.of(project.testSourceDir),
                     project.mainOutputDir,
                     project.testOutputDir,
                     List.of(),
@@ -526,7 +522,7 @@ public final class MavenTooling {
 
             var classpath = new HashSet<Path>();
             var sources = new HashSet<Path>();
-            for (var line : Files.readAllLines(output)) {
+            for (var line : Files.exists(output) ? Files.readAllLines(output) : List.<String>of()) {
                 var jar = readDependency(line);
                 if (jar == NOT_FOUND) continue;
                 if (jar.getFileName().toString().contains("-sources")) sources.add(jar);
@@ -549,205 +545,96 @@ public final class MavenTooling {
     }
 
     static MavenDependencies resolveModuleDependencies(
-            Path pomXml,
-            Path mavenHome,
-            Map<String, String> envVars,
-            ModuleGraph graph,
-            ModuleGraph.ModuleInfo module,
-            boolean testSources) {
+            Path pomXml, Path mavenHome, Map<String, String> envVars, ModuleGraph graph,
+            ModuleGraph.ModuleInfo module, boolean testSources) {
         var buildRoot = normalizePath(pomXml).getParent();
         var selector = moduleSelector(buildRoot, module);
-        var mvn = findMvnCommand(buildRoot, envVars);
-        var cacheGoal = "module-classpath-" + (testSources ? "test" : "main");
         var cacheHome = cacheHome(envVars);
-        var cached = loadCachedMavenDependencies(pomXml, cacheGoal, mavenHome, cacheHome, selector);
-        var reactorOutputs = new HashSet<Path>();
-        for (var info : graph.modules().values()) {
-            if (info.mainOutputDir() != null) reactorOutputs.add(info.mainOutputDir());
-            if (info.testOutputDir() != null) reactorOutputs.add(info.testOutputDir());
-        }
-        if (cached != null && cached.stream()
-                .anyMatch(path -> !Files.exists(path) && !reactorOutputs.contains(path))) cached = null;
-        try {
-            if (cached == null) {
-                var output = Files.createTempFile("jls-maven-module", ".txt");
-                var mainClasspath = new LinkedHashSet<Path>();
-                var testClasspath = new LinkedHashSet<Path>();
-                try {
-                        var resolved = false;
-                        deleteIfExists(output);
-                        var command = new ArrayList<String>();
-                        command.add(mvn);
-                        command.add("--batch-mode");
-                        command.add("-DskipTests");
-                        command.add("-Dmaven.compiler.failOnError=false");
-                        command.add("-Dmaven.compiler.proc=none");
-                        command.add(DEPENDENCY_LIST);
-                        command.add("-pl");
-                        command.add(selector);
-                        command.add("-am");
-                        command.add("-DincludeScope=test");
-                        command.add("-DoutputAbsoluteArtifactFilename=true");
-                        command.add("-DoutputFile=" + output);
-
-                        LOG.fine("[maven-exec] command=" + String.join(" ", command)
-                                + " reason=module_dependencies module=" + module.projectPath());
-
-                        var started = Instant.now();
-                        var process = trackProcess(new ProcessBuilder(command)
-                                .directory(buildRoot.toFile())
-                                .redirectError(ProcessBuilder.Redirect.INHERIT)
-                                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                                .start());
-                        int exit;
-                        try { exit = process.waitFor(); } finally { untrackProcess(process); }
-
-                        LOG.info("[maven-exec] reason=module_dependencies module=" + module.projectPath()
-                                + " scope=" + (testSources ? "test" : "main")
-                                + " exit=" + exit
-                                + " took=" + Duration.between(started, Instant.now()).toMillis() + "ms");
-                        if (exit == 0 && Files.exists(output)) {
-                            resolved = true;
-                        }
-                    if (!resolved) {
-                        throw new RuntimeException(
-                                "Maven dependency resolution failed for " + module.projectPath());
-                    }
-                    var reactorModules = new HashMap<String, ModuleGraph.ModuleInfo>();
-                    for (var info : graph.modules().values()) {
-                        reactorModules.put(info.coordinates(), info);
-                    }
-                    for (var line : Files.readAllLines(output)) {
-                        var dependency = readResolvedDependency(line);
-                        if (dependency == null) continue;
-                        var path = dependency.path();
-                        var reactorModule = reactorModules.get(dependency.coordinates());
-                        var reactorOutput = false;
-                        if (reactorModule != null) {
-                            if (dependency.isTestArtifact()) {
-                                path = reactorModule.testOutputDir();
-                                reactorOutput = true;
-                            } else if (dependency.classifier().isBlank()) {
-                                path = reactorModule.mainOutputDir();
-                                reactorOutput = true;
-                            }
-                        }
-                        if (path == null || !reactorOutput && !Files.exists(path)) continue;
-                        testClasspath.add(path);
-                        if (dependency.onMainClasspath()) mainClasspath.add(path);
-                    }
-                } finally {
-                    deleteIfExists(output);
-                }
-                if (module.mainOutputDir() != null) {
-                    mainClasspath.add(module.mainOutputDir());
-                    testClasspath.add(module.mainOutputDir());
-                }
-                if (module.testOutputDir() != null) testClasspath.add(module.testOutputDir());
-                var main = Set.copyOf(mainClasspath);
-                var test = Set.copyOf(testClasspath);
-                storeCachedMavenDependencies(
-                        pomXml,
-                        mavenHome,
-                        cacheHome,
-                        Map.of("module-classpath-main", main, "module-classpath-test", test),
-                        selector);
-                cached = testSources ? test : main;
+        var scope = testSources ? "test" : "main";
+        var classpath = loadCachedMavenDependencies(pomXml, "source-classpath-" + scope, mavenHome, cacheHome, selector);
+        var sourceRoots = loadCachedMavenDependencies(pomXml, "source-roots-" + scope, mavenHome, cacheHome, selector);
+        if (classpath == null || sourceRoots == null || classpath.stream().anyMatch(path -> !Files.exists(path))) {
+            var resolved = resolveSourceDependencies(buildRoot, envVars, module, selector);
+            var cache = new LinkedHashMap<String, Set<Path>>();
+            for (var selectedScope : List.of("main", "test")) {
+                cache.put("source-classpath-" + selectedScope, propertyPaths(resolved, selectedScope + ".path."));
+                var roots = new LinkedHashSet<>(graph.transitiveSourceDirs(module.projectPath(), selectedScope.equals("test")));
+                roots.addAll(propertyPaths(resolved, selectedScope + ".source."));
+                cache.put("source-roots-" + selectedScope, Set.copyOf(roots));
             }
-            refreshMissingModuleOutputs(buildRoot, mvn, graph, module, cached, testSources);
-            return moduleDependencies(graph, module, cached, testSources);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException(e);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+            // An incomplete result is useful now, but must not become a permanent disk cache.
+            if ("true".equals(resolved.getProperty("complete"))) {
+                storeCachedMavenDependencies(pomXml, mavenHome, cacheHome, cache, selector);
+            }
+            classpath = cache.get("source-classpath-" + scope);
+            sourceRoots = cache.get("source-roots-" + scope);
         }
+        var external = graph.externalClasspath(classpath);
+        var sources = new LinkedHashSet<Path>();
+        for (var dependency : external) {
+            var name = dependency.getFileName().toString();
+            if (!name.endsWith(".jar")) continue;
+            var source = dependency.resolveSibling(name.substring(0, name.length() - 4) + "-sources.jar");
+            if (Files.isRegularFile(source)) sources.add(source);
+        }
+        return new MavenDependencies(external, Set.copyOf(sources), sourceRoots);
     }
 
-    private static void refreshMissingModuleOutputs(
-            Path buildRoot,
-            String mvn,
-            ModuleGraph graph,
-            ModuleGraph.ModuleInfo module,
-            Set<Path> classpath,
-            boolean testSources) throws IOException, InterruptedException {
-        var requiredOutputs = new LinkedHashSet<Path>();
-        for (var candidate : graph.modules().values()) {
-            if (candidate.projectPath().equals(module.projectPath())) continue;
-            if (classpath.contains(candidate.mainOutputDir())) requiredOutputs.add(candidate.mainOutputDir());
-            if (classpath.contains(candidate.testOutputDir())) requiredOutputs.add(candidate.testOutputDir());
+    private static Properties resolveSourceDependencies(
+            Path buildRoot, Map<String, String> envVars, ModuleGraph.ModuleInfo module, String selector) {
+        var result = new Properties();
+        Path output = null;
+        try {
+            output = Files.createTempFile("jls-maven-dependencies", ".properties");
+            var command = List.of(findMvnCommand(buildRoot, envVars), "--batch-mode",
+                    "-Dmaven.ext.class.path=" + dependencyExtension(),
+                    "-Djls.dependencies.output=" + output,
+                    "-Djls.dependencies.project=" + module.coordinates(),
+                    "-pl", selector, "-am", EFFECTIVE_POM);
+            var started = System.nanoTime();
+            var process = trackProcess(new ProcessBuilder(command).directory(buildRoot.toFile())
+                    .redirectError(ProcessBuilder.Redirect.INHERIT)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD).start());
+            int exit;
+            try { exit = process.waitFor(); } finally { untrackProcess(process); }
+            try (var input = Files.newInputStream(output)) { result.load(input); }
+            LOG.info("[maven] source_dependencies module=" + module.projectPath() + " exit=" + exit
+                    + " complete=" + result.getProperty("complete", "false")
+                    + " ms=" + (System.nanoTime() - started) / 1_000_000);
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | RuntimeException failure) {
+            LOG.warning("[maven] partial_dependencies module=" + module.projectPath() + " cause=" + failure.getMessage());
+        } finally {
+            if (output != null) deleteIfExists(output);
         }
-        if (requiredOutputs.stream().allMatch(Files::isDirectory)) return;
-        var selector = moduleSelector(buildRoot, module);
-        var command = List.of(
-                mvn,
-                "--batch-mode",
-                "-DskipTests",
-                "-Dmaven.compiler.failOnError=false",
-                "-Dmaven.test.failure.ignore=true",
-                testSources ? "test-compile" : "compile",
-                "-pl", selector,
-                "-am");
-        LOG.fine("[maven-exec] command=" + String.join(" ", command)
-                + " reason=missing_module_outputs module=" + module.projectPath());
-        var started = Instant.now();
-        var process = trackProcess(new ProcessBuilder(command)
-                .directory(buildRoot.toFile())
-                .redirectError(ProcessBuilder.Redirect.INHERIT)
-                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                .start());
-        int exit;
-        try { exit = process.waitFor(); } finally { untrackProcess(process); }
-        LOG.info("[maven-exec] reason=missing_module_outputs module="
-                + module.projectPath() + " exit=" + exit + " took="
-                + Duration.between(started, Instant.now()).toMillis() + "ms");
-        var missingOutputs = requiredOutputs.stream()
-                .filter(path -> !Files.isDirectory(path))
-                .toList();
-        if (exit != 0 || !missingOutputs.isEmpty()) {
-            throw new RuntimeException(
-                    "Maven could not build required module outputs for " + module.projectPath()
-                            + ": " + missingOutputs);
+        return result;
+    }
+
+    private static Set<Path> propertyPaths(Properties properties, String prefix) {
+        var paths = new LinkedHashSet<Path>();
+        properties.stringPropertyNames().stream().filter(key -> key.startsWith(prefix)).sorted()
+                .forEach(key -> paths.add(Path.of(properties.getProperty(key))));
+        return Set.copyOf(paths);
+    }
+
+    private static Path dependencyExtension;
+
+    private static synchronized Path dependencyExtension() throws IOException {
+        if (dependencyExtension != null) return dependencyExtension;
+        try (var resource = MavenTooling.class.getResourceAsStream("/org/javacs/maven/jls-maven-extension.jar")) {
+            if (resource == null) throw new IOException("Missing Maven dependency extension");
+            var jar = Files.createTempFile("jls-maven-extension", ".jar");
+            Files.copy(resource, jar, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            jar.toFile().deleteOnExit();
+            dependencyExtension = jar;
+            return jar;
         }
     }
 
     private static String moduleSelector(Path buildRoot, ModuleGraph.ModuleInfo module) {
         var selector = buildRoot.relativize(module.projectDir()).toString();
         return selector.isBlank() ? "." : selector.replace(File.separatorChar, '/');
-    }
-
-    private static MavenDependencies moduleDependencies(
-            ModuleGraph graph,
-            ModuleGraph.ModuleInfo module,
-            Set<Path> externalClasspath,
-            boolean testSources) {
-        var classpath = new LinkedHashSet<>(externalClasspath);
-        var sources = new LinkedHashSet<Path>();
-        for (var dependency : externalClasspath) {
-            var name = dependency.getFileName().toString();
-            if (!name.endsWith(".jar")) continue;
-            var source = dependency.resolveSibling(name.substring(0, name.length() - 4) + "-sources.jar");
-            if (Files.exists(source)) sources.add(source);
-        }
-        var sourceRoots = new LinkedHashSet<Path>();
-        for (var source : module.sourceDirs()) {
-            if (testSources || !source.equals(module.testSourceDir())) sourceRoots.add(source);
-        }
-        for (var dependency : graph.modules().values()) {
-            if (dependency.projectPath().equals(module.projectPath())) continue;
-            if (dependency.mainOutputDir() != null && classpath.contains(dependency.mainOutputDir())) {
-                for (var source : dependency.sourceDirs()) {
-                    if (!source.equals(dependency.testSourceDir())) sourceRoots.add(source);
-                }
-            }
-            if (dependency.testOutputDir() != null
-                    && classpath.contains(dependency.testOutputDir())
-                    && dependency.testSourceDir() != null) {
-                sourceRoots.add(dependency.testSourceDir());
-            }
-        }
-        return new MavenDependencies(
-                Set.copyOf(classpath), Set.copyOf(sources), Set.copyOf(sourceRoots));
     }
 
     // =========================================================================
@@ -799,7 +686,7 @@ public final class MavenTooling {
                     cached.projectPath(),
                     Paths.get(cached.projectDir()),
                     sourceDirs,
-                    cached.testSourceDir() == null ? null : Paths.get(cached.testSourceDir()),
+                    cached.testSourceDirs() == null ? List.of() : cached.testSourceDirs().stream().map(Paths::get).toList(),
                     cached.mainOutputDir() == null ? null : Paths.get(cached.mainOutputDir()),
                     cached.testOutputDir() == null ? null : Paths.get(cached.testOutputDir()),
                     List.of(),
@@ -830,7 +717,7 @@ public final class MavenTooling {
                         module.projectPath(),
                         module.projectDir().toString(),
                         module.sourceDirs().stream().map(Path::toString).toList(),
-                        module.testSourceDir() == null ? null : module.testSourceDir().toString(),
+                        module.testSourceDirs().stream().map(Path::toString).toList(),
                         module.mainOutputDir() == null ? null : module.mainOutputDir().toString(),
                         module.testOutputDir() == null ? null : module.testOutputDir().toString(),
                         module.moduleDeps(),
@@ -1092,18 +979,8 @@ public final class MavenTooling {
         return false;
     }
 
-    // warnings queued during Maven resolution for the client to display.
-    // Flushed by JavaLanguageServer after createCompilers().
-    private static final List<String> pendingWarnings = Collections.synchronizedList(new ArrayList<>());
-
     // Track active Maven subprocesses for cleanup on shutdown
     private static final List<Process> activeProcesses = Collections.synchronizedList(new ArrayList<>());
-
-    static List<String> flushWarnings() {
-        var copy = new ArrayList<>(pendingWarnings);
-        pendingWarnings.clear();
-        return copy;
-    }
 
     /** Kill all tracked Maven subprocesses. Call on server shutdown. */
     static void destroyAllProcesses() {
@@ -1151,9 +1028,8 @@ public final class MavenTooling {
                     }
                 }
                 if (!validateWrapper(candidate)) {
-                    var msg = "Maven wrapper '" + candidate + "' is broken (missing .mvn/wrapper/ files?). Falling back to system mvn. Fix: run 'mvn -N wrapper:wrapper' in your project.";
-                    LOG.warning("[maven] " + msg);
-                    pendingWarnings.add(msg);
+                    LOG.warning("[maven] wrapper '" + candidate + "' is broken (missing .mvn/wrapper/ files?)."
+                            + " Falling back to system mvn; run 'mvn -N wrapper:wrapper' to repair it.");
                     break;
                 }
                 LOG.fine("[maven] using wrapper: " + candidate);

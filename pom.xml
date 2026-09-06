@@ -125,6 +125,42 @@
             </plugins>
         </pluginManagement>
         <plugins>
+            <!-- Maven reads unbuilt reactor metadata in its own JVM; no Maven APIs enter the server JAR. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.apache.maven</groupId>
+                        <artifactId>maven-core</artifactId>
+                        <version>3.9.12</version>
+                    </dependency>
+                </dependencies>
+                <executions>
+                    <execution>
+                        <id>build-maven-extension</id>
+                        <phase>generate-resources</phase>
+                        <goals><goal>run</goal></goals>
+                        <configuration>
+                            <target>
+                                <mkdir dir="${project.build.directory}/maven-extension-classes"/>
+                                <javac srcdir="${project.basedir}/src/maven-extension/java"
+                                       destdir="${project.build.directory}/maven-extension-classes"
+                                       release="8" includeantruntime="false" encoding="UTF-8">
+                                    <classpath refid="maven.plugin.classpath"/>
+                                    <compilerarg value="-proc:none"/>
+                                </javac>
+                                <mkdir dir="${project.build.outputDirectory}/org/javacs/maven"/>
+                                <jar destfile="${project.build.outputDirectory}/org/javacs/maven/jls-maven-extension.jar">
+                                    <fileset dir="${project.build.directory}/maven-extension-classes"/>
+                                    <fileset dir="${project.basedir}/src/maven-extension/resources"/>
+                                </jar>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-enforcer-plugin</artifactId>
@@ -163,6 +199,8 @@
                         <arg>--add-exports</arg>
                         <arg>jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED</arg>
                         <arg>--add-exports</arg>
+                        <arg>jdk.compiler/com.sun.tools.javac.platform=ALL-UNNAMED</arg>
+                        <arg>--add-exports</arg>
                         <arg>jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED</arg>
                         <arg>--add-exports</arg>
                         <arg>jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED</arg>
@@ -170,13 +208,7 @@
                         <arg>jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED</arg>
                     </compilerArgs>
                     <!-- Workaround of https://issues.apache.org/jira/browse/MCOMPILER-369 -->
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>org.openjdk.jmh</groupId>
-                            <artifactId>jmh-generator-annprocess</artifactId>
-                            <version>1.37</version>
-                        </path>
-                    </annotationProcessorPaths>
+                    <proc>none</proc>
                 </configuration>
             </plugin>
             <!-- Test runtime configuration -->
@@ -193,6 +225,7 @@
                         --add-exports jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.jvm=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED
+                        --add-exports jdk.compiler/com.sun.tools.javac.platform=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED
                         --add-exports jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED

@@ -19,7 +19,7 @@ class Parser {
     private static JavacTask singleFileTask(
             JavaFileObject file, DiagnosticCollector<JavaFileObject> diagnostics) {
         return (JavacTask)
-                COMPILER.getTask(null, FILE_MANAGER, diagnostics, List.of(), List.of(), List.of(file));
+                COMPILER.getTask(null, FILE_MANAGER, diagnostics, List.of("-proc:none"), List.of(), List.of(file));
     }
 
     final JavaFileObject file;

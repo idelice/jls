@@ -86,27 +86,13 @@ public final class GradleTooling {
         var started = Instant.now();
         try {
             var graph = runPhase1(workspaceRoot);
-            if (graph == ModuleGraph.EMPTY) {
-                // Try stale cache as fallback
-                var stale = loadStaleGraphCache(cacheHome, workspaceRoot);
-                if (stale != null) {
-                    LOG.info("[gradle] using stale graph cache (" + stale.modules().size() + " modules)");
-                    return stale;
-                }
-                return graph;
-            }
+            if (graph == ModuleGraph.EMPTY) return graph;
             storeGraphCache(cacheDir, graphFile, fingerprint, graph);
             LOG.info("[gradle] phase1 resolved " + graph.modules().size() + " modules in "
                     + Duration.between(started, Instant.now()).toMillis() + "ms");
             return graph;
         } catch (Exception e) {
             LOG.warning("[gradle] phase1 failed: " + e.getMessage());
-            // Fallback to stale cache
-            var stale = loadStaleGraphCache(cacheHome, workspaceRoot);
-            if (stale != null) {
-                LOG.info("[gradle] using stale graph cache after failure (" + stale.modules().size() + " modules)");
-                return stale;
-            }
             return ModuleGraph.EMPTY;
         }
     }
@@ -165,14 +151,6 @@ public final class GradleTooling {
                     + Duration.between(started, Instant.now()).toMillis() + "ms");
         } catch (Exception e) {
             LOG.warning("[gradle] phase2 failed: " + e.getMessage());
-            // Try stale cache for remaining modules
-            for (var modulePath : uncached) {
-                var stale = loadStaleModuleCache(cacheHome, workspaceRoot, modulePath);
-                if (stale != null) {
-                    LOG.info("[gradle] using stale module cache: " + modulePath);
-                    result.put(modulePath, stale);
-                }
-            }
         }
 
         return new ModuleClasspath(Collections.unmodifiableMap(result));
@@ -189,53 +167,47 @@ public final class GradleTooling {
             return ModuleGraph.EMPTY;
         }
         var initScript = extractResource("/jls-gradle-graph.gradle");
-        if (initScript == null) {
-            // Fallback: try old init script name
-            initScript = extractResource("/jls-gradle-init.gradle");
-            if (initScript == null) {
-                LOG.severe("[gradle] init script not found on classpath");
-                return ModuleGraph.EMPTY;
-            }
-        }
+        if (initScript == null) throw new IOException("Missing Gradle graph resource");
+        var outputDir = Files.createTempDirectory("jls-gradle-graph");
         try {
             var cmd = List.of(gradle.toString(), "--no-daemon",
-                    "--init-script", initScript.toString(), "-q", "jlsModuleGraph");
+                    "--init-script", initScript.toString(), "-q",
+                    "-Pjls.outputDir=" + outputDir, "jlsModuleGraph");
             LOG.info("[gradle] phase1 exec: " + String.join(" ", cmd));
-
-            var output = executeGradle(cmd, gradle.getParent());
-            if (output == null) return ModuleGraph.EMPTY;
-            return parseGraphOutput(output);
-        } finally {
-            Files.deleteIfExists(initScript);
-        }
-    }
-
-    private static ModuleGraph parseGraphOutput(String output) {
-        // Try new markers first, fall back to old markers
-        var startMarker = GRAPH_MARKER_START;
-        var endMarker = GRAPH_MARKER_END;
-        var startIdx = output.indexOf(startMarker);
-        var endIdx = output.indexOf(endMarker);
-
-        // Fallback to old init script markers
-        if (startIdx < 0 || endIdx < 0) {
-            startMarker = "___JLS_MODULE_GRAPH_START___";
-            endMarker = "___JLS_MODULE_GRAPH_END___";
-            startIdx = output.indexOf(startMarker);
-            endIdx = output.indexOf(endMarker);
-        }
-
-        if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) {
-            LOG.warning("[gradle] phase1 markers not found (len=" + output.length() + ")");
-            return ModuleGraph.EMPTY;
-        }
-        var json = output.substring(startIdx + startMarker.length(), endIdx).trim();
-        try {
-            var parsed = GSON.fromJson(json, GraphOutput.class);
-            return toModuleGraph(parsed);
+            executeGradle(cmd, workspaceRoot, "phase1");
+            var modules = new ArrayList<GraphModule>();
+            for (var json : readResults(outputDir, "phase1")) {
+                var module = GSON.fromJson(json, GraphModule.class);
+                if (module != null && module.projectPath != null) modules.add(module);
+            }
+            return toModuleGraph(modules);
         } catch (JsonParseException e) {
             LOG.warning("[gradle] phase1 parse failed: " + e.getMessage());
             return ModuleGraph.EMPTY;
+        } finally {
+            Files.deleteIfExists(initScript);
+            deleteRecursively(outputDir);
+        }
+    }
+
+    /** Each project writes one JSON file: parallel builds interleave stdout. */
+    private static List<String> readResults(Path outputDir, String phase) throws IOException {
+        if (!Files.isDirectory(outputDir)) return List.of();
+        var results = new ArrayList<String>();
+        try (var files = Files.list(outputDir)) {
+            for (var file : files.sorted().toList()) {
+                results.add(Files.readString(file));
+            }
+        }
+        LOG.info("[gradle] " + phase + " results=" + results.size());
+        return results;
+    }
+
+    private static void deleteRecursively(Path dir) {
+        try (var paths = Files.walk(dir)) {
+            for (var path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+        } catch (IOException e) {
+            LOG.fine("[gradle] could not remove " + dir + ": " + e.getMessage());
         }
     }
 
@@ -251,140 +223,97 @@ public final class GradleTooling {
             return Map.of();
         }
         var initScript = extractResource("/jls-gradle-classpath.gradle");
-        if (initScript == null) {
-            // Fallback: resolve using old init script (which bundles classpath in graph)
-            LOG.warning("[gradle] classpath init script not found, falling back to combined resolution");
-            return resolveClasspathViaOldScript(workspaceRoot, modules);
-        }
+        if (initScript == null) throw new IOException("Missing Gradle classpath resource");
+        var outputDir = Files.createTempDirectory("jls-gradle-classpath");
         try {
-            var targetModules = String.join(",", modules);
-            var cmd = List.of(gradle.toString(), "--no-daemon",
-                    "--init-script", initScript.toString(), "-q",
-                    "jlsResolveClasspath", "-Pjls.targetModules=" + targetModules);
+            // Qualified task paths: only the requested projects resolve, and each holds its own lock.
+            var cmd = new ArrayList<>(List.of(gradle.toString(), "--no-daemon",
+                    "--init-script", initScript.toString(), "-q", "-Pjls.outputDir=" + outputDir));
+            for (var module : modules) {
+                cmd.add((module.equals(":") ? "" : module) + ":jlsResolveClasspath");
+            }
             LOG.info("[gradle] phase2 exec: " + String.join(" ", cmd));
-
-            var output = executeGradle(cmd, gradle.getParent());
-            if (output == null) return Map.of();
-            return parseClasspathOutput(output);
+            executeGradle(cmd, workspaceRoot, "phase2");
+            return parseClasspathResults(readResults(outputDir, "phase2"));
         } finally {
             Files.deleteIfExists(initScript);
+            deleteRecursively(outputDir);
         }
     }
 
-    /** Fallback: use old init script which resolves everything together. */
-    private static Map<String, ResolvedModule> resolveClasspathViaOldScript(Path workspaceRoot, List<String> modules)
-            throws IOException, InterruptedException {
-        var gradle = findGradleExecutable(workspaceRoot);
-        if (gradle == null) return Map.of();
-        var initScript = extractResource("/jls-gradle-init.gradle");
-        if (initScript == null) return Map.of();
-        try {
-            var cmd = List.of(gradle.toString(), "--no-daemon",
-                    "--init-script", initScript.toString(), "-q", "jlsProjectInfo");
-            var output = executeGradle(cmd, gradle.getParent());
-            if (output == null) return Map.of();
-
-            var startIdx = output.indexOf("___JLS_MODULE_GRAPH_START___");
-            var endIdx = output.indexOf("___JLS_MODULE_GRAPH_END___");
-            if (startIdx < 0 || endIdx < 0) return Map.of();
-
-            var json = output.substring(startIdx + "___JLS_MODULE_GRAPH_START___".length(), endIdx).trim();
-            var parsed = GSON.fromJson(json, GraphOutput.class);
-            if (parsed == null || parsed.modules == null) return Map.of();
-
-            var requested = new HashSet<>(modules);
-            var result = new LinkedHashMap<String, ResolvedModule>();
-            for (var m : parsed.modules) {
-                if (requested.contains(m.projectPath)) {
-                    var cp = m.externalClasspath == null ? List.<Path>of()
-                            : m.externalClasspath.stream().map(Path::of).toList();
-                    result.put(m.projectPath, new ResolvedModule(cp, List.of()));
-                }
+    private static Map<String, ResolvedModule> parseClasspathResults(List<String> results) {
+        var result = new LinkedHashMap<String, ResolvedModule>();
+        for (var json : results) {
+            try {
+                var module = GSON.fromJson(json, ClasspathModule.class);
+                if (module == null || module.projectPath == null) continue;
+                var cp = module.externalClasspath == null ? List.<Path>of()
+                        : module.externalClasspath.stream().map(Path::of).toList();
+                var testCp = module.testClasspath == null ? List.<Path>of()
+                        : module.testClasspath.stream().map(Path::of).toList();
+                result.put(module.projectPath, new ResolvedModule(cp, testCp));
+            } catch (JsonParseException e) {
+                LOG.warning("[gradle] phase2 parse failed: " + e.getMessage());
             }
-            return result;
-        } finally {
-            Files.deleteIfExists(initScript);
         }
-    }
-
-    private static Map<String, ResolvedModule> parseClasspathOutput(String output) {
-        var startIdx = output.indexOf(CP_MARKER_START);
-        var endIdx = output.indexOf(CP_MARKER_END);
-        if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) {
-            LOG.warning("[gradle] phase2 markers not found (len=" + output.length() + ")");
-            return Map.of();
-        }
-        var json = output.substring(startIdx + CP_MARKER_START.length(), endIdx).trim();
-        try {
-            var type = new TypeToken<ClasspathOutput>() {}.getType();
-            ClasspathOutput parsed = GSON.fromJson(json, type);
-            if (parsed == null || parsed.modules == null) return Map.of();
-
-            var result = new LinkedHashMap<String, ResolvedModule>();
-            for (var m : parsed.modules) {
-                var cp = m.externalClasspath == null ? List.<Path>of()
-                        : m.externalClasspath.stream().map(Path::of).toList();
-                var testCp = m.testClasspath == null ? List.<Path>of()
-                        : m.testClasspath.stream().map(Path::of).toList();
-                result.put(m.projectPath, new ResolvedModule(cp, testCp));
-            }
-            return result;
-        } catch (JsonParseException e) {
-            LOG.warning("[gradle] phase2 parse failed: " + e.getMessage());
-            return Map.of();
-        }
+        return result;
     }
 
     // =========================================================================
     // Gradle execution helper
     // =========================================================================
 
-    private static String executeGradle(List<String> cmd, Path workingDir) throws IOException, InterruptedException {
+    /**
+     * Run Gradle and report failures. Results are read from files, so a non-zero exit is only a
+     * signal: a build that fails late (for example on deprecation warnings) can still have written
+     * usable per-project results.
+     */
+    private static void executeGradle(List<String> cmd, Path workingDir, String phase)
+            throws IOException, InterruptedException {
         var process = new ProcessBuilder(cmd)
                 .directory(workingDir.toFile())
                 .redirectErrorStream(true)
                 .start();
-
         var output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        var exited = process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        if (!exited) {
+        if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
             process.destroyForcibly();
             process.waitFor(5, TimeUnit.SECONDS);
-            LOG.warning("[gradle] timeout " + TIMEOUT_SECONDS + "s");
-            return null;
+            LOG.warning("[gradle] " + phase + " timeout " + TIMEOUT_SECONDS + "s");
+            return;
         }
         if (process.exitValue() != 0) {
-            // Gradle may exit non-zero due to deprecation warnings or other non-fatal issues.
-            // If our markers are present in the output, the task actually succeeded.
-            if (output.contains("___JLS_") && output.contains("_START___")) {
-                LOG.info("[gradle] exit=" + process.exitValue() + " but output contains markers — using it");
-                return output;
-            }
-            LOG.warning("[gradle] exit=" + process.exitValue() + " output=" + truncate(output, 500));
-            return null;
+            LOG.warning("[gradle] " + phase + " exit=" + process.exitValue() + " " + failureCause(output));
         }
-        return output;
+    }
+
+    /** Gradle prints the cause after "What went wrong"; the banner above it is noise. */
+    private static String failureCause(String output) {
+        var start = output.indexOf("* What went wrong:");
+        if (start < 0) return truncate(output, 600);
+        var end = output.indexOf("* Try:", start);
+        var cause = end < 0 ? output.substring(start) : output.substring(start, end);
+        return cause.replace('\n', ' ').replaceAll("\\s+", " ").trim();
     }
 
     // =========================================================================
     // Graph → ModuleGraph conversion
     // =========================================================================
 
-    private static ModuleGraph toModuleGraph(GraphOutput parsed) {
-        if (parsed == null || parsed.modules == null) return ModuleGraph.EMPTY;
+    private static ModuleGraph toModuleGraph(List<GraphModule> parsed) {
+        if (parsed == null || parsed.isEmpty()) return ModuleGraph.EMPTY;
         var modules = new LinkedHashMap<String, ModuleGraph.ModuleInfo>();
-        for (var m : parsed.modules) {
+        for (var m : parsed) {
             modules.put(m.projectPath, new ModuleGraph.ModuleInfo(
                     m.projectPath,
                     Path.of(m.projectDir),
                     m.sourceDirs == null ? List.of() : m.sourceDirs.stream().map(Path::of).toList(),
-                    null,
+                    m.testSourceDirs == null ? List.of() : m.testSourceDirs.stream().map(Path::of).toList(),
                     m.classOutputDir == null ? null : Path.of(m.classOutputDir),
-                    null,
+                    m.testOutputDir == null ? null : Path.of(m.testOutputDir),
                     // Phase 1 does NOT resolve classpath — leave empty
                     m.externalClasspath == null ? List.of() : m.externalClasspath.stream().map(Path::of).toList(),
                     m.moduleDeps == null ? List.of() : List.copyOf(m.moduleDeps),
-                    m.moduleDeps == null ? List.of() : List.copyOf(m.moduleDeps),
+                    m.testModuleDeps == null ? List.of() : List.copyOf(m.testModuleDeps),
                     m.sourceCompatibility,
                     List.of(),
                     null,
@@ -400,7 +329,7 @@ public final class GradleTooling {
     private static ModuleGraph loadGraphCache(Path graphFile) {
         try (Reader reader = Files.newBufferedReader(graphFile)) {
             var parsed = GSON.fromJson(reader, GraphOutput.class);
-            var graph = toModuleGraph(parsed);
+            var graph = toModuleGraph(parsed == null ? null : parsed.modules);
             return graph == ModuleGraph.EMPTY ? null : graph;
         } catch (IOException | JsonParseException e) {
             LOG.warning("[gradle] graph cache read failed: " + e.getMessage());
@@ -416,6 +345,9 @@ public final class GradleTooling {
             m.projectPath = info.projectPath();
             m.projectDir = info.projectDir().toString();
             m.sourceDirs = info.sourceDirs().stream().map(Path::toString).toList();
+            m.testSourceDirs = info.testSourceDirs().stream().map(Path::toString).toList();
+            m.testOutputDir = info.testOutputDir() == null ? null : info.testOutputDir().toString();
+            m.testModuleDeps = List.copyOf(info.testModuleDeps());
             m.classOutputDir = info.mainOutputDir() == null ? null : info.mainOutputDir().toString();
             m.externalClasspath = info.externalClasspath().stream().map(Path::toString).toList();
             m.moduleDeps = List.copyOf(info.moduleDeps());
@@ -435,11 +367,6 @@ public final class GradleTooling {
     }
 
     /** Try to load any stale graph cache for this workspace (different fingerprint). */
-    private static ModuleGraph loadStaleGraphCache(Path cacheHome, Path workspaceRoot) {
-        LOG.warning("[gradle] stale graph cache not used — data from different build config is unreliable");
-        return null;
-    }
-
     // =========================================================================
     // Cache — Phase 2 (per-module)
     // =========================================================================
@@ -484,12 +411,6 @@ public final class GradleTooling {
         }
     }
 
-    /** Try to load a stale module cache across all fingerprint dirs. */
-    private static ResolvedModule loadStaleModuleCache(Path cacheHome, Path workspaceRoot, String modulePath) {
-        LOG.warning("[gradle] stale module cache not used for " + modulePath + " — data from different build config is unreliable");
-        return null;
-    }
-
     // =========================================================================
     // Fingerprinting
     // =========================================================================
@@ -498,6 +419,7 @@ public final class GradleTooling {
     private static String computeProjectFingerprint(Path workspaceRoot) {
         try {
             var digest = MessageDigest.getInstance("SHA-256");
+            digest.update("per-project-tasks-v3".getBytes(StandardCharsets.UTF_8));
 
             // settings.gradle(.kts) — walk up from workspaceRoot to find the Gradle project root
             var settings = findSettingsGradle(workspaceRoot);
@@ -612,6 +534,10 @@ public final class GradleTooling {
                 if (Files.exists(f)) return f;
             }
         }
+        for (var name : List.of("build.gradle", "build.gradle.kts")) {
+            var file = workspaceRoot.resolve(name);
+            if (Files.exists(file)) return file;
+        }
         return null;
     }
 
@@ -641,11 +567,6 @@ public final class GradleTooling {
 
         LOG.warning("[gradle] no gradlew or system gradle found");
         return null;
-    }
-
-    // kept for backward compat with any test that calls findGradlew directly
-    static Path findGradlew(Path workspaceRoot) {
-        return findGradleExecutable(workspaceRoot);
     }
 
     private static List<Path> findBuildGradleFiles(Path workspaceRoot) {
@@ -712,15 +633,11 @@ public final class GradleTooling {
     }
 
     private static final class GraphModule {
-        String projectPath, projectDir, classOutputDir, sourceCompatibility;
-        List<String> sourceDirs, externalClasspath, moduleDeps;
+        String projectPath, projectDir, classOutputDir, testOutputDir, sourceCompatibility;
+        List<String> sourceDirs, testSourceDirs, externalClasspath, moduleDeps, testModuleDeps;
     }
 
     /** Phase 2 output from Gradle classpath init script. */
-    private static final class ClasspathOutput {
-        List<ClasspathModule> modules;
-    }
-
     private static final class ClasspathModule {
         String projectPath;
         List<String> externalClasspath, testClasspath;

@@ -25,8 +25,15 @@ public class FileStore {
     private static final Set<Path> workspaceRoots = ConcurrentHashMap.newKeySet();
 
     private static final Map<Path, VersionedContent> activeDocuments = new ConcurrentHashMap<>();
+    /** Content hash last observed on disk for each open document. */
+    private static final Map<Path, Integer> savedContentHashes = new ConcurrentHashMap<>();
     private static final Set<Path> dirtyDocuments = ConcurrentHashMap.newKeySet();
     private static final AtomicLong contentRevision = new AtomicLong();
+    private static final AtomicLong sourceRevision = new AtomicLong();
+    // TODO: one (Path, revision) entry per distinct file edited this session; grows with files
+    // touched, cleared on reset(). Pruning would need the oldest live warm-context revision, which
+    // is more coupling than the few thousand small entries cost.
+    private static final Map<Path, Long> contentChanges = new ConcurrentHashMap<>();
 
     /** javaSources[file] is the javaSources time of a .java source file. */
     private static final ConcurrentSkipListMap<Path, Info> javaSources = new ConcurrentSkipListMap<>();
@@ -50,17 +57,13 @@ public class FileStore {
 
     static void setWorkspaceRoots(Set<Path> newRoots) {
         newRoots = normalize(newRoots);
-        for (var root : workspaceRoots) {
-            if (!newRoots.contains(root)) {
-                javaSources.keySet().removeIf(f -> {
-                    if (f.startsWith(root)) {
-                        removeFromPackageIndex(f);
-                        return true;
-                    }
-                    return false;
-                });
-            }
-        }
+        if (newRoots.equals(workspaceRoots)) return;
+        var retained = newRoots;
+        javaSources.keySet().removeIf(file -> {
+            if (retained.stream().anyMatch(file::startsWith)) return false;
+            removeFromPackageIndex(file);
+            return true;
+        });
         for (var root : newRoots) {
             if (!workspaceRoots.contains(root)) {
                 addFiles(root);
@@ -68,6 +71,7 @@ public class FileStore {
         }
         workspaceRoots.clear();
         workspaceRoots.addAll(newRoots);
+        sourceRevision.incrementAndGet();
         bumpContentRevision();
     }
 
@@ -81,7 +85,7 @@ public class FileStore {
 
     private static void addFiles(Path root) {
         try {
-            Files.walkFileTree(root, new FindJavaSources());
+            if (Files.isDirectory(root)) Files.walkFileTree(root, new FindJavaSources(root));
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -92,6 +96,8 @@ public class FileStore {
             "generated-test-sources", "node_modules", ".idea", ".metals");
 
     static class FindJavaSources extends SimpleFileVisitor<Path> {
+        private final Path root;
+        FindJavaSources(Path root) { this.root = root; }
         @Override
         public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
             if (attrs.isSymbolicLink()) {
@@ -99,7 +105,7 @@ public class FileStore {
                 return FileVisitResult.SKIP_SUBTREE;
             }
             var name = dir.getFileName();
-            if (name != null && EXCLUDED_DIRS.contains(name.toString())) {
+            if (!dir.equals(root) && name != null && EXCLUDED_DIRS.contains(name.toString())) {
                 return FileVisitResult.SKIP_SUBTREE;
             }
             return FileVisitResult.CONTINUE;
@@ -116,7 +122,7 @@ public class FileStore {
         @Override
         public FileVisitResult visitFileFailed(Path file, IOException e) {
             // Temp files created by git and other tools may disappear mid-walk. Skip silently.
-            if (e instanceof java.nio.file.NoSuchFileException) {
+            if (e instanceof NoSuchFileException) {
                 return FileVisitResult.CONTINUE;
             }
             LOG.warning("Failed to visit " + file + ": " + e.getMessage());
@@ -130,11 +136,14 @@ public class FileStore {
 
     static void reset() {
         activeDocuments.clear();
+        savedContentHashes.clear();
         LOG.info("[dirty] reset() clearing ALL dirty flags");
         dirtyDocuments.clear();
         workspaceRoots.clear();
         javaSources.clear();
+        sourceRevision.incrementAndGet();
         packageIndex.clear();
+        contentChanges.clear();
         bumpContentRevision();
     }
 
@@ -156,6 +165,8 @@ public class FileStore {
 
     private static Path sourceRoot(Path file) {
         var info = javaSources.get(file);
+        if (info == null) return null;
+        if (info.packageName.isEmpty()) return file.getParent();
         var parts = info.packageName.split("\\.");
         var dir = file.getParent();
         for (var i = parts.length - 1; i >= 0; i--) {
@@ -246,19 +257,43 @@ public class FileStore {
     }
 
     static void externalCreate(Path file) {
+        if (activeDocuments.containsKey(file)) dirtyDocuments.add(file);
         readInfoFromDisk(file);
-        bumpContentRevision();
+        refreshSavedBaseline(file);
+        bumpContentRevision(file);
     }
 
     static void externalChange(Path file) {
+        if (activeDocuments.containsKey(file)) dirtyDocuments.add(file);
         readInfoFromDisk(file);
-        bumpContentRevision();
+        refreshSavedBaseline(file);
+        bumpContentRevision(file);
     }
 
     static void externalDelete(Path file) {
+        if (activeDocuments.containsKey(file)) {
+            dirtyDocuments.add(file);
+            LOG.info("[dirty] externalDelete() marking active document dirty: " + file.getFileName());
+        }
         removeFromPackageIndex(file);
         javaSources.remove(file);
-        bumpContentRevision();
+        savedContentHashes.remove(file);
+        sourceRevision.incrementAndGet();
+        bumpContentRevision(file);
+    }
+
+    private static void refreshSavedBaseline(Path file) {
+        var active = activeDocuments.get(file);
+        if (active == null) return;
+        var diskHash = diskContentHash(file);
+        if (diskHash == null) {
+            savedContentHashes.remove(file);
+            dirtyDocuments.add(file);
+        } else {
+            savedContentHashes.put(file, diskHash);
+            if (active.contentHash == diskHash) dirtyDocuments.remove(file);
+            else dirtyDocuments.add(file);
+        }
     }
 
     private static void readInfoFromDisk(Path file) {
@@ -266,12 +301,13 @@ public class FileStore {
             var time = Files.getLastModifiedTime(file).toInstant();
             var packageName = StringSearch.packageName(file);
             removeFromPackageIndex(file);
-            javaSources.put(file, new Info(time, packageName));
+            var previous = javaSources.put(file, new Info(time, packageName));
+            if (previous == null || !previous.packageName.equals(packageName)) sourceRevision.incrementAndGet();
             packageIndex.computeIfAbsent(packageName, k -> new CopyOnWriteArrayList<>()).addIfAbsent(file);
         } catch (NoSuchFileException | CharacterCodingException e) {
             LOG.warning(e.getMessage());
             removeFromPackageIndex(file);
-            javaSources.remove(file);
+            if (javaSources.remove(file) != null) sourceRevision.incrementAndGet();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -291,19 +327,37 @@ public class FileStore {
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
         var newContent = new VersionedContent(document.text, document.version);
-        activeDocuments.put(file, newContent);
-        // Only invalidate caches if the content actually changed (not just opened)
-        var contentChanged = existing != null && existing.contentHash != newContent.contentHash;
+        if (!Files.exists(file) && existing == null) sourceRevision.incrementAndGet();
+        // Read disk once per open document; subsequent changes compare against this baseline.
         if (existing == null) {
-            try {
-                contentChanged = !Files.readString(file).equals(document.text);
-            } catch (IOException e) {
-                contentChanged = true;
-            }
+            var diskHash = diskContentHash(file);
+            if (diskHash == null) savedContentHashes.remove(file);
+            else savedContentHashes.put(file, diskHash);
         }
-        if (contentChanged) {
-            bumpContentRevision();
+        var contentChanged = existing != null && existing.contentHash != newContent.contentHash;
+        if (existing == null) contentChanged = !sameAsSaved(file, newContent.contentHash);
+        var matchesSaved = sameAsSaved(file, newContent.contentHash);
+        if (!matchesSaved) {
+            dirtyDocuments.add(file);
+            activeDocuments.put(file, newContent);
+        } else {
+            activeDocuments.put(file, newContent);
+            dirtyDocuments.remove(file);
         }
+        refreshPackage(file);
+        if (contentChanged) bumpContentRevision(file);
+    }
+
+    private static void refreshPackage(Path file) {
+        try {
+            var name = StringSearch.packageName(file);
+            var previous = javaSources.get(file);
+            if (previous != null && previous.packageName.equals(name)) return;
+            removeFromPackageIndex(file);
+            javaSources.put(file, new Info(Instant.now(), name));
+            packageIndex.computeIfAbsent(name, key -> new CopyOnWriteArrayList<>()).addIfAbsent(file);
+            sourceRevision.incrementAndGet();
+        } catch (IOException failure) { LOG.fine(failure.getMessage()); }
     }
 
     static void change(DidChangeTextDocumentParams params) {
@@ -312,50 +366,43 @@ public class FileStore {
         var file = Paths.get(document.uri);
         var existing = activeDocuments.get(file);
         if (existing == null) return;
-        // Always mark dirty — the user attempted to edit this file
-        LOG.info("[dirty] change() marking dirty: " + file.getFileName() + " (version=" + document.version + " existing=" + existing.version + ")");
-        dirtyDocuments.add(file);
         if (document.version <= existing.version) {
             LOG.warning("Ignored change with version " + document.version + " <= " + existing.version);
             return;
         }
+        LOG.info("[dirty] change() applying version=" + document.version + " over " + existing.version);
         var newText = existing.content;
         for (var change : params.contentChanges) {
             if (change.range == null) newText = change.text;
             else newText = patch(newText, change);
         }
-        activeDocuments.put(file, new VersionedContent(newText, document.version));
-        bumpContentRevision();
+        var newContent = new VersionedContent(newText, document.version);
         // If content now matches disk (e.g. undo), clear dirty flag — no cross-file errors needed
-        var diskInfo = javaSources.get(file);
-        if (diskInfo != null) {
-            try {
-                var diskContent = Files.readString(file);
-                if (diskContent.equals(newText)) {
-                    dirtyDocuments.remove(file);
-                    LOG.info("[dirty] change() content matches disk — clearing dirty: " + file.getFileName());
-                } else {
-                    dirtyDocuments.add(file);
-                }
-            } catch (IOException ignored) {
-                dirtyDocuments.add(file);
-            }
+        if (sameAsSaved(file, newContent.contentHash)) {
+            activeDocuments.put(file, newContent);
+            dirtyDocuments.remove(file);
+            LOG.info("[dirty] change() content matches disk — clearing dirty: " + file.getFileName());
         } else {
             dirtyDocuments.add(file);
+            activeDocuments.put(file, newContent);
         }
+        refreshPackage(file);
+        bumpContentRevision(file);
     }
 
     static void close(DidCloseTextDocumentParams params) {
         if (!isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         var removed = activeDocuments.remove(file);
+        savedContentHashes.remove(file);
         // If the in-memory content differed from disk, caches are stale.
         if (removed != null) {
+            // Closing discards the editor buffer, so any unsaved dirty state no longer applies.
+            dirtyDocuments.remove(file);
             readInfoFromDisk(file);
-            var diskHash = javaSources.containsKey(file)
-                    ? Long.hashCode(javaSources.get(file).modified.toEpochMilli()) : 0;
-            if (diskHash != removed.contentHash) {
-                bumpContentRevision();
+            var diskHash = diskContentHash(file);
+            if (!Objects.equals(diskHash, removed.contentHash)) {
+                bumpContentRevision(file);
             }
         }
     }
@@ -365,8 +412,10 @@ public class FileStore {
             return;
         }
         LOG.info("[dirty] save() clearing dirty: " + file.getFileName());
-        bumpContentRevision();
+        var active = activeDocuments.get(file);
+        if (active != null) savedContentHashes.put(file, active.contentHash);
         dirtyDocuments.remove(file);
+        bumpContentRevision(file);
     }
 
     static Set<Path> activeDocuments() {
@@ -377,12 +426,46 @@ public class FileStore {
         return Set.copyOf(dirtyDocuments);
     }
 
+    static boolean isDirty(Path file) { return dirtyDocuments.contains(file); }
+
+    static long sourceRevision() { return sourceRevision.get(); }
+
     public static long contentRevision() {
         return contentRevision.get();
     }
 
+    /**
+     * Files whose content changed after {@code revision}. Callers that cache per-file analysis use
+     * this to keep results derived from unchanged files instead of discarding everything.
+     */
+    static Collection<Path> changedSince(long revision) {
+        if (contentChanges.isEmpty()) return List.of();
+        var changed = new ArrayList<Path>();
+        contentChanges.forEach((file, at) -> {
+            if (at > revision) changed.add(file);
+        });
+        return changed;
+    }
+
     private static void bumpContentRevision() {
         contentRevision.incrementAndGet();
+    }
+
+    private static void bumpContentRevision(Path file) {
+        contentChanges.put(file, contentRevision.incrementAndGet());
+    }
+
+    private static boolean sameAsSaved(Path file, int contentHash) {
+        var savedHash = savedContentHashes.get(file);
+        return savedHash != null && savedHash == contentHash;
+    }
+
+    private static Integer diskContentHash(Path file) {
+        try {
+            return Files.readString(file).hashCode();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     static VersionedContent activeDocument(Path file) {

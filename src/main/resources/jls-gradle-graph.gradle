@@ -1,86 +1,48 @@
-// JLS Gradle init script — Phase 1: extracts module graph structure (no classpath resolution).
-// Invoked via: ./gradlew --no-daemon --init-script <this-file> -q jlsModuleGraph
-
-rootProject {
-    task jlsModuleGraph {
+// Read Java source sets and project edges without executing compilation tasks.
+// One task per project: reading another project's model is deprecated (and fails under isolated
+// projects), and parallel builds interleave stdout, so each project writes its own file.
+gradle.allprojects { proj ->
+    proj.tasks.register('jlsModuleGraph') {
         doLast {
-            def modules = []
-
-            rootProject.allprojects { proj ->
-                def info = [:]
-                info.projectPath = proj.path
-                info.projectDir = proj.projectDir.absolutePath
-
-                def hasJavaPlugin = proj.plugins.hasPlugin('java') || proj.plugins.hasPlugin('java-library')
-
-                // Source directories
-                def srcDirs = []
-                if (hasJavaPlugin) {
-                    proj.sourceSets.each { ss ->
-                        ss.java.srcDirs.each { dir ->
-                            if (dir.exists()) {
-                                srcDirs.add(dir.absolutePath)
-                            }
-                        }
-                    }
-                }
-                info.sourceDirs = srcDirs
-
-                // Inter-module (project) dependencies
-                // Uses allDependencies (walks configuration hierarchy: api/implementation → compileClasspath)
-                // Uses dep.path (Gradle 9.x removed dep.dependencyProject)
-                def moduleDeps = []
-                try {
-                    def config = proj.configurations.findByName('compileClasspath')
-                    if (config != null) {
-                        config.allDependencies.each { dep ->
-                            if (dep instanceof org.gradle.api.artifacts.ProjectDependency) {
-                                try {
-                                    moduleDeps.add(dep.path)
-                                } catch (Exception pathEx) {
-                                    // Gradle < 8.11 fallback
-                                    try { moduleDeps.add(dep.dependencyProject.path) } catch (Exception ignored) {}
-                                }
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    System.err.println("[jls-gradle] ERROR reading moduleDeps for ${proj.path}: ${e.message}")
-                }
-                info.moduleDeps = moduleDeps
-
-                // Build output directory
-                def buildDir
-                try {
-                    buildDir = proj.layout.buildDirectory.get().asFile
-                } catch (Exception e) {
-                    buildDir = proj.buildDir
-                }
-                info.classOutputDir = new File(buildDir, 'classes/java/main').absolutePath
-
-                // Source compatibility
-                info.sourceCompatibility = null
-                if (proj.plugins.hasPlugin('java')) {
-                    try {
-                        def javaExt = proj.extensions.findByName('java')
-                        if (javaExt != null && javaExt.sourceCompatibility != null) {
-                            info.sourceCompatibility = javaExt.sourceCompatibility.toString()
-                        }
-                    } catch (Exception e) {
-                        // ignore
-                    }
-                }
-
-                // Phase 1 does NOT resolve classpath
-                info.externalClasspath = []
-
-                modules.add(info)
+            def outputDir = proj.findProperty('jls.outputDir')
+            if (outputDir == null) throw new GradleException('jls.outputDir not set')
+            def projectDependencies = { configurationName ->
+                def config = proj.configurations.findByName(configurationName)
+                if (config == null) return []
+                config.allDependencies.findAll { it instanceof org.gradle.api.artifacts.ProjectDependency }
+                    .collect { dep ->
+                        try { dep.path } catch (MissingPropertyException ignored) { dep.dependencyProject.path }
+                    }.unique()
             }
-
-            def json = groovy.json.JsonOutput.toJson([modules: modules])
-            println "___JLS_MODULE_GRAPH_START___"
-            println json
-            println "___JLS_MODULE_GRAPH_END___"
+            def sourceDirs = [], testSourceDirs = [], moduleDeps = [], testModuleDeps = []
+            def mainOutput = null, testOutput = null, release = null
+            def sets = proj.extensions.findByName('sourceSets')
+            if (sets != null) {
+                sets.each { sourceSet ->
+                    def dirs = sourceSet.java.srcDirs.collect { it.absolutePath }
+                    def compile = proj.tasks.findByName(sourceSet.compileJavaTaskName)
+                    if (compile instanceof org.gradle.api.tasks.compile.JavaCompile) {
+                        def generated = compile.options.generatedSourceOutputDirectory.orNull
+                        if (generated != null) dirs.add(generated.asFile.absolutePath)
+                        def output = compile.destinationDirectory.orNull?.asFile?.absolutePath
+                        if (sourceSet.name == 'main') {
+                            mainOutput = output
+                            release = compile.options.release.orNull?.toString() ?: compile.sourceCompatibility
+                        } else if (sourceSet.name == 'test') testOutput = output
+                    }
+                    sourceDirs.addAll(dirs)
+                    def deps = projectDependencies(sourceSet.compileClasspathConfigurationName)
+                    if (sourceSet.name == 'main') moduleDeps.addAll(deps)
+                    else { testSourceDirs.addAll(dirs); testModuleDeps.addAll(deps) }
+                }
+            }
+            def json = groovy.json.JsonOutput.toJson(
+                    [projectPath: proj.path, projectDir: proj.projectDir.absolutePath,
+                     sourceDirs: sourceDirs.unique(), testSourceDirs: testSourceDirs.unique(),
+                     classOutputDir: mainOutput, testOutputDir: testOutput,
+                     moduleDeps: moduleDeps.unique(), testModuleDeps: (moduleDeps + testModuleDeps).unique(),
+                     sourceCompatibility: release, externalClasspath: []])
+            new File(outputDir as String, proj.path.replace(':', '_') + '.json').text = json
         }
     }
 }

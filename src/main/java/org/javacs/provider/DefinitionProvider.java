@@ -1,5 +1,7 @@
 package org.javacs.provider;
 import com.sun.source.util.TreePath;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Symbol;
 import java.lang.classfile.ClassFile;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -42,6 +44,13 @@ public class DefinitionProvider {
     public List<Location> find() {
         var start = System.currentTimeMillis();
         try (var task = compiler.compile(file)) {
+            return findInScope(task);
+        } finally {
+            LOG.fine("[def] goto-definition " + file.getFileName() + ":" + line + ":" + column + " completed in " + (System.currentTimeMillis() - start) + "ms");
+        }
+    }
+
+    private List<Location> findInScope(CompileTask task) {
             var element = NavigationHelper.findElement(task, file, line, column);
             if (element == null) { LOG.fine("[def] element=null"); return NOT_SUPPORTED; }
             LOG.fine("[def] element=" + element.getKind() + " " + element + " type=" + element.asType().getKind());
@@ -53,7 +62,7 @@ public class DefinitionProvider {
                     if (!result.isEmpty()) { LOG.fine("[def] return=lombok-error-field"); return result; }
                 }
                 LOG.fine("[def] branch=findError");
-                return findError(element);
+                return findError(task, element);
             }
             if (NavigationHelper.isLocal(element)) {
                 LOG.fine("[def] branch=isLocal kind=" + element.getKind() + " name=" + element.getSimpleName());
@@ -106,11 +115,33 @@ public class DefinitionProvider {
                         return List.of(FindHelper.location(parse, path, method.getSimpleName()));
                     }
                 } catch (RuntimeException notInSource) {
-                    // Method not in source tree (Lombok-generated) — check .class bytecode
+                }
+                if (otherFile.get() instanceof SourceFileObject && compiler.lombokPresentOnClasspath()) {
+                    var builderField = resolveLombokBuilderField(
+                            method, method.getSimpleName().toString(), task.elements);
+                    if (!builderField.isEmpty()) return builderField;
+                    try {
+                        var result = resolveLombokField(method, method.getSimpleName().toString(), task.elements);
+                        if (!result.isEmpty()) {
+                            LOG.info("[lombok-source-compile] definition=source-field method=" + method.getSimpleName());
+                            return result;
+                        }
+                    } catch (RuntimeException ignored) {
+                        // Treat this as a missing Lombok source definition.
+                    }
+                    LOG.info("[lombok-source-compile] definition=source-field-miss method=" + method.getSimpleName());
+                }
+                // A workspace source is authoritative for a Lombok accessor. Do not jump
+                // to the containing class when the generated accessor has no source field.
+                if (otherFile.get() instanceof SourceFileObject
+                        && compiler.lombokPresentOnClasspath()
+                        && LombokAnnotations.accessorFieldName(method.getSimpleName().toString()).isPresent()) {
+                    return List.of();
+                }
+                if (!(otherFile.get() instanceof SourceFileObject)) {
                     var classFile = compiler.findClassFile(className);
                     var methodName = method.getSimpleName().toString();
                     if (classFile.isPresent() && classHasMethod(classFile.get(), methodName)) {
-                        // Map getter/setter to field name, navigate to field if found
                         var fieldName = compiler.lombokPresentOnClasspath()
                                 ? LombokAnnotations.accessorFieldName(methodName) : java.util.Optional.<String>empty();
                         if (fieldName.isPresent()) {
@@ -137,23 +168,24 @@ public class DefinitionProvider {
                     var path = TreePath.getPath(parse.root(), memberTree);
                     return List.of(FindHelper.location(parse, path, memberName));
                 } catch (RuntimeException notInSource) {
-                    var classFile = compiler.findClassFile(className);
-                    if (classFile.isPresent() && classHasMethod(classFile.get(), memberName)) {
-                        LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + memberName + ")");
-                        var path = TreePath.getPath(parse.root(), tree);
-                        return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+                    if (otherFile.get() instanceof SourceFileObject && compiler.lombokPresentOnClasspath()) {
+                        LOG.info("[lombok-source-compile] definition=source-field-miss field=" + memberName);
+                    } else if (!(otherFile.get() instanceof SourceFileObject)) {
+                        var classFile = compiler.findClassFile(className);
+                        if (classFile.isPresent() && classHasMethod(classFile.get(), memberName)) {
+                            LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + memberName + ")");
+                            var path = TreePath.getPath(parse.root(), tree);
+                            return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+                        }
                     }
                 }
             }
             LOG.fine("[def] return=class-in-other-file");
             var path = TreePath.getPath(parse.root(), tree);
             return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
-        } finally {
-            LOG.fine("[def] goto-definition " + file.getFileName() + ":" + line + ":" + column + " completed in " + (System.currentTimeMillis() - start) + "ms");
-        }
     }
 
-    private String resolveImportClass(String memberName) {
+    private String resolveImportClass(CompileTask task, String memberName) {
         var parse = compiler.parse(file);
         for (var imp : parse.root().getImports()) {
             if (!imp.isStatic()) continue;
@@ -169,13 +201,13 @@ public class DefinitionProvider {
             if (memberPart.equals("*")) {
                 var qid = qualifiedId.toString();
                 var className = qid.substring(0, qid.lastIndexOf('.'));
-                if (compiler.findAnywhere(className).isPresent() && !findAllMembers(className, memberName).isEmpty()) return className;
+                if (compiler.findAnywhere(className).isPresent() && !findAllMembers(task, className, memberName).isEmpty()) return className;
             }
         }
         return null;
     }
 
-    private List<Location> findError(Element element) {
+    private List<Location> findError(CompileTask task, Element element) {
         var name = element.getSimpleName();
         if (name == null) return NOT_SUPPORTED;
         var memberName = name.toString();
@@ -191,36 +223,36 @@ public class DefinitionProvider {
                 if (resolved.isEmpty()) return NOT_SUPPORTED;
                 className = resolved.get();
             }
-            var result = findAllMembers(className, memberName);
+            var result = findAllMembers(task, className, memberName);
             if (!result.isEmpty()) return result;
         }
         // Try resolving via imports — handles static imports where the error
         // symbol's enclosing element is not a proper TypeElement
-        var importClass = resolveImportClass(memberName);
-        if (importClass != null) return findAllMembers(importClass, memberName);
+        var importClass = resolveImportClass(task, memberName);
+        if (importClass != null) return findAllMembers(task, importClass, memberName);
         return List.of();
     }
 
-    private List<Location> findAllMembers(String className, String memberName) {
-        var otherFile = compiler.findAnywhere(className);
-        if (otherFile.isEmpty()) return List.of();
-        var fileAsSource = new SourceFileObject(file);
-        var sources = List.of(fileAsSource, otherFile.get());
-        if (otherFile.get().toString().equals(file.toUri())) {
-            sources = List.of(fileAsSource);
+    private List<Location> findAllMembers(CompileTask outerTask, String className, String memberName) {
+        LOG.fine("[def] findAllMembers using outer task for " + className + "." + memberName);
+        var parentClass = outerTask.elements.getTypeElement(className);
+        if (parentClass == null) {
+            // Type not resolved in outer compile — fall back to parse-based resolution
+            var otherFile = compiler.findAnywhere(className);
+            if (otherFile.isEmpty()) return List.of();
+            var parse = compiler.parse(otherFile.get());
+            var tree = FindHelper.findType(parse, className);
+            if (tree == null) return List.of();
+            var path = TreePath.getPath(parse.root(), tree);
+            return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
         }
         var locations = new ArrayList<Location>();
-        try (var task = compiler.compile(sources)) {
-            var trees = task.trees;
-            var elements = task.elements;
-            var parentClass = elements.getTypeElement(className);
-            for (var member : elements.getAllMembers(parentClass)) {
-                if (!member.getSimpleName().contentEquals(memberName)) continue;
-                var path = trees.getPath(member);
-                if (path == null) continue;
-                var location = FindHelper.location(task, path, memberName);
-                locations.add(location);
-            }
+        for (var member : outerTask.elements.getAllMembers(parentClass)) {
+            if (!member.getSimpleName().contentEquals(memberName)) continue;
+            var path = outerTask.trees.getPath(member);
+            if (path == null) continue;
+            var location = FindHelper.location(outerTask, path, memberName);
+            locations.add(location);
         }
         return locations;
     }
@@ -257,9 +289,59 @@ public class DefinitionProvider {
         var sourceFile = compiler.findAnywhere(declaringClass);
         if (sourceFile.isEmpty()) return List.of();
         var parse = compiler.parse(sourceFile.get());
+        var classTree = FindHelper.findType(parse, declaringClass);
         var fieldTree = FindHelper.findField(parse, declaringClass, fieldName);
+        var accessor = LombokAnnotations.accessorFieldName(memberName);
+        if (accessor.isPresent()) {
+            var info = LombokAnnotations.accessorInfo(
+                    parse.root(), classTree.getModifiers(), fieldTree.getModifiers(), fieldName,
+                    fieldTree.getType().toString());
+            if (info.isEmpty()
+                    || (!memberName.equals(info.get().getterName()) && !memberName.equals(info.get().setterName()))) {
+                return List.of();
+            }
+        }
         var path = TreePath.getPath(parse.root(), fieldTree);
         return List.of(FindHelper.location(parse, path, fieldName));
+    }
+
+    /** Resolve a class-level Lombok builder setter to the owner's real source field. */
+    private List<Location> resolveLombokBuilderField(
+            Element element, String memberName, Elements elements) {
+        if (!(element instanceof ExecutableElement method)
+                || method.getParameters().size() != 1
+                || memberName == null
+                || memberName.isBlank()) {
+            return List.of();
+        }
+        if (!(method instanceof Symbol symbol)
+                || (symbol.flags() & Flags.GENERATED_MEMBER) == 0) {
+            return List.of();
+        }
+        if (!(method.getEnclosingElement() instanceof TypeElement builderType)) {
+            return List.of();
+        }
+        var builderName = builderType.getQualifiedName().toString();
+        var suffix = builderName.lastIndexOf(".");
+        if (suffix < 0 || !builderName.endsWith("Builder")) {
+            return List.of();
+        }
+        var ownerName = builderName.substring(0, suffix);
+        var owner = elements.getTypeElement(ownerName);
+        if (owner == null) return List.of();
+        var hasField = owner.getEnclosedElements().stream()
+                .anyMatch(member -> member.getKind() == ElementKind.FIELD
+                        && member.getSimpleName().contentEquals(memberName));
+        if (!hasField) return List.of();
+        var sourceFile = compiler.findAnywhere(ownerName);
+        if (sourceFile.isEmpty() || !(sourceFile.get() instanceof SourceFileObject)) {
+            return List.of();
+        }
+        var parse = compiler.parse(sourceFile.get());
+        var fieldTree = FindHelper.findField(parse, ownerName, memberName);
+        var path = TreePath.getPath(parse.root(), fieldTree);
+        LOG.info("[lombok-source-compile] definition=builder-field method=" + memberName);
+        return List.of(FindHelper.location(parse, path, memberName));
     }
 
     private List<Location> navigateToDeclaration(CompileTask task, ExecutableElement method) {
@@ -361,6 +443,11 @@ public class DefinitionProvider {
     }
 
     private List<Location> findDefinitions(CompileTask task, Element element) {
+        if (compiler.lombokPresentOnClasspath() && element instanceof ExecutableElement method) {
+            var builderField = resolveLombokBuilderField(
+                    element, method.getSimpleName().toString(), task.elements);
+            if (!builderField.isEmpty()) return builderField;
+        }
         var trees = task.trees;
         var path = trees.getPath(element);
         LOG.fine("[def] findDefinitions kind=" + element.getKind() + " name=" + element.getSimpleName() + " getPath=" + (path != null ? "found" : "null"));

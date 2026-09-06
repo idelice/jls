@@ -26,7 +26,9 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     public TreePath visitClass(ClassTree t, Long find) {
         var push = surroundingClass;
         surroundingClass = t;
-        if (contains(t, t.getSimpleName(), find)) {
+        // An anonymous class has no name to click on. Matching its empty name would make every
+        // word boundary in its body resolve to the class instead of the symbol under the cursor.
+        if (!t.getSimpleName().isEmpty() && contains(t, t.getSimpleName(), find)) {
             surroundingClass = push;
             return getCurrentPath();
         }

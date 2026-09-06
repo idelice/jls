@@ -139,8 +139,7 @@ class RenameHelper {
     private TextEdit[] replaceAll(List<TreePath> found, String newName) {
         var trees = task.trees;
         var pos = trees.getSourcePositions();
-        var edits = new TextEdit[found.size()];
-        var i = 0;
+        var edits = new ArrayList<TextEdit>(found.size());
         for (var f : found) {
             var root = f.getCompilationUnit();
             var startPos = pos.getStartPosition(root, f.getLeaf());
@@ -168,12 +167,14 @@ class RenameHelper {
                 startPos = findName(root, startPos, select.getIdentifier());
                 endPos = startPos + select.getIdentifier().length();
             }
-            edits[i++] = new TextEdit(LspPosition.range(root, startPos, endPos), newName);
+            if (startPos < 0 || endPos < startPos) continue; // injected declaration, nothing to edit
+            edits.add(new TextEdit(LspPosition.range(root, startPos, endPos), newName));
         }
-        return edits;
+        return edits.toArray(TextEdit[]::new);
     }
 
     private long findName(CompilationUnitTree root, long startPos, CharSequence name) {
+        if (startPos < 0) return startPos;
         try {
             var contents = root.getSourceFile().getCharContent(true);
             var matcher = Pattern.compile("\\b" + name + "\\b").matcher(contents);

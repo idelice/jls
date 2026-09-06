@@ -43,7 +43,6 @@ import java.util.Objects;
 import java.util.Optional;
 
 import org.javacs.CompilerProvider;
-import org.javacs.LombokAnnotations;
 import org.javacs.ParseTask;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.WorkspaceTypeIndex;
@@ -177,10 +176,6 @@ public final class ParseTypeResolver {
         if (variable.isPresent()) {
             return variable;
         }
-        var implicitLogger = resolveImplicitSlf4jLogger(fallbackIdentifier);
-        if (implicitLogger.isPresent()) {
-            return implicitLogger;
-        }
         var enclosingField = resolveEnclosingField(fallbackIdentifier);
         if (enclosingField.isPresent()) {
             return enclosingField;
@@ -234,10 +229,6 @@ public final class ParseTypeResolver {
             var variable = resolveVisibleVariable(name, depth + 1);
             if (variable.isPresent()) {
                 return variable;
-            }
-            var implicitLogger = resolveImplicitSlf4jLogger(name);
-            if (implicitLogger.isPresent()) {
-                return implicitLogger;
             }
             var enclosingField = resolveEnclosingField(name);
             if (enclosingField.isPresent()) {
@@ -527,34 +518,6 @@ public final class ParseTypeResolver {
             typeArg = typeArg.substring("? super ".length()).trim();
         }
         return typeArg.equals(expectedTypeVar);
-    }
-
-    private Optional<TypeResolution> resolveImplicitSlf4jLogger(String identifier) {
-        if (!"log".equals(identifier)) {
-            return Optional.empty();
-        }
-        var classPath = enclosingClassPath();
-        if (classPath == null) {
-            return Optional.empty();
-        }
-        var classTree = (ClassTree) classPath.getLeaf();
-        if (!LombokAnnotations.hasLoggingOnlyLombokAnnotation(classTree.getModifiers())) {
-            return Optional.empty();
-        }
-        var ownerType = qualifiedClassName(root, classPath);
-        var loggerMember = resolveIndexedMember(ownerType, "log", false, null);
-        if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
-            return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
-        }
-        loggerMember = resolveIndexedMember(ownerType, "log", true, null);
-        if (loggerMember.isPresent() && loggerMember.get().returnType != null) {
-            return Optional.of(new TypeResolution(loggerMember.get().returnType, false, false));
-        }
-        var loggerType = "org.slf4j.Logger";
-        if (!index.containsType(loggerType)) {
-            return Optional.empty();
-        }
-        return Optional.of(new TypeResolution(loggerType, false, false));
     }
 
     // Current-file and enclosing-scope fallback.

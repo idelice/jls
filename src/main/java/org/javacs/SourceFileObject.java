@@ -1,14 +1,12 @@
 package org.javacs;
 
-import java.io.*;
-import java.net.URI;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import javax.lang.model.element.Modifier;
-import javax.lang.model.element.NestingKind;
-import javax.tools.JavaFileObject;
+import javax.tools.SimpleJavaFileObject;
 
-public class SourceFileObject implements JavaFileObject {
+public class SourceFileObject extends SimpleJavaFileObject {
     /** path is the absolute path to this file on disk */
     final Path path;
     /** contents is the text in this file, or null if we should use the text in FileStore */
@@ -17,9 +15,10 @@ public class SourceFileObject implements JavaFileObject {
     final Instant modified;
     /** if contents is set from an open document, this is its LSP version, otherwise -1 */
     final int version;
+    private final boolean dynamicLastModified;
 
     public SourceFileObject(Path path) {
-        if (!FileStore.isJavaFile(path)) throw new RuntimeException(path + " is not a java source");
+        super(sourceUri(path), Kind.SOURCE);
         this.path = path;
         var active = FileStore.activeDocument(path);
         if (active != null) {
@@ -31,6 +30,7 @@ public class SourceFileObject implements JavaFileObject {
             this.modified = Instant.EPOCH;
             this.version = -1;
         }
+        this.dynamicLastModified = true;
     }
 
     public SourceFileObject(Path path, String contents, Instant modified) {
@@ -38,11 +38,17 @@ public class SourceFileObject implements JavaFileObject {
     }
 
     public SourceFileObject(Path path, String contents, Instant modified, int version) {
-        if (!FileStore.isJavaFile(path)) throw new RuntimeException(path + " is not a java source");
+        super(sourceUri(path), Kind.SOURCE);
         this.path = path;
         this.contents = contents;
         this.modified = modified;
         this.version = version;
+        this.dynamicLastModified = false;
+    }
+
+    private static java.net.URI sourceUri(Path path) {
+        if (!FileStore.isJavaFile(path)) throw new RuntimeException(path + " is not a java source");
+        return path.toUri();
     }
 
     @Override
@@ -58,68 +64,6 @@ public class SourceFileObject implements JavaFileObject {
     }
 
     @Override
-    public Kind getKind() {
-        var name = path.getFileName().toString();
-        return kindFromExtension(name);
-    }
-
-    private static Kind kindFromExtension(String name) {
-        for (var candidate : Kind.values()) {
-            if (name.endsWith(candidate.extension)) {
-                return candidate;
-            }
-        }
-        return null;
-    }
-
-    @Override
-    public boolean isNameCompatible(String simpleName, Kind kind) {
-        return path.getFileName().toString().equals(simpleName + kind.extension);
-    }
-
-    @Override
-    public NestingKind getNestingKind() {
-        return null;
-    }
-
-    @Override
-    public Modifier getAccessLevel() {
-        return null;
-    }
-
-    @Override
-    public URI toUri() {
-        return path.toUri();
-    }
-
-    @Override
-    public String getName() {
-        return path.toString();
-    }
-
-    @Override
-    public InputStream openInputStream() {
-        if (contents != null) {
-            var bytes = contents.getBytes();
-            return new ByteArrayInputStream(bytes);
-        }
-        return FileStore.inputStream(path);
-    }
-
-    @Override
-    public OutputStream openOutputStream() {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public Reader openReader(boolean ignoreEncodingErrors) {
-        if (contents != null) {
-            return new StringReader(contents);
-        }
-        return FileStore.bufferedReader(path);
-    }
-
-    @Override
     public CharSequence getCharContent(boolean ignoreEncodingErrors) {
         if (contents != null) {
             return contents;
@@ -128,23 +72,22 @@ public class SourceFileObject implements JavaFileObject {
     }
 
     @Override
-    public Writer openWriter() {
-        throw new UnsupportedOperationException();
+    public String getName() {
+        return path.toString();
     }
 
     @Override
     public long getLastModified() {
-        if (contents != null) {
-            return modified.toEpochMilli();
-        }
-        var fileModified = FileStore.modified(path);
-        if (fileModified == null) return 0;
-        return fileModified.toEpochMilli();
+        if (!dynamicLastModified) return modified.toEpochMilli();
+        return FileStore.isDirty(path) ? Long.MAX_VALUE : diskModified(path);
     }
 
-    @Override
-    public boolean delete() {
-        throw new UnsupportedOperationException();
+    private static long diskModified(Path path) {
+        try {
+            return Files.getLastModifiedTime(path).toMillis();
+        } catch (IOException e) {
+            return 0;
+        }
     }
 
     @Override

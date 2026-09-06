@@ -1,83 +1,32 @@
-// JLS Gradle init script — Phase 2: resolves classpath for targeted modules only.
-// Invoked via: ./gradlew --no-daemon --init-script <this-file> -q jlsResolveClasspath -Pjls.targetModules=:mod1,:mod2
-
-rootProject {
-    task jlsResolveClasspath {
+// Resolve available external artifacts. Project artifacts are represented by source roots.
+// Each project resolves only its OWN configurations: Gradle grants the required lock to the
+// owning project, and cross-project resolution is forbidden. Results go to one file per project
+// because parallel builds interleave stdout.
+gradle.allprojects { proj ->
+    proj.tasks.register('jlsResolveClasspath') {
         doLast {
-            def targetModulesStr = project.findProperty('jls.targetModules') ?: ''
-            def targetModules = targetModulesStr.split(',').collect { it.trim() }.findAll { !it.isEmpty() } as Set
-
-            def resolveAll = targetModules.isEmpty()
-            if (resolveAll) {
-                System.err.println("[jls-gradle] no target modules specified, resolving all")
-            } else {
-                System.err.println("[jls-gradle] resolving classpath for: ${targetModules}")
+            def outputDir = proj.findProperty('jls.outputDir')
+            if (outputDir == null) throw new GradleException('jls.outputDir not set')
+            def externalFiles = { sourceSet ->
+                def config = proj.configurations.findByName(sourceSet.compileClasspathConfigurationName)
+                if (config == null || !config.canBeResolved) return []
+                def artifacts = config.incoming.artifactView {
+                    lenient = true
+                    componentFilter { !(it instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier) }
+                }.artifacts
+                artifacts.failures.each { System.err.println("[jls-gradle] partial ${proj.path}: ${it.message}") }
+                artifacts.artifactFiles.files.collect { it.absolutePath }
             }
-
-            def modules = []
-
-            rootProject.allprojects { proj ->
-                if (!resolveAll && !targetModules.contains(proj.path)) return
-
-                def info = [:]
-                info.projectPath = proj.path
-
-                def hasJavaPlugin = proj.plugins.hasPlugin('java') || proj.plugins.hasPlugin('java-library')
-                if (!hasJavaPlugin) {
-                    info.externalClasspath = []
-                    info.testClasspath = []
-                    modules.add(info)
-                    return
-                }
-
-                // Resolve compile classpath
-                def classpath = [] as Set
-                try {
-                    proj.configurations.each { config ->
-                        if (config.name.endsWith('CompileClasspath') && config.isCanBeResolved()) {
-                            try {
-                                config.resolve().each { file ->
-                                    classpath.add(file.absolutePath)
-                                }
-                            } catch (Exception resolveEx) {
-                                System.err.println("[jls-gradle] ERROR resolving ${config.name}: ${resolveEx.message}")
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    System.err.println("[jls-gradle] ERROR iterating configurations for ${proj.path}: ${e.message}")
-                }
-                info.externalClasspath = classpath.toList()
-
-                // Resolve test classpath (testCompileClasspath minus compileClasspath)
-                def testClasspath = [] as Set
-                try {
-                    def testConfig = proj.configurations.findByName('testCompileClasspath')
-                    if (testConfig != null && testConfig.isCanBeResolved()) {
-                        try {
-                            testConfig.resolve().each { file ->
-                                def path = file.absolutePath
-                                if (!classpath.contains(path)) {
-                                    testClasspath.add(path)
-                                }
-                            }
-                        } catch (Exception e) {
-                            System.err.println("[jls-gradle] ERROR resolving testCompileClasspath: ${e.message}")
-                        }
-                    }
-                } catch (Exception e) {
-                    // ignore
-                }
-                info.testClasspath = testClasspath.toList()
-
-                System.err.println("[jls-gradle] ${proj.path}: ${classpath.size()} compile + ${testClasspath.size()} test jars")
-                modules.add(info)
+            def main = [], test = []
+            def sets = proj.extensions.findByName('sourceSets')
+            if (sets != null) sets.each { sourceSet ->
+                def files = externalFiles(sourceSet)
+                if (sourceSet.name == 'main') main.addAll(files)
+                else test.addAll(files)
             }
-
-            def json = groovy.json.JsonOutput.toJson([modules: modules])
-            println "___JLS_CLASSPATH_START___"
-            println json
-            println "___JLS_CLASSPATH_END___"
+            def json = groovy.json.JsonOutput.toJson([projectPath: proj.path,
+                    externalClasspath: main.unique(), testClasspath: (main + test).unique()])
+            new File(outputDir as String, proj.path.replace(':', '_') + '.json').text = json
         }
     }
 }

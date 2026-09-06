@@ -29,6 +29,7 @@ import javax.lang.model.element.Modifier;
 import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
 import org.javacs.LombokAnnotations;
+import org.javacs.LombokStubInjector;
 import org.javacs.ParseTask;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.TypeNames;
@@ -567,25 +568,29 @@ public class WorkspaceTypeIndex {
      * <p>Inherited members are resolved lazily at query time.
      *
      * <p>Record component accessors are synthesized from the parse tree without attribution.
-     * Lombok synthetics use the same parse-tree-based path as the compiled index.
+     * Lombok members are read from the same injected AST used by the compiler.
      */
-    public static WorkspaceTypeIndex fromParseTrees(List<ParseTask> parseTasks) {
+    public static WorkspaceTypeIndex fromParseTrees(Iterable<ParseTask> parseTasks) {
         return fromParseTrees(parseTasks, __ -> false);
     }
 
     public static WorkspaceTypeIndex fromParseTrees(
-            List<ParseTask> parseTasks, Predicate<String> knownType) {
+            Iterable<ParseTask> parseTasks, Predicate<String> knownType) {
         return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true);
     }
 
+    /**
+     * @param parseTasks iterated once and never retained: pass a lazy sequence so only one syntax
+     *     tree is alive at a time. Materialising every tree first exhausts the heap on a large
+     *     module closure.
+     */
     public static WorkspaceTypeIndex fromParseTrees(
-            List<ParseTask> parseTasks,
+            Iterable<ParseTask> parseTasks,
             BiPredicate<Path, String> knownType,
             BiPredicate<Path, Path> sourceVisible) {
         // Single-pass: parse each file, extract all metadata + members, discard AST immediately.
         // Supertype resolution is deferred to a post-pass using collected import/package data.
         var allQualifiedNames = new ObjectOpenHashSet<String>();
-        var typeClassTrees = new Object2ObjectOpenHashMap<String, ClassTree>();
         var typeSources = new Object2ObjectOpenHashMap<String, Path>();
         var typeSourceUris = new Object2ObjectOpenHashMap<String, java.net.URI>();
         var typeKinds = new Object2ObjectOpenHashMap<String, Integer>();
@@ -600,9 +605,9 @@ public class WorkspaceTypeIndex {
         // Members extracted per type
         var typeDirectMembers = new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
 
-        for (int i = 0; i < parseTasks.size(); i++) {
-            var parseTask = parseTasks.get(i);
+        for (var parseTask : parseTasks) {
             var root = parseTask.root();
+            LombokStubInjector.injectParseTask(parseTask);
             var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
             Path sourcePath = null;
             URI sourceUri = null;
@@ -649,7 +654,6 @@ public class WorkspaceTypeIndex {
 
                     qualifiedNameStack.push(qualified);
                     allQualifiedNames.add(qualified);
-                    typeClassTrees.put(qualified, tree);
                     typeKinds.put(qualified, parseTreeKindToCompletionItemKind(tree.getKind()));
                     typeModifiers.put(qualified, Set.copyOf(tree.getModifiers().getFlags()));
                     declaredTypesInFile.add(qualified);
@@ -678,9 +682,14 @@ public class WorkspaceTypeIndex {
                             || tree.getKind() == Tree.Kind.ANNOTATION_TYPE;
                     for (var member : tree.getMembers()) {
                         if (member instanceof MethodTree method) {
-                            addParseTreeMethod(qualified, method, seen);
+                            addParseTreeMethod(qualified, method, seen, tree, root, isGeneratedClass(tree));
                         } else if (member instanceof VariableTree variable) {
-                            addParseTreeField(qualified, variable, seen, enclosingIsInterface);
+                            addParseTreeField(
+                                    qualified,
+                                    variable,
+                                    seen,
+                                    enclosingIsInterface,
+                                    isGeneratedClass(tree));
                         }
                     }
                     if (tree.getKind() == Tree.Kind.RECORD) {
@@ -699,10 +708,9 @@ public class WorkspaceTypeIndex {
                         finalSourcePath, finalSourceUri, packageName,
                         explicitImports, staticImports, declaredTypesInFile, ""));
             }
-            // Allow GC to reclaim this file's AST before parsing the next
-            parseTasks.set(i, null);
         }
-        // ASTs are now eligible for GC — only lightweight data structures remain.
+        // Each syntax tree became garbage as soon as its iteration ended; only the collected
+        // declaration data below is retained.
 
         // === Post-pass: resolve raw supertype/interface names using collected workspace names ===
         var typeSupertypes = new Object2ObjectOpenHashMap<String, String>();
@@ -750,17 +758,12 @@ public class WorkspaceTypeIndex {
             }
         }
 
-        // === Build IndexedType entries with synthetics ===
+        // === Build IndexedType entries from the injected AST ===
         var typeEntries = new Object2ObjectLinkedOpenHashMap<String, IndexedType>();
 
         for (var qualifiedName : allQualifiedNames) {
             var seen = typeDirectMembers.get(qualifiedName);
-            var classTree = typeClassTrees.get(qualifiedName);
             var sourcePath = typeSources.get(qualifiedName);
-
-            addSyntheticLombokAccessors(qualifiedName, classTree, seen);
-            addSyntheticLombokConstructors(qualifiedName, classTree, seen);
-            addSyntheticSlf4jLoggerField(qualifiedName, classTree, seen);
 
             var members = new ArrayList<>(seen.values());
             IndexedMember.sort(members);
@@ -784,8 +787,6 @@ public class WorkspaceTypeIndex {
                     null,
                     IndexedMember.Provenance.WORKSPACE));
         }
-
-        normalizeLombokBuilderTypes(typeEntries, typeClassTrees, typeSources);
 
         var finalizedSourceFiles = finalizeSourceFiles(sourceFileSnapshots, typeEntries);
 
@@ -965,7 +966,12 @@ public class WorkspaceTypeIndex {
      * {@code declaredParameterTypes}.
      */
     private static void addParseTreeMethod(
-            String ownerQualifiedName, MethodTree method, Map<String, IndexedMember> seen) {
+            String ownerQualifiedName,
+            MethodTree method,
+            Map<String, IndexedMember> seen,
+            ClassTree declaration,
+            CompilationUnitTree root,
+            boolean enclosingIsGenerated) {
         var name = method.getName() == null ? null : method.getName().toString();
         if (name == null || name.isBlank()) return;
 
@@ -994,19 +1000,124 @@ public class WorkspaceTypeIndex {
 
         var canonicalKey = IndexedMember.canonicalKey(
                 ownerQualifiedName, kind, name, erasedParamTypes);
+        var generated = method instanceof com.sun.tools.javac.tree.JCTree.JCMethodDecl jcMethod
+                && (jcMethod.mods.flags & Flags.GENERATED_MEMBER) != 0;
+        // A generated factory/toBuilder on the outer class returns the (generated) builder type;
+        // qualify its simple name to the nested type so completion chains resolve. Detected
+        // structurally by return-type name so custom @Builder(builderClassName/...) names work too.
+        var returnsGeneratedBuilder = generated && !enclosingIsGenerated && !isConstructor
+                && returnsGeneratedNestedClass(declaration, returnTypeStr);
+        // A generated build method inside the builder returns the enclosing (outer) type.
+        var separatorIdx = ownerQualifiedName.lastIndexOf('.');
+        var outerSimpleName = separatorIdx > 0
+                ? TypeNames.simpleName(ownerQualifiedName.substring(0, separatorIdx)) : null;
+        var isBuildMethod = generated && enclosingIsGenerated && params.isEmpty()
+                && outerSimpleName != null && outerSimpleName.equals(returnTypeStr);
+        if (returnsGeneratedBuilder) {
+            returnTypeStr = ownerQualifiedName + "." + returnTypeStr;
+        } else if (generated && enclosingIsGenerated) {
+            var separator = ownerQualifiedName.lastIndexOf('.');
+            if (separator > 0) {
+                returnTypeStr = isBuildMethod
+                        ? ownerQualifiedName.substring(0, separator)
+                        : ownerQualifiedName;
+            }
+        }
         var detail = isConstructor
                 ? TypeNames.simpleName(ownerQualifiedName) + "(" + String.join(", ", declaredParamTypes) + ")"
                 : returnTypeStr + " " + name + "(" + String.join(", ", declaredParamTypes) + ")";
+
+        var origin = generated
+                ? (isConstructor
+                        ? IndexedMember.Origin.LOMBOK_CONSTRUCTOR
+                        : enclosingIsGenerated || returnsGeneratedBuilder
+                                ? IndexedMember.Origin.LOMBOK_BUILDER
+                                : IndexedMember.Origin.LOMBOK_ACCESSOR)
+                : IndexedMember.Origin.DECLARED;
+        var logicalKey = canonicalKey;
+        var backingFieldName = (String) null;
+        var declarationOwnerType = (String) null;
+        var targetDeclarationKey = (String) null;
+        if (generated && !isConstructor && !enclosingIsGenerated && !returnsGeneratedBuilder) {
+            var accessorField = generatedAccessorFieldName(name, declaration, root);
+            if (accessorField != null) {
+                backingFieldName = accessorField;
+                logicalKey = IndexedMember.canonicalKey(
+                        ownerQualifiedName, CompletionItemKind.Field, backingFieldName, null);
+                declarationOwnerType = ownerQualifiedName;
+                targetDeclarationKey = logicalKey;
+            }
+        } else if (generated && !isConstructor && enclosingIsGenerated) {
+            var separator = ownerQualifiedName.lastIndexOf('.');
+            if (separator > 0) {
+                var outerOwner = ownerQualifiedName.substring(0, separator);
+                if (!isBuildMethod) {
+                    backingFieldName = params.isEmpty() ? name : params.get(0).getName().toString();
+                    logicalKey = IndexedMember.canonicalKey(
+                            outerOwner, CompletionItemKind.Field, backingFieldName, null);
+                    declarationOwnerType = outerOwner;
+                    targetDeclarationKey = logicalKey;
+                }
+            }
+        }
 
         var next = new IndexedMember(
                 ownerQualifiedName, name, kind,
                 isStatic, isPrivate, isProtected, isPublic, isAbstract,
                 0, detail, returnTypeStr, returnTypeStr,
                 paramNames, erasedParamTypes, declaredParamTypes,
-                canonicalKey, canonicalKey, null, false,
-                IndexedMember.Origin.DECLARED, Set.copyOf(flags), null, null);
+                canonicalKey, logicalKey, backingFieldName, generated,
+                origin, Set.copyOf(flags), null, null);
+
+        if (declarationOwnerType != null) {
+            next = next.withNavigation(declarationOwnerType, targetDeclarationKey);
+        }
 
         seen.putIfAbsent(memberStorageKey(next), next);
+    }
+
+    /**
+     * True if {@code returnTypeSimpleName} names a generated nested class of {@code declaration}.
+     * Used to recognise a Lombok builder factory / toBuilder method (which returns the builder
+     * type) regardless of its method name, so custom {@code @Builder} names resolve.
+     */
+    private static boolean returnsGeneratedNestedClass(ClassTree declaration, String returnTypeSimpleName) {
+        if (returnTypeSimpleName == null || returnTypeSimpleName.indexOf('.') >= 0) return false;
+        for (var member : declaration.getMembers()) {
+            if (member instanceof ClassTree nested
+                    && nested instanceof com.sun.tools.javac.tree.JCTree.JCClassDecl jc
+                    && (jc.mods.flags & Flags.GENERATED_MEMBER) != 0
+                    && nested.getSimpleName().contentEquals(returnTypeSimpleName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String generatedAccessorFieldName(
+            String methodName, ClassTree declaration, CompilationUnitTree root) {
+        for (var member : declaration.getMembers()) {
+            if (!(member instanceof VariableTree field)
+                    || field.getName() == null
+                    || field.getModifiers().getFlags().contains(Modifier.STATIC)) {
+                continue;
+            }
+            if (field instanceof JCVariableDecl jcField
+                    && (jcField.mods.flags & Flags.GENERATED_MEMBER) != 0) {
+                continue;
+            }
+            var fieldName = field.getName().toString();
+            var fieldType = field.getType() == null ? "Object" : field.getType().toString();
+            var accessorInfo = LombokAnnotations.accessorInfo(
+                    root, declaration.getModifiers(), field.getModifiers(), fieldName, fieldType);
+            if (accessorInfo.isPresent()) {
+                var info = accessorInfo.get();
+                if (methodName.equals(info.getterName()) || methodName.equals(info.setterName())) {
+                    return fieldName;
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -1017,9 +1128,17 @@ public class WorkspaceTypeIndex {
      */
     private static void addParseTreeField(
             String ownerQualifiedName, VariableTree variable, Map<String, IndexedMember> seen,
-            boolean enclosingIsInterface) {
+            boolean enclosingIsInterface, boolean enclosingIsGenerated) {
         var name = variable.getName() == null ? null : variable.getName().toString();
         if (name == null || name.isBlank()) return;
+
+        var generated = variable instanceof com.sun.tools.javac.tree.JCTree.JCVariableDecl jcVariable
+                && (jcVariable.mods.flags & Flags.GENERATED_MEMBER) != 0;
+        // Lombok's builder stores values in private generated fields. They are implementation
+        // details and must not leak into completion/member lookup.
+        if (generated && enclosingIsGenerated && variable.getModifiers().getFlags().contains(Modifier.PRIVATE)) {
+            return;
+        }
 
         var flags = variable.getModifiers().getFlags();
         // Detect enum constants via internal javac flag (ENUM is not a javax.lang.model.element.Modifier).
@@ -1042,13 +1161,18 @@ public class WorkspaceTypeIndex {
         var canonicalKey = IndexedMember.canonicalKey(
                 ownerQualifiedName, kind, name, null);
 
+        var origin = generated
+                ? (enclosingIsGenerated
+                        ? IndexedMember.Origin.LOMBOK_BUILDER
+                        : IndexedMember.Origin.LOMBOK_LOGGER)
+                : IndexedMember.Origin.DECLARED;
         var next = new IndexedMember(
                 ownerQualifiedName, name, kind,
                 isStatic, isPrivate, isProtected, isPublic, false,
                 0, typeStr + " " + name, typeStr, typeStr,
                 null, null, null,
-                canonicalKey, canonicalKey, null, false,
-                IndexedMember.Origin.DECLARED, Set.copyOf(flags), null, null);
+                canonicalKey, canonicalKey, null, generated,
+                origin, Set.copyOf(flags), null, null);
 
         seen.putIfAbsent(memberStorageKey(next), next);
     }
@@ -1159,459 +1283,9 @@ public class WorkspaceTypeIndex {
         return key != null && !key.isBlank() && (key.contains(".") || TypeNames.isPrimitive(key));
     }
 
-    private static void addSyntheticLombokAccessors(
-            String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
-        if (declaration == null) {
-            return;
-        }
-        for (var member : declaration.getMembers()) {
-            if (!(member instanceof VariableTree variable)) {
-                continue;
-            }
-            if (variable.getName() == null) {
-                continue;
-            }
-            if (variable.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                continue;
-            }
-            var fieldName = variable.getName().toString();
-            if (fieldName.isBlank()) {
-                continue;
-            }
-            var fieldType = resolvedFieldType(variable, fieldName, seen);
-            var accessors =
-                    LombokAnnotations.accessorInfo(
-                            declaration.getModifiers(), variable.getModifiers(), fieldName, fieldType);
-            if (accessors.isEmpty()) {
-                continue;
-            }
-            var accessorInfo = accessors.get();
-            if (accessorInfo.hasGetter()) {
-                var getterName = accessorInfo.getterName();
-                var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
-                putSyntheticMethod(
-                        seen,
-                        new IndexedMember(
-                                ownerQualifiedName,
-                                getterName,
-                                CompletionItemKind.Method,
-                                false,
-                                false,
-                                false,
-                                true,
-                                false,
-                                0,
-                                fieldType + " " + getterName + "()",
-                                fieldType,
-                                fieldType,
-                                new String[0],
-                                new String[0],
-                                new String[0],
-                                IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, getterName, new String[0]),
-                                fieldKey,
-                                fieldName,
-                                true,
-                                IndexedMember.Origin.LOMBOK_ACCESSOR,
-                                Set.of(Modifier.PUBLIC),
-                                null,
-                                null).withNavigation(ownerQualifiedName, fieldKey));
-            }
-            if (accessorInfo.hasSetter()) {
-                var setterName = accessorInfo.setterName();
-                var erasedParameterTypes = new String[] {TypeNames.normalize(accessorInfo.fieldType())};
-                var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, fieldName, null);
-                putSyntheticMethod(
-                        seen,
-                        new IndexedMember(
-                                ownerQualifiedName,
-                                setterName,
-                                CompletionItemKind.Method,
-                                false,
-                                false,
-                                false,
-                                true,
-                                false,
-                                0,
-                                "void " + setterName + "(" + fieldType + " " + fieldName + ")",
-                                "void",
-                                "void",
-                                new String[] {fieldName},
-                                erasedParameterTypes,
-                                new String[] {fieldType},
-                                IndexedMember.canonicalKey(
-                                        ownerQualifiedName,
-                                        CompletionItemKind.Method,
-                                        setterName,
-                                        erasedParameterTypes),
-                                fieldKey,
-                                fieldName,
-                                true,
-                                IndexedMember.Origin.LOMBOK_ACCESSOR,
-                                Set.of(Modifier.PUBLIC),
-                                null,
-                                null).withNavigation(ownerQualifiedName, fieldKey));
-            }
-        }
-    }
-
-    private static void addSyntheticLombokConstructors(
-            String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
-        if (declaration == null
-                || declaration.getKind() == Tree.Kind.INTERFACE
-                || declaration.getKind() == Tree.Kind.ANNOTATION_TYPE
-                || declaration.getKind() == Tree.Kind.RECORD) {
-            return;
-        }
-
-        var modifiers = declaration.getModifiers();
-        var noArgs = LombokAnnotations.hasAnnotation(modifiers, "NoArgsConstructor");
-        var requiredArgs = LombokAnnotations.hasAnnotation(modifiers, "RequiredArgsConstructor");
-        var allArgs = LombokAnnotations.hasAnnotation(modifiers, "AllArgsConstructor");
-        var data = LombokAnnotations.hasAnnotation(modifiers, "Data");
-        var value = LombokAnnotations.hasAnnotation(modifiers, "Value");
-        var builder = LombokAnnotations.hasAnnotation(modifiers, "Builder");
-        if (!noArgs && !requiredArgs && !allArgs && !data && !value && !builder) {
-            return;
-        }
-
-        var writtenConstructor = false;
-        for (var member : declaration.getMembers()) {
-            if (member instanceof MethodTree method && method.getReturnType() == null) {
-                writtenConstructor = true;
-                break;
-            }
-        }
-        var explicitConstructorAnnotation = noArgs || requiredArgs || allArgs;
-        requiredArgs |= data && !writtenConstructor && !explicitConstructorAnnotation;
-        allArgs |= value && !writtenConstructor && !explicitConstructorAnnotation;
-        allArgs |= builder && !writtenConstructor && !explicitConstructorAnnotation;
-
-        var fields = new ArrayList<VariableTree>();
-        for (var member : declaration.getMembers()) {
-            if (!(member instanceof VariableTree field)
-                    || field.getModifiers().getFlags().contains(Modifier.STATIC)
-                    || field instanceof JCVariableDecl jcField && (jcField.mods.flags & Flags.ENUM) != 0) {
-                continue;
-            }
-            fields.add(field);
-        }
-
-        var constructors = new ArrayList<List<VariableTree>>();
-        if (noArgs) {
-            constructors.add(List.of());
-        }
-        if (requiredArgs) {
-            constructors.add(fields.stream()
-                    .filter(field -> field.getInitializer() == null)
-                    .filter(field -> field.getModifiers().getFlags().contains(Modifier.FINAL)
-                            || LombokAnnotations.hasAnnotation(field.getModifiers(), "NonNull"))
-                    .toList());
-        }
-        if (allArgs) {
-            constructors.add(fields.stream()
-                    .filter(field -> !(field.getModifiers().getFlags().contains(Modifier.FINAL)
-                            && field.getInitializer() != null))
-                    .filter(field -> !(value
-                            && field.getInitializer() != null
-                            && !LombokAnnotations.hasAnnotation(field.getModifiers(), "NonFinal")))
-                    .toList());
-        }
-
-        for (var constructorFields : constructors) {
-            var parameterNames = new String[constructorFields.size()];
-            var erasedParameterTypes = new String[constructorFields.size()];
-            var declaredParameterTypes = new String[constructorFields.size()];
-            for (var i = 0; i < constructorFields.size(); i++) {
-                var field = constructorFields.get(i);
-                var fieldName = field.getName().toString();
-                var fieldType = resolvedFieldType(field, fieldName, seen);
-                parameterNames[i] = fieldName;
-                erasedParameterTypes[i] = TypeNames.normalize(fieldType);
-                declaredParameterTypes[i] = fieldType;
-            }
-
-            var canonicalKey = IndexedMember.canonicalKey(
-                    ownerQualifiedName, CompletionItemKind.Constructor, "<init>", erasedParameterTypes);
-            if (seen.containsKey(canonicalKey)) {
-                continue;
-            }
-            var detail = TypeNames.simpleName(ownerQualifiedName)
-                    + "("
-                    + String.join(", ", declaredParameterTypes)
-                    + ")";
-            seen.put(canonicalKey, new IndexedMember(
-                    ownerQualifiedName,
-                    "<init>",
-                    CompletionItemKind.Constructor,
-                    false,
-                    false,
-                    false,
-                    true,
-                    false,
-                    0,
-                    detail,
-                    "void",
-                    "void",
-                    parameterNames,
-                    erasedParameterTypes,
-                    declaredParameterTypes,
-                    canonicalKey,
-                    canonicalKey,
-                    null,
-                    true,
-                    IndexedMember.Origin.LOMBOK_CONSTRUCTOR,
-                    Set.of(Modifier.PUBLIC),
-                    null,
-                    null));
-        }
-    }
-
-
-    private static void normalizeLombokBuilderTypes(
-            Map<String, IndexedType> typeEntries,
-            Map<String, ClassTree> rootDeclaredTypeTrees,
-            Map<String, Path> rootDeclaredTypeSources) {
-        for (var entry : rootDeclaredTypeTrees.entrySet()) {
-            var ownerQualifiedName = entry.getKey();
-            var declaration = entry.getValue();
-            if (declaration == null || !LombokAnnotations.hasBuilderLombokAnnotation(declaration.getModifiers())) {
-                continue;
-            }
-            var ownerInfo = typeEntries.get(ownerQualifiedName);
-            if (ownerInfo == null) {
-                continue;
-            }
-            var fields = declaredInstanceFields(declaration, membersByStorageKey(ownerInfo.members));
-            if (fields.isEmpty()) {
-                continue;
-            }
-            var sourcePath = rootDeclaredTypeSources.get(ownerQualifiedName);
-            var builderQualifiedName = builderQualifiedName(ownerQualifiedName);
-
-            // Add builder() static factory method to owner if not already present
-            var builderMethodKey = IndexedMember.canonicalKey(
-                    ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]);
-            var hasBuilderMethod = ownerInfo.members.stream()
-                    .anyMatch(m -> builderMethodKey.equals(m.canonicalKey));
-            if (!hasBuilderMethod) {
-                var ownerMembers = new ArrayList<>(ownerInfo.members);
-                ownerMembers.add(builderFactoryMethod(ownerQualifiedName, builderQualifiedName));
-                IndexedMember.sort(ownerMembers);
-                typeEntries.put(ownerQualifiedName, new IndexedType(
-                        ownerInfo.qualifiedName,
-                        ownerInfo.simpleName,
-                        ownerMembers,
-                        ownerInfo.sourcePath,
-                        ownerInfo.sourceUri,
-                        ownerInfo.superclass,
-                        ownerInfo.interfaces,
-                        ownerInfo.nestedTypes,
-                        ownerInfo.kind,
-                        ownerInfo.modifiers,
-                        ownerInfo.declarationRange,
-                        ownerInfo.provenance));
-            }
-
-            // Create or merge builder type
-            var existing = typeEntries.get(builderQualifiedName);
-            if (existing == null) {
-                typeEntries.put(
-                        builderQualifiedName,
-                        createSyntheticLombokBuilderType(ownerQualifiedName, fields, sourcePath));
-            } else {
-                typeEntries.put(
-                        builderQualifiedName,
-                        normalizeLombokBuilderType(existing, ownerQualifiedName, fields, sourcePath));
-            }
-            if (sourcePath != null) {
-                rootDeclaredTypeSources.put(builderQualifiedName, sourcePath);
-            }
-        }
-    }
-
-    private static IndexedType createSyntheticLombokBuilderType(
-            String ownerQualifiedName, List<DeclaredField> fields, Path sourcePath) {
-        var builderQualifiedName = builderQualifiedName(ownerQualifiedName);
-        var builderMembers = new ArrayList<IndexedMember>();
-        for (var field : fields) {
-            builderMembers.add(linkedBuilderSetter(ownerQualifiedName, builderQualifiedName, field));
-        }
-        builderMembers.add(builderBuildMethod(ownerQualifiedName, builderQualifiedName));
-        IndexedMember.sort(builderMembers);
-        return new IndexedType(
-                builderQualifiedName,
-                TypeNames.simpleName(builderQualifiedName),
-                builderMembers,
-                sourcePath,
-                null,
-                List.of(),
-                IndexedMember.Provenance.WORKSPACE);
-    }
-
-    private static IndexedType normalizeLombokBuilderType(
-            IndexedType existing, String ownerQualifiedName, List<DeclaredField> fields, Path sourcePath) {
-        var builderQualifiedName = existing.qualifiedName;
-        var members = new Object2ObjectLinkedOpenHashMap<String, IndexedMember>();
-        for (var member : existing.members) {
-            members.put(memberStorageKey(member), member);
-        }
-        for (var field : fields) {
-            var setter = linkedBuilderSetter(ownerQualifiedName, builderQualifiedName, field);
-            var key = memberStorageKey(setter);
-            var existingMember = members.get(key);
-            if (existingMember == null) {
-                members.put(key, setter);
-                continue;
-            }
-            members.put(key, mergeLombokFieldLink(existingMember, setter));
-        }
-        var buildKey = memberStorageKey(builderBuildMethod(ownerQualifiedName, builderQualifiedName));
-        members.putIfAbsent(buildKey, builderBuildMethod(ownerQualifiedName, builderQualifiedName));
-        var normalizedMembers = new ArrayList<>(members.values());
-        IndexedMember.sort(normalizedMembers);
-        return new IndexedType(
-                builderQualifiedName,
-                existing.simpleName,
-                normalizedMembers,
-                existing.sourcePath != null ? existing.sourcePath : sourcePath,
-                existing.superclass,
-                existing.interfaces,
-                existing.provenance);
-    }
-
-    private static IndexedMember builderFactoryMethod(String ownerQualifiedName, String builderQualifiedName) {
-        return new IndexedMember(
-                ownerQualifiedName,
-                "builder",
-                CompletionItemKind.Method,
-                true,
-                false,
-                false,
-                true,
-                false,
-                0,
-                builderQualifiedName + " builder()",
-                builderQualifiedName,
-                builderQualifiedName,
-                new String[0],
-                new String[0],
-                new String[0],
-                IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]),
-                IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Method, "builder", new String[0]),
-                null,
-                true,
-                IndexedMember.Origin.LOMBOK_BUILDER,
-                Set.of(Modifier.PUBLIC, Modifier.STATIC),
-                null,
-                null);
-    }
-
-    private static IndexedMember linkedBuilderSetter(
-            String ownerQualifiedName, String builderQualifiedName, DeclaredField field) {
-        var fieldKey = IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, field.name, null);
-        var erasedParameterTypes = new String[] {TypeNames.normalize(field.type)};
-        return new IndexedMember(
-                builderQualifiedName,
-                field.name,
-                CompletionItemKind.Method,
-                false,
-                false,
-                false,
-                true,
-                false,
-                0,
-                builderQualifiedName + " " + field.name + "(" + field.type + " " + field.name + ")",
-                builderQualifiedName,
-                builderQualifiedName,
-                new String[] {field.name},
-                erasedParameterTypes,
-                new String[] {field.type},
-                IndexedMember.canonicalKey(
-                        builderQualifiedName,
-                        CompletionItemKind.Method,
-                        field.name,
-                        erasedParameterTypes),
-                fieldKey,
-                field.name,
-                true,
-                IndexedMember.Origin.LOMBOK_BUILDER,
-                Set.of(Modifier.PUBLIC),
-                null,
-                null).withNavigation(ownerQualifiedName, fieldKey);
-    }
-
-    private static IndexedMember builderBuildMethod(String ownerQualifiedName, String builderQualifiedName) {
-        return new IndexedMember(
-                builderQualifiedName,
-                "build",
-                CompletionItemKind.Method,
-                false,
-                false,
-                false,
-                true,
-                false,
-                0,
-                ownerQualifiedName + " build()",
-                ownerQualifiedName,
-                ownerQualifiedName,
-                new String[0],
-                new String[0],
-                new String[0],
-                IndexedMember.canonicalKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
-                IndexedMember.canonicalKey(builderQualifiedName, CompletionItemKind.Method, "build", new String[0]),
-                null,
-                true,
-                IndexedMember.Origin.LOMBOK_BUILDER,
-                Set.of(Modifier.PUBLIC),
-                null,
-                null);
-    }
-
-    private static void addSyntheticSlf4jLoggerField(
-            String ownerQualifiedName, ClassTree declaration, Map<String, IndexedMember> seen) {
-        if (declaration == null || !LombokAnnotations.hasLoggingOnlyLombokAnnotation(declaration.getModifiers())) {
-            return;
-        }
-        var next =
-                new IndexedMember(
-                        ownerQualifiedName,
-                        "log",
-                        CompletionItemKind.Field,
-                        true,
-                        true,
-                        false,
-                        false,
-                        false,
-                        0,
-                        "org.slf4j.Logger log",
-                        "org.slf4j.Logger",
-                        "org.slf4j.Logger",
-                        null,
-                        null,
-                        null,
-                        IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
-                        IndexedMember.canonicalKey(ownerQualifiedName, CompletionItemKind.Field, "log", null),
-                        null,
-                        true,
-                        IndexedMember.Origin.LOMBOK_LOGGER,
-                        Set.of(Modifier.PRIVATE, Modifier.STATIC),
-                        null,
-                        null);
-        seen.putIfAbsent(memberStorageKey(next), next);
-    }
-
-    private static void putSyntheticMethod(Map<String, IndexedMember> seen, IndexedMember next) {
-        var key = memberStorageKey(next);
-        var existing = seen.get(key);
-        if (existing == null) {
-            seen.put(key, next);
-            return;
-        }
-        if ((existing.backingFieldName == null || existing.backingFieldName.isBlank())
-                && next.backingFieldName != null
-                && !next.backingFieldName.isBlank()) {
-            seen.put(key, mergeLombokFieldLink(existing, next));
-        }
+    private static boolean isGeneratedClass(ClassTree tree) {
+        return tree instanceof com.sun.tools.javac.tree.JCTree.JCClassDecl classDecl
+                && (classDecl.mods.flags & Flags.GENERATED_MEMBER) != 0;
     }
 
     private static String memberStorageKey(IndexedMember member) {
@@ -1619,104 +1293,4 @@ public class WorkspaceTypeIndex {
                 member.ownerType, member.kind, member.name, member.erasedParameterTypes);
     }
 
-    private static String builderQualifiedName(String ownerQualifiedName) {
-        return ownerQualifiedName + "." + TypeNames.simpleName(ownerQualifiedName) + "Builder";
-    }
-
-    private static List<DeclaredField> declaredInstanceFields(ClassTree declaration, Map<String, IndexedMember> seen) {
-        var fields = new ArrayList<DeclaredField>();
-        if (declaration == null) {
-            return fields;
-        }
-        for (var member : declaration.getMembers()) {
-            if (!(member instanceof VariableTree variable)) {
-                continue;
-            }
-            if (variable.getName() == null || variable.getName().contentEquals("")) {
-                continue;
-            }
-            if (variable.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                continue;
-            }
-            var fieldName = variable.getName().toString();
-            if (fieldName.isBlank()) {
-                continue;
-            }
-            fields.add(new DeclaredField(fieldName, resolvedFieldType(variable, fieldName, seen)));
-        }
-        return fields;
-    }
-
-    private static String resolvedFieldType(VariableTree variable, String fieldName, Map<String, IndexedMember> seen) {
-        var fieldType = variable.getType() == null ? "java.lang.Object" : variable.getType().toString();
-        for (var existing : seen.values()) {
-            if (existing.kind != CompletionItemKind.Field || existing.isStatic) {
-                continue;
-            }
-            if (!fieldName.equals(existing.name)) {
-                continue;
-            }
-            if (existing.declaredReturnType != null && !existing.declaredReturnType.isBlank()) {
-                return existing.declaredReturnType;
-            }
-            if (existing.returnType != null && !existing.returnType.isBlank()) {
-                return existing.returnType;
-            }
-        }
-        return fieldType;
-    }
-
-    private record DeclaredField(String name, String type) {}
-
-    private static Map<String, IndexedMember> membersByStorageKey(List<IndexedMember> members) {
-        var seen = new Object2ObjectOpenHashMap<String, IndexedMember>();
-        for (var member : members) {
-            seen.put(memberStorageKey(member), member);
-        }
-        return seen;
-    }
-
-    private static IndexedMember mergeLombokFieldLink(IndexedMember existing, IndexedMember synthetic) {
-        return mergeFieldLink(
-                        existing,
-                        synthetic.logicalKey,
-                        synthetic.backingFieldName,
-                        synthetic.synthetic,
-                        synthetic.origin)
-                .withNavigation(synthetic.declarationOwnerType, synthetic.targetDeclarationKey);
-    }
-
-    private static IndexedMember mergeFieldLink(
-            IndexedMember existing,
-            String logicalKey,
-            String backingFieldName,
-            boolean synthetic,
-            IndexedMember.Origin origin) {
-        return new IndexedMember(
-                existing.ownerType,
-                existing.name,
-                existing.kind,
-                existing.isStatic,
-                existing.isPrivate,
-                existing.isProtected,
-                existing.isPublic,
-                existing.isAbstract,
-                existing.priority,
-                existing.detail,
-                existing.returnType,
-                existing.declaredReturnType,
-                existing.parameterNames,
-                existing.erasedParameterTypes,
-                existing.declaredParameterTypes,
-                existing.canonicalKey,
-                logicalKey != null && !logicalKey.isBlank()
-                        ? logicalKey
-                        : existing.logicalKey,
-                backingFieldName,
-                existing.synthetic || synthetic,
-                origin == null ? existing.origin : origin,
-                existing.modifiers,
-                existing.sourceUri,
-                existing.declarationRange);
-    }
 }

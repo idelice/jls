@@ -44,6 +44,8 @@ require('lspconfig').jls.setup({
 - **Autocomplete** — symbols, members, imports
 - **Go-to-definition** — workspace files, dependency JARs (with source), decompiled classes
 - **Find references** — all usages across workspace
+- **Find type** — find type definition
+- **Find implementation** — find implementations
 - **Hover** — type information and Javadoc
 - **Diagnostics** — pull-based (real-time linting without keystroke lag)
 - **Signature help** — parameter info for method calls
@@ -53,10 +55,35 @@ require('lspconfig').jls.setup({
 - **Document symbols** — outline view of classes, methods, fields
 - **Folding ranges** — collapse imports, classes, methods, blocks
 - **Formatting** — whole-document formatting
-- **Lombok** — @Data, @Getter, @Setter, @Builder, @AllArgsConstructor, @Slf4j, etc.
+- **Lombok** — modeled from source, including @Builder/@SuperBuilder, @Singular, @Accessors and `lombok.config`
 - **Private repositories** — Maven authentication inherited from `~/.m2/settings.xml`
 - **JAR navigation** — go-to-definition into dependency source JARs
 - **Multi-module Gradle/Maven support** (experimental)
+
+### Lombok
+
+Lombok members are modeled from your source, without running Lombok's annotation processor and
+without reading previously compiled classes. No build step is needed.
+
+Modeled: `@Data`, `@Getter`, `@Setter`, `@Value` (including its implicit `private final` fields and
+`final` class), `@With`, `@ToString`, `@EqualsAndHashCode`, `@AllArgsConstructor`,
+`@NoArgsConstructor`, `@RequiredArgsConstructor`, `@Accessors` (fluent, chained), `@Builder`
+including its arguments (`builderMethodName`, `buildMethodName`, `builderClassName`, `setterPrefix`,
+`toBuilder`), `@Singular` collections and maps, `@SuperBuilder`, and the logger annotations
+(`@Slf4j`, `@Log`, `@Log4j`, `@Log4j2`, `@CommonsLog`, `@Flogger`, `@JBossLog`, `@XSlf4j`,
+`@CustomLog`).
+
+`lombok.config` is read per directory, walking up until `config.stopBubbling = true`. These keys are
+honoured: `lombok.accessors.prefix`, `lombok.accessors.fluent`, `lombok.accessors.chain`,
+`lombok.accessors.capitalization`, `lombok.log.fieldName` and `lombok.log.custom.declaration`. Other
+keys are ignored, and the server must be restarted to pick up an edited `lombok.config`.
+
+Known boundaries — members here resolve and give correct diagnostics, but autocomplete is thinner:
+
+- For `@SuperBuilder`, completion part-way through a builder chain does not list the parent's
+  setters, because the parse-only resolver cannot follow the generated self-type. The code still
+  compiles and go-to-definition works.
+- `@Accessors(prefix = ...)` on an individual class is not read; only the `lombok.config` prefix is.
 
 ### Code actions
 
@@ -156,21 +183,12 @@ JLS supports multi-module Maven and Gradle projects. Modules are resolved lazily
 
 ### Prerequisites
 
-Multi-module projects require that dependency artifacts are available locally. The server resolves classpaths via `mvn dependency:list` or Gradle tooling — it does **not** compile your project.
+None beyond resolvable dependencies. The server reads your build's model (module graph, source
+directories, inter-module dependencies, external artifacts) and analyzes everything else from
+source. It never compiles your project, so an unbuilt or freshly cloned reactor works.
 
-**For Maven multi-module projects**, you must build/install the reactor first:
-
-```bash
-mvn install -DskipTests
-```
-
-Without this, modules that depend on sibling modules will fail to resolve (the server cannot find their compiled artifacts).
-
-**For Gradle multi-module projects**, ensure the project builds successfully:
-
-```bash
-./gradlew classes
-```
+External artifacts still have to be downloadable or already cached. If an artifact is missing, the
+affected module is analyzed with a partial classpath instead of failing.
 
 ### Maven Daemon (recommended for Maven)
 
@@ -185,9 +203,9 @@ JLS auto-detects `mvnd` on PATH and uses it instead of `mvn`/`mvnw`. The daemon 
 ### Limitations
 
 - Module resolution happens on the LSP thread — the server may be briefly unresponsive during first-time resolution of many modules
-- Modules whose dependency resolution fails are skipped for that session (restart the server after fixing build issues)
+- A module whose dependencies resolve only partially is still analyzed; unresolved external types are reported as errors
 - The server does not eagerly resolve all modules — only those you navigate to
-- Very large reactors (500+ modules) are supported but first find-references on widely-used types may take 10-40s while modules resolve in parallel
+- Very large reactors (500+ modules) are supported, but the first find-references on a widely-used type may take 10-40s while modules resolve
 
 ## Debugging
 
@@ -256,6 +274,27 @@ Features are split across two resolution strategies:
 
 This avoids full compilation on high-frequency triggers like `(` and keystroke-driven completions.
 
+### Source-only analysis
+
+Your code is always read from source; only dependencies are read as bytecode.
+
+- Annotation processors never run (`-proc:none`), and the server emits no `.class` files.
+- Workspace build output (`target/classes`, `build/classes`, reactor jars, and their local-repository
+  copies) is excluded from every classpath, index and navigation lookup. A stale or missing build
+  cannot affect results.
+- Sibling modules resolve through their source directories, so an unbuilt reactor behaves the same
+  as a built one, and unsaved edits in one module are visible to another immediately.
+- External dependencies and the JDK are still read as bytecode, with source jars used for hover and
+  navigation.
+- Lombok members are modeled from source (see below) instead of being read back from compiled
+  output.
+- Generated sources are indexed as ordinary sources when they exist on disk. Code that only exists
+  after a generator runs is unavailable until you run your normal build once.
+- `module-info.java` is not part of analysis. A reactor usually spans many named modules, and one
+  javac task can only compile one of them from source, so the workspace is analysed as unnamed code.
+  Everything resolves and navigates normally; the cost is that module-visibility errors (a package
+  that a module does not export) are not reported.
+
 ## Building from source
 
 Prerequisites: Java 25, Maven.
@@ -277,11 +316,12 @@ The server logs to stderr. Startup prints the active JDK version.
 If find-references shows fewer results than expected, check the server logs for warnings like:
 
 ```
-[maven] compiler_failed module=:some-module reason=Maven dependency resolution failed
-[ref] skip_candidate file=SomeFile.java reason=Maven dependency resolution previously failed
+[module] partial_dependencies id=:some-module cause=...
 ```
 
-This means a module's dependencies couldn't be resolved. Fix: run `mvn install -DskipTests` in the project root, then restart the server.
+A module whose external dependencies resolved only partially can miss references that depend on
+those types. Fix the dependency (network, repository, or credentials), then save the build file to
+re-resolve.
 
 ### Server unresponsive after opening a file
 
@@ -289,20 +329,15 @@ On first open in a multi-module project, the server resolves the module's classp
 
 If the server stays unresponsive for more than 30s, check if Maven/Gradle is hanging (network issues, misconfigured repositories, or missing local artifacts).
 
-### Multi-module: "dependency resolution failed"
-
-The server runs `mvn dependency:list -pl <module> -am` to resolve each module. This fails if:
-
-- Sibling module artifacts aren't installed locally → run `mvn install -DskipTests`
-- A remote repository cached a "not found" result → run `mvn -U install -DskipTests` to force-update
-- The module has a broken pom.xml → fix the pom and restart the server
-
-After fixing the issue, save the pom.xml and the server will retry previously-failed modules on the next request (hover, definition, or references). For other fixes, restart the server.
-
 ### Diagnostics show errors that don't exist
 
-If the server reports compilation errors that your build doesn't, the classpath is likely incomplete. Ensure:
+The server analyzes your sources with `-proc:none`, so a type that only exists after annotation
+processing has no declaration to resolve. Common causes:
 
-- Maven: `mvn install -DskipTests` has been run
-- Gradle: `./gradlew classes` has been run
-- Check that the module's dependencies are all available in your local repository
+- A code generator (MapStruct, Dagger, Immutables, protobuf) has never run. Run your normal build
+  once so the generated `.java` files exist; they are indexed as ordinary sources.
+- A generator emits only `.class` files. Those declarations cannot be recovered from source.
+- An external dependency failed to resolve. Check the log for `partial_dependencies`.
+
+Lombok is modeled directly from source and needs no build. See the Lombok section for the forms
+that are not modeled.
