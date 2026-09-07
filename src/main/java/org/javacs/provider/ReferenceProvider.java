@@ -118,9 +118,8 @@ public class ReferenceProvider {
                 var searchClassNames = new LinkedHashSet<String>();
                 searchClassNames.add(className);
                 if (element instanceof ExecutableElement method) {
-                    var root = NavigationHelper.findRootDeclaringType(task.types, parentClass, memberName);
-                    if (!root.equals(parentClass)) {
-                        searchClassNames.add(root.getQualifiedName().toString());
+                    for (var st : NavigationHelper.findDeclaringSupertypes(task.types, parentClass, memberName)) {
+                        searchClassNames.add(st.getQualifiedName().toString());
                     }
                 }
                 task.close();

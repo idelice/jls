@@ -145,7 +145,13 @@ public class NavigationHelper {
 
     /** Walks transitive supertypes of {@code owner} to find the highest type declaring {@code methodName}. */
     public static TypeElement findRootDeclaringType(Types types, TypeElement owner, String methodName) {
-        var root = owner;
+        var all = findDeclaringSupertypes(types, owner, methodName);
+        return all.isEmpty() ? owner : all.getLast();
+    }
+
+    /** Returns all transitive supertypes of {@code owner} that declare a method with {@code methodName}, in BFS order. */
+    public static ArrayList<TypeElement> findDeclaringSupertypes(Types types, TypeElement owner, String methodName) {
+        var result = new ArrayList<TypeElement>();
         var visited = new HashSet<String>();
         var queue = new ArrayDeque<TypeMirror>();
         queue.addAll(types.directSupertypes(owner.asType()));
@@ -156,12 +162,12 @@ public class NavigationHelper {
             if (!visited.add(superType.getQualifiedName().toString())) continue;
             for (var m : superType.getEnclosedElements()) {
                 if (m.getSimpleName().contentEquals(methodName) && m.getKind() == ElementKind.METHOD) {
-                    root = superType;
+                    result.add(superType);
                     break;
                 }
             }
             queue.addAll(types.directSupertypes(superType.asType()));
         }
-        return root;
+        return result;
     }
 }
