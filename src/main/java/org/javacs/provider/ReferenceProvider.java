@@ -16,6 +16,7 @@ import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.tools.Diagnostic;
@@ -113,8 +114,17 @@ public class ReferenceProvider {
                     LOG.fine(String.format("[ref] private_member kind=%s name=%s — file-only scan", element.getKind(), memberName));
                     return findReferences(task);
                 }
+                // For methods, also search by supertypes that declare the same method
+                var searchClassNames = new LinkedHashSet<String>();
+                searchClassNames.add(className);
+                if (element instanceof ExecutableElement method) {
+                    var root = NavigationHelper.findRootDeclaringType(task.types, parentClass, memberName);
+                    if (!root.equals(parentClass)) {
+                        searchClassNames.add(root.getQualifiedName().toString());
+                    }
+                }
                 task.close();
-                return findMemberReferences(className, memberName, declaration, isPackagePrivate);
+                return findMemberReferences(searchClassNames, memberName, declaration, isPackagePrivate);
             }
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(task);
@@ -143,16 +153,20 @@ public class ReferenceProvider {
         return findReferences(files, compiler.findTypeDeclaration(className));
     }
 
-    private List<Location> findMemberReferences(String className, String memberName, Path declaration, boolean packagePrivate) {
-        var files = compiler.findMemberReferences(className, memberName);
+    private List<Location> findMemberReferences(Set<String> classNames, String memberName, Path declaration, boolean packagePrivate) {
+        var allFiles = new LinkedHashSet<Path>();
+        for (var cn : classNames) {
+            for (var f : compiler.findMemberReferences(cn, memberName)) allFiles.add(f);
+        }
+        var files = allFiles.toArray(Path[]::new);
         if (packagePrivate && declaration != null) {
             var declarationPackage = FileStore.packageName(declaration);
             files = java.util.Arrays.stream(files)
                     .filter(f -> declarationPackage.equals(FileStore.packageName(f)))
                     .toArray(Path[]::new);
-            LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", className, memberName, files.length));
+            LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", classNames, memberName, files.length));
         } else {
-            LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d", className, memberName, files.length));
+            LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d", classNames, memberName, files.length));
         }
         if (files.length == 0) return List.of();
         return findReferences(files, declaration);

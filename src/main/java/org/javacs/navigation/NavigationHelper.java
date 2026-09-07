@@ -4,11 +4,14 @@ import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashSet;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.util.Types;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.ExecutableType;
@@ -138,5 +141,27 @@ public class NavigationHelper {
             default:
                 return false;
         }
+    }
+
+    /** Walks transitive supertypes of {@code owner} to find the highest type declaring {@code methodName}. */
+    public static TypeElement findRootDeclaringType(Types types, TypeElement owner, String methodName) {
+        var root = owner;
+        var visited = new HashSet<String>();
+        var queue = new ArrayDeque<TypeMirror>();
+        queue.addAll(types.directSupertypes(owner.asType()));
+        while (!queue.isEmpty()) {
+            var superMirror = queue.poll();
+            if (superMirror.getKind() != TypeKind.DECLARED) continue;
+            var superType = (TypeElement) ((DeclaredType) superMirror).asElement();
+            if (!visited.add(superType.getQualifiedName().toString())) continue;
+            for (var m : superType.getEnclosedElements()) {
+                if (m.getSimpleName().contentEquals(methodName) && m.getKind() == ElementKind.METHOD) {
+                    root = superType;
+                    break;
+                }
+            }
+            queue.addAll(types.directSupertypes(superType.asType()));
+        }
+        return root;
     }
 }

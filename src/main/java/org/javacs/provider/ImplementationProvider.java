@@ -88,11 +88,13 @@ public final class ImplementationProvider {
                 || !(method.getEnclosingElement() instanceof TypeElement owner)) {
             return null;
         }
+        // Walk to the root type that declares this method so we search its subtypes.
+        var rootOwner = NavigationHelper.findRootDeclaringType(task.types, owner, method.getSimpleName().toString());
         return new Target(
-                owner.getQualifiedName().toString(),
+                rootOwner.getQualifiedName().toString(),
                 method.getSimpleName().toString(),
                 FindHelper.erasedParameterTypes(task, method),
-                declarationPath(task, owner));
+                declarationPath(task, rootOwner));
     }
 
     private Path declarationPath(CompileTask task, TypeElement type) {
