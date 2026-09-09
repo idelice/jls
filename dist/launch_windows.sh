@@ -51,4 +51,4 @@ else
     AOT_OPTS="-XX:AOTMode=record -XX:AOTConfiguration=$AOT_CONF_FILE"
 fi
 
-exec "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} $AOT_OPTS -classpath "$DIR/classpath/*" "$@"
+exec "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} $AOT_OPTS -Xlog:aot*=warning:stderr -classpath "$DIR/classpath/*" "$@"
