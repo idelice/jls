@@ -45,6 +45,18 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
     }
 
+    void addDocPathEntries(Set<Path> entries) {
+        if (entries.isEmpty()) return;
+        try {
+            var merged = new java.util.LinkedHashSet<>(docPath);
+            if (merged.addAll(entries)) {
+                docsFileManager.setLocationFromPaths(StandardLocation.SOURCE_PATH, merged);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     static boolean lombokPresentOnClasspath(Collection<Path> classPath) {
         return classPath.stream().anyMatch(path -> {
             var name = path.getFileName() == null ? "" : path.getFileName().toString().toLowerCase();

@@ -88,6 +88,12 @@ final class ModuleCompilerRegistry implements AutoCloseable {
                     inputs.sources(), configuredAddExports, compilerArguments(module));
             next.setSourceRoots(inputs.sourceRoots());
             moduleCompilers.put(key, new ModuleCompiler(next, inputs.sourceRoots()));
+            // Make source JARs available to the main (fallback) compiler so definition
+            // lookups inside JAR sources can resolve types across JARs.
+            var mainCompiler = server.getOrCreateCompiler();
+            if (mainCompiler != null && mainCompiler != next) {
+                mainCompiler.addDocPathEntries(inputs.sources());
+            }
             LOG.info("[module] ready id=" + key + " sources=" + inputs.sourceRoots().size()
                     + " dependencies=" + next.classPath.size() + " workspace_binaries=0 ms="
                     + (System.nanoTime() - started) / 1_000_000);

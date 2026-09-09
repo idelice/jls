@@ -61,6 +61,8 @@ public class DefinitionProvider {
                     var result = resolveLombokField(element, memberName, task.elements);
                     if (!result.isEmpty()) { LOG.fine("[def] return=lombok-error-field"); return result; }
                 }
+                var errorTypeResult = resolveErrorType(element.getSimpleName().toString());
+                if (!errorTypeResult.isEmpty()) return errorTypeResult;
                 LOG.fine("[def] branch=findError");
                 return findError(task, element);
             }
@@ -205,6 +207,20 @@ public class DefinitionProvider {
             }
         }
         return null;
+    }
+
+    private List<Location> resolveErrorType(String simpleName) {
+        var parse = compiler.parse(file);
+        var resolved = TypeNames.resolveSimpleName(simpleName, parse.root(),
+                fqn -> compiler.findAnywhere(fqn).isPresent());
+        if (resolved.isEmpty()) return List.of();
+        var source = compiler.findAnywhere(resolved.get());
+        if (source.isEmpty()) return List.of();
+        var p = compiler.parse(source.get());
+        var tree = FindHelper.findType(p, resolved.get());
+        if (tree == null) return List.of();
+        var path = TreePath.getPath(p.root(), tree);
+        return List.of(FindHelper.location(p, path, tree.getSimpleName()));
     }
 
     private List<Location> findError(CompileTask task, Element element) {
