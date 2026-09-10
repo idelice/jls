@@ -34,6 +34,8 @@ import org.javacs.provider.InlayHintProvider;
 import org.javacs.provider.ImplementationProvider;
 import org.javacs.provider.ReferenceProvider;
 import org.javacs.provider.TypeDefinitionProvider;
+import org.javacs.provider.TypeHierarchyProvider;
+import org.javacs.provider.CallHierarchyProvider;
 import org.javacs.rewrite.*;
 
 /**
@@ -353,6 +355,8 @@ class JavaLanguageServer extends LanguageServer {
         c.addProperty("definitionProvider", true);
         c.addProperty("implementationProvider", true);
         c.addProperty("typeDefinitionProvider", true);
+        c.addProperty("typeHierarchyProvider", true);
+        c.addProperty("callHierarchyProvider", true);
         c.addProperty("workspaceSymbolProvider", true);
         c.addProperty("documentSymbolProvider", true);
         c.addProperty("documentFormattingProvider", true);
@@ -689,6 +693,66 @@ class JavaLanguageServer extends LanguageServer {
             return Optional.empty();
         }
         return Optional.of(found);
+    }
+
+    @Override
+    public Optional<List<TypeHierarchyItem>> prepareTypeHierarchy(TextDocumentPositionParams position) {
+        if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        var file = Paths.get(position.textDocument.uri);
+        return new TypeHierarchyProvider(compilerFor(file), moduleRegistry::typeIndexFor, this::compilerFor)
+                .prepare(file, position.position.line + 1, position.position.character + 1);
+    }
+
+    @Override
+    public List<TypeHierarchyItem> typeHierarchySupertypes(TypeHierarchyParams params) {
+        if (params == null || params.item == null || params.item.uri == null) return List.of();
+        var file = Paths.get(params.item.uri);
+        return new TypeHierarchyProvider(compilerFor(file), moduleRegistry::typeIndexFor, this::compilerFor)
+                .supertypes(params.item);
+    }
+
+    @Override
+    public List<TypeHierarchyItem> typeHierarchySubtypes(TypeHierarchyParams params) {
+        if (params == null || params.item == null || params.item.uri == null) return List.of();
+        var file = Paths.get(params.item.uri);
+        return new TypeHierarchyProvider(compilerFor(file), moduleRegistry::typeIndexFor, this::compilerFor)
+                .subtypes(params.item);
+    }
+
+    @Override
+    public Optional<List<CallHierarchyItem>> prepareCallHierarchy(TextDocumentPositionParams position) {
+        if (!FileStore.isJavaFile(position.textDocument.uri)) return Optional.empty();
+        var file = Paths.get(position.textDocument.uri);
+        return new CallHierarchyProvider(
+                        compilerFor(file),
+                        this::compilerFor,
+                        moduleRegistry::batchResolveModulesForFiles,
+                        moduleRegistry::includeReferenceSources)
+                .prepare(file, position.position.line + 1, position.position.character + 1);
+    }
+
+    @Override
+    public List<CallHierarchyIncomingCall> callHierarchyIncomingCalls(CallHierarchyParams params) {
+        if (params == null || params.item == null || params.item.uri == null) return List.of();
+        var file = Paths.get(params.item.uri);
+        return new CallHierarchyProvider(
+                        compilerFor(file),
+                        this::compilerFor,
+                        moduleRegistry::batchResolveModulesForFiles,
+                        moduleRegistry::includeReferenceSources)
+                .incomingCalls(params.item);
+    }
+
+    @Override
+    public List<CallHierarchyOutgoingCall> callHierarchyOutgoingCalls(CallHierarchyParams params) {
+        if (params == null || params.item == null || params.item.uri == null) return List.of();
+        var file = Paths.get(params.item.uri);
+        return new CallHierarchyProvider(
+                        compilerFor(file),
+                        this::compilerFor,
+                        moduleRegistry::batchResolveModulesForFiles,
+                        moduleRegistry::includeReferenceSources)
+                .outgoingCalls(params.item);
     }
 
     @Override

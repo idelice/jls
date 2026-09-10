@@ -84,6 +84,30 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    public Optional<List<TypeHierarchyItem>> prepareTypeHierarchy(TextDocumentPositionParams params) {
+        return Optional.empty();
+    }
+
+    public List<TypeHierarchyItem> typeHierarchySupertypes(TypeHierarchyParams params) {
+        return List.of();
+    }
+
+    public List<TypeHierarchyItem> typeHierarchySubtypes(TypeHierarchyParams params) {
+        return List.of();
+    }
+
+    public Optional<List<CallHierarchyItem>> prepareCallHierarchy(TextDocumentPositionParams params) {
+        return Optional.empty();
+    }
+
+    public List<CallHierarchyIncomingCall> callHierarchyIncomingCalls(CallHierarchyParams params) {
+        return List.of();
+    }
+
+    public List<CallHierarchyOutgoingCall> callHierarchyOutgoingCalls(CallHierarchyParams params) {
+        return List.of();
+    }
+
     public List<SymbolInformation> workspaceSymbols(WorkspaceSymbolParams params) {
         throw new RuntimeException("Unimplemented");
     }

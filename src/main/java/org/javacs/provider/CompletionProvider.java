@@ -715,6 +715,9 @@ public class CompletionProvider {
         var file = Paths.get(task.root().getSourceFile().toUri());
         if (!hasTypeDeclaration(task.root())) {
             list.items.add(classSnippet(file));
+            list.items.add(interfaceSnippet(file));
+            list.items.add(recordSnippet(file));
+            list.items.add(enumSnippet(file));
             if (task.root().getPackage() == null) {
                 list.items.add(packageSnippet(file));
             }
@@ -736,9 +739,28 @@ public class CompletionProvider {
     }
 
     private CompletionItem classSnippet(Path file) {
-        var name = file.getFileName().toString();
-        name = name.substring(0, name.length() - ".java".length());
+        var name = typeName(file);
         return snippetItem("class " + name, "class " + name + " {\n    $0\n}");
+    }
+
+    private CompletionItem interfaceSnippet(Path file) {
+        var name = typeName(file);
+        return snippetItem("interface " + name, "interface " + name + " {\n    $0\n}");
+    }
+
+    private CompletionItem recordSnippet(Path file) {
+        var name = typeName(file);
+        return snippetItem("record " + name, "record " + name + "($0) {\n}");
+    }
+
+    private CompletionItem enumSnippet(Path file) {
+        var name = typeName(file);
+        return snippetItem("enum " + name, "enum " + name + " {\n    $0\n}");
+    }
+
+    private static String typeName(Path file) {
+        var name = file.getFileName().toString();
+        return name.substring(0, name.length() - ".java".length());
     }
 
     private String partialIdentifier(String contents, int end) {

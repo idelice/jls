@@ -471,6 +471,48 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
+                    case "textDocument/prepareTypeHierarchy":
+                        {
+                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
+                            var response = server.prepareTypeHierarchy(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "typeHierarchy/supertypes":
+                        {
+                            var params = gson.fromJson(r.params, TypeHierarchyParams.class);
+                            var response = server.typeHierarchySupertypes(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "typeHierarchy/subtypes":
+                        {
+                            var params = gson.fromJson(r.params, TypeHierarchyParams.class);
+                            var response = server.typeHierarchySubtypes(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "textDocument/prepareCallHierarchy":
+                        {
+                            var params = gson.fromJson(r.params, TextDocumentPositionParams.class);
+                            var response = server.prepareCallHierarchy(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "callHierarchy/incomingCalls":
+                        {
+                            var params = gson.fromJson(r.params, CallHierarchyParams.class);
+                            var response = server.callHierarchyIncomingCalls(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
+                    case "callHierarchy/outgoingCalls":
+                        {
+                            var params = gson.fromJson(r.params, CallHierarchyParams.class);
+                            var response = server.callHierarchyOutgoingCalls(params);
+                            respond(send, r.id, response);
+                            break;
+                        }
                     case "textDocument/documentSymbol":
                         {
                             var params = gson.fromJson(r.params, DocumentSymbolParams.class);
