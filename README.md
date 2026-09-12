@@ -46,6 +46,7 @@ require('lspconfig').jls.setup({
 - **Find references** — all usages across workspace
 - **Find type** — find type definition
 - **Find implementation** — find implementations
+- **Type/call hierachy** — find type/call hierachy 
 - **Hover** — type information and Javadoc
 - **Diagnostics** — pull-based (real-time linting without keystroke lag)
 - **Signature help** — parameter info for method calls
@@ -55,35 +56,9 @@ require('lspconfig').jls.setup({
 - **Document symbols** — outline view of classes, methods, fields
 - **Folding ranges** — collapse imports, classes, methods, blocks
 - **Formatting** — whole-document formatting
-- **Lombok** — modeled from source, including @Builder/@SuperBuilder, @Singular, @Accessors and `lombok.config`
-- **Private repositories** — Maven authentication inherited from `~/.m2/settings.xml`
+- **Lombok** — support lombok
 - **JAR navigation** — go-to-definition into dependency source JARs
 - **Multi-module Gradle/Maven support** (experimental)
-
-### Lombok
-
-Lombok members are modeled from your source, without running Lombok's annotation processor and
-without reading previously compiled classes. No build step is needed.
-
-Modeled: `@Data`, `@Getter`, `@Setter`, `@Value` (including its implicit `private final` fields and
-`final` class), `@With`, `@ToString`, `@EqualsAndHashCode`, `@AllArgsConstructor`,
-`@NoArgsConstructor`, `@RequiredArgsConstructor`, `@Accessors` (fluent, chained), `@Builder`
-including its arguments (`builderMethodName`, `buildMethodName`, `builderClassName`, `setterPrefix`,
-`toBuilder`), `@Singular` collections and maps, `@SuperBuilder`, and the logger annotations
-(`@Slf4j`, `@Log`, `@Log4j`, `@Log4j2`, `@CommonsLog`, `@Flogger`, `@JBossLog`, `@XSlf4j`,
-`@CustomLog`).
-
-`lombok.config` is read per directory, walking up until `config.stopBubbling = true`. These keys are
-honoured: `lombok.accessors.prefix`, `lombok.accessors.fluent`, `lombok.accessors.chain`,
-`lombok.accessors.capitalization`, `lombok.log.fieldName` and `lombok.log.custom.declaration`. Other
-keys are ignored, and the server must be restarted to pick up an edited `lombok.config`.
-
-Known boundaries — members here resolve and give correct diagnostics, but autocomplete is thinner:
-
-- For `@SuperBuilder`, completion part-way through a builder chain does not list the parent's
-  setters, because the parse-only resolver cannot follow the generated self-type. The code still
-  compiles and go-to-definition works.
-- `@Accessors(prefix = ...)` on an individual class is not read; only the `lombok.config` prefix is.
 
 ### Code actions
 
@@ -175,12 +150,6 @@ The nvim-jls client exposes a `jvm_args` config field that sets this automatical
 
 JLS supports multi-module Maven and Gradle projects. Modules are resolved lazily — only when you open a file or navigate to a reference in another module.
 
-### How it works
-
-1. On startup, JLS reads the project structure (module graph, source directories, inter-module dependencies)
-2. When you open a file, the server resolves that module's classpath on-demand
-3. When you use find-references or go-to-definition across modules, referenced modules are resolved in parallel
-
 ### Prerequisites
 
 None beyond resolvable dependencies. The server reads your build's model (module graph, source
@@ -270,9 +239,7 @@ dap.configurations.java = {
 Features are split across two resolution strategies:
 
 - **Compile-based** (javac attribution): go-to-definition, hover, diagnostics, code actions, find-references
-- **Index-based** (parse + workspace index): autocomplete, signature help
-
-This avoids full compilation on high-frequency triggers like `(` and keystroke-driven completions.
+- **Index-based** (parse + workspace index): autocomplete, signature help, inlay hints
 
 ### Source-only analysis
 
