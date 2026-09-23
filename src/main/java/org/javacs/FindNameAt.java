@@ -28,7 +28,7 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         surroundingClass = t;
         // An anonymous class has no name to click on. Matching its empty name would make every
         // word boundary in its body resolve to the class instead of the symbol under the cursor.
-        if (!t.getSimpleName().isEmpty() && contains(t, t.getSimpleName(), find)) {
+        if (!t.getSimpleName().isEmpty() && containsInHeader(t, find)) {
             surroundingClass = push;
             return getCurrentPath();
         }
@@ -143,6 +143,17 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     public TreePath reduce(TreePath r1, TreePath r2) {
         if (r1 != null) return r1;
         return r2;
+    }
+
+    private boolean containsInHeader(ClassTree t, long find) {
+        var pos = trees.getSourcePositions();
+        var start = (int) pos.getStartPosition(root, t);
+        var end = (int) pos.getEndPosition(root, t);
+        if (start < 0 || end < 0) return false;
+        var name = t.getSimpleName();
+        var nameStart = FindHelper.findNameIn(root, name, start, end);
+        if (nameStart < 0) return false;
+        return nameStart <= find && find <= nameStart + name.length();
     }
 
     private boolean contains(Tree t, CharSequence name, long find) {
