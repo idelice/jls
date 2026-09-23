@@ -89,11 +89,7 @@ public class DefinitionProvider {
                 LOG.fine("[def] branch=decompile-fallback");
                 var decompiled = compiler.decompileClass(className);
                 if (decompiled.isPresent()) {
-                    LOG.fine("[def] return=decompiled " + decompiled.get());
-                    var parse = compiler.parse(new SourceFileObject(decompiled.get()));
-                    var tree = FindHelper.findType(parse, className);
-                    var path = TreePath.getPath(parse.root(), tree);
-                    return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+                    return findInDecompiledClass(task, element, className, decompiled.get());
                 }
                 LOG.fine("[def] return=empty");
                 return List.of();
@@ -207,6 +203,38 @@ public class DefinitionProvider {
             }
         }
         return null;
+    }
+
+    private List<Location> findInDecompiledClass(CompileTask task, Element element, String className, Path decompiled) {
+        var parse = compiler.parse(new SourceFileObject(decompiled));
+        var tree = FindHelper.findType(parse, className);
+        if (element instanceof ExecutableElement method) {
+            try {
+                var erased = FindHelper.erasedParameterTypes(task, method);
+                var name = method.getSimpleName().toString();
+                var memberTree = FindHelper.findMethod(parse, className, name, erased);
+                var memberPath = TreePath.getPath(parse.root(), memberTree);
+                // A constructor's tree name is "<init>"; highlight the class name instead.
+                var highlight = name.equals("<init>") ? tree.getSimpleName().toString() : name;
+                LOG.fine("[def] return=decompiled-member kind=" + element.getKind() + " name=" + name);
+                return List.of(FindHelper.location(parse, memberPath, highlight));
+            } catch (RuntimeException noMember) {
+                // Fall through to the class declaration.
+            }
+        } else if (element.getKind() == ElementKind.FIELD || element.getKind() == ElementKind.ENUM_CONSTANT) {
+            try {
+                var name = element.getSimpleName().toString();
+                var memberTree = FindHelper.findField(parse, className, name);
+                var memberPath = TreePath.getPath(parse.root(), memberTree);
+                LOG.fine("[def] return=decompiled-member kind=" + element.getKind() + " name=" + name);
+                return List.of(FindHelper.location(parse, memberPath, name));
+            } catch (RuntimeException noMember) {
+                // Fall through to the class declaration.
+            }
+        }
+        LOG.fine("[def] return=decompiled " + decompiled);
+        var path = TreePath.getPath(parse.root(), tree);
+        return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
     }
 
     private List<Location> resolveErrorType(String simpleName) {
