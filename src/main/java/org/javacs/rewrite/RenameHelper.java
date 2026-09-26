@@ -6,7 +6,6 @@ import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
-import com.sun.source.util.Trees;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;

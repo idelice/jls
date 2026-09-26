@@ -3,8 +3,7 @@ package org.javacs;
 import com.google.gson.Gson;
 import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.Symbol;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
@@ -38,7 +37,7 @@ final class RenameHandler {
                                 task.root(file).getSourceFile().getCharContent(true).toString(),
                                 params.position.line + 1,
                                 params.position.character + 1);
-            } catch (java.io.IOException e) {
+            } catch (IOException e) {
                 throw new RuntimeException(e);
             }
             var path = new FindNameAt(task).scan(task.root(file), cursor);
