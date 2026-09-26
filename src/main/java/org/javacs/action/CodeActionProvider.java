@@ -305,65 +305,64 @@ public class CodeActionProvider {
         LOG.info(String.format("Check %d diagnostics for quick fixes...", params.context.diagnostics.size()));
         var started = Instant.now();
         var file = Paths.get(params.textDocument.uri);
+        // Collect (title, rewrite) while the compile task is open, then build the actions AFTER it
+        // closes. A rewrite may itself compile, and the reused compiler allows only one open task.
+        var fixes = new ArrayList<Map.Entry<String, Rewrite>>();
         try (var task = compiler.compile(file)) {
-            var actions = new ArrayList<CodeAction>();
             for (var d : params.context.diagnostics) {
-                var newActions = codeActionForDiagnostic(task, file, d);
-                actions.addAll(newActions);
+                fixes.addAll(rewritesForDiagnostic(task, file, d));
             }
-            var elapsed = Duration.between(started, Instant.now()).toMillis();
-            LOG.info(String.format("...created %d quick fixes in %d ms", actions.size(), elapsed));
-            return actions;
         }
+        var actions = new ArrayList<CodeAction>();
+        for (var fix : fixes) {
+            actions.addAll(createQuickFix(fix.getKey(), fix.getValue()));
+        }
+        var elapsed = Duration.between(started, Instant.now()).toMillis();
+        LOG.info(String.format("...created %d quick fixes in %d ms", actions.size(), elapsed));
+        return actions;
     }
 
-    private List<CodeAction> codeActionForDiagnostic(CompileTask task, Path file, Diagnostic d) {
+    private List<Map.Entry<String, Rewrite>> rewritesForDiagnostic(CompileTask task, Path file, Diagnostic d) {
         var root = task.root(file);
-        // TODO this should be done asynchronously using executeCommand
         switch (d.code) {
             case "unused_local":
-                var toStatement = new ConvertVariableToStatement(file, findPosition(root, d.range.start));
-                return createQuickFix("Convert to statement", toStatement);
+                return List.of(Map.entry("Convert to statement",
+                        new ConvertVariableToStatement(file, findPosition(root, d.range.start))));
             case "compiler.warn.unchecked.call.mbr.of.raw.type":
                 var warnedMethod = findMethod(task, root, d.range);
-                var suppressWarning =
+                return List.of(Map.entry("Suppress 'unchecked' warning",
                         new AddSuppressWarningAnnotation(
-                                warnedMethod.className, warnedMethod.methodName, warnedMethod.erasedParameterTypes);
-                return createQuickFix("Suppress 'unchecked' warning", suppressWarning);
+                                warnedMethod.className, warnedMethod.methodName, warnedMethod.erasedParameterTypes)));
             case "compiler.err.unreported.exception.need.to.catch.or.throw":
                 var needsThrow = findMethod(task, root, d.range);
                 var exceptionName = extractExceptionName(d.message);
-                var addThrows =
+                return List.of(Map.entry("Add 'throws'",
                         new AddException(
                                 needsThrow.className,
                                 needsThrow.methodName,
                                 needsThrow.erasedParameterTypes,
-                                exceptionName);
-                return createQuickFix("Add 'throws'", addThrows);
+                                exceptionName)));
             case "compiler.err.cant.resolve":
             case "compiler.err.cant.resolve.location":
+            case "compiler.err.not.stmt":
                 var simpleName = extractRange(root, d.range);
-                var allImports = new ArrayList<CodeAction>();
+                var allImports = new ArrayList<Map.Entry<String, Rewrite>>();
                 for (var qualifiedName : compiler.publicTopLevelTypes()) {
                     if (qualifiedName.endsWith("." + simpleName)) {
-                        var title = "Import '" + qualifiedName + "'";
-                        var addImport = new AddImport(file, qualifiedName);
-                        allImports.addAll(createQuickFix(title, addImport));
+                        allImports.add(Map.entry("Import '" + qualifiedName + "'", new AddImport(file, qualifiedName)));
                     }
                 }
                 return allImports;
             case "compiler.err.var.not.initialized.in.default.constructor":
                 var needsConstructor = findClassNeedingConstructor(task, root, d.range);
                 if (needsConstructor == null) return List.of();
-                var generateConstructor = new GenerateRecordConstructor(needsConstructor);
-                return createQuickFix("Generate constructor", generateConstructor);
+                return List.of(Map.entry("Generate constructor", new GenerateRecordConstructor(needsConstructor)));
             case "compiler.err.does.not.override.abstract":
                 var missingAbstracts = findClass(task, root, d.range);
-                var implementAbstracts = new ImplementAbstractMethods(missingAbstracts);
-                return createQuickFix("Implement abstract methods", implementAbstracts);
+                return List.of(Map.entry("Implement abstract methods", new ImplementAbstractMethods(missingAbstracts)));
             case "compiler.err.cant.resolve.location.args":
-                var missingMethod = new CreateMissingMethod(file, findPosition(root, d.range.start));
-                return createQuickFix("Create missing method", missingMethod);
+                return List.of(Map.entry("Create missing method",
+                        new CreateMissingMethod(file, findPosition(root, d.range.start))));
             default:
                 return List.of();
         }
