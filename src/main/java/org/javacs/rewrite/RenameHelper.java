@@ -128,12 +128,23 @@ class RenameHelper {
         Consumer<TreePath> forEach =
                 path -> {
                     var candidate = trees.getElement(path);
-                    if (find.equals(candidate)) {
+                    if (find.equals(candidate) || overridesTarget(candidate, find)) {
                         found.add(path);
                     }
                 };
         new FindMethodReferences().scan(root, forEach);
         return found;
+    }
+
+    private boolean overridesTarget(Element candidate, ExecutableElement find) {
+        if (!(candidate instanceof ExecutableElement method) || method.equals(find)) return false;
+        var elements = task.elements;
+        if (!(method.getEnclosingElement() instanceof TypeElement methodType)
+                || !(find.getEnclosingElement() instanceof TypeElement findType)) {
+            return false;
+        }
+        return elements.overrides(method, find, methodType)
+                || elements.overrides(find, method, findType);
     }
 
     private TextEdit[] replaceAll(List<TreePath> found, String newName) {
