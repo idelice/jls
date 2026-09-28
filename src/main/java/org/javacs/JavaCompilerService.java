@@ -45,6 +45,10 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
     }
 
+    void setRetainScans(boolean retain) {
+        compiler.retainScans = retain;
+    }
+
     void addDocPathEntries(Set<Path> entries) {
         if (entries.isEmpty()) return;
         try {
@@ -345,56 +349,32 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
     }
 
     @Override
-    public Path[] findTypeReferences(String className) {
-        var candidates = new ArrayList<Path>();
-        for (var file : FileStore.all()) {
-            if (referencesType(file, className)) candidates.add(file);
+    public Path[] findTypeReferences(String className, Collection<Path> candidates) {
+        var result = new ArrayList<Path>();
+        for (var file : candidates != null ? candidates : FileStore.all()) {
+            if (referencesType(file, className)) result.add(file);
         }
-        return candidates.toArray(Path[]::new);
-    }
-
-    @Override
-    public Path[] findTypeReferences(Collection<String> classNames) {
-        var names = classNames.stream().filter(name -> name != null && !name.isBlank()).distinct().toList();
-        if (names.size() == 1) return findTypeReferences(names.getFirst());
-        if (names.isEmpty()) return new Path[0];
-
-        var simpleNames = names.stream()
-                .map(this::simpleName)
-                .filter(name -> !name.isBlank())
-                .distinct()
-                .map(StringSearch::new)
-                .toList();
-        var candidates = new ArrayList<Path>();
-        for (var file : FileStore.all()) {
-            if (!StringSearch.containsAnyWord(file, simpleNames)) continue;
-            for (var className : names) {
-                if (referencesType(file, className)) {
-                    candidates.add(file);
-                    break;
-                }
-            }
-        }
-        return candidates.toArray(Path[]::new);
+        return result.toArray(Path[]::new);
     }
 
     private boolean referencesType(Path file, String className) {
         var pkg = packageName(className);
-        return (pkg.isEmpty() || containsWord(file, pkg))
-                && (containsImport(file, className) || containsWord(file, className))
+        return (containsImport(file, className) || containsWord(file, className))
+                && (pkg.isEmpty() || containsWord(file, pkg))
                 && containsWord(file, simpleName(className));
     }
 
     @Override
-    public Path[] findMemberReferences(String className, String memberName) {
+    public Path[] findMemberReferences(String className, String memberName, Collection<Path> candidates) {
         var pkg = packageName(className);
-        var candidates = new ArrayList<Path>();
-        for (var f : FileStore.all()) {
-            if (containsWord(f, memberName) && (pkg.equals(FileStore.packageName(f)) || containsImport(f, className))) {
-                candidates.add(f);
+        var result = new ArrayList<Path>();
+        for (var f : candidates != null ? candidates : FileStore.all()) {
+            if ((pkg.equals(FileStore.packageName(f)) || containsImport(f, className))
+                    && containsWord(f, memberName)) {
+                result.add(f);
             }
         }
-        return candidates.toArray(Path[]::new);
+        return result.toArray(Path[]::new);
     }
 
     private volatile ExternalBinaryDecompiler decompiler;

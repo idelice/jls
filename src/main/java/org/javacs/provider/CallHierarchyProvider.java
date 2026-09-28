@@ -36,6 +36,8 @@ public final class CallHierarchyProvider {
     private final Function<Path, CompilerProvider> compilerForFile;
     private final Consumer<Path[]> batchResolver;
     private final Runnable includeReferenceSources;
+    /** Token->files lookup from the workspace index. Null = fall back to text-scan. */
+    public Function<String, List<Path>> tokenLookup;
 
     public CallHierarchyProvider(
             CompilerProvider compiler,
@@ -85,9 +87,10 @@ public final class CallHierarchyProvider {
         var memberName = data.methodName.equals("<init>") ? simpleName(data.className) : data.methodName;
         try {
             var searchNames = incomingSearchNames(file, data.className, memberName);
+            var postings = tokenLookup == null ? null : tokenLookup.apply(memberName);
             var candidates = new LinkedHashSet<Path>();
             for (var cn : searchNames) {
-                for (var f : compilerForFile.apply(file).findMemberReferences(cn, memberName)) candidates.add(f);
+                for (var f : compilerForFile.apply(file).findMemberReferences(cn, memberName, postings)) candidates.add(f);
             }
             if (candidates.isEmpty()) return List.of();
             candidates.add(file);

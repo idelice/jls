@@ -4,7 +4,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -25,17 +24,9 @@ public interface CompilerProvider {
 
     Path findTypeDeclaration(String className);
 
-    Path[] findTypeReferences(String className);
+    Path[] findTypeReferences(String className, Collection<Path> candidates);
 
-    default Path[] findTypeReferences(Collection<String> classNames) {
-        var result = new LinkedHashSet<Path>();
-        for (var className : classNames) {
-            for (var file : findTypeReferences(className)) result.add(file);
-        }
-        return result.toArray(Path[]::new);
-    }
-
-    Path[] findMemberReferences(String className, String memberName);
+    Path[] findMemberReferences(String className, String memberName, Collection<Path> candidates);
 
     ParseTask parse(Path file);
 

@@ -1,4 +1,5 @@
 package org.javacs.provider;
+import com.sun.source.tree.ClassTree;
 import com.sun.source.util.TreePath;
 import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.Symbol;
@@ -6,6 +7,7 @@ import java.lang.classfile.ClassFile;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.logging.Logger;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.VariableTree;
@@ -16,10 +18,12 @@ import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.util.Elements;
 import javax.lang.model.type.TypeKind;
+import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
+import org.javacs.ParseTask;
 import org.javacs.SourceFileObject;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.NavigationHelper;
@@ -104,59 +108,8 @@ public class DefinitionProvider {
             var parse = compiler.parse(otherFile.get());
             var tree = FindHelper.findType(parse, className);
             if (element instanceof ExecutableElement method) {
-                var erased = FindHelper.erasedParameterTypes(task, method);
-                try {
-                    var memberTree = FindHelper.findMethod(parse, className, method.getSimpleName().toString(), erased);
-                    if (memberTree != null) {
-                        LOG.fine("[def] return=method-in-other-file");
-                        var path = TreePath.getPath(parse.root(), memberTree);
-                        return List.of(FindHelper.location(parse, path, method.getSimpleName()));
-                    }
-                } catch (RuntimeException notInSource) {
-                }
-                if (otherFile.get() instanceof SourceFileObject && compiler.lombokPresentOnClasspath()) {
-                    var builderField = resolveLombokBuilderField(
-                            method, method.getSimpleName().toString(), task.elements);
-                    if (!builderField.isEmpty()) return builderField;
-                    try {
-                        var result = resolveLombokField(method, method.getSimpleName().toString(), task.elements);
-                        if (!result.isEmpty()) {
-                            LOG.info("[lombok-source-compile] definition=source-field method=" + method.getSimpleName());
-                            return result;
-                        }
-                    } catch (RuntimeException ignored) {
-                        // Treat this as a missing Lombok source definition.
-                    }
-                    LOG.info("[lombok-source-compile] definition=source-field-miss method=" + method.getSimpleName());
-                }
-                // A workspace source is authoritative for a Lombok accessor. Do not jump
-                // to the containing class when the generated accessor has no source field.
-                if (otherFile.get() instanceof SourceFileObject
-                        && compiler.lombokPresentOnClasspath()
-                        && LombokAnnotations.accessorFieldName(method.getSimpleName().toString()).isPresent()) {
-                    return List.of();
-                }
-                if (!(otherFile.get() instanceof SourceFileObject)) {
-                    var classFile = compiler.findClassFile(className);
-                    var methodName = method.getSimpleName().toString();
-                    if (classFile.isPresent() && classHasMethod(classFile.get(), methodName)) {
-                        var fieldName = compiler.lombokPresentOnClasspath()
-                                ? LombokAnnotations.accessorFieldName(methodName) : java.util.Optional.<String>empty();
-                        if (fieldName.isPresent()) {
-                            try {
-                                var fieldTree = FindHelper.findField(parse, className, fieldName.get());
-                                LOG.fine("[def] return=field-in-other-file (via bytecode+accessor)");
-                                var path = TreePath.getPath(parse.root(), fieldTree);
-                                return List.of(FindHelper.location(parse, path, fieldName.get()));
-                            } catch (RuntimeException e) {
-                                // field not in source, fall through to class
-                            }
-                        }
-                        LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + methodName + ")");
-                        var path = TreePath.getPath(parse.root(), tree);
-                        return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
-                    }
-                }
+                var resolved = resolveMethodInOtherFile(task, parse, tree, otherFile.get(), className, method);
+                if (resolved.isPresent()) return resolved.get();
             }
             if (element.getKind() == ElementKind.FIELD || element.getKind() == ElementKind.ENUM_CONSTANT) {
                 var memberName = element.getSimpleName().toString();
@@ -181,6 +134,61 @@ public class DefinitionProvider {
             LOG.fine("[def] return=class-in-other-file");
             var path = TreePath.getPath(parse.root(), tree);
             return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+    }
+
+    /** present+non-empty = found; present+empty = stop; empty = fall through. */
+    private Optional<List<Location>> resolveMethodInOtherFile(
+            CompileTask task, ParseTask parse, ClassTree tree,
+            JavaFileObject otherFile, String className, ExecutableElement method) {
+        var methodName = method.getSimpleName().toString();
+        var erased = FindHelper.erasedParameterTypes(task, method);
+        try {
+            var memberTree = FindHelper.findMethod(parse, className, methodName, erased);
+            if (memberTree != null) {
+                LOG.fine("[def] return=method-in-other-file");
+                var path = TreePath.getPath(parse.root(), memberTree);
+                return Optional.of(List.of(FindHelper.location(parse, path, method.getSimpleName())));
+            }
+        } catch (RuntimeException notInSource) {
+        }
+        if (otherFile instanceof SourceFileObject && compiler.lombokPresentOnClasspath()) {
+            var builderField = resolveLombokBuilderField(method, methodName, task.elements);
+            if (!builderField.isEmpty()) return Optional.of(builderField);
+            try {
+                var result = resolveLombokField(method, methodName, task.elements);
+                if (!result.isEmpty()) {
+                    LOG.info("[lombok-source-compile] definition=source-field method=" + methodName);
+                    return Optional.of(result);
+                }
+            } catch (RuntimeException ignored) {
+            }
+            LOG.info("[lombok-source-compile] definition=source-field-miss method=" + methodName);
+        }
+        // A workspace source is authoritative for a Lombok accessor: stop rather than jump to the class.
+        if (otherFile instanceof SourceFileObject && compiler.lombokPresentOnClasspath()
+                && LombokAnnotations.accessorFieldName(methodName).isPresent()) {
+            return Optional.of(List.of());
+        }
+        if (!(otherFile instanceof SourceFileObject)) {
+            var classFile = compiler.findClassFile(className);
+            if (classFile.isPresent() && classHasMethod(classFile.get(), methodName)) {
+                var fieldName = compiler.lombokPresentOnClasspath()
+                        ? LombokAnnotations.accessorFieldName(methodName) : Optional.<String>empty();
+                if (fieldName.isPresent()) {
+                    try {
+                        var fieldTree = FindHelper.findField(parse, className, fieldName.get());
+                        LOG.fine("[def] return=field-in-other-file (via bytecode+accessor)");
+                        var path = TreePath.getPath(parse.root(), fieldTree);
+                        return Optional.of(List.of(FindHelper.location(parse, path, fieldName.get())));
+                    } catch (RuntimeException e) {
+                    }
+                }
+                LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + methodName + ")");
+                var path = TreePath.getPath(parse.root(), tree);
+                return Optional.of(List.of(FindHelper.location(parse, path, tree.getSimpleName())));
+            }
+        }
+        return Optional.empty();
     }
 
     private String resolveImportClass(CompileTask task, String memberName) {

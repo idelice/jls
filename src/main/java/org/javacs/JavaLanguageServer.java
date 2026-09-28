@@ -267,6 +267,7 @@ class JavaLanguageServer extends LanguageServer {
             var args = scoped ? configured.extraCompilerArgs() : selectCompilerArgs(configured.extraCompilerArgs(), infer).args();
             compiler = new JavaCompilerService(moduleGraph.externalClasspath(classpath), docs, configured.addExports(), args);
             if (!roots.isEmpty()) compiler.setSourceRoots(roots);
+            compiler.setRetainScans(moduleGraph.modules().size() <= 1);
             LOG.info("[analysis] configured proc=none workspace_binaries=0 modules=" + moduleGraph.modules().size()
                     + " sources=" + roots.size() + " ms=" + (System.nanoTime() - started) / 1_000_000);
         } finally {
@@ -684,11 +685,15 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var found =
+        var refProvider =
                 new ReferenceProvider(
                                 compilerFor(file), file, line, column, this::compilerFor,
-                                this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles)
-                        .find();
+                                this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles);
+        var wsIndex = completionSnapshotRef.get().workspaceIndex();
+        if (wsIndex != null && wsIndex != WorkspaceTypeIndex.EMPTY) {
+            refProvider.tokenLookup = wsIndex::filesContainingToken;
+        }
+        var found = refProvider.find();
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -735,12 +740,16 @@ class JavaLanguageServer extends LanguageServer {
     public List<CallHierarchyIncomingCall> callHierarchyIncomingCalls(CallHierarchyParams params) {
         if (params == null || params.item == null || params.item.uri == null) return List.of();
         var file = Paths.get(params.item.uri);
-        return new CallHierarchyProvider(
+        var provider = new CallHierarchyProvider(
                         compilerFor(file),
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
-                        moduleRegistry::includeReferenceSources)
-                .incomingCalls(params.item);
+                        moduleRegistry::includeReferenceSources);
+        var wsIndex = completionSnapshotRef.get().workspaceIndex();
+        if (wsIndex != null && wsIndex != WorkspaceTypeIndex.EMPTY) {
+            provider.tokenLookup = wsIndex::filesContainingToken;
+        }
+        return provider.incomingCalls(params.item);
     }
 
     @Override

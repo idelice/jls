@@ -6,6 +6,7 @@ import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -37,6 +38,8 @@ public class ReferenceProvider {
     private final java.util.function.Consumer<Path[]> batchResolver;
     private final Path file;
     private final int line, column;
+    /** Token->files lookup from the workspace index. Null = fall back to text-scan. */
+    public Function<String, List<Path>> tokenLookup;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
@@ -85,7 +88,6 @@ public class ReferenceProvider {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
-                // Package-private members can only be referenced within the same package
                 var isPackagePrivate = !element.getModifiers().contains(Modifier.PUBLIC)
                         && !element.getModifiers().contains(Modifier.PROTECTED)
                         && !element.getModifiers().contains(Modifier.PRIVATE);
@@ -97,7 +99,6 @@ public class ReferenceProvider {
                 if (memberName.equals("<init>")) {
                     memberName = parentClass.getSimpleName().toString();
                 }
-                // Lombok gate first — private fields with Lombok annotations generate public accessors
                 if (compiler.lombokPresentOnClasspath()) {
                     LOG.fine("[ref] lombokOnClasspath=true");
                     var names = lombokSearchNames(element, memberName, task);
@@ -107,14 +108,13 @@ public class ReferenceProvider {
                     }
                     LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
-                // Private members (non-Lombok) can only be referenced within the same file
-                // Exception: record components are private fields but have public accessors
+                // Private non-Lombok: file-only scan (record components are private but have public accessors)
                 if (element.getModifiers().contains(Modifier.PRIVATE)
                         && parentClass.getKind() != ElementKind.RECORD) {
                     LOG.fine(String.format("[ref] private_member kind=%s name=%s — file-only scan", element.getKind(), memberName));
                     return findReferences(task);
                 }
-                // For methods, also search by supertypes that declare the same method
+                // For methods, search supertypes that declare the same name (interface chain)
                 var searchClassNames = new LinkedHashSet<String>();
                 searchClassNames.add(className);
                 if (element instanceof ExecutableElement method) {
@@ -145,27 +145,36 @@ public class ReferenceProvider {
         }
     }
 
+    private List<Path> tokenCandidates(String name) {
+        if (tokenLookup == null) return null;
+        return tokenLookup.apply(name);
+    }
+
     private List<Location> findTypeReferences(String className) {
-        var files = compiler.findTypeReferences(className);
-        LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d", className, files.length));
+        var simpleName = className.contains(".") ? className.substring(className.lastIndexOf('.') + 1) : className;
+        var postings = tokenCandidates(simpleName);
+        var files = compiler.findTypeReferences(className, postings);
+        LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d source=%s",
+                className, files.length, postings != null ? "token_index" : "text_scan"));
         if (files.length == 0) return List.of();
         return findReferences(files, compiler.findTypeDeclaration(className));
     }
 
     private List<Location> findMemberReferences(Set<String> classNames, String memberName, Path declaration, boolean packagePrivate) {
+        var postings = tokenCandidates(memberName);
         var allFiles = new LinkedHashSet<Path>();
         for (var cn : classNames) {
-            for (var f : compiler.findMemberReferences(cn, memberName)) allFiles.add(f);
+            for (var f : compiler.findMemberReferences(cn, memberName, postings)) allFiles.add(f);
         }
         var files = allFiles.toArray(Path[]::new);
+        LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d source=%s",
+                classNames, memberName, files.length, postings != null ? "token_index" : "text_scan"));
         if (packagePrivate && declaration != null) {
             var declarationPackage = FileStore.packageName(declaration);
-            files = java.util.Arrays.stream(files)
+            files = Arrays.stream(files)
                     .filter(f -> declarationPackage.equals(FileStore.packageName(f)))
                     .toArray(Path[]::new);
             LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", classNames, memberName, files.length));
-        } else {
-            LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d", classNames, memberName, files.length));
         }
         if (files.length == 0) return List.of();
         return findReferences(files, declaration);
@@ -287,9 +296,19 @@ public class ReferenceProvider {
     private List<Location> findLombokReferences(String className, Set<String> names) {
         var start = System.currentTimeMillis();
         var files = new LinkedHashSet<Path>();
+        var useIndex = tokenLookup != null;
+        List<Path> postings = null;
+        if (useIndex) {
+            postings = new ArrayList<>();
+            for (var name : names) {
+                var p = tokenLookup.apply(name);
+                if (p == null) { useIndex = false; postings = null; break; }
+                postings.addAll(p);
+            }
+        }
         for (var name : names) {
-            for (var f : compiler.findMemberReferences(className, name)) {
-                files.add(f);
+            for (var f : compiler.findMemberReferences(className, name, postings)) {
+                  files.add(f);
             }
         }
         if (files.isEmpty()) {
@@ -303,7 +322,6 @@ public class ReferenceProvider {
         for (var candidate : files) {
             if (!candidateAllowed.test(declaration, candidate)) continue;
             var candidateCompiler = compilerForFile.apply(candidate);
-            if (!candidateAllowed.test(declaration, candidate)) continue;
             groups.computeIfAbsent(candidateCompiler, __ -> new LinkedHashSet<>())
                     .add(candidate);
         }
@@ -325,13 +343,14 @@ public class ReferenceProvider {
             }
         }
         LOG.fine(String.format(
-                "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d total=%dms",
+                "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d source=%s total=%dms",
                 className,
                 names,
                 files.size(),
                 roots,
                 errors,
                 locations.size(),
+                useIndex ? "token_index" : "text_scan",
                 System.currentTimeMillis() - start));
         return new ArrayList<>(locations.values());
     }

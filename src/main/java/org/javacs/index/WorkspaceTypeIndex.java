@@ -99,6 +99,7 @@ public class WorkspaceTypeIndex {
     private final Set<String> workspaceOwnedTypeNames;
     private final Map<String, Set<String>> subtypesByType;
     private final Map<Path, SourceFileSnapshot> sourceFiles;
+    private Map<String, List<Path>> filesByToken = Map.of();
 
     private WorkspaceTypeIndex(
             Map<String, IndexedType> typesByQualifiedName,
@@ -155,11 +156,28 @@ public class WorkspaceTypeIndex {
                 files.put(entry.getKey(), entry.getValue());
             }
         }
-        return new WorkspaceTypeIndex(types, files);
+        var restricted = new WorkspaceTypeIndex(types, files);
+        restricted.filesByToken = filterTokens(filesByToken, files.keySet());
+        return restricted;
+    }
+
+    private static Map<String, List<Path>> filterTokens(Map<String, List<Path>> source, Set<Path> keep) {
+        if (source.isEmpty()) return Map.of();
+        var out = new Object2ObjectOpenHashMap<String, List<Path>>();
+        for (var e : source.entrySet()) {
+            var kept = new ArrayList<Path>();
+            for (var p : e.getValue()) if (keep.contains(p)) kept.add(p);
+            if (!kept.isEmpty()) out.put(e.getKey(), kept);
+        }
+        return out;
     }
 
     public boolean containsType(String qualifiedName) {
         return typesByQualifiedName.containsKey(qualifiedName);
+    }
+
+    public List<Path> filesContainingToken(String simpleName) {
+        return filesByToken.get(simpleName);
     }
 
     public boolean ownsTypeOrEnclosingType(String qualifiedName) {
@@ -180,13 +198,6 @@ public class WorkspaceTypeIndex {
 
     public Optional<IndexedType> typeInfo(String qualifiedName) {
         return Optional.ofNullable(typesByQualifiedName.get(qualifiedName));
-    }
-
-    public Optional<SourceFileSnapshot> sourceFile(Path file) {
-        if (file == null) {
-            return Optional.empty();
-        }
-        return Optional.ofNullable(sourceFiles.get(file));
     }
 
     /** Return true when an update contains the same index-facing declarations for these files. */
@@ -266,7 +277,27 @@ public class WorkspaceTypeIndex {
             }
         }
 
-        return new WorkspaceTypeIndex(nextTypes, nextSourceFiles);
+        var result = new WorkspaceTypeIndex(nextTypes, nextSourceFiles);
+        // Carry the inverted token index forward: base postings minus replaced files, plus delta.
+        if (!filesByToken.isEmpty() || (updates != null && !updates.filesByToken.isEmpty())) {
+            var nextTokens = new Object2ObjectOpenHashMap<String, List<Path>>();
+            for (var e : filesByToken.entrySet()) {
+                var kept = new ArrayList<Path>();
+                for (var p : e.getValue()) if (!filesToReplace.contains(p)) kept.add(p);
+                if (!kept.isEmpty()) nextTokens.put(e.getKey(), kept);
+            }
+            if (updates != null) {
+                for (var e : updates.filesByToken.entrySet()) {
+                    nextTokens.merge(e.getKey(), e.getValue(), (a, b) -> {
+                        var merged = new ArrayList<>(a);
+                        merged.addAll(b);
+                        return merged;
+                    });
+                }
+            }
+            result.filesByToken = nextTokens;
+        }
+        return result;
     }
 
     public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
@@ -604,6 +635,8 @@ public class WorkspaceTypeIndex {
         var typeSourceFile = new Object2ObjectOpenHashMap<String, Path>();
         // Members extracted per type
         var typeDirectMembers = new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
+        // Inverted body-identifier prefilter: token -> files mentioning it (bounded post-pass).
+        var tokenFiles = new Object2ObjectOpenHashMap<String, ObjectOpenHashSet<Path>>();
 
         for (var parseTask : parseTasks) {
             var root = parseTask.root();
@@ -629,9 +662,40 @@ public class WorkspaceTypeIndex {
 
             var declaredTypesInFile = new ArrayList<String>();
             var qualifiedNameStack = new ArrayDeque<String>();
+            var fileTokens = new ObjectOpenHashSet<String>();
 
             // Extract types, members, raw supertypes — all in one scan
             new TreeScanner<Void, Void>() {
+                @Override
+                public Void visitIdentifier(com.sun.source.tree.IdentifierTree node, Void p) {
+                    addToken(fileTokens, node.getName());
+                    return super.visitIdentifier(node, p);
+                }
+
+                @Override
+                public Void visitMemberSelect(com.sun.source.tree.MemberSelectTree node, Void p) {
+                    addToken(fileTokens, node.getIdentifier());
+                    return super.visitMemberSelect(node, p);
+                }
+
+                @Override
+                public Void visitMemberReference(com.sun.source.tree.MemberReferenceTree node, Void p) {
+                    addToken(fileTokens, node.getName());
+                    return super.visitMemberReference(node, p);
+                }
+
+                @Override
+                public Void visitMethod(MethodTree node, Void p) {
+                    addToken(fileTokens, node.getName());
+                    return super.visitMethod(node, p);
+                }
+
+                @Override
+                public Void visitVariable(VariableTree node, Void p) {
+                    addToken(fileTokens, node.getName());
+                    return super.visitVariable(node, p);
+                }
+
                 @Override
                 public Void visitClass(ClassTree tree, Void p) {
                     var simpleName = tree.getSimpleName() == null ? null : tree.getSimpleName().toString();
@@ -706,7 +770,11 @@ public class WorkspaceTypeIndex {
             if (finalSourcePath != null) {
                 sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
                         finalSourcePath, finalSourceUri, packageName,
-                        explicitImports, staticImports, declaredTypesInFile, ""));
+                        explicitImports, staticImports, declaredTypesInFile,
+                        Integer.toString(fileTokens.hashCode())));
+                for (var token : fileTokens) {
+                    tokenFiles.computeIfAbsent(token, __ -> new ObjectOpenHashSet<>()).add(finalSourcePath);
+                }
             }
         }
         // Each syntax tree became garbage as soon as its iteration ended; only the collected
@@ -790,9 +858,28 @@ public class WorkspaceTypeIndex {
 
         var finalizedSourceFiles = finalizeSourceFiles(sourceFileSnapshots, typeEntries);
 
-        return new WorkspaceTypeIndex(
+        var index = new WorkspaceTypeIndex(
                         Collections.unmodifiableMap(typeEntries),
                         Collections.unmodifiableMap(finalizedSourceFiles));
+        index.filesByToken = buildTokenIndex(tokenFiles);
+        return index;
+    }
+
+    private static void addToken(ObjectOpenHashSet<String> fileTokens, CharSequence name) {
+        if (name == null) return;
+        var s = name.toString();
+        if (!s.isBlank()) fileTokens.add(s);
+    }
+
+    /** Absent token means no indexed source mentions it. */
+    private static Map<String, List<Path>> buildTokenIndex(
+            Map<String, ObjectOpenHashSet<Path>> tokenFiles) {
+        if (tokenFiles.isEmpty()) return Map.of();
+        var out = new Object2ObjectOpenHashMap<String, List<Path>>();
+        for (var e : tokenFiles.entrySet()) {
+            out.put(e.getKey(), List.copyOf(e.getValue()));
+        }
+        return out;
     }
 
     /** Resolve a simple type name using import/package data from a SourceFileSnapshot. */
@@ -857,6 +944,7 @@ public class WorkspaceTypeIndex {
     private static String declarationKey(
             SourceFileSnapshot source, List<String> declaredTypes, Map<String, IndexedType> types) {
         var key = new StringBuilder();
+        appendDeclarationValue(key, source.declarationKey); // per-file body-token hash
         appendDeclarationValue(key, source.packageName);
         appendDeclarationValues(key, source.imports);
         appendDeclarationValues(key, source.staticImports);
