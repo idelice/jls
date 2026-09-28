@@ -120,7 +120,7 @@ public class StringSearch {
     }
 
     private boolean isWordChar(byte b) {
-        char c = (char) (b + 128);
+        char c = (char) (b & 0xFF);
         return Character.isAlphabetic(c) || Character.isDigit(c) || c == '$' || c == '_';
     }
 
