@@ -10,7 +10,6 @@ import com.sun.source.tree.ParameterizedTypeTree;
 import com.sun.source.tree.PrimitiveTypeTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
-import com.sun.source.util.JavacTask;
 import com.sun.source.util.TreePath;
 import com.sun.source.util.Trees;
 import java.io.IOException;
@@ -140,10 +139,6 @@ public class FindHelper {
         return true;
     }
 
-    public static Location location(ParseTask task, TreePath path) {
-        return location(Trees.instance(task.task()), path, "", false);
-    }
-
     public static Location location(CompileTask task, TreePath path) {
         return location(task.trees, path, "", false);
     }
@@ -154,10 +149,6 @@ public class FindHelper {
 
     public static Location location(ParseTask task, TreePath path, CharSequence name) {
         return location(Trees.instance(task.task()), path, name, false);
-    }
-
-    public static Location locationStrict(ParseTask task, TreePath path, CharSequence name) {
-        return location(Trees.instance(task.task()), path, name, true);
     }
 
     public static Location location(Trees trees, TreePath path, CharSequence name, boolean strictNameMatch) {
@@ -277,10 +268,6 @@ public class FindHelper {
         return firstMatch;
     }
 
-    /**
-     * Returns true if {@code position} falls inside a line comment ({@code //}) or
-     * block comment ({@code /* ... * /}). Uses backward scanning — no full parse needed.
-     */
     static boolean isInsideComment(CharSequence contents, int position) {
         // Check line comment: scan backward to start of line, look for //
         int lineStart = position;
