@@ -24,6 +24,7 @@
     </dependencies>
     
     <build>
+        <sourceDirectory>src</sourceDirectory>
         <plugins>
             <!-- Set source 1.8 -->
             <plugin>

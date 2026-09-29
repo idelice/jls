@@ -60,7 +60,7 @@
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
-            <version>4.13.1</version>
+            <version>4.13.2</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -217,6 +217,8 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.0.0-M7</version>
                 <configuration>
+                    <!-- Each test class stands up a full language server; isolate in a fresh fork per class. -->
+                    <reuseForks>false</reuseForks>
                     <argLine>
                         --add-modules jdk.jdeps
                         --add-exports jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED

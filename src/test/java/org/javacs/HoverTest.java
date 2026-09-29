@@ -6,6 +6,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import java.util.List;
 import java.util.StringJoiner;
 import org.javacs.lsp.*;
+import org.junit.AfterClass;
 import org.junit.Test;
 
 public class HoverTest {
@@ -80,6 +81,11 @@ public class HoverTest {
     // Re-using the language server makes these tests go a lot faster, but it will potentially produce surprising output
     // if things go wrong
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+
+    @AfterClass
+    public static void shutdownServer() {
+        server.shutdown();
+    }
 
     private String symbolAt(String file, int line, int character) {
         var pos =

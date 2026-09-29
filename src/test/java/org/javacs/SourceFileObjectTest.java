@@ -26,7 +26,6 @@ public class SourceFileObjectTest {
         FileStore.open(open);
 
         var snapshot = new SourceFileObject(file);
-        var snapshotModified = snapshot.getLastModified();
 
         var changed = new DidChangeTextDocumentParams();
         changed.textDocument.uri = file.toUri();
@@ -37,7 +36,8 @@ public class SourceFileObjectTest {
         FileStore.change(changed);
 
         assertThat(snapshot.contentVersion(), is(1));
-        assertThat(snapshot.getLastModified(), is(snapshotModified));
+        // Dynamic snapshot: reports MAX_VALUE while the doc is open/dirty, not the construction-time stamp.
+        assertThat(snapshot.getLastModified(), is(Long.MAX_VALUE));
         assertThat(snapshot.getCharContent(true).toString(), is(initial));
         assertThat(FileStore.version(file), is(2));
     }

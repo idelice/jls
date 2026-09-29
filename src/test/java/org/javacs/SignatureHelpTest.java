@@ -7,6 +7,7 @@ import static org.junit.Assert.fail;
 import java.util.ArrayList;
 import java.util.List;
 import org.javacs.lsp.*;
+import org.junit.AfterClass;
 import org.junit.Ignore;
 import org.junit.Test;
 
@@ -88,9 +89,16 @@ public class SignatureHelpTest {
 
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
 
+    @AfterClass
+    public static void shutdown() {
+        server.shutdown();
+    }
+
     private SignatureHelp doHelp(String file, int row, int column) {
         var document = new TextDocumentIdentifier();
         document.uri = FindResource.uri(file);
+        server.completionIndexScheduler.ensureIndexed(java.nio.file.Paths.get(document.uri));
+        server.completionIndexScheduler.awaitReady(10_000);
         var position = new Position();
         position.line = row - 1;
         position.character = column - 1;
