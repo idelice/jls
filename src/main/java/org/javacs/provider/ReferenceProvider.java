@@ -13,6 +13,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiPredicate;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
@@ -35,29 +36,15 @@ public class ReferenceProvider {
     private final CompilerProvider compiler;
     private final Function<Path, CompilerProvider> compilerForFile;
     private final BiPredicate<Path, Path> candidateAllowed;
-    private final java.util.function.Consumer<Path[]> batchResolver;
+    private final Consumer<Path[]> batchResolver;
     private final Path file;
     private final int line, column;
     /** Token->files lookup from the workspace index. Null = fall back to text-scan. */
-    public Function<String, List<Path>> tokenLookup;
+    private final Function<String, List<Path>> tokenLookup;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
     private static final Logger LOG = Logger.getLogger("main");
-
-    public ReferenceProvider(CompilerProvider compiler, Path file, int line, int column) {
-        this(compiler, file, line, column, __ -> compiler, (__, ___) -> true, __ -> {});
-    }
-
-    public ReferenceProvider(
-            CompilerProvider compiler,
-            Path file,
-            int line,
-            int column,
-            Function<Path, CompilerProvider> compilerForFile,
-            BiPredicate<Path, Path> candidateAllowed) {
-        this(compiler, file, line, column, compilerForFile, candidateAllowed, __ -> {});
-    }
 
     public ReferenceProvider(
             CompilerProvider compiler,
@@ -66,11 +53,13 @@ public class ReferenceProvider {
             int column,
             Function<Path, CompilerProvider> compilerForFile,
             BiPredicate<Path, Path> candidateAllowed,
-            java.util.function.Consumer<Path[]> batchResolver) {
+            Consumer<Path[]> batchResolver,
+            Function<String, List<Path>> tokenLookup) {
         this.compiler = compiler;
         this.compilerForFile = compilerForFile;
         this.candidateAllowed = candidateAllowed;
         this.batchResolver = batchResolver;
+        this.tokenLookup = tokenLookup;
         this.file = file;
         this.line = line;
         this.column = column;

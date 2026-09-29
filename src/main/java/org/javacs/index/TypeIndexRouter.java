@@ -170,6 +170,11 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return workspace.subtypes(qualifiedName);
     }
 
+    /** Token->files postings, workspace-only (external deps are bytecode, never token-scanned). */
+    public List<Path> filesContainingToken(String simpleName) {
+        return workspace.filesContainingToken(simpleName);
+    }
+
     public Set<String> directSupertypes(String qualifiedName) {
         var workspaceSupertypes = workspace.directSupertypes(qualifiedName);
         if (!workspaceSupertypes.isEmpty()) {

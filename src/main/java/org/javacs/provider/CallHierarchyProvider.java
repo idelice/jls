@@ -1,5 +1,6 @@
 package org.javacs.provider;
 
+import com.google.gson.JsonElement;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
@@ -37,17 +38,19 @@ public final class CallHierarchyProvider {
     private final Consumer<Path[]> batchResolver;
     private final Runnable includeReferenceSources;
     /** Token->files lookup from the workspace index. Null = fall back to text-scan. */
-    public Function<String, List<Path>> tokenLookup;
+    private final Function<String, List<Path>> tokenLookup;
 
     public CallHierarchyProvider(
             CompilerProvider compiler,
             Function<Path, CompilerProvider> compilerForFile,
             Consumer<Path[]> batchResolver,
-            Runnable includeReferenceSources) {
+            Runnable includeReferenceSources,
+            Function<String, List<Path>> tokenLookup) {
         this.compiler = compiler;
         this.compilerForFile = compilerForFile;
         this.batchResolver = batchResolver;
         this.includeReferenceSources = includeReferenceSources;
+        this.tokenLookup = tokenLookup;
     }
 
     public Optional<List<CallHierarchyItem>> prepare(Path file, int line, int column) {
@@ -277,7 +280,7 @@ public final class CallHierarchyProvider {
 
     private static String dataString(Object data) {
         if (data == null) return null;
-        if (data instanceof com.google.gson.JsonElement json) {
+        if (data instanceof JsonElement json) {
             return json.isJsonPrimitive() ? json.getAsString() : null;
         }
         return data.toString();
