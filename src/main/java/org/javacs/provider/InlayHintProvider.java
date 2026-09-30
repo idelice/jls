@@ -11,16 +11,15 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import org.javacs.ClassFileParameterNames;
+import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.LspPosition;
-import org.javacs.index.IndexedMember;
 import org.javacs.index.TypeIndexRouter;
-import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.InlayHint;
 import org.javacs.lsp.Range;
 
@@ -34,16 +33,15 @@ public class InlayHintProvider {
         this.typeIndex = typeIndex;
     }
 
-    public List<InlayHint> inlayHints(Path file, Range range) {
+    public List<InlayHint> inlayHints(CompileTask task, Path file, Range range) {
         try {
-            return inlayHintsFromCompiler(file, range);
+            return scanTree(task, file, range);
         } catch (RuntimeException | AssertionError e) {
             return List.of();
         }
     }
 
-    private List<InlayHint> inlayHintsFromCompiler(Path file, Range range) {
-        try (var task = compiler.compile(file)) {
+    private List<InlayHint> scanTree(CompileTask task, Path file, Range range) {
             var root = task.root(file);
             if (root == null) return List.of();
 
@@ -54,10 +52,16 @@ public class InlayHintProvider {
             } catch (IOException e) {
                 fileLength = Long.MAX_VALUE / 2;
             }
-            var rangeStartOffset = LspPosition.offset(root, range.start);
-            var rangeEndOffset = LspPosition.offset(root, range.end);
-            var rangeStart = rangeStartOffset < 0 ? 0 : rangeStartOffset;
-            var rangeEnd = rangeEndOffset < 0 ? fileLength : rangeEndOffset;
+            long rangeStart, rangeEnd;
+            if (range == null) {
+                rangeStart = 0;
+                rangeEnd = fileLength;
+            } else {
+                var startOffset = LspPosition.offset(root, range.start);
+                var endOffset = LspPosition.offset(root, range.end);
+                rangeStart = startOffset < 0 ? 0 : startOffset;
+                rangeEnd = endOffset < 0 ? fileLength : endOffset;
+            }
             var hints = new ArrayList<InlayHint>();
 
             new TreePathScanner<Void, Void>() {
@@ -131,38 +135,20 @@ public class InlayHintProvider {
                     return constructors.size() == 1 ? constructors.getFirst().parameterNames : null;
                 }
 
-                private String[] parameterNames(org.javacs.CompileTask compileTask, ExecutableElement method) {
+                private String[] parameterNames(CompileTask compileTask, ExecutableElement method) {
                     var names = method.getParameters().stream()
                             .map(parameter -> parameter.getSimpleName().toString())
                             .toArray(String[]::new);
                     if (!hasGeneratedNames(names)) return names;
                     if (!(method.getEnclosingElement() instanceof TypeElement owner)) return names;
-
                     var ownerName = owner.getQualifiedName().toString();
-                    var methodName = method.getSimpleName().toString();
+                    var classBytes = compiler.findClassFile(ownerName);
+                    if (classBytes.isEmpty()) return names;
                     var isStatic = method.getModifiers().contains(Modifier.STATIC);
-                    var erasedParameters = FindHelper.erasedParameterTypes(compileTask, method);
-                    var kind = method.getKind() == ElementKind.CONSTRUCTOR
-                            ? CompletionItemKind.Constructor
-                            : CompletionItemKind.Method;
-                    var indexed = indexedMember(ownerName, methodName, kind, isStatic, erasedParameters);
-                    if (indexed != null && indexed.parameterNames != null) {
-                        return indexed.parameterNames;
-                    }
-                    return names;
-                }
-
-                private IndexedMember indexedMember(
-                        String owner, String name, int kind, boolean isStatic, String[] erasedParameters) {
-                    if (kind == CompletionItemKind.Method) {
-                        var exact = typeIndex.member(owner, name, isStatic, erasedParameters);
-                        if (exact.isPresent()) return exact.get();
-                    }
-                    var key = IndexedMember.canonicalKey(owner, kind, name, erasedParameters);
-                    for (var member : typeIndex.ownerMembers(owner, isStatic)) {
-                        if (key.equals(member.canonicalKey)) return member;
-                    }
-                    return null;
+                    var erasedParams = FindHelper.erasedParameterTypes(compileTask, method);
+                    var lvtNames = ClassFileParameterNames.read(
+                            classBytes.get(), method.getSimpleName().toString(), erasedParams, isStatic);
+                    return lvtNames != null ? lvtNames : names;
                 }
 
                 private boolean hasGeneratedNames(String[] names) {
@@ -174,6 +160,5 @@ public class InlayHintProvider {
             }.scan(root, null);
 
             return hints;
-        }
     }
 }
