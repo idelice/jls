@@ -797,7 +797,11 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
         if (compiler == null) return Optional.of(List.of());
         var file = Paths.get(params.textDocument.uri);
-        return Optional.of(new InlayHintProvider(compilerFor(file), moduleRegistry.typeIndexFor(file)).inlayHints(file, params.range));
+        var requestCompiler = compilerFor(file);
+        try (var task = requestCompiler.compile(file)) {
+            return Optional.of(new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
+                    .inlayHints(task, file, params.range));
+        }
     }
 
     private final RenameHandler renameHandler = new RenameHandler(this);
@@ -852,6 +856,21 @@ class JavaLanguageServer extends LanguageServer {
                 LOG.info(String.format(
                         "[diagnostics] pull_compile_done file=%s duration=%dms errors=%d",
                         file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
+
+                // Piggyback: compute inlay hints on the same attributed tree.
+                try {
+                    var hints = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
+                            .inlayHints(task, file, null);
+                    if (!hints.isEmpty()) {
+                        var payload = new JsonObject();
+                        payload.addProperty("uri", file.toUri().toString());
+                        payload.add("hints", new Gson().toJsonTree(hints));
+                        client.customNotification("java/inlayHints", payload);
+                    }
+                } catch (Exception hintError) {
+                    LOG.fine("[inlayHints] piggyback failed: " + hintError.getMessage());
+                }
+
                 for (var diagParams : errorReport.diagnostics()) {
                     if (file.toUri().equals(diagParams.uri)) {
                         return new DocumentDiagnosticReport("full", resultId, diagParams.diagnostics);
