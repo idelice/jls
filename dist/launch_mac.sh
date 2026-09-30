@@ -31,6 +31,8 @@ JLS_JVM_DEFAULT_MEM="-Xmx2g -Xms512m -XX:MaxHeapFreeRatio=50 -XX:MinHeapFreeRati
 
 # AOT cache: pre-warm JIT profiles for faster startup and peak performance.
 # Keyed on the server jar: an archived cache from another build must never be loaded.
+# Flow: 1st launch records a profile (.aotconf), builds the cache (.aot) on exit.
+#       2nd+ launch loads the cache directly. A rebuild invalidates the old cache.
 AOT_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jls"
 AOT_ID=`cksum "$DIR/classpath/jls.jar" 2>/dev/null | cut -d' ' -f1`
 AOT_CACHE_FILE="$AOT_CACHE_DIR/jls-$AOT_ID.aot"
@@ -39,6 +41,8 @@ AOT_OPTS=""
 if [ -f "$AOT_CACHE_FILE" ]; then
     AOT_OPTS="-XX:AOTCache=$AOT_CACHE_FILE"
 elif [ -f "$AOT_CONF_FILE" ]; then
+    # Conf from a previous recording exists but the build didn't complete.
+    # Build it now before starting, then use it.
     "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} \
         -XX:AOTMode=create -XX:AOTConfiguration="$AOT_CONF_FILE" \
         -XX:AOTCache="$AOT_CACHE_FILE" -classpath "$DIR/classpath/*" 2>/dev/null
@@ -50,6 +54,15 @@ else
     mkdir -p "$AOT_CACHE_DIR"
     rm -f "$AOT_CACHE_DIR"/jls-*.aot "$AOT_CACHE_DIR"/jls-*.aotconf "$AOT_CACHE_DIR"/jls.aot "$AOT_CACHE_DIR"/jls.aotconf
     AOT_OPTS="-XX:AOTMode=record -XX:AOTConfiguration=$AOT_CONF_FILE"
+    # After the recording run exits, build the cache so the next launch is fast.
+    trap '
+        if [ -f "$AOT_CONF_FILE" ] && [ ! -f "$AOT_CACHE_FILE" ]; then
+            "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} \
+                -XX:AOTMode=create -XX:AOTConfiguration="$AOT_CONF_FILE" \
+                -XX:AOTCache="$AOT_CACHE_FILE" -classpath "$DIR/classpath/*" 2>/dev/null
+            [ -f "$AOT_CACHE_FILE" ] && rm -f "$AOT_CONF_FILE"
+        fi
+    ' EXIT
 fi
 
 exec "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} $AOT_OPTS -Xlog:aot*=warning:stderr -Djava.util.logging.config.file="$LOGGING_CONFIG" -classpath "$DIR/classpath/*" "$@"
