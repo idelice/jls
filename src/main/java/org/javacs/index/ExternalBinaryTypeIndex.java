@@ -801,6 +801,7 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
     }
 
     private IndexedType applySourceLinks(IndexedType raw) {
+        if (compiler == null || !compiler.lombokPresentOnClasspath()) return raw;
         var linkedMembers = applySourceFieldLinks(raw.qualifiedName, raw.members);
         if (linkedMembers == raw.members) {
             return raw;
