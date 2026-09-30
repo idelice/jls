@@ -49,6 +49,7 @@ import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
 
 import org.javacs.CacheAudit;
+import org.javacs.ClassFileParameterNames;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FileStore;
@@ -593,7 +594,7 @@ public class CompletionProvider {
         var item = new CompletionItem();
         item.label = member.name;
         item.kind = member.kind;
-        item.detail = member.detail;
+        item.detail = resolveDetail(member);
         item.insertText = member.name;
         item.insertTextFormat = InsertTextFormat.PlainText;
         var data = new CompletionData();
@@ -609,7 +610,7 @@ public class CompletionProvider {
         var item = new CompletionItem();
         item.label = first.name;
         item.kind = CompletionItemKind.Method;
-        item.detail = first.detail;
+        item.detail = resolveDetail(first);
         if (addParens) {
             var noArgs =
                     overloads.size() == 1
@@ -633,6 +634,27 @@ public class CompletionProvider {
         data.compilerId = compilerId;
         item.data = JsonHelper.GSON.toJsonTree(data);
         return item;
+    }
+
+    /** Rebuild the detail string with real parameter names from the classfile LVT when the index only has types. */
+    private String resolveDetail(IndexedMember member) {
+        if (member.parameterNames != null || member.erasedParameterTypes == null
+                || member.erasedParameterTypes.length == 0 || member.kind == CompletionItemKind.Field) {
+            return member.detail;
+        }
+        var classBytes = compiler.findClassFile(member.ownerType);
+        if (classBytes.isEmpty()) return member.detail;
+        var names = ClassFileParameterNames.read(
+                classBytes.get(), member.name, member.erasedParameterTypes,
+                member.isStatic);
+        if (names == null) return member.detail;
+        var params = new StringJoiner(", ");
+        for (int i = 0; i < member.erasedParameterTypes.length; i++) {
+            params.add(TypeNames.simpleName(member.erasedParameterTypes[i]) + " " + names[i]);
+        }
+        var returnType = member.returnType != null
+                ? TypeNames.simpleName(member.returnType) : "void";
+        return returnType + " " + member.name + "(" + params + ")";
     }
 
     private boolean isImportOrPackageContext(TreePath path) {

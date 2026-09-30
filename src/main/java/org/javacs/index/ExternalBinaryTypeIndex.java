@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Modifier;
 import java.lang.classfile.ClassFile;
-import java.lang.classfile.ClassModel;
 import java.lang.classfile.constantpool.ConstantPoolException;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
@@ -357,8 +356,6 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                 }
             }
             var publicMethods = visibleMethods(binaryClass);
-            var parameterSourceRoots = new HashMap<String, Optional<CompilationUnitTree>>();
-            var parameterClassModels = new HashMap<String, Optional<ClassModel>>();
             for (var method : publicMethods) {
                 try {
                     if (method.isSynthetic() || method.isBridge()) {
@@ -366,38 +363,29 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                     }
                     var declaring = method.getDeclaringClass().getName();
                     var priority = memberPriority(qualifiedName, declaring);
-                    var parameterNames = new String[method.getParameterCount()];
                     var erasedParameterTypes = new String[method.getParameterCount()];
                     var parameters = new StringJoiner(", ");
                     boolean hasSyntheticNames = false;
                     for (int i = 0; i < method.getParameterCount(); i++) {
                         var parameter = method.getParameters()[i];
-                        parameterNames[i] = parameter.getName();
                         if (!parameter.isNamePresent()) hasSyntheticNames = true;
                         erasedParameterTypes[i] = method.getParameterTypes()[i].getTypeName();
-                        parameters.add(TypeNames.simpleName(erasedParameterTypes[i]) + " " + parameter.getName());
+                        parameters.add(TypeNames.simpleName(erasedParameterTypes[i])
+                                + " " + parameter.getName());
                     }
-                    if (hasSyntheticNames && method.getParameterCount() > 0) {
-                        var sourceNames = resolveParameterNamesFromSource(
-                                declaring,
-                                method.getName(),
-                                method.getParameterCount(),
-                                erasedParameterTypes,
-                                parameterSourceRoots);
-                        if (sourceNames == null) {
-                            sourceNames = resolveParameterNamesFromClassFile(
-                                    declaring,
-                                    method.getName(),
-                                    erasedParameterTypes,
-                                    Modifier.isStatic(method.getModifiers()),
-                                    parameterClassModels);
+                    // Store null when names are synthetic — callers that need real names
+                    // resolve them on demand via ClassFileParameterNames.
+                    String[] parameterNames = null;
+                    if (!hasSyntheticNames) {
+                        parameterNames = new String[method.getParameterCount()];
+                        for (int i = 0; i < method.getParameterCount(); i++) {
+                            parameterNames[i] = method.getParameters()[i].getName();
                         }
-                        if (sourceNames != null) {
-                            parameters = new StringJoiner(", ");
-                            for (int i = 0; i < method.getParameterCount(); i++) {
-                                parameterNames[i] = sourceNames[i];
-                                parameters.add(TypeNames.simpleName(erasedParameterTypes[i]) + " " + sourceNames[i]);
-                            }
+                    } else if (method.getParameterCount() > 0) {
+                        // Rebuild detail from types only (no misleading arg0/arg1).
+                        parameters = new StringJoiner(", ");
+                        for (int i = 0; i < method.getParameterCount(); i++) {
+                            parameters.add(TypeNames.simpleName(erasedParameterTypes[i]));
                         }
                     }
                     var detail =
@@ -1125,125 +1113,6 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                 break;
         }
         return baseType + "[]".repeat(dimensions);
-    }
-
-    /** Read parameter names from the classfile's LocalVariableTable (available when compiled with -g). */
-    private String[] resolveParameterNamesFromClassFile(
-            String className,
-            String methodName,
-            String[] parameterTypes,
-            boolean isStatic,
-            Map<String, Optional<ClassModel>> classModels) {
-        var model = classModels.computeIfAbsent(className, this::readParameterClassModel).orElse(null);
-        if (model == null) return null;
-        try {
-            for (var m : model.methods()) {
-                if (!m.methodName().equalsString(methodName)) continue;
-                if (!Arrays.equals(parseBinaryParameterTypes(m.methodTypeSymbol()), parameterTypes)) continue;
-                var code = m.findAttribute(java.lang.classfile.Attributes.code()).orElse(null);
-                if (code == null) continue;
-                var lvt = code.findAttribute(java.lang.classfile.Attributes.localVariableTable()).orElse(null);
-                if (lvt == null) continue;
-                // LocalVariableTable slots: instance methods start at 1 (0=this), static at 0
-                int slot = isStatic ? 0 : 1;
-                var names = new String[parameterTypes.length];
-                int found = 0;
-                for (var i = 0; i < parameterTypes.length; i++) {
-                    for (var entry : lvt.localVariables()) {
-                        if (entry.slot() == slot && entry.startPc() == 0) {
-                            names[i] = entry.name().stringValue();
-                            found++;
-                            break;
-                        }
-                    }
-                    slot += parameterTypes[i].equals("long") || parameterTypes[i].equals("double") ? 2 : 1;
-                }
-                if (found == parameterTypes.length) return names;
-            }
-        } catch (Exception e) {
-            return null;
-        }
-        return null;
-    }
-
-    private Optional<ClassModel> readParameterClassModel(String className) {
-        if (compiler == null) return Optional.empty();
-        var classFile = compiler.findClassFile(className);
-        if (classFile.isEmpty()) return Optional.empty();
-        try {
-            return Optional.of(ClassFile.of().parse(classFile.get()));
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
-
-    private String[] resolveParameterNamesFromSource(
-            String className,
-            String methodName,
-            int paramCount,
-            String[] erasedParameterTypes,
-            Map<String, Optional<CompilationUnitTree>> sourceRoots) {
-        var root = sourceRoots.computeIfAbsent(className, this::readParameterSourceRoot).orElse(null);
-        if (root == null) return null;
-        for (var decl : root.getTypeDecls()) {
-            var result = findMethodParamNames(decl, methodName, paramCount, erasedParameterTypes);
-            if (result != null) return result;
-        }
-        return null;
-    }
-
-    private Optional<CompilationUnitTree> readParameterSourceRoot(String className) {
-        if (compiler == null) return Optional.empty();
-        try {
-            var source = compiler.findAnywhere(className);
-            if (source.isEmpty()) return Optional.empty();
-            return Optional.of(compiler.parse(source.get()).root());
-        } catch (Exception e) {
-            return Optional.empty();
-        }
-    }
-
-    private String[] findMethodParamNames(
-            com.sun.source.tree.Tree decl, String methodName, int paramCount, String[] erasedParameterTypes) {
-        if (!(decl instanceof com.sun.source.tree.ClassTree classTree)) return null;
-        for (var member : classTree.getMembers()) {
-            if (member instanceof com.sun.source.tree.MethodTree method) {
-                if (!method.getName().toString().equals(methodName)) continue;
-                var params = method.getParameters();
-                if (params.size() != paramCount) continue;
-                // Verify types match by comparing simple type names
-                boolean match = true;
-                for (int i = 0; i < paramCount; i++) {
-                    var sourceType = params.get(i).getType().toString();
-                    // Strip generics and array/varargs markers
-                    var sourceTypeRaw = sourceType.contains("<")
-                            ? sourceType.substring(0, sourceType.indexOf('<')) : sourceType;
-                    sourceTypeRaw = sourceTypeRaw.replace("...", "").replace("[]", "").trim();
-                    var erasedSimple = TypeNames.simpleName(erasedParameterTypes[i])
-                            .replace("[]", "").trim();
-                    boolean isTypeVariable = sourceTypeRaw.length() <= 2
-                            && Character.isUpperCase(sourceTypeRaw.charAt(0));
-                    if (!isTypeVariable
-                            && !sourceTypeRaw.equals(erasedSimple)
-                            && !sourceTypeRaw.endsWith("." + erasedSimple)) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (!match) continue;
-                var names = new String[paramCount];
-                for (int i = 0; i < paramCount; i++) {
-                    names[i] = params.get(i).getName().toString();
-                }
-                return names;
-            }
-            // Recurse into nested classes
-            if (member instanceof com.sun.source.tree.ClassTree nested) {
-                var result = findMethodParamNames(nested, methodName, paramCount, erasedParameterTypes);
-                if (result != null) return result;
-            }
-        }
-        return null;
     }
 
     private record BinaryClassModel(
