@@ -425,6 +425,12 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
                 }
             }
         }
+        // JDK classes are not on the project classpath — fall back to the system classloader.
+        try (var in = ClassLoader.getSystemResourceAsStream(relative)) {
+            if (in != null) return Optional.of(in.readAllBytes());
+        } catch (IOException e) {
+            LOG.fine("[classfile] failed to read JDK class " + qualifiedName + ": " + e.getMessage());
+        }
         return Optional.empty();
     }
     @Override

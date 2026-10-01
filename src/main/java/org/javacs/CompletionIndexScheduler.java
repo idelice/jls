@@ -247,7 +247,6 @@ final class CompletionIndexScheduler {
                 if (state != State.READY || epoch != startedEpoch) return;
                 server.publishCompletionSnapshot(merged, server.completionIndexVersion.incrementAndGet());
             }
-            server.refreshDiagnostics();
             LOG.fine(String.format("[index] merged files=%d types=%d took=%dms",
                     indexed.size(), merged.size(), Duration.between(started, Instant.now()).toMillis()));
         } catch (RuntimeException failure) {

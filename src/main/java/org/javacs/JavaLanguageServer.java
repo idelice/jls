@@ -85,6 +85,10 @@ class JavaLanguageServer extends LanguageServer {
     final ModuleCompilerRegistry moduleRegistry = new ModuleCompilerRegistry(this);
     volatile Path activeModuleFile;
 
+    // Guards cross-file diagnostic propagation: compiling a dependent file re-enters
+    // textDocumentDiagnostic -> propagate; this flag stops propagation at one level.
+    private boolean propagatingDiagnostics;
+
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
     ModuleGraph moduleGraph = ModuleGraph.EMPTY;
@@ -97,7 +101,6 @@ class JavaLanguageServer extends LanguageServer {
             Executors.newSingleThreadScheduledExecutor(
                     Thread.ofPlatform().daemon().name("javacs-completion-index").factory());
 
-    private final AtomicLong diagnosticRevision = new AtomicLong();
     final AtomicLong completionIndexVersion = new AtomicLong();
     final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
@@ -203,22 +206,15 @@ class JavaLanguageServer extends LanguageServer {
             appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
             publishExternalBinaryIndexSnapshot();
             refreshStateForCompilerRecreated();
-            refreshDiagnostics();
+            propagatingDiagnostics = true;
+            try { lint(filterJavaFiles(FileStore.activeDocuments())); }
+            finally { propagatingDiagnostics = false; }
         } finally {
             notifyWorkspaceInfo();
             LOG.info(String.format(
                     "[perf] compiler_recreate trigger=%s took=%dms",
                     trigger, Duration.between(started, Instant.now()).toMillis()));
         }
-    }
-
-    void refreshDiagnostics() {
-        diagnosticRevision.incrementAndGet();
-        client.customNotification("workspace/diagnostic/refresh", null);
-    }
-
-    private String diagnosticResultId() {
-        return FileStore.contentRevision() + ":" + diagnosticRevision.get();
     }
 
     /** The index and its external index came from the replaced compiler, so rebuild from scratch. */
@@ -377,11 +373,6 @@ class JavaLanguageServer extends LanguageServer {
         commands.add("java.generateFields");
         executeCommandOptions.add("commands", commands);
         c.add("executeCommandProvider", executeCommandOptions);
-        var diagnosticOptions = new JsonObject();
-        diagnosticOptions.addProperty("interFileDependencies", true);
-        diagnosticOptions.addProperty("workspaceDiagnostics", false);
-        c.add("diagnosticProvider", diagnosticOptions);
-
         return new InitializeResult(c);
     }
 
@@ -523,7 +514,9 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         if (refreshActiveDiagnostics) {
-            refreshDiagnostics();
+            propagatingDiagnostics = true;
+            try { lint(filterJavaFiles(FileStore.activeDocuments())); }
+            finally { propagatingDiagnostics = false; }
         }
         if (compilerInputsChanged) {
             recreateCompilersAndRefreshState("didChangeWatchedFiles");
@@ -831,12 +824,9 @@ class JavaLanguageServer extends LanguageServer {
             if (compiler == null) {
                 return new DocumentDiagnosticReport(List.of());
             }
-            var resultId = diagnosticResultId();
-            if (resultId.equals(params.previousResultId)) {
-                return new DocumentDiagnosticReport("unchanged", resultId, null);
-            }
             LOG.info("[diagnostics] pull_compile_start file=" + file.getFileName());
             var started = System.nanoTime();
+            DocumentDiagnosticReport report = null;
             var sources = List.<JavaFileObject>of(new SourceFileObject(file));
             var requestCompiler = compilerFor(file);
             String compileProgressToken = null;
@@ -873,19 +863,70 @@ class JavaLanguageServer extends LanguageServer {
 
                 for (var diagParams : errorReport.diagnostics()) {
                     if (file.toUri().equals(diagParams.uri)) {
-                        return new DocumentDiagnosticReport("full", resultId, diagParams.diagnostics);
+                        client.publishDiagnostics(diagParams);
+                        report = new DocumentDiagnosticReport("full", null, diagParams.diagnostics);
+                        break;
                     }
                 }
-                return new DocumentDiagnosticReport("full", resultId, List.of());
+                if (report == null) {
+                    client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
+                    report = new DocumentDiagnosticReport("full", null, List.of());
+                }
             } finally {
                 if (compileProgressToken != null) {
                     progress.end(compileProgressToken, "Compiled");
                 }
             }
+            // Propagate AFTER the outer task closes — a dependent file in the same module would
+            // otherwise nest a compile on the same warm context (checkedOut=true -> failure).
+            propagateDiagnostics(file);
+            return report;
         } catch (Exception e) {
             LOG.warning("[diagnostics] pull_compile_failed file=" + file.getFileName()
                     + " reason=" + e.getMessage());
             return new DocumentDiagnosticReport(List.of());
+        }
+    }
+
+    /**
+     * After compiling {@code changed}, re-lint the active documents that reference its declared
+     * types so cross-file errors surface without the client issuing one request per open buffer.
+     * Guarded by {@link #propagatingDiagnostics} so a propagated lint does not propagate again.
+     */
+    private void propagateDiagnostics(Path changed) {
+        if (propagatingDiagnostics) return;
+        try {
+            var snapshot = completionSnapshotRef.get();
+            if (snapshot == null) return;
+            var typeIndex = snapshot.typeIndex();
+            if (typeIndex == null) return;
+
+            var active = new HashSet<>(filterJavaFiles(FileStore.activeDocuments()));
+            active.remove(changed);
+            if (active.isEmpty()) return;
+
+            var dependents = new LinkedHashSet<Path>();
+            for (var fqn : JavaCompilerService.declaredTypes(changed)) {
+                var simpleName = fqn.substring(fqn.lastIndexOf('.') + 1);
+                if (simpleName.isEmpty()) continue;
+                var candidates = typeIndex.filesContainingToken(simpleName);
+                if (candidates == null) continue;
+                for (var candidate : candidates) {
+                    if (active.contains(candidate)) dependents.add(candidate);
+                }
+            }
+            if (dependents.isEmpty()) return;
+
+            LOG.info(String.format(
+                    "[diagnostics] propagate from=%s dependents=%d",
+                    changed.getFileName(), dependents.size()));
+            propagatingDiagnostics = true;
+            lint(dependents);
+        } catch (Exception e) {
+            LOG.warning("[diagnostics] propagate_failed file=" + changed.getFileName()
+                    + " reason=" + e.getMessage());
+        } finally {
+            propagatingDiagnostics = false;
         }
     }
 
@@ -894,8 +935,7 @@ class JavaLanguageServer extends LanguageServer {
         for (var file : files) {
             var params = new DocumentDiagnosticParams();
             params.textDocument = new TextDocumentIdentifier(file.toUri());
-            var report = textDocumentDiagnostic(params);
-            client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), report.items));
+            textDocumentDiagnostic(params);
         }
     }
 
@@ -913,6 +953,7 @@ class JavaLanguageServer extends LanguageServer {
         // Index the active module and its dependency sources. Sibling modules are only visible
         // through their source, so a workspace-size shortcut here would leave completion empty.
         completionIndexScheduler.ensureIndexed(file);
+        lint(List.of(file));
     }
 
     @Override
