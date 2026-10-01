@@ -450,14 +450,27 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                 try {
                     if (ctor.isSynthetic()) continue;
                     if (java.lang.reflect.Modifier.isPrivate(ctor.getModifiers())) continue;
-                    var parameterNames = new String[ctor.getParameterCount()];
                     var erasedParameterTypes = new String[ctor.getParameterCount()];
                     var parameters = new StringJoiner(", ");
+                    boolean hasSyntheticNames = false;
                     for (int i = 0; i < ctor.getParameterCount(); i++) {
                         var parameter = ctor.getParameters()[i];
-                        parameterNames[i] = parameter.isNamePresent() ? parameter.getName() : "arg" + i;
+                        if (!parameter.isNamePresent()) hasSyntheticNames = true;
                         erasedParameterTypes[i] = ctor.getParameterTypes()[i].getTypeName();
-                        parameters.add(canonicalTypeName(ctor.getParameterTypes()[i]) + " " + parameterNames[i]);
+                        parameters.add(TypeNames.simpleName(erasedParameterTypes[i])
+                                + " " + parameter.getName());
+                    }
+                    String[] parameterNames = null;
+                    if (!hasSyntheticNames) {
+                        parameterNames = new String[ctor.getParameterCount()];
+                        for (int i = 0; i < ctor.getParameterCount(); i++) {
+                            parameterNames[i] = ctor.getParameters()[i].getName();
+                        }
+                    } else if (ctor.getParameterCount() > 0) {
+                        parameters = new StringJoiner(", ");
+                        for (int i = 0; i < ctor.getParameterCount(); i++) {
+                            parameters.add(TypeNames.simpleName(erasedParameterTypes[i]));
+                        }
                     }
                     var simpleName = binaryClass.getSimpleName();
                     var detail = simpleName + "(" + parameters + ")";
