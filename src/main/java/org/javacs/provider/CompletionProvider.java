@@ -652,6 +652,9 @@ public class CompletionProvider {
         for (int i = 0; i < member.erasedParameterTypes.length; i++) {
             params.add(TypeNames.simpleName(member.erasedParameterTypes[i]) + " " + names[i]);
         }
+        if (member.kind == CompletionItemKind.Constructor) {
+            return TypeNames.simpleName(member.ownerType) + "(" + params + ")";
+        }
         var returnType = member.returnType != null
                 ? TypeNames.simpleName(member.returnType) : "void";
         return returnType + " " + member.name + "(" + params + ")";
@@ -697,40 +700,46 @@ public class CompletionProvider {
 
     private CompletionList completeParseOnly(ParseTask parseTask, String contents, long cursor, String partial) {
         var path = new FindCompletionsAt(parseTask.task()).scan(parseTask.root(), cursor);
-        if (path == null) {
-            return new CompletionList();
-        }
+        if (path == null) return new CompletionList();
+
         var memberAccess = memberAccessContext(contents, (int) cursor);
         if (memberAccess != null && !isImportOrPackageContext(path)) {
-            var list = new CompletionList();
-            addSyntacticMemberUsages(parseTask, cursor, memberAccess.receiver, partial, list);
-            sortCompletionItems(list.items);
-            return list;
+            return completeSyntacticMemberAccess(parseTask, cursor, memberAccess.receiver, partial);
         }
-        switch (path.getLeaf().getKind()) {
-            case IMPORT:
-                return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
-            default:
-                var enumCase = completeEnumCase(parseTask, path, cursor, partial);
-                if (enumCase != null) {
-                    return enumCase;
-                }
-                var list = new CompletionList();
-                var endsWithParen = endsWithParen(contents, (int) cursor);
-                addKeywords(path, partial, list);
-                addSyntacticLocalVariables(parseTask, cursor, partial, list);
-                addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
-                addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
-                addEnclosingInstanceKeywords(path, list);
-                addStaticImportsFromIndex(parseTask.root(), partial, false, list);
-                addImportedTypeNames(parseTask.root(), partial, list);
-                if (!list.isIncomplete && !partial.isEmpty() && Character.isUpperCase(partial.charAt(0))) {
-                    addClassNames(parseTask.root(), Trees.instance(parseTask.task()).getSourcePositions(), partial, list);
-                }
-                boostExactMatches(parseTask.root(), list.items, partial);
-                sortCompletionItems(list.items);
-                return list;
+        if (path.getLeaf().getKind() == Tree.Kind.IMPORT) {
+            return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
         }
+        var enumCase = completeEnumCase(parseTask, path, cursor, partial);
+        if (enumCase != null) return enumCase;
+
+        return completeIdentifier(parseTask, path, contents, cursor, partial);
+    }
+
+    private CompletionList completeSyntacticMemberAccess(
+            ParseTask parseTask, long cursor, String receiver, String partial) {
+        var list = new CompletionList();
+        addSyntacticMemberUsages(parseTask, cursor, receiver, partial, list);
+        sortCompletionItems(list.items);
+        return list;
+    }
+
+    private CompletionList completeIdentifier(
+            ParseTask parseTask, TreePath path, String contents, long cursor, String partial) {
+        var list = new CompletionList();
+        var endsWithParen = endsWithParen(contents, (int) cursor);
+        addKeywords(path, partial, list);
+        addSyntacticLocalVariables(parseTask, cursor, partial, list);
+        addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
+        addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
+        addEnclosingInstanceKeywords(path, list);
+        addStaticImportsFromIndex(parseTask.root(), partial, false, list);
+        addImportedTypeNames(parseTask.root(), partial, list);
+        if (!list.isIncomplete && !partial.isEmpty() && Character.isUpperCase(partial.charAt(0))) {
+            addClassNames(parseTask.root(), Trees.instance(parseTask.task()).getSourcePositions(), partial, list);
+        }
+        boostExactMatches(parseTask.root(), list.items, partial);
+        sortCompletionItems(list.items);
+        return list;
     }
 
     private void addTopLevelSnippets(ParseTask task, CompletionList list) {
