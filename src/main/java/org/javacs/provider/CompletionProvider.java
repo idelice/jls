@@ -1133,11 +1133,15 @@ public class CompletionProvider {
 
     private Tree switchExpression(TreePath path) {
         for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
-            if (cursor.getLeaf() instanceof SwitchTree switchTree) {
+            var leaf = cursor.getLeaf();
+            if (leaf instanceof SwitchTree switchTree) {
                 return switchTree.getExpression();
             }
-            if (cursor.getLeaf() instanceof SwitchExpressionTree switchExpressionTree) {
+            if (leaf instanceof SwitchExpressionTree switchExpressionTree) {
                 return switchExpressionTree.getExpression();
+            }
+            if (leaf instanceof BlockTree) {
+                return null;
             }
         }
         return null;
