@@ -101,7 +101,7 @@ public class HoverProvider {
         var paramElements = method.getParameters();
         String[] resolvedNames = null;
         if (!paramElements.isEmpty() && hasSyntheticNames(paramElements)) {
-            resolvedNames = resolveParamNamesFromSource(method);
+            resolvedNames = resolveParamNames(method);
         }
 
         var params = new StringJoiner(", ");
@@ -130,29 +130,19 @@ public class HoverProvider {
         return false;
     }
 
-    private String[] resolveParamNamesFromSource(ExecutableElement method) {
+    private String[] resolveParamNames(ExecutableElement method) {
         var enclosing = method.getEnclosingElement();
         if (!(enclosing instanceof TypeElement type)) return null;
         var className = type.getQualifiedName().toString();
-        var sourceFile = compiler.findAnywhere(className);
-        if (sourceFile.isEmpty()) return null;
-        try {
-            var parse = compiler.parse(sourceFile.get());
-            // Build erased parameter types from the element (already erased for .class-loaded elements)
-            var erasedTypes = new String[method.getParameters().size()];
-            for (int i = 0; i < erasedTypes.length; i++) {
-                erasedTypes[i] = method.getParameters().get(i).asType().toString();
-            }
-            var methodTree = FindHelper.findMethod(
-                    parse, className, method.getSimpleName().toString(), erasedTypes);
-            var names = new String[methodTree.getParameters().size()];
-            for (int i = 0; i < names.length; i++) {
-                names[i] = methodTree.getParameters().get(i).getName().toString();
-            }
-            return names;
-        } catch (Exception e) {
-            return null;
+        var classBytes = compiler.findClassFile(className);
+        if (classBytes.isEmpty()) return null;
+        var erasedTypes = new String[method.getParameters().size()];
+        for (int i = 0; i < erasedTypes.length; i++) {
+            erasedTypes[i] = method.getParameters().get(i).asType().toString();
         }
+        return ClassFileParameterNames.read(
+                classBytes.get(), method.getSimpleName().toString(), erasedTypes,
+                method.getModifiers().contains(javax.lang.model.element.Modifier.STATIC));
     }
 
     private String renderFieldSignature(VariableElement field) {

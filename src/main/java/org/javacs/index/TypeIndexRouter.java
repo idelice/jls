@@ -144,17 +144,6 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return workspace.resolveType(owner, root).isPresent();
     }
 
-    public boolean containsType(String qualifiedName) {
-        return workspace.containsType(qualifiedName) || external.containsType(qualifiedName);
-    }
-
-    /**
-     * Returns whether the requested type belongs to the workspace, including nested candidates
-     * under workspace owners such as {@code ServiceTwo.MyEnum}.
-     *
-     * <p>Interactive callers that already know the owner type should use this to stay on
-     * {@link #workspace()} and avoid leaking workspace-owned symbols into dependency fallback.
-     */
     public boolean isWorkspaceOwnedType(String qualifiedName) {
         return workspace.ownsTypeOrEnclosingType(qualifiedName);
     }
@@ -169,14 +158,6 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return external.containsType(qualifiedName) ? EXTERNAL : NONE;
     }
 
-    public Optional<IndexedType> ownerTypeInfo(String qualifiedType) {
-        return switch (ownerStore(qualifiedType)) {
-            case WORKSPACE -> workspace().typeInfo(qualifiedType);
-            case EXTERNAL -> external().typeInfo(qualifiedType);
-            case NONE -> Optional.empty();
-        };
-    }
-
     public Optional<IndexedType> typeInfo(String qualifiedName) {
         var workspaceType = workspace.typeInfo(qualifiedName);
         if (workspaceType.isPresent() || isWorkspaceOwnedType(qualifiedName)) {
@@ -187,6 +168,11 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
 
     public Set<String> workspaceSubTypes(String qualifiedName) {
         return workspace.subtypes(qualifiedName);
+    }
+
+    /** Token->files postings, workspace-only (external deps are bytecode, never token-scanned). */
+    public List<Path> filesContainingToken(String simpleName) {
+        return workspace.filesContainingToken(simpleName);
     }
 
     public Set<String> directSupertypes(String qualifiedName) {
@@ -202,31 +188,6 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
 
     public Optional<Path> externalDecompiledSourcePath(String qualifiedName) {
         return external.decompiledSourcePath(qualifiedName);
-    }
-
-    public Optional<String> workspaceNestedType(String ownerType, String simpleName) {
-        if (ownerType == null || ownerType.isBlank() || simpleName == null || simpleName.isBlank()) {
-            return Optional.empty();
-        }
-        var candidate = ownerType + "." + simpleName;
-        return workspace.containsType(candidate) ? Optional.of(candidate) : Optional.empty();
-    }
-
-    public Optional<IndexedMember> ownerMember(String ownerType, String name, boolean staticContext) {
-        return switch (ownerStore(ownerType)) {
-            case WORKSPACE -> workspace().member(ownerType, name, staticContext);
-            case EXTERNAL -> external().member(ownerType, name, staticContext);
-            case NONE -> Optional.empty();
-        };
-    }
-
-    public Optional<IndexedMember> ownerMember(
-            String ownerType, String name, boolean staticContext, String[] erasedParameterTypes) {
-        return switch (ownerStore(ownerType)) {
-            case WORKSPACE -> workspace().member(ownerType, name, staticContext, erasedParameterTypes);
-            case EXTERNAL -> external().member(ownerType, name, staticContext, erasedParameterTypes);
-            case NONE -> Optional.empty();
-        };
     }
 
     public List<IndexedMember> ownerMembers(String ownerType, boolean staticContext) {
@@ -255,5 +216,4 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
             case NONE -> List.of();
         };
     }
-
 }

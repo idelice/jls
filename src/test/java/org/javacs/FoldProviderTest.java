@@ -7,11 +7,17 @@ import java.lang.reflect.Method;
 import org.javacs.lsp.FoldingRangeParams;
 import org.javacs.lsp.TextDocumentIdentifier;
 import org.javacs.fold.FoldProvider;
+import org.junit.AfterClass;
 import org.junit.Test;
 
 public class FoldProviderTest {
 
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+
+    @AfterClass
+    public static void shutdownServer() {
+        server.shutdown();
+    }
 
     @Test
     public void foldingRangeDoesNotCrashOnIncompleteAssignment() {

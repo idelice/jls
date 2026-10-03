@@ -1,7 +1,6 @@
 package org.javacs;
 
 import java.io.IOException;
-import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.CharacterCodingException;
@@ -9,7 +8,6 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
-import javax.lang.model.element.TypeElement;
 
 // Translated from https://golang.org/src/strings/search.go
 
@@ -120,7 +118,7 @@ public class StringSearch {
     }
 
     private boolean isWordChar(byte b) {
-        char c = (char) (b + 128);
+        char c = (char) (b & 0xFF);
         return Character.isAlphabetic(c) || Character.isDigit(c) || c == '$' || c == '_';
     }
 
@@ -211,11 +209,6 @@ public class StringSearch {
         return searches.stream().anyMatch(search -> search.nextWord(text) != -1);
     }
 
-    private static boolean containsString(Path java, String query) {
-        var search = new StringSearch(query);
-        return search.next(readBytes(java)) != -1;
-    }
-
     private static byte[] readBytes(Path java) {
         if (FileStore.activeDocuments().contains(java)) {
             return FileStore.contents(java).getBytes(StandardCharsets.UTF_8);
@@ -282,52 +275,6 @@ public class StringSearch {
 
     private static boolean isWordChar(char c) {
         return Character.isAlphabetic(c) || Character.isDigit(c) || c == '_' || c == '$';
-    }
-
-    static boolean containsType(Path file, TypeElement el) {
-        switch (el.getKind()) {
-            case INTERFACE:
-                return containsInterface(file, el.getSimpleName().toString());
-            case CLASS:
-                return containsClass(file, el.getSimpleName().toString());
-            default:
-                throw new RuntimeException("Don't know what to do with " + el.getKind());
-        }
-    }
-
-    private static Cache<String, Boolean> cacheContainsClass = new Cache<>("string_search.contains_class");
-
-    private static boolean containsClass(Path file, String simpleName) {
-        // TODO verify this by actually parsing the file
-        return cacheContainsClass.getOrLoad(
-                file, simpleName, () -> containsString(file, "class " + simpleName));
-    }
-
-    private static Cache<String, Boolean> cacheContainsInterface = new Cache<>("string_search.contains_interface");
-
-    private static boolean containsInterface(Path file, String simpleName) {
-        // TODO verify this by actually parsing the file
-        return cacheContainsInterface.getOrLoad(
-                file, simpleName, () -> containsString(file, "interface " + simpleName));
-    }
-
-    // TODO this doesn't work for inner classes, eliminate
-    static String mostName(String name) {
-        var lastDot = name.lastIndexOf('.');
-        return lastDot == -1 ? "" : name.substring(0, lastDot);
-    }
-
-    // TODO this doesn't work for inner classes, eliminate
-    static String lastName(String name) {
-        int i = name.lastIndexOf('.');
-        if (i == -1) return name;
-        else return name.substring(i + 1);
-    }
-
-    static String fileName(URI uri) {
-        var parts = uri.toString().split("/");
-        if (parts.length == 0) return "";
-        return parts[parts.length - 1];
     }
 
     private static final Pattern PACKAGE_LINE = Pattern.compile("^package +(.*);");

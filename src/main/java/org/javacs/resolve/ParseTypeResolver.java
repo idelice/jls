@@ -196,20 +196,6 @@ public final class ParseTypeResolver {
         return resolveThisType().map(TypeResolution::qualifiedType);
     }
 
-    /**
-     * Ask the functional-target helper whether a method reference should be treated as an unbound
-     * instance method, a bound instance method, or a static method.
-     *
-     * <p>Example: {@code LineItem::getFamily} inside {@code stream.map(...)} resolves to receiver
-     * type {@code LineItem} with invocation arity {@code 0}, not a static call on the type literal.
-     */
-    public Optional<MethodReferenceTarget> resolveMethodReferenceTarget(MemberReferenceTree reference) {
-        if (reference == null || cursorPath == null) {
-            return Optional.empty();
-        }
-        return functionalTargetResolver.resolveMethodReferenceTarget(reference, cursorPath, 0);
-    }
-
     // Expression dispatch.
     private Optional<TypeResolution> resolveExpressionAtDepth(Tree expression, int depth) {
         if (expression == null || depth > MAX_RESOLVE_DEPTH) {
@@ -418,11 +404,6 @@ public final class ParseTypeResolver {
                 || methodName.isBlank()) {
             return Optional.empty();
         }
-        return resolveIndexedClassLiteralTypeVarReturn(receiverType, methodName, staticContext, invocation);
-    }
-
-    private Optional<TypeResolution> resolveIndexedClassLiteralTypeVarReturn(
-            TypeResolution receiverType, String methodName, boolean staticContext, MethodInvocationTree invocation) {
         TypeResolution match = null;
         for (var member : index.members(receiverType.qualifiedType(), staticContext)) {
             if (member.kind != CompletionItemKind.Method
@@ -1008,23 +989,9 @@ public final class ParseTypeResolver {
             return Optional.empty();
         }
         if (isWorkspaceType(functionalType.qualifiedType())) {
-            IndexedMember sam = null;
-            for (var member : index.workspace().members(functionalType.qualifiedType(), false)) {
-                if (member.kind != CompletionItemKind.Method || member.isStatic || member.isPrivate) {
-                    continue;
-                }
-                if (!member.isAbstract) {
-                    continue;
-                }
-                if (sam != null && !Objects.equals(sam.canonicalKey, member.canonicalKey)) {
-                    return Optional.empty();
-                }
-                sam = member;
-            }
-            if (sam == null) {
-                return Optional.empty();
-            }
-            return Optional.of(sam.declaredParameterTypes == null ? 0 : sam.declaredParameterTypes.length);
+            var sam = indexedSam(functionalType.qualifiedType());
+            if (sam.isEmpty()) return Optional.empty();
+            return Optional.of(sam.get().declaredParameterTypes == null ? 0 : sam.get().declaredParameterTypes.length);
         }
         var rawClass = loadExternalClass(functionalType.qualifiedType());
         if (rawClass.isEmpty()) {
@@ -1034,26 +1001,23 @@ public final class ParseTypeResolver {
     }
 
     private Optional<TypeResolution> resolveIndexedSamParameterType(TypeResolution functionalType) {
+        var sam = indexedSam(functionalType.qualifiedType());
+        if (sam.isEmpty()) return Optional.empty();
+        if (sam.get().declaredParameterTypes == null || sam.get().declaredParameterTypes.length != 1) {
+            return Optional.empty();
+        }
+        return resolveDeclaredTypeName(sam.get().declaredParameterTypes[0]);
+    }
+
+    private Optional<IndexedMember> indexedSam(String qualifiedType) {
         IndexedMember sam = null;
-        for (var member : index.workspace().members(functionalType.qualifiedType(), false)) {
-            if (member.kind != CompletionItemKind.Method || member.isStatic || member.isPrivate) {
-                continue;
-            }
-            if (!member.isAbstract) {
-                continue;
-            }
-            if (sam != null && !Objects.equals(sam.canonicalKey, member.canonicalKey)) {
-                return Optional.empty();
-            }
+        for (var member : index.workspace().members(qualifiedType, false)) {
+            if (member.kind != CompletionItemKind.Method || member.isStatic || member.isPrivate) continue;
+            if (!member.isAbstract) continue;
+            if (sam != null && !Objects.equals(sam.canonicalKey, member.canonicalKey)) return Optional.empty();
             sam = member;
         }
-        if (sam == null) {
-            return Optional.empty();
-        }
-        if (sam.declaredParameterTypes == null || sam.declaredParameterTypes.length != 1) {
-            return Optional.empty();
-        }
-        return resolveDeclaredTypeName(sam.declaredParameterTypes[0]);
+        return Optional.ofNullable(sam);
     }
 
     // External reflective inference.
@@ -1678,25 +1642,7 @@ public final class ParseTypeResolver {
         return resolution.arrayType() ? resolution.qualifiedType() + "[]" : resolution.qualifiedType();
     }
 
-    /** Return the nearest local declaration that is visible at the cursor position. */
-    public Optional<TreePath> resolveVisibleDeclaration(String targetName) {
-        return findVisibleVariable(targetName).map(VisibleVariable::path);
-    }
-
-    public Optional<IndexedMember> resolveInheritedFieldMember(String identifier) {
-        var owner = resolveThisType();
-        if (owner.isEmpty()) {
-            return Optional.empty();
-        }
-        return resolveIndexedMember(owner.get().qualifiedType(), identifier, false, null)
-                .filter(member -> member.kind == CompletionItemKind.Field);
-    }
-
-    public Optional<TypeResolution> resolveTypeTree(Tree tree, boolean staticContext) {
-        return resolveTypeTree(tree, root, staticContext);
-    }
-
-    public Optional<VisibleVariable> findVisibleVariable(String targetName) {
+    private Optional<VisibleVariable> findVisibleVariable(String targetName) {
         VisibleVariable best = null;
         for (var candidate : scopeSnapshot().visibleVariables()) {
             if (!candidate.tree().getName().contentEquals(targetName)) {

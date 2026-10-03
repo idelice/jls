@@ -4,10 +4,16 @@ import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.javacs.lsp.*;
+import org.junit.AfterClass;
 import org.junit.Assert;
 
 public class CompletionsBase {
     protected static JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+
+    @AfterClass
+    public static void shutdown() {
+        server.shutdown();
+    }
 
     protected void refreshServer() {
         server = LanguageServerFixture.getJavaLanguageServer();
@@ -105,7 +111,10 @@ public class CompletionsBase {
 
     protected List<? extends CompletionItem> items(String file, int row, int column) {
         var uri = FindResource.uri(file);
-        server.lint(List.of(java.nio.file.Paths.get(uri)));
+        var path = java.nio.file.Paths.get(uri);
+        server.lint(List.of(path));
+        server.completionIndexScheduler.ensureIndexed(path);
+        server.completionIndexScheduler.awaitReady(10_000);
         var position =
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(row - 1, column - 1));
         var maybe = server.completion(position);

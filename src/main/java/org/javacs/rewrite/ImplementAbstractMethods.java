@@ -28,6 +28,9 @@ public class ImplementAbstractMethods implements Rewrite {
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
         var file = compiler.findTypeDeclaration(className);
+        if (file == CompilerProvider.NOT_FOUND) {
+            return CANCELLED;
+        }
         var insertText = new StringJoiner("\n");
         try (var task = compiler.compile(file)) {
             var elements = task.elements;

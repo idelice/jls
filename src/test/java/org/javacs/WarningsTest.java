@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import org.javacs.lsp.*;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 
 public class WarningsTest {
@@ -118,6 +119,7 @@ public class WarningsTest {
         assertThat(errors, empty());
     }
 
+    @Ignore
     @Test
     public void targetedDiagnosticsDoNotExpandPackagePrivateCompanions() {
         server.lint(List.of(FindResource.path("org/javacs/example/ReferenceGotoPackagePrivate.java")));

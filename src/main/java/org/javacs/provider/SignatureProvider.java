@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Logger;
+import org.javacs.ClassFileParameterNames;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.ParseTask;
@@ -77,9 +78,10 @@ public class SignatureProvider {
 
             var signatures = new ArrayList<SignatureInformation>();
             for (var member : overloads) {
+                var names = resolveParameterNames(member);
                 var info = new SignatureInformation();
-                info.label = buildLabel(member);
-                info.parameters = buildParameters(member);
+                info.label = buildLabel(member, names);
+                info.parameters = buildParameters(member, names);
                 signatures.add(info);
             }
 
@@ -186,7 +188,7 @@ public class SignatureProvider {
         return simpleName;
     }
 
-    private static String buildLabel(IndexedMember member) {
+    private String buildLabel(IndexedMember member, String[] names) {
         var sb = new StringBuilder();
         if (member.kind == CompletionItemKind.Constructor) {
             var owner = member.ownerType;
@@ -196,7 +198,6 @@ public class SignatureProvider {
         }
         sb.append('(');
         var params = member.erasedParameterTypes;
-        var names = member.parameterNames;
         if (params != null) {
             for (int i = 0; i < params.length; i++) {
                 if (i > 0) sb.append(", ");
@@ -210,9 +211,8 @@ public class SignatureProvider {
         return sb.toString();
     }
 
-    private static List<ParameterInformation> buildParameters(IndexedMember member) {
+    private List<ParameterInformation> buildParameters(IndexedMember member, String[] names) {
         var params = member.erasedParameterTypes;
-        var names = member.parameterNames;
         var result = new ArrayList<ParameterInformation>();
         if (params == null) return result;
         for (int i = 0; i < params.length; i++) {
@@ -223,5 +223,14 @@ public class SignatureProvider {
             result.add(info);
         }
         return result;
+    }
+
+    private String[] resolveParameterNames(IndexedMember member) {
+        if (member.parameterNames != null) return member.parameterNames;
+        if (member.erasedParameterTypes == null || member.erasedParameterTypes.length == 0) return null;
+        var classBytes = compiler.findClassFile(member.ownerType);
+        if (classBytes.isEmpty()) return null;
+        return ClassFileParameterNames.read(
+                classBytes.get(), member.name, member.erasedParameterTypes, member.isStatic);
     }
 }

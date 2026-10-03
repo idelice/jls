@@ -355,7 +355,7 @@ public class InferConfigTest {
         InferConfig currentTestProject = new InferConfig(Paths.get("."), Collections.emptySet());
         assertThat(
                 currentTestProject.classPath(),
-                hasItem(hasToString(endsWith(".m2/repository/junit/junit/4.13.1/junit-4.13.1.jar"))));
+                hasItem(hasToString(endsWith(".m2/repository/junit/junit/4.13.2/junit-4.13.2.jar"))));
     }
 
     @Test
@@ -363,7 +363,7 @@ public class InferConfigTest {
         InferConfig currentTestProject = new InferConfig(Paths.get("."), Collections.emptySet());
         assertThat(
                 currentTestProject.buildDocPath(),
-                hasItem(hasToString(endsWith(".m2/repository/junit/junit/4.13.1/junit-4.13.1-sources.jar"))));
+                hasItem(hasToString(endsWith(".m2/repository/junit/junit/4.13.2/junit-4.13.2-sources.jar"))));
     }
 
     @Test
@@ -400,7 +400,7 @@ public class InferConfigTest {
         assertThat(cacheFile.toString(), containsString("cache-home"));
         assertThat(cacheFile.toString(), containsString("jls"));
         assertThat(cacheFile.getFileName().toString(), equalTo("maven-inference.json"));
-        assertThat(cacheFile.getParent().getFileName().toString(), startsWith("demo-"));
+        assertThat(cacheFile.getParent().getFileName().toString(), equalTo("root"));
     }
 
     @Test
@@ -429,7 +429,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -457,7 +457,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -469,7 +469,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -484,7 +484,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -529,7 +529,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -547,7 +547,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspaceTwo.resolve("pom.xml"), "dependency:list", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -562,7 +562,7 @@ public class InferConfigTest {
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(
                         workspace.resolve("pom.xml"), "dependency:list", temp.newFolder("m2").toPath(), cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test
@@ -577,7 +577,7 @@ public class InferConfigTest {
 
         assertThat(
                 MavenTooling.loadCachedMavenDependencies(workspace.resolve("pom.xml"), "dependency:sources", m2, cacheHome, null),
-                empty());
+                is(nullValue()));
     }
 
     @Test

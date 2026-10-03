@@ -125,7 +125,8 @@ public final class ImplementationProvider {
 
     private Set<Path> hierarchyCandidates(
             Target target, Set<String> typeNames, Set<Path> compiledFiles) {
-        var textual = compiler.findTypeReferences(typeNames);
+        var textual = new LinkedHashSet<Path>();
+        for (var tn : typeNames) for (var f : compiler.findTypeReferences(tn, null)) textual.add(f);
         var candidates = new LinkedHashSet<Path>();
         for (var candidate : textual) {
             var source = normalized(candidate);

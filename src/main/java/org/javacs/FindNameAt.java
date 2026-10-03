@@ -12,10 +12,6 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         this.trees = task.trees;
     }
 
-    public FindNameAt(ParseTask task) {
-        this.trees = Trees.instance(task.task());
-    }
-
     @Override
     public TreePath visitCompilationUnit(CompilationUnitTree t, Long find) {
         root = t;

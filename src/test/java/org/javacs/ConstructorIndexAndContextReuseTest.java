@@ -25,6 +25,7 @@ public class ConstructorIndexAndContextReuseTest {
     }
 
     private static Path workspaceRoot;
+    private static JavaCompilerService compiler;
 
     @BeforeClass
     public static void setup() throws Exception {
@@ -53,10 +54,13 @@ public class ConstructorIndexAndContextReuseTest {
                 "}\n");
 
         FileStore.setWorkspaceRoots(Set.of(workspaceRoot));
+        compiler = new JavaCompilerService(
+                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
     }
 
     @AfterClass
     public static void teardown() throws Exception {
+        if (compiler != null) compiler.close();
         FileStore.reset();
         if (workspaceRoot != null) {
             Files.walk(workspaceRoot)
@@ -67,8 +71,6 @@ public class ConstructorIndexAndContextReuseTest {
 
     @Test
     public void workspaceIndexIncludesRecordCanonicalConstructor() {
-        var compiler = new JavaCompilerService(
-                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         var parseTasks = List.of(
                 compiler.parse(workspaceRoot.resolve("pkg/MyRecord.java")),
                 compiler.parse(workspaceRoot.resolve("pkg/MyClass.java")));
@@ -81,8 +83,6 @@ public class ConstructorIndexAndContextReuseTest {
 
     @Test
     public void workspaceIndexIncludesExplicitConstructor() {
-        var compiler = new JavaCompilerService(
-                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         var parseTasks = List.of(
                 compiler.parse(workspaceRoot.resolve("pkg/MyClass.java")));
         var index = WorkspaceTypeIndex.fromParseTrees(parseTasks);
@@ -93,8 +93,6 @@ public class ConstructorIndexAndContextReuseTest {
 
     @Test
     public void constructorsNotInheritedInMembers() {
-        var compiler = new JavaCompilerService(
-                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         var parseTasks = List.of(
                 compiler.parse(workspaceRoot.resolve("pkg/MyClass.java")),
                 compiler.parse(workspaceRoot.resolve("pkg/Usage.java")));
@@ -108,8 +106,6 @@ public class ConstructorIndexAndContextReuseTest {
 
     @Test
     public void inlayHintsWorkForRecordConstructor() {
-        var compiler = new JavaCompilerService(
-                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         var usageFile = workspaceRoot.resolve("pkg/Usage.java");
 
         var parseTasks = List.of(
@@ -129,8 +125,6 @@ public class ConstructorIndexAndContextReuseTest {
 
     @Test
     public void inlayHintsWorkForExplicitConstructor() {
-        var compiler = new JavaCompilerService(
-                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         var usageFile = workspaceRoot.resolve("pkg/Usage.java");
 
         var parseTasks = List.of(
@@ -150,8 +144,6 @@ public class ConstructorIndexAndContextReuseTest {
 
     @Test
     public void multipleCompileFastCallsDontFailWithDuplicateContext() {
-        var compiler = new JavaCompilerService(
-                Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), Collections.emptySet());
         var file = workspaceRoot.resolve("pkg/MyClass.java");
 
         // First compile — populates cache and releases slot
@@ -191,5 +183,21 @@ public class ConstructorIndexAndContextReuseTest {
         try (var task = compiler.compile(file)) {
             assertThat(task.root(), notNullValue());
         }
+    }
+
+    // Regression: replaceWorkspaceDeclarations must carry filesByToken forward across a merge.
+    @Test
+    public void incrementalMergePreservesTokenIndex() {
+        var recordFile = workspaceRoot.resolve("pkg/MyRecord.java");
+        var usageFile = workspaceRoot.resolve("pkg/Usage.java");
+
+        var base = WorkspaceTypeIndex.fromParseTrees(List.of(
+                compiler.parse(recordFile), compiler.parse(usageFile)));
+        assertThat(base.filesContainingToken("MyRecord"), hasItem(usageFile));
+
+        var delta = WorkspaceTypeIndex.fromParseTrees(List.of(compiler.parse(recordFile)));
+        var merged = base.replaceWorkspaceDeclarations(delta, Set.of(recordFile));
+        assertThat("token postings for an unchanged file must survive the merge",
+                merged.filesContainingToken("MyRecord"), hasItem(usageFile));
     }
 }

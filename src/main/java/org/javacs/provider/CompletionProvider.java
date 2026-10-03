@@ -49,6 +49,7 @@ import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
 
 import org.javacs.CacheAudit;
+import org.javacs.ClassFileParameterNames;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FileStore;
@@ -593,7 +594,7 @@ public class CompletionProvider {
         var item = new CompletionItem();
         item.label = member.name;
         item.kind = member.kind;
-        item.detail = member.detail;
+        item.detail = resolveDetail(member);
         item.insertText = member.name;
         item.insertTextFormat = InsertTextFormat.PlainText;
         var data = new CompletionData();
@@ -609,7 +610,7 @@ public class CompletionProvider {
         var item = new CompletionItem();
         item.label = first.name;
         item.kind = CompletionItemKind.Method;
-        item.detail = first.detail;
+        item.detail = resolveDetail(first);
         if (addParens) {
             var noArgs =
                     overloads.size() == 1
@@ -633,6 +634,30 @@ public class CompletionProvider {
         data.compilerId = compilerId;
         item.data = JsonHelper.GSON.toJsonTree(data);
         return item;
+    }
+
+    /** Rebuild the detail string with real parameter names from the classfile LVT when the index only has types. */
+    private String resolveDetail(IndexedMember member) {
+        if (member.parameterNames != null || member.erasedParameterTypes == null
+                || member.erasedParameterTypes.length == 0 || member.kind == CompletionItemKind.Field) {
+            return member.detail;
+        }
+        var classBytes = compiler.findClassFile(member.ownerType);
+        if (classBytes.isEmpty()) return member.detail;
+        var names = ClassFileParameterNames.read(
+                classBytes.get(), member.name, member.erasedParameterTypes,
+                member.isStatic);
+        if (names == null) return member.detail;
+        var params = new StringJoiner(", ");
+        for (int i = 0; i < member.erasedParameterTypes.length; i++) {
+            params.add(TypeNames.simpleName(member.erasedParameterTypes[i]) + " " + names[i]);
+        }
+        if (member.kind == CompletionItemKind.Constructor) {
+            return TypeNames.simpleName(member.ownerType) + "(" + params + ")";
+        }
+        var returnType = member.returnType != null
+                ? TypeNames.simpleName(member.returnType) : "void";
+        return returnType + " " + member.name + "(" + params + ")";
     }
 
     private boolean isImportOrPackageContext(TreePath path) {
@@ -675,40 +700,46 @@ public class CompletionProvider {
 
     private CompletionList completeParseOnly(ParseTask parseTask, String contents, long cursor, String partial) {
         var path = new FindCompletionsAt(parseTask.task()).scan(parseTask.root(), cursor);
-        if (path == null) {
-            return new CompletionList();
-        }
+        if (path == null) return new CompletionList();
+
         var memberAccess = memberAccessContext(contents, (int) cursor);
         if (memberAccess != null && !isImportOrPackageContext(path)) {
-            var list = new CompletionList();
-            addSyntacticMemberUsages(parseTask, cursor, memberAccess.receiver, partial, list);
-            sortCompletionItems(list.items);
-            return list;
+            return completeSyntacticMemberAccess(parseTask, cursor, memberAccess.receiver, partial);
         }
-        switch (path.getLeaf().getKind()) {
-            case IMPORT:
-                return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
-            default:
-                var enumCase = completeEnumCase(parseTask, path, cursor, partial);
-                if (enumCase != null) {
-                    return enumCase;
-                }
-                var list = new CompletionList();
-                var endsWithParen = endsWithParen(contents, (int) cursor);
-                addKeywords(path, partial, list);
-                addSyntacticLocalVariables(parseTask, cursor, partial, list);
-                addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
-                addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
-                addEnclosingInstanceKeywords(path, list);
-                addStaticImportsFromIndex(parseTask.root(), partial, false, list);
-                addImportedTypeNames(parseTask.root(), partial, list);
-                if (!list.isIncomplete && !partial.isEmpty() && Character.isUpperCase(partial.charAt(0))) {
-                    addClassNames(parseTask.root(), Trees.instance(parseTask.task()).getSourcePositions(), partial, list);
-                }
-                boostExactMatches(parseTask.root(), list.items, partial);
-                sortCompletionItems(list.items);
-                return list;
+        if (path.getLeaf().getKind() == Tree.Kind.IMPORT) {
+            return completeImport(qualifiedPartialIdentifier(contents, (int) cursor));
         }
+        var enumCase = completeEnumCase(parseTask, path, cursor, partial);
+        if (enumCase != null) return enumCase;
+
+        return completeIdentifier(parseTask, path, contents, cursor, partial);
+    }
+
+    private CompletionList completeSyntacticMemberAccess(
+            ParseTask parseTask, long cursor, String receiver, String partial) {
+        var list = new CompletionList();
+        addSyntacticMemberUsages(parseTask, cursor, receiver, partial, list);
+        sortCompletionItems(list.items);
+        return list;
+    }
+
+    private CompletionList completeIdentifier(
+            ParseTask parseTask, TreePath path, String contents, long cursor, String partial) {
+        var list = new CompletionList();
+        var endsWithParen = endsWithParen(contents, (int) cursor);
+        addKeywords(path, partial, list);
+        addSyntacticLocalVariables(parseTask, cursor, partial, list);
+        addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
+        addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
+        addEnclosingInstanceKeywords(path, list);
+        addStaticImportsFromIndex(parseTask.root(), partial, false, list);
+        addImportedTypeNames(parseTask.root(), partial, list);
+        if (!list.isIncomplete && !partial.isEmpty() && Character.isUpperCase(partial.charAt(0))) {
+            addClassNames(parseTask.root(), Trees.instance(parseTask.task()).getSourcePositions(), partial, list);
+        }
+        boostExactMatches(parseTask.root(), list.items, partial);
+        sortCompletionItems(list.items);
+        return list;
     }
 
     private void addTopLevelSnippets(ParseTask task, CompletionList list) {
@@ -1111,11 +1142,15 @@ public class CompletionProvider {
 
     private Tree switchExpression(TreePath path) {
         for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
-            if (cursor.getLeaf() instanceof SwitchTree switchTree) {
+            var leaf = cursor.getLeaf();
+            if (leaf instanceof SwitchTree switchTree) {
                 return switchTree.getExpression();
             }
-            if (cursor.getLeaf() instanceof SwitchExpressionTree switchExpressionTree) {
+            if (leaf instanceof SwitchExpressionTree switchExpressionTree) {
                 return switchExpressionTree.getExpression();
+            }
+            if (leaf instanceof BlockTree) {
+                return null;
             }
         }
         return null;

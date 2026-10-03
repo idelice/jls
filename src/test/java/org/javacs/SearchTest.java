@@ -11,10 +11,16 @@ import java.util.StringJoiner;
 import java.util.stream.Collectors;
 import org.javacs.lsp.*;
 import org.junit.BeforeClass;
+import org.junit.AfterClass;
 import org.junit.Test;
 
 public class SearchTest {
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+
+    @AfterClass
+    public static void shutdownServer() {
+        server.shutdown();
+    }
 
     @BeforeClass
     public static void openSource() throws IOException {

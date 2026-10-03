@@ -60,6 +60,11 @@ public class StringSearchTest {
         testNextWord("aa", "aaa", -1);
         testNextWord("aa", "a aa", 2);
         testNextWord("aa", "aa a", 0);
+        // ':' must be a word boundary (regression: byte decode mapped it to a letter, breaking obj::method).
+        testNextWord("method", "obj::method", 5);
+        testNextWord("method", "obj.method", 4);
+        testNextWord("foo", "String::foo", 8);
+        testNextWord("ab", "x::ab", 3);
     }
 
     @Test

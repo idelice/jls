@@ -47,12 +47,9 @@ final class ReusableCompiler {
     private static final int MAX_USES = 64;
     private ReusableContext context;
     private boolean checkedOut;
+    /** Single-module projects keep scan contexts warm; reactors retire them to spare the idle pool. */
+    boolean retainScans;
 
-    /**
-     * @param oneShot the caller consumes the result once (a workspace-wide scan). A context created
-     *     for a one-shot borrow is retired instead of competing for the idle pool with the modules
-     *     the user is editing. An already warm context stays warm.
-     */
     Borrow borrow(JavaFileManager files, DiagnosticListener<? super JavaFileObject> diagnostics,
             List<String> options, Collection<? extends JavaFileObject> sources, boolean oneShot) {
         if (checkedOut) throw new IllegalStateException("Compiler is already in use");
@@ -75,7 +72,7 @@ final class ReusableCompiler {
             task.addTaskListener(context);
             context.uses++;
             context.capturePlatform();
-            return new Borrow(task, context, reused, oneShot && !reused);
+            return new Borrow(task, context, reused, oneShot && !reused && !retainScans);
         } catch (RuntimeException | Error failure) {
             checkedOut = false;
             discard();

@@ -11,6 +11,11 @@ import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 
+/**
+ * One attributed compile. Its {@code trees}/{@code elements}/{@code types}/{@code roots} are valid
+ * only until {@link #close()}. Do not cache them past close — see {@link ReusableCompiler} for the
+ * warm-context invariants (the underlying context is cleared and reused on close).
+ */
 public class CompileTask implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
 

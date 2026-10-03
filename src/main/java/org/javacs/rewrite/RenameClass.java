@@ -32,7 +32,7 @@ public class RenameClass implements Rewrite {
             return CANCELLED;
         }
 
-        var referenceFiles = compiler.findTypeReferences(oldQualifiedName);
+        var referenceFiles = compiler.findTypeReferences(oldQualifiedName, null);
         var allPaths = new LinkedHashSet<Path>();
         allPaths.add(sourceFile);
         Collections.addAll(allPaths, referenceFiles);

@@ -32,7 +32,7 @@ public class RenameMethod implements Rewrite {
             Function<Path, CompilerProvider> compilerForFile,
             BiPredicate<Path, Path> candidateAllowed) {
         LOG.info("Rewrite " + className + "#" + methodName + " to " + newName + "...");
-        var paths = compiler.findMemberReferences(className, methodName);
+        var paths = compiler.findMemberReferences(className, methodName, null);
         if (paths.length == 0) {
             LOG.warning("...no references to " + className + "#" + methodName);
             return Map.of();

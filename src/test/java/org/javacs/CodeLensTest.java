@@ -6,11 +6,17 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import java.util.ArrayList;
 import java.util.List;
 import org.javacs.lsp.*;
+import org.junit.AfterClass;
 import org.junit.Test;
 
 public class CodeLensTest {
 
     private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+
+    @AfterClass
+    public static void shutdownServer() {
+        server.shutdown();
+    }
 
     private List<? extends CodeLens> lenses(String file) {
         var uri = FindResource.uri(file);

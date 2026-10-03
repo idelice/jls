@@ -36,9 +36,9 @@ public class RenameField implements Rewrite {
         LOG.info("Rewrite " + className + "#" + fieldName + " to " + newName + "...");
         var accessorRenames = lombokAccessorRenames(compiler);
         var paths = new LinkedHashSet<Path>();
-        paths.addAll(Arrays.asList(compiler.findMemberReferences(className, fieldName)));
+        paths.addAll(Arrays.asList(compiler.findMemberReferences(className, fieldName, null)));
         for (var accessor : accessorRenames.keySet()) {
-            paths.addAll(Arrays.asList(compiler.findMemberReferences(className, accessor)));
+            paths.addAll(Arrays.asList(compiler.findMemberReferences(className, accessor, null)));
         }
         if (paths.isEmpty()) {
             LOG.warning("...no references to " + className + "#" + fieldName);
