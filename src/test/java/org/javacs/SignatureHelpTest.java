@@ -13,6 +13,42 @@ import org.junit.Test;
 
 public class SignatureHelpTest {
     @Test
+    public void overriddenInterfaceMethodPreservesRealOverloads() {
+        var labels = labels("/org/javacs/example/SignatureHelpOverrides.java", 18, 20);
+        assertThat(labels, containsInAnyOrder(
+                "setup(int numberOfChannels)", "setup(String configuration)"));
+    }
+
+    @Test
+    public void overriddenNoArgumentInterfaceMethodHasOneSignature() {
+        assertThat(labels("/org/javacs/example/SignatureHelpOverrides.java", 19, 26),
+                contains("isBroadcast()"));
+    }
+
+    @Test
+    public void overriddenSuperclassMethodPreservesInheritedAndDirectOverloads() {
+        assertThat(labels("/org/javacs/example/SignatureHelpOverrides.java", 33, 20),
+                containsInAnyOrder("setup(int channels)", "setup(long channels)", "setup(String configuration)"));
+    }
+
+    @Test
+    public void overriddenMethodsHaveCorrectCompletionOverloadCounts() {
+        var uri = FindResource.uri("/org/javacs/example/SignatureHelpOverrides.java");
+        var path = java.nio.file.Paths.get(uri);
+        server.completionIndexScheduler.ensureIndexed(path);
+        server.completionIndexScheduler.awaitReady(10_000);
+        var params = new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(17, 13));
+        var items = server.completion(params).orElseThrow().items;
+        for (var expected : java.util.Map.of(
+                "setup", 1, "isBroadcast", 0, "equals", 0, "hashCode", 0, "wait", 2).entrySet()) {
+            var matches = items.stream().filter(item -> item.label.equals(expected.getKey())).toList();
+            assertThat(expected.getKey(), matches, hasSize(1));
+            var data = JsonHelper.GSON.fromJson(matches.get(0).data, CompletionData.class);
+            assertThat(expected.getKey(), data.plusOverloads, equalTo(expected.getValue()));
+        }
+    }
+
+    @Test
     public void signatureHelp() {
         var help = doHelp("/org/javacs/example/SignatureHelp.java", 7, 36);
         assertThat(help.signatures, hasSize(2));

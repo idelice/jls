@@ -370,7 +370,7 @@ public class WorkspaceTypeIndex {
             if (staticContext != member.isStatic) {
                 continue;
             }
-            var storageKey = memberStorageKey(member);
+            var storageKey = visibleMemberKey(member, this::containsType);
             if (!seenStorageKeys.add(storageKey)) {
                 continue;
             }
@@ -398,7 +398,7 @@ public class WorkspaceTypeIndex {
                 if (member.kind == CompletionItemKind.Constructor) {
                     continue; // constructors are not inherited
                 }
-                var storageKey = memberStorageKey(member);
+                var storageKey = visibleMemberKey(member, this::containsType);
                 if (!seenStorageKeys.add(storageKey)) {
                     continue;
                 }
@@ -1374,6 +1374,23 @@ public class WorkspaceTypeIndex {
     private static boolean isGeneratedClass(ClassTree tree) {
         return tree instanceof com.sun.tools.javac.tree.JCTree.JCClassDecl classDecl
                 && (classDecl.mods.flags & Flags.GENERATED_MEMBER) != 0;
+    }
+
+    String visibleMemberKey(IndexedMember member, Predicate<String> containsType) {
+        if (member.kind != CompletionItemKind.Method) return member.canonicalKey;
+        var params = member.erasedParameterTypes == null ? new String[0] : member.erasedParameterTypes.clone();
+        var owner = typesByQualifiedName.get(member.ownerType);
+        var snapshot = owner == null ? null : sourceFiles.get(owner.sourcePath);
+        if (snapshot != null) {
+            for (int i = 0; i < params.length; i++) {
+                var type = params[i];
+                var arrayStart = type.indexOf('[');
+                var component = arrayStart < 0 ? type : type.substring(0, arrayStart);
+                var resolved = resolveSimpleTypeNameFromSnapshot(component, snapshot, containsType);
+                if (resolved != null) params[i] = resolved + (arrayStart < 0 ? "" : type.substring(arrayStart));
+            }
+        }
+        return IndexedMember.canonicalKey("", member.kind, member.name, params);
     }
 
     private static String memberStorageKey(IndexedMember member) {

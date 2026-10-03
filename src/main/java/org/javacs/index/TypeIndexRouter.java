@@ -8,6 +8,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 import org.javacs.lsp.CompletionItemKind;
 
 import static org.javacs.index.TypeIndexRouter.OwnerStore.*;
@@ -46,10 +47,12 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
                 return workspaceMembers;
             }
             var covered = new HashSet<String>(workspaceMembers.size() * 2);
-            for (var m : workspaceMembers) covered.add(m.canonicalKey);
+            Predicate<String> containsType =
+                    name -> workspace.containsType(name) || external.containsType(name);
+            for (var m : workspaceMembers) covered.add(workspace.visibleMemberKey(m, containsType));
             var merged = new ArrayList<>(workspaceMembers);
             for (var m : externalInherited) {
-                if (covered.add(m.canonicalKey)) merged.add(m);
+                if (covered.add(workspace.visibleMemberKey(m, containsType))) merged.add(m);
             }
             return merged;
         }
