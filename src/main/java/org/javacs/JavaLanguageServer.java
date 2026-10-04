@@ -912,7 +912,9 @@ class JavaLanguageServer extends LanguageServer {
                 var candidates = typeIndex.filesContainingToken(simpleName);
                 if (candidates == null) continue;
                 for (var candidate : candidates) {
-                    if (active.contains(candidate)) dependents.add(candidate);
+                    if (active.contains(candidate) && StringSearch.containsWord(candidate, simpleName)) {
+                        dependents.add(candidate);
+                    }
                 }
             }
             if (dependents.isEmpty()) return;
