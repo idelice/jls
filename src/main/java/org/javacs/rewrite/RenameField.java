@@ -54,7 +54,7 @@ public class RenameField implements Rewrite {
         var edits = new LinkedHashMap<Path, TextEdit[]>();
         for (var entry : groups.entrySet()) {
             if (declaration != CompilerProvider.NOT_FOUND) entry.getValue().add(declaration);
-            try (var compile = entry.getKey().compileScan(entry.getValue().toArray(Path[]::new))) {
+            try (var compile = entry.getKey().compile(entry.getValue().toArray(Path[]::new))) {
                 edits.putAll(new RenameHelper(compile).renameField(
                         compile.roots, className, fieldName, newName, accessorRenames));
             }

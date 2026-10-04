@@ -22,11 +22,11 @@ public final class CompileBatch implements AutoCloseable {
     final List<CompilationUnitTree> roots = new ArrayList<>();
     final List<Diagnostic<? extends JavaFileObject>> diagnostics = new ArrayList<>();
 
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean oneShot) {
+    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
         if (files.isEmpty()) throw new IllegalArgumentException("No source files to analyze");
         parent.prepareFileManager();
         borrow = parent.compiler.borrow(parent.fileManager, diagnostics::add,
-                options(parent.classPath, parent.addExports, parent.extraArgs), files, oneShot);
+                options(parent.classPath, parent.addExports, parent.extraArgs), files);
         task = borrow.task;
         trees = Trees.instance(task);
         elements = task.getElements();

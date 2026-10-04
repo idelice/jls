@@ -87,7 +87,6 @@ final class ModuleCompilerRegistry implements AutoCloseable {
             var next = new JavaCompilerService(server.moduleGraph.externalClasspath(inputs.classpath()),
                     inputs.sources(), configuredAddExports, compilerArguments(module));
             next.setSourceRoots(inputs.sourceRoots());
-            next.setRetainScans(!multiModule());
             moduleCompilers.put(key, new ModuleCompiler(next, inputs.sourceRoots()));
             // Make source JARs available to the main (fallback) compiler so definition
             // lookups inside JAR sources can resolve types across JARs.

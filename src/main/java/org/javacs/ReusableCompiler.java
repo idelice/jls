@@ -45,14 +45,12 @@ final class ReusableCompiler {
     private static final Method CLEANUP = cleanupMethod();
     private static final AtomicLong IDS = new AtomicLong();
     private static final LinkedHashMap<ReusableCompiler, Boolean> IDLE = new LinkedHashMap<>();
-    private static final int MAX_IDLE_CONTEXTS = 4;
+    private static final int MAX_IDLE_CONTEXTS = 8;
     private ReusableContext context;
     private boolean checkedOut;
-    /** Single-module projects keep scan contexts warm; reactors retire them to spare the idle pool. */
-    boolean retainScans;
 
     Borrow borrow(JavaFileManager files, DiagnosticListener<? super JavaFileObject> diagnostics,
-            List<String> options, Collection<? extends JavaFileObject> sources, boolean oneShot) {
+            List<String> options, Collection<? extends JavaFileObject> sources) {
         if (checkedOut) throw new IllegalStateException("Compiler is already in use");
         if (!options.contains("-proc:none") || options.stream().anyMatch(option ->
                 option.startsWith("-proc:") && !option.equals("-proc:none"))) {
@@ -73,7 +71,7 @@ final class ReusableCompiler {
             task.addTaskListener(context);
             context.uses++;
             context.capturePlatform();
-            return new Borrow(task, context, reused, oneShot && !reused && !retainScans);
+            return new Borrow(task, context, reused);
         } catch (RuntimeException | Error failure) {
             checkedOut = false;
             discard();
@@ -105,7 +103,11 @@ final class ReusableCompiler {
         synchronized (IDLE) {
             IDLE.remove(this);
             IDLE.put(this, Boolean.TRUE);
-            while (IDLE.size() > MAX_IDLE_CONTEXTS) IDLE.firstEntry().getKey().discard("idle_evicted");
+            var runtime = Runtime.getRuntime();
+            boolean heapPressure = runtime.totalMemory() - runtime.freeMemory() > runtime.maxMemory() * 3 / 4;
+            while (IDLE.size() > MAX_IDLE_CONTEXTS || (heapPressure && !IDLE.isEmpty())) {
+                IDLE.firstEntry().getKey().discard(heapPressure ? "heap_pressure" : "idle_evicted");
+            }
         }
     }
 
@@ -121,15 +123,13 @@ final class ReusableCompiler {
         final JavacTaskImpl task;
         final boolean reused;
         private final ReusableContext borrowed;
-        private final boolean oneShot;
         private boolean valid = true;
         private boolean closed;
 
-        Borrow(JavacTaskImpl task, ReusableContext borrowed, boolean reused, boolean oneShot) {
+        Borrow(JavacTaskImpl task, ReusableContext borrowed, boolean reused) {
             this.task = task;
             this.borrowed = borrowed;
             this.reused = reused;
-            this.oneShot = oneShot;
         }
 
         long id() { return borrowed.id; }
@@ -147,7 +147,6 @@ final class ReusableCompiler {
             } finally {
                 checkedOut = false;
                 if (!valid) discard("analysis_failed");
-                else if (oneShot) discard("one_shot_scan");
                 else if (borrowed.polluted) discard("polluted");
                 else retain();
             }
@@ -222,7 +221,8 @@ final class ReusableCompiler {
                 if (path != null) reparsed.add(path);
             }
             for (var file : changed) {
-                if (parsed.contains(file) && !reparsed.contains(file)) {
+                var source = filePath(file.toUri());
+                if (parsed.contains(source) && !reparsed.contains(source)) {
                     LOG.info("[analysis] retire context=" + id + " reason=implicit_source_changed file="
                             + file.getFileName());
                     return false;
@@ -233,7 +233,14 @@ final class ReusableCompiler {
 
         private static Path filePath(java.net.URI uri) {
             if (!"file".equalsIgnoreCase(uri.getScheme())) return null;
-            return Path.of(uri).toAbsolutePath().normalize();
+            var path = Path.of(uri).toAbsolutePath().normalize();
+            // javac can canonicalize implicit sources while editor events retain symlink aliases.
+            try { return path.toRealPath(); }
+            catch (IOException missing) {
+                // A deleted source still needs the same identity as its retained symbol.
+                try { return path.getParent().toRealPath().resolve(path.getFileName()); }
+                catch (IOException unavailable) { return path; }
+            }
         }
 
         void clear() {

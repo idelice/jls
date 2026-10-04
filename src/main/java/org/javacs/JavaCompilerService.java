@@ -45,10 +45,6 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         this(classPath, docPath, addExports, (Collection<String>) extraArgs);
     }
 
-    void setRetainScans(boolean retain) {
-        compiler.retainScans = retain;
-    }
-
     void addDocPathEntries(Set<Path> entries) {
         if (entries.isEmpty()) return;
         try {
@@ -104,18 +100,7 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
-        return compile(sources, false);
-    }
-
-    @Override
-    public CompileTask compileScan(Path... files) {
-        var sources = new ArrayList<JavaFileObject>(files.length);
-        for (var f : files) sources.add(new SourceFileObject(f));
-        return compile(sources, true);
-    }
-
-    private CompileTask compile(Collection<? extends JavaFileObject> sources, boolean oneShot) {
-        var batch = new CompileBatch(this, sources, oneShot);
+        var batch = new CompileBatch(this, sources);
         return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, batch.diagnostics, batch::close);
     }
 

@@ -263,7 +263,6 @@ class JavaLanguageServer extends LanguageServer {
             var args = scoped ? configured.extraCompilerArgs() : selectCompilerArgs(configured.extraCompilerArgs(), infer).args();
             compiler = new JavaCompilerService(moduleGraph.externalClasspath(classpath), docs, configured.addExports(), args);
             if (!roots.isEmpty()) compiler.setSourceRoots(roots);
-            compiler.setRetainScans(moduleGraph.modules().size() <= 1);
             LOG.info("[analysis] configured proc=none workspace_binaries=0 modules=" + moduleGraph.modules().size()
                     + " sources=" + roots.size() + " ms=" + (System.nanoTime() - started) / 1_000_000);
         } finally {

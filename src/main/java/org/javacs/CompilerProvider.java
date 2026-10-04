@@ -36,15 +36,6 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
-    /**
-     * Compile files for a workspace-wide scan (references, implementations, rename). The result is
-     * consumed once, so a context created only for this scan must not displace the warm contexts of
-     * the modules being edited.
-     */
-    default CompileTask compileScan(Path... files) {
-        return compile(files);
-    }
-
     default List<ParseTask> parseAll(Collection<Path> files) {
         var result = new ArrayList<ParseTask>(files.size());
         for (var file : files) {

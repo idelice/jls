@@ -145,7 +145,7 @@ public final class CallHierarchyProvider {
             Path file, MethodData data, String memberName, Path[] candidates) {
         batchResolver.accept(candidates);
         var grouped = new LinkedHashMap<String, CallHierarchyIncomingCall>();
-        try (var task = compilerForFile.apply(file).compileScan(candidates)) {
+        try (var task = compilerForFile.apply(file).compile(candidates)) {
             var target = FindHelper.findMethod(task, data.className, data.methodName, data.erasedParameterTypes);
             if (target == null) return List.of();
             for (var root : task.roots) {
