@@ -31,6 +31,7 @@ import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
 import org.javacs.LombokAnnotations;
 import org.javacs.LombokStubInjector;
 import org.javacs.ParseTask;
+import org.javacs.FileStore;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.TypeNames;
 
@@ -177,7 +178,14 @@ public class WorkspaceTypeIndex {
     }
 
     public List<Path> filesContainingToken(String simpleName) {
-        return filesByToken.get(simpleName);
+        // A module-scoped snapshot cannot rule out matches in other workspace files.
+        var postings = filesByToken.get(simpleName);
+        var candidates = new ArrayList<Path>();
+        if (postings != null) candidates.addAll(postings);
+        for (var file : FileStore.all()) {
+            if (!sourceFiles.containsKey(file)) candidates.add(file);
+        }
+        return candidates;
     }
 
     public boolean ownsTypeOrEnclosingType(String qualifiedName) {

@@ -369,8 +369,8 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         var pkg = packageName(className);
         var result = new ArrayList<Path>();
         for (var f : candidates != null ? candidates : FileStore.all()) {
-            if ((pkg.equals(FileStore.packageName(f)) || containsImport(f, className))
-                    && containsWord(f, memberName)) {
+            if (containsWord(f, memberName)
+                    && (pkg.equals(FileStore.packageName(f)) || containsImport(f, className))) {
                 result.add(f);
             }
         }
