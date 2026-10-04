@@ -2,6 +2,7 @@ package org.javacs;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
+import javax.lang.model.element.ElementKind;
 
 public class FindNameAt extends TreePathScanner<TreePath, Long> {
     private final Trees trees;
@@ -116,6 +117,12 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
         var end = t.getInitializer() != null
                 ? (int) pos.getStartPosition(root, t.getInitializer())
                 : (int) pos.getEndPosition(root, t);
+        var element = trees.getElement(getCurrentPath());
+        if (element != null && element.getKind() == ElementKind.ENUM_CONSTANT
+                && t.getInitializer() instanceof NewClassTree initializer) {
+            // javac's synthetic enum constructor can start at the constant's name.
+            end = (int) pos.getStartPosition(root, initializer.getIdentifier()) + t.getName().length();
+        }
         if (start >= 0 && end > start) {
             var nameStart = FindHelper.findNameIn(root, t.getName(), start, end, find);
             if (nameStart >= 0 && nameStart <= find && find <= nameStart + t.getName().length()) {
