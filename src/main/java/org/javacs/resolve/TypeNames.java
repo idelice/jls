@@ -5,6 +5,8 @@ import it.unimi.dsi.fastutil.objects.ObjectLinkedOpenHashSet;
 import java.util.Set;
 import java.util.Optional;
 import java.util.function.Predicate;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Shared type-name helpers for providers that need to normalize user/source names without
@@ -64,36 +66,45 @@ public final class TypeNames {
 
     public static Optional<String> resolveSimpleName(
             String simpleName, CompilationUnitTree root, Predicate<String> containsType) {
-        if (simpleName == null || simpleName.isBlank() || root == null || containsType == null) {
+        if (!isTypeNameCandidate(simpleName) || root == null || containsType == null) {
             return Optional.empty();
         }
-        // Short-circuit: Java type names start with uppercase; reject obvious non-types
-        if (Character.isLowerCase(simpleName.charAt(0)) && simpleName.indexOf('.') < 0) {
+        return resolveSimpleName(simpleName,
+                () -> root.getPackageName() == null ? "" : root.getPackageName().toString(), root.getImports(),
+                importTree -> importTree.isStatic() ? null : importTree.getQualifiedIdentifier().toString(), containsType);
+    }
+
+    /** Shared import policy for live syntax trees and stored source snapshots; imports exclude static imports. */
+    public static Optional<String> resolveSimpleName(
+            String simpleName, String packageName, Iterable<String> imports, Predicate<String> containsType) {
+        return resolveSimpleName(simpleName, () -> packageName, imports, Function.identity(), containsType);
+    }
+
+    private static <T> Optional<String> resolveSimpleName(
+            String simpleName, Supplier<String> packageName, Iterable<T> imports, Function<T, String> importName,
+            Predicate<String> containsType) {
+        if (!isTypeNameCandidate(simpleName) || containsType == null) {
             return Optional.empty();
         }
-        for (var importTree : root.getImports()) {
-            if (importTree.isStatic()) {
-                continue;
-            }
-            var imported = importTree.getQualifiedIdentifier().toString();
+        for (var entry : imports) {
+            var imported = importName.apply(entry);
+            if (imported == null) continue;
             if (!imported.endsWith(".*") && imported.endsWith("." + simpleName) && containsType.test(imported)) {
                 return Optional.of(imported);
             }
         }
         var candidates = new ObjectLinkedOpenHashSet<String>();
-        var packageName = root.getPackageName() == null ? "" : root.getPackageName().toString();
-        if (!packageName.isBlank()) {
-            var samePackage = packageName + "." + simpleName;
+        var sourcePackage = packageName.get();
+        if (sourcePackage != null && !sourcePackage.isBlank()) {
+            var samePackage = sourcePackage + "." + simpleName;
             if (containsType.test(samePackage)) {
                 candidates.add(samePackage);
             }
         }
 
-        for (var importTree : root.getImports()) {
-            if (importTree.isStatic()) {
-                continue;
-            }
-            var imported = importTree.getQualifiedIdentifier().toString();
+        for (var entry : imports) {
+            var imported = importName.apply(entry);
+            if (imported == null) continue;
             if (imported.endsWith(".*")) {
                 var candidate = imported.substring(0, imported.length() - 1) + simpleName;
                 if (containsType.test(candidate)) {
@@ -110,5 +121,11 @@ public final class TypeNames {
             return Optional.of(candidates.iterator().next());
         }
         return Optional.empty();
+    }
+
+    private static boolean isTypeNameCandidate(String name) {
+        // Preserve the existing rejection of lowercase simple names before inspecting source imports.
+        return name != null && !name.isBlank()
+                && (!Character.isLowerCase(name.charAt(0)) || name.indexOf('.') >= 0);
     }
 }
