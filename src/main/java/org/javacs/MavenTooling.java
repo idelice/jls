@@ -32,7 +32,7 @@ import org.w3c.dom.NodeList;
 public final class MavenTooling {
     private static final Logger LOG = Logger.getLogger("main");
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-    private static final int CACHE_VERSION = 5;
+    private static final int CACHE_VERSION = 6;
 
     static final Path NOT_FOUND = Paths.get("");
 
@@ -134,26 +134,12 @@ public final class MavenTooling {
             this(classpath, sources, Set.of());
         }
     }
-    private record ResolvedDependency(
-            String coordinates, String type, String classifier, String scope, Path path) {
-        boolean onMainClasspath() {
-            return "compile".equals(scope) || "provided".equals(scope) || "system".equals(scope);
-        }
-    }
     static final record MavenWorkspace(Path buildRoot, ModuleGraph graph) {}
     private record ResolvedMavenModel(ModuleGraph graph, CompilerArgs compilerArgs) {}
 
     // =========================================================================
     // Module Graph Resolution
     // =========================================================================
-
-    /** Build the exact single- or multi-module graph reported by Maven. */
-    public static ModuleGraph resolveModuleGraph(Path workspaceRoot) {
-        return resolveModuleGraph(
-                workspaceRoot,
-                Paths.get(System.getProperty("user.home")).resolve(".m2"),
-                System.getenv());
-    }
 
     static ModuleGraph resolveModuleGraph(
             Path workspaceRoot, Path mavenHome, Map<String, String> envVars) {
@@ -184,13 +170,7 @@ public final class MavenTooling {
         return false;
     }
 
-    static ModuleGraph parseEffectivePomModuleGraph(Path workspaceRoot, Path effectivePom) {
-        var document = parseXml(effectivePom);
-        if (document == null) return ModuleGraph.EMPTY;
-        return parseEffectivePomModuleGraph(workspaceRoot, document);
-    }
-
-    private static ModuleGraph parseEffectivePomModuleGraph(Path workspaceRoot, Document document) {
+    static ModuleGraph parseEffectivePomModuleGraph(Path workspaceRoot, Document document) {
         var projectElements = effectiveProjects(document);
         if (projectElements.isEmpty()) return ModuleGraph.EMPTY;
 
@@ -299,6 +279,7 @@ public final class MavenTooling {
         final String groupId;
         final String artifactId;
         final String declaredArtifactId;
+        final PomIdentity parent;
         final String version;
         final List<String> modules;
         final List<MavenDependency> dependencies;
@@ -312,6 +293,7 @@ public final class MavenTooling {
             this.groupId = textOf(element, "groupId");
             this.artifactId = textOf(element, "artifactId");
             this.declaredArtifactId = declaredArtifactId(element);
+            this.parent = pomIdentity(firstChild(element, "parent"));
             this.version = textOf(element, "version");
             this.modules = childTexts(firstChild(element, "modules"), "module");
             var dependenciesElement = firstChild(element, "dependencies");
@@ -389,20 +371,34 @@ public final class MavenTooling {
 
     private static EffectiveProject findEffectiveProject(
             Path pom, List<EffectiveProject> projects, Set<EffectiveProject> used) {
-        var identity = pomIdentity(pom);
+        var document = parseXml(pom);
+        if (document == null) return null;
+        var identity = pomIdentity(document.getDocumentElement());
         if (identity == null || identity.artifactId == null || identity.artifactId.isBlank()) return null;
         var matches = projects.stream()
                 .filter(project -> !used.contains(project))
                 .filter(project -> identity.matches(project))
                 .toList();
+        if (matches.size() > 1) {
+            matches = matches.stream().filter(identity::matchesParent).toList();
+        }
         return matches.size() == 1 ? matches.getFirst() : null;
     }
 
-    private record PomIdentity(String groupId, String artifactId, String version) {
+    private record PomIdentity(String groupId, String artifactId, String version, PomIdentity parent) {
         boolean matches(EffectiveProject project) {
             if (!artifactId.equals(project.artifactId) && !artifactId.equals(project.declaredArtifactId)) return false;
             if (isConcrete(groupId) && !groupId.equals(project.groupId)) return false;
             return !isConcrete(version) || version.equals(project.version);
+        }
+
+        boolean matchesParent(EffectiveProject project) {
+            if (parent != null && project.parent != null) {
+                if (isConcrete(parent.groupId) && !parent.groupId.equals(project.parent.groupId)) return false;
+                if (isConcrete(parent.artifactId) && !parent.artifactId.equals(project.parent.artifactId)) return false;
+                if (isConcrete(parent.version) && !parent.version.equals(project.parent.version)) return false;
+            }
+            return true;
         }
     }
 
@@ -425,16 +421,14 @@ public final class MavenTooling {
         return artifactId.getTextContent().trim();
     }
 
-    private static PomIdentity pomIdentity(Path pom) {
-        var document = parseXml(pom);
-        if (document == null) return null;
-        var project = document.getDocumentElement();
+    private static PomIdentity pomIdentity(Element project) {
+        if (project == null) return null;
         var parent = firstChild(project, "parent");
         var groupId = textOf(project, "groupId");
         if (groupId == null) groupId = textOf(parent, "groupId");
         var version = textOf(project, "version");
         if (version == null) version = textOf(parent, "version");
-        return new PomIdentity(groupId, textOf(project, "artifactId"), version);
+        return new PomIdentity(groupId, textOf(project, "artifactId"), version, pomIdentity(parent));
     }
 
     private static String projectPath(Path workspaceRoot, Path moduleDir) {
@@ -535,8 +529,8 @@ public final class MavenTooling {
                     Duration.between(started, Instant.now()).toMillis()));
             var immutableClasspath = Set.copyOf(classpath);
             var immutableSources = Set.copyOf(sources);
-            storeCachedMavenDependencies(pomXml, DEPENDENCY_LIST, mavenHome, cacheHome, immutableClasspath, modulePath);
-            storeCachedMavenDependencies(pomXml, DEPENDENCY_SOURCES, mavenHome, cacheHome, immutableSources, modulePath);
+            storeCachedMavenDependencies(pomXml, mavenHome, cacheHome, Map.of(DEPENDENCY_LIST, immutableClasspath), modulePath);
+            storeCachedMavenDependencies(pomXml, mavenHome, cacheHome, Map.of(DEPENDENCY_SOURCES, immutableSources), modulePath);
             CacheAudit.store("infer_config.maven_dependencies");
             return new MavenDependencies(immutableClasspath, immutableSources);
         } catch (InterruptedException | IOException e) {
@@ -669,7 +663,7 @@ public final class MavenTooling {
     private static ResolvedMavenModel loadCachedMavenModel(
             Path pomXml, Path mavenHome, Path cacheHome) {
         var workspaceRoot = normalizePath(pomXml).getParent();
-        var cache = readCacheFile(workspaceCacheFile(workspaceRoot, cacheHome));
+        var cache = readCacheFile(workspaceCacheFile(workspaceRoot, cacheHome, null));
         if (cache == null || cache.version() != CACHE_VERSION || cache.compilerLevel() == null || cache.moduleGraph() == null) return null;
         var inputs = getCacheInputs(workspaceRoot, mavenHome);
         if (!Objects.equals(cache.moduleGraph().pomInputs(), inputs.pomInputs())
@@ -709,7 +703,7 @@ public final class MavenTooling {
     private static void storeCachedMavenModel(
             Path pomXml, Path mavenHome, Path cacheHome, ResolvedMavenModel model) {
         var workspaceRoot = normalizePath(pomXml).getParent();
-        var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome);
+        var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, null);
         var cache = readCacheFile(cacheFile);
         var inputs = getCacheInputs(workspaceRoot, mavenHome);
         var modules = model.graph().modules().values().stream()
@@ -747,12 +741,6 @@ public final class MavenTooling {
     }
 
     static void storeCachedMavenDependencies(
-            Path pomXml, String goal, Path mavenHome, Path cacheHome, Set<Path> dependencies, String modulePath) {
-        storeCachedMavenDependencies(
-                pomXml, mavenHome, cacheHome, Map.of(goal, dependencies), modulePath);
-    }
-
-    private static void storeCachedMavenDependencies(
             Path pomXml,
             Path mavenHome,
             Path cacheHome,
@@ -793,10 +781,6 @@ public final class MavenTooling {
             LOG.fine(String.format("Failed to read Maven cache file %s: %s", cacheFile, e.getMessage()));
             return null;
         }
-    }
-
-    static Path workspaceCacheFile(Path workspaceRoot, Path cacheHome) {
-        return workspaceCacheFile(workspaceRoot, cacheHome, null);
     }
 
     static Path workspaceCacheFile(Path workspaceRoot, Path cacheHome, String modulePath) {
@@ -863,13 +847,13 @@ public final class MavenTooling {
     }
 
     private static CompilerArgs parseCompilerArgs(Element project) {
-        var release = property(project, "maven.compiler.release");
-        if (isConcreteJavaLevel(release)) return new CompilerArgs(List.of("--release", release), "maven_release", false);
+        var release = nestedText(project, "properties", "maven.compiler.release");
+        if (isConcrete(release)) return new CompilerArgs(List.of("--release", release), "maven_release", false);
         var pluginRelease = compilerPluginRelease(project);
-        if (isConcreteJavaLevel(pluginRelease)) return new CompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
-        var source = property(project, "maven.compiler.source");
-        var target = property(project, "maven.compiler.target");
-        if (isConcreteJavaLevel(source) && isConcreteJavaLevel(target)) return sourceTargetArgs(source, target);
+        if (isConcrete(pluginRelease)) return new CompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
+        var source = nestedText(project, "properties", "maven.compiler.source");
+        var target = nestedText(project, "properties", "maven.compiler.target");
+        if (isConcrete(source) && isConcrete(target)) return sourceTargetArgs(source, target);
         return compilerPluginSourceTarget(project);
     }
 
@@ -883,7 +867,7 @@ public final class MavenTooling {
         if (plugin == null) return CompilerArgs.none();
         var source = nestedText(plugin, "configuration", "source");
         var target = nestedText(plugin, "configuration", "target");
-        return !isConcreteJavaLevel(source) || !isConcreteJavaLevel(target)
+        return !isConcrete(source) || !isConcrete(target)
                 ? CompilerArgs.none() : sourceTargetArgs(source, target);
     }
 
@@ -1079,23 +1063,9 @@ public final class MavenTooling {
     }
 
     static Path readDependency(String line) {
-        var dependency = readResolvedDependency(line);
-        return dependency == null ? NOT_FOUND : dependency.path();
-    }
-
-    private static ResolvedDependency readResolvedDependency(String line) {
         var match = DEPENDENCY.matcher(line);
-        if (!match.matches()) return null;
-        var parts = match.group(1).split(":");
-        if (parts.length < 5) return null;
-        var coordinates = parts[0] + ":" + parts[1] + ":" + parts[parts.length - 2];
-        var classifier = parts.length > 5 ? parts[3] : "";
-        return new ResolvedDependency(
-                coordinates,
-                parts[2],
-                classifier,
-                parts[parts.length - 1],
-                Paths.get(match.group(2)));
+        if (!match.matches() || match.group(1).split(":").length < 5) return NOT_FOUND;
+        return Paths.get(match.group(2));
     }
 
     // =========================================================================
@@ -1155,14 +1125,6 @@ public final class MavenTooling {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    private static String property(Element project, String name) {
-        return nestedText(project, "properties", name);
-    }
-
-    private static boolean isConcreteJavaLevel(String value) {
-        return value != null && !value.isBlank() && !value.contains("${");
     }
 
     private static void deleteIfExists(Path path) {
