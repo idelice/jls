@@ -801,7 +801,8 @@ public class WorkspaceTypeIndex {
                 } else {
                     var resolved = resolveInEnclosingScopes(rawSupertype, qualifiedName, workspaceContains);
                     if (resolved == null && snapshot != null) {
-                        resolved = resolveSimpleTypeNameFromSnapshot(rawSupertype, snapshot, workspaceContains);
+                        resolved = TypeNames.resolveSimpleName(
+                                rawSupertype, snapshot.packageName, snapshot.imports, workspaceContains).orElse(null);
                     }
                     if (resolved != null) typeSupertypes.put(qualifiedName, resolved);
                 }
@@ -817,7 +818,8 @@ public class WorkspaceTypeIndex {
                     } else {
                         var r = resolveInEnclosingScopes(rawIface, qualifiedName, workspaceContains);
                         if (r == null && snapshot != null) {
-                            r = resolveSimpleTypeNameFromSnapshot(rawIface, snapshot, workspaceContains);
+                            r = TypeNames.resolveSimpleName(
+                                    rawIface, snapshot.packageName, snapshot.imports, workspaceContains).orElse(null);
                         }
                         if (r != null) resolved.add(r);
                     }
@@ -880,37 +882,6 @@ public class WorkspaceTypeIndex {
             out.put(e.getKey(), List.copyOf(e.getValue()));
         }
         return out;
-    }
-
-    /** Resolve a simple type name using import/package data from a SourceFileSnapshot. */
-    private static String resolveSimpleTypeNameFromSnapshot(
-            String simpleName, SourceFileSnapshot snapshot, Predicate<String> containsType) {
-        if (simpleName == null || simpleName.isBlank()) return null;
-        if (Character.isLowerCase(simpleName.charAt(0)) && simpleName.indexOf('.') < 0) return null;
-        // Check explicit imports
-        for (var imported : snapshot.imports) {
-            if (!imported.endsWith(".*") && imported.endsWith("." + simpleName) && containsType.test(imported)) {
-                return imported;
-            }
-        }
-        // Check same package
-        var candidates = new ObjectLinkedOpenHashSet<String>();
-        if (snapshot.packageName != null && !snapshot.packageName.isBlank()) {
-            var samePackage = snapshot.packageName + "." + simpleName;
-            if (containsType.test(samePackage)) candidates.add(samePackage);
-        }
-        // Check wildcard imports
-        for (var imported : snapshot.imports) {
-            if (imported.endsWith(".*")) {
-                var candidate = imported.substring(0, imported.length() - 1) + simpleName;
-                if (containsType.test(candidate)) candidates.add(candidate);
-            }
-        }
-        // Check java.lang
-        var javaLang = "java.lang." + simpleName;
-        if (containsType.test(javaLang)) candidates.add(javaLang);
-        if (candidates.size() == 1) return candidates.iterator().next();
-        return null;
     }
 
     private static Map<Path, SourceFileSnapshot> finalizeSourceFiles(
@@ -1386,7 +1357,8 @@ public class WorkspaceTypeIndex {
                 var type = params[i];
                 var arrayStart = type.indexOf('[');
                 var component = arrayStart < 0 ? type : type.substring(0, arrayStart);
-                var resolved = resolveSimpleTypeNameFromSnapshot(component, snapshot, containsType);
+                var resolved = TypeNames.resolveSimpleName(
+                        component, snapshot.packageName, snapshot.imports, containsType).orElse(null);
                 if (resolved != null) params[i] = resolved + (arrayStart < 0 ? "" : type.substring(arrayStart));
             }
         }
