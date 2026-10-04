@@ -18,6 +18,8 @@ import com.sun.tools.javac.code.Preview;
 import com.sun.tools.javac.code.Types;
 import com.sun.tools.javac.comp.*;
 import com.sun.tools.javac.main.Arguments;
+import com.sun.tools.javac.main.DelegatingJavaFileManager;
+import com.sun.tools.javac.main.Option;
 import com.sun.tools.javac.main.JavaCompiler;
 import com.sun.tools.javac.model.JavacElements;
 import com.sun.tools.javac.platform.PlatformDescription;
@@ -44,7 +46,6 @@ final class ReusableCompiler {
     private static final AtomicLong IDS = new AtomicLong();
     private static final LinkedHashMap<ReusableCompiler, Boolean> IDLE = new LinkedHashMap<>();
     private static final int MAX_IDLE_CONTEXTS = 4;
-    private static final int MAX_USES = 64;
     private ReusableContext context;
     private boolean checkedOut;
     /** Single-module projects keep scan contexts warm; reactors retire them to spare the idle pool. */
@@ -148,7 +149,6 @@ final class ReusableCompiler {
                 if (!valid) discard("analysis_failed");
                 else if (oneShot) discard("one_shot_scan");
                 else if (borrowed.polluted) discard("polluted");
-                else if (borrowed.uses >= MAX_USES) discard("use_limit");
                 else retain();
             }
         }
@@ -159,6 +159,8 @@ final class ReusableCompiler {
         final List<String> options;
         final List<CompilationUnitTree> roots = new ArrayList<>();
         final List<PlatformDescription> platforms = new ArrayList<>();
+        PlatformDescription releasePlatform;
+        JavaFileManager releaseFiles;
         /** Every source this context has entered, including files javac loaded implicitly. */
         final Set<Path> parsed = new HashSet<>();
         long revision;
@@ -169,6 +171,31 @@ final class ReusableCompiler {
             this.options = List.copyOf(options);
             put(Log.logKey, (Factory<Log>) ReusableLog::new);
             put(JavaCompiler.compilerKey, (Factory<JavaCompiler>) ReusableJavaCompiler::new);
+            put(Arguments.argsKey, (Factory<Arguments>) ReusableArguments::new);
+        }
+
+        /** Options are immutable for this context; validate release setup once and reuse its files. */
+        private final class ReusableArguments extends Arguments {
+            ReusableArguments(Context context) { super(context); }
+
+            @Override public boolean handleReleaseOptions(java.util.function.Predicate<Iterable<String>> additionalOptions) {
+                var baseFiles = get(JavaFileManager.class);
+                if (releasePlatform == null) {
+                    if (!super.handleReleaseOptions(additionalOptions)) return false;
+                    releasePlatform = get(PlatformDescription.class);
+                    if (releasePlatform == null) return true;
+                    capturePlatform();
+                    releaseFiles = releasePlatform.getFileManager();
+                } else {
+                    var compilerOptions = Options.instance(ReusableContext.this);
+                    compilerOptions.put(Option.SOURCE, releasePlatform.getSourceVersion());
+                    compilerOptions.put(Option.TARGET, releasePlatform.getTargetVersion());
+                    if (!additionalOptions.test(releasePlatform.getAdditionalOptions())) return false;
+                    put(PlatformDescription.class, releasePlatform);
+                }
+                DelegatingJavaFileManager.installReleaseFileManager(ReusableContext.this, releaseFiles, baseFiles);
+                return true;
+            }
         }
 
         void capturePlatform() {
@@ -239,6 +266,7 @@ final class ReusableCompiler {
             }.scan(roots, null);
             roots.clear();
             drop(Arguments.argsKey);
+            put(Arguments.argsKey, (Factory<Arguments>) ReusableArguments::new);
             drop(DiagnosticListener.class);
             drop(Log.outKey);
             drop(Log.errKey);
@@ -263,11 +291,16 @@ final class ReusableCompiler {
 
         void dispose() {
             capturePlatform();
+            if (releaseFiles != null) {
+                try { releaseFiles.close(); } catch (IOException e) { LOG.fine(e.getMessage()); }
+            }
             // Warm components can retain any release file manager. Close them only on retirement.
             for (var platform : platforms) {
                 try { platform.close(); } catch (IOException e) { LOG.fine(e.getMessage()); }
             }
             platforms.clear();
+            releasePlatform = null;
+            releaseFiles = null;
             roots.clear();
             parsed.clear();
             ht.clear();
