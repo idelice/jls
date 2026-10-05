@@ -1119,6 +1119,11 @@ public final class MavenTooling {
                     }
                     return FileVisitResult.CONTINUE;
                 }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    return FileVisitResult.CONTINUE;
+                }
             });
             result.sort(Comparator.naturalOrder());
             return List.copyOf(result);
