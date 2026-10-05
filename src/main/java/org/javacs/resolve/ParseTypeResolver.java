@@ -102,7 +102,8 @@ public final class ParseTypeResolver {
     private final TypeIndexRouter index;
     private final FunctionalTargetResolver functionalTargetResolver;
     private final long cursor;
-    private final TreePath cursorPath;
+    private TreePath cursorPath;
+    private final com.sun.source.util.JavacTask javacTask;
     private ScopeSnapshot scopeSnapshot;
     private ClassLoader externalClassLoader;
     private TypeResolution thisType;
@@ -114,7 +115,7 @@ public final class ParseTypeResolver {
         this.compiler = compiler;
         this.index = index == null ? TypeIndexRouter.EMPTY : index;
         this.cursor = cursor;
-        this.cursorPath = new FindCompletionsAt(parseTask.task()).scan(parseTask.root(), cursor);
+        this.javacTask = parseTask.task();
         this.functionalTargetResolver =
                         new FunctionalTargetResolver(
                                 root,
@@ -643,13 +644,10 @@ public final class ParseTypeResolver {
             default -> {}
         }
         var resolved =
-                sourceRoot == root
-                        ? resolveTypeNameInSource(typeName, sourceRoot)
-                                .or(
-                                        () ->
-                                                index.resolveType(typeName, sourceRoot)
-                                                        .map(indexed -> indexed.qualifiedName))
-                        : index.resolveType(typeName, sourceRoot).map(indexed -> indexed.qualifiedName);
+                index.resolveType(typeName, sourceRoot).map(indexed -> indexed.qualifiedName)
+                        .or(() -> sourceRoot == root
+                                ? resolveTypeNameInSource(typeName, sourceRoot)
+                                : Optional.empty());
         if (resolved.isEmpty() && sourceRoot != root) {
             resolved = resolveTypeNameInSource(typeName, sourceRoot);
         }
@@ -1321,8 +1319,8 @@ public final class ParseTypeResolver {
             return Optional.empty();
         }
         var resolved =
-                resolveTypeNameInSource(normalized, root)
-                        .or(() -> index.resolveType(normalized, root).map(indexed -> indexed.qualifiedName));
+                index.resolveType(normalized, root).map(indexed -> indexed.qualifiedName)
+                        .or(() -> resolveTypeNameInSource(normalized, root));
         if (resolved.isEmpty()) {
             return Optional.empty();
         }
@@ -1442,6 +1440,9 @@ public final class ParseTypeResolver {
     private ScopeSnapshot scopeSnapshot() {
         if (scopeSnapshot != null) {
             return scopeSnapshot;
+        }
+        if (cursorPath == null) {
+            cursorPath = new FindCompletionsAt(javacTask).scan(root, cursor);
         }
 
         final TreePath[] enclosingClass = {parentClassPath(cursorPath)};

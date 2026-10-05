@@ -272,7 +272,6 @@ public class CompletionProvider {
         var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
         var memberAccess = memberAccessContext(pruned, (int) cursor);
         if (memberAccess == null) {
-            // Log what's around the cursor to debug why member access wasn't detected
             var start = Math.max(0, (int) cursor - 20);
             var end = Math.min(pruned.length(), (int) cursor + 10);
             LOG.fine(String.format("[completion] memberAccess=null cursor=%d context='%s'",
@@ -285,10 +284,6 @@ public class CompletionProvider {
         return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, annotationContext, parseMs);
     }
 
-    /**
-     * Scans source text up to cursor offset to determine if the cursor is inside a comment.
-     * Tracks string and char literals to avoid false positives where // or /* appear inside strings.
-     */
     private static boolean isInComment(String source, long cursorOffset) {
         var inLineComment = false;
         var inBlockComment = false;
@@ -402,20 +397,23 @@ public class CompletionProvider {
         }
         var index = typeIndexRouter;
         var started = Instant.now();
-        var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
         var expression = memberReceiverExpression(parsePath);
         if (expression == null && memberAccess.receiver().isEmpty()) {
-            // ParsePath didn't find a MemberSelectTree at the cursor (e.g. double-dot error recovery).
-            // Fall back to finding the expression that ends exactly at the separator position.
             expression = findExpressionEndingAt(parseTask, memberAccess.separatorEnd());
         }
-        var resolveStarted = Instant.now();
-        var resolved = resolver.resolve(expression, memberAccess.receiver());
-        var resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
+        Optional<ParseTypeResolver.TypeResolution> resolved;
+        long resolveMs;
+        var importedType = index.resolveTypeName(memberAccess.receiver(), parseTask.root());
+        if (importedType.isPresent()) {
+            resolved = Optional.of(new ParseTypeResolver.TypeResolution(importedType.get(), true, false));
+            resolveMs = 0;
+        } else {
+            var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
+            var resolveStarted = Instant.now();
+            resolved = resolver.resolve(expression, memberAccess.receiver());
+            resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
+        }
         if (resolved.isEmpty()) {
-            // TODO: ParseTypeResolver cannot infer types for lambda parameters, var with generic
-            // inference, or complex method chains. Fall back to the compile cache which has full
-            // javac attribution from the last successful ATTR compile.
             var cacheFallback = tryResolveMemberFromCompileCache(parseTask, cursor, memberAccess);
             if (cacheFallback != null) {
                 LOG.fine(String.format("[completion] compile_cache_fallback receiver='%s' items=%d",
@@ -430,7 +428,7 @@ public class CompletionProvider {
         if (!target.arrayType() && !isQualifiedTypeName(target.qualifiedType())) {
             return new IndexedCompletionResult(EMPTY, resolveMs, "non_fqn_type");
         }
-        var currentType = resolver.currentEnclosingTypeName();
+        var currentType = new ParseTypeResolver(parseTask, compiler, index, cursor).currentEnclosingTypeName();
         if (target.arrayType()) {
             return new IndexedCompletionResult(
                     completeArrayMemberSelect(target.staticContext()), resolveMs, "array_type");
@@ -486,8 +484,14 @@ public class CompletionProvider {
                 list.add(item);
             }
         }
+        byte[] ownerClassBytes = null;
+        if (!methods.isEmpty()) {
+            var ownerType = methods.firstEntry().getValue().getFirst().ownerType;
+            var bytes = compiler.findClassFile(ownerType);
+            if (bytes.isPresent()) ownerClassBytes = bytes.get();
+        }
         for (var entry : methods.entrySet()) {
-            var method = indexedMethod(entry.getValue(), memberAccess.methodReference() ? false : !endsWithParen);
+            var method = indexedMethod(entry.getValue(), memberAccess.methodReference() ? false : !endsWithParen, ownerClassBytes);
             method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
             list.add(method);
         }
@@ -594,7 +598,7 @@ public class CompletionProvider {
         var item = new CompletionItem();
         item.label = member.name;
         item.kind = member.kind;
-        item.detail = resolveDetail(member);
+        item.detail = resolveDetail(member, null);
         item.insertText = member.name;
         item.insertTextFormat = InsertTextFormat.PlainText;
         var data = new CompletionData();
@@ -605,12 +609,12 @@ public class CompletionProvider {
         return item;
     }
 
-    private CompletionItem indexedMethod(List<IndexedMember> overloads, boolean addParens) {
+    private CompletionItem indexedMethod(List<IndexedMember> overloads, boolean addParens, byte[] classBytes) {
         var first = overloads.get(0);
         var item = new CompletionItem();
         item.label = first.name;
         item.kind = CompletionItemKind.Method;
-        item.detail = resolveDetail(first);
+        item.detail = resolveDetail(first, classBytes);
         if (addParens) {
             var noArgs =
                     overloads.size() == 1
@@ -637,15 +641,18 @@ public class CompletionProvider {
     }
 
     /** Rebuild the detail string with real parameter names from the classfile LVT when the index only has types. */
-    private String resolveDetail(IndexedMember member) {
+    private String resolveDetail(IndexedMember member, byte[] classBytes) {
         if (member.parameterNames != null || member.erasedParameterTypes == null
                 || member.erasedParameterTypes.length == 0 || member.kind == CompletionItemKind.Field) {
             return member.detail;
         }
-        var classBytes = compiler.findClassFile(member.ownerType);
-        if (classBytes.isEmpty()) return member.detail;
+        if (classBytes == null) {
+            var bytes = compiler.findClassFile(member.ownerType);
+            if (bytes.isEmpty()) return member.detail;
+            classBytes = bytes.get();
+        }
         var names = ClassFileParameterNames.read(
-                classBytes.get(), member.name, member.erasedParameterTypes,
+                classBytes, member.name, member.erasedParameterTypes,
                 member.isStatic);
         if (names == null) return member.detail;
         var params = new StringJoiner(", ");
@@ -1098,7 +1105,7 @@ public class CompletionProvider {
             }
         }
         for (var entry : methods.entrySet()) {
-            var method = indexedMethod(entry.getValue(), !endsWithParen);
+            var method = indexedMethod(entry.getValue(), !endsWithParen, null);
             method.sortText =
                     sortKey(
                             methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
@@ -1404,7 +1411,7 @@ public class CompletionProvider {
         }
         for (var entry : methods.entrySet()) {
             if (!seen.add(entry.getKey())) continue;
-            var method = indexedMethod(entry.getValue(), !endsWithParen);
+            var method = indexedMethod(entry.getValue(), !endsWithParen, null);
             method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
             list.items.add(method);
         }
@@ -1555,7 +1562,6 @@ public class CompletionProvider {
             var trees = task.trees;
             var pos = trees.getSourcePositions();
             var root = task.root(file);
-            // Find the identifier at the cursor position in the attributed tree
             var found = new Object() { TreePath result; };
             new TreePathScanner<Void, Void>() {
                 @Override
@@ -1563,7 +1569,6 @@ public class CompletionProvider {
                     if (id.getName().contentEquals(memberAccess.receiver())) {
                         long start = pos.getStartPosition(root, id);
                         long end = pos.getEndPosition(root, id);
-                        // Match by proximity to cursor (receiver is just before the dot)
                         if (start >= 0 && end >= 0 && end <= cursor && cursor - end <= 2) {
                             found.result = getCurrentPath();
                         }
@@ -1587,7 +1592,6 @@ public class CompletionProvider {
                 default -> null;
             };
             if (qualifiedType == null || qualifiedType.isBlank()) return null;
-            // Use the type index to get members (consistent with the normal path)
             var members = typeIndexRouter.members(qualifiedType, false);
             if (members.isEmpty()) return null;
             var list = new ArrayList<CompletionItem>();
@@ -1606,7 +1610,7 @@ public class CompletionProvider {
                 }
             }
             for (var entry : methods.entrySet()) {
-                var method = indexedMethod(entry.getValue(), true);
+                var method = indexedMethod(entry.getValue(), true, null);
                 method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
                 list.add(method);
             }

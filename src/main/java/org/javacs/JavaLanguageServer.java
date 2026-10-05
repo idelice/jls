@@ -541,7 +541,8 @@ class JavaLanguageServer extends LanguageServer {
         }
         var snapshot = completionSnapshotRef.get();
         var provider = new CompletionProvider(
-                compilerFor(file), moduleRegistry.typeIndexFor(file), snapshot.version(), moduleRegistry.moduleCompilerKey(file));
+                compilerFor(file), moduleRegistry.typeIndexFor(file), snapshot.version(),
+                moduleRegistry.moduleCompilerKey(file));
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(String.format("[perf] completion_request file=%s took=%dms",
