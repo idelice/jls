@@ -278,12 +278,10 @@ public class LSP {
 
         // Process messages on main thread
         LOG.info("Reading messages from queue...");
-        var hasAsyncWork = false;
         processMessages:
         while (true) {
             Message r;
             try {
-                // Take a break periodically
                 r = pending.poll(200, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
                 LOG.log(Level.SEVERE, e.getMessage(), e);
@@ -294,16 +292,9 @@ public class LSP {
                 LOG.warning("Stream from client has been closed, exiting...");
                 break processMessages;
             }
-            // If poll(_) failed, loop again
             if (r == null) {
-                if (hasAsyncWork) {
-                    server.doAsyncWork();
-                    hasAsyncWork = false;
-                }
                 continue;
             }
-            // Otherwise, process the new message
-            hasAsyncWork = true;
             if (r.method == null) {
                 // Response to a server-initiated request; we don't track callbacks.
                 continue;
