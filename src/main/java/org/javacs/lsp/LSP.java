@@ -371,13 +371,6 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
-                    case "textDocument/inlayHint":
-                        {
-                            var params = gson.fromJson(r.params, InlayHintParams.class);
-                            var response = server.inlayHint(params);
-                            respond(send, r.id, response);
-                            break;
-                        }
                     case "textDocument/didOpen":
                         {
                             var params = gson.fromJson(r.params, DidOpenTextDocumentParams.class);
@@ -580,13 +573,6 @@ public class LSP {
                         {
                             var params = gson.fromJson(r.params, FoldingRangeParams.class);
                             var response = server.foldingRange(params);
-                            respond(send, r.id, response);
-                            break;
-                        }
-                    case "textDocument/diagnostic":
-                        {
-                            var params = gson.fromJson(r.params, DocumentDiagnosticParams.class);
-                            var response = server.textDocumentDiagnostic(params);
                             respond(send, r.id, response);
                             break;
                         }

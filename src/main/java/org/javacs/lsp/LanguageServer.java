@@ -156,16 +156,8 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
-    public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
-        return Optional.of(List.of());
-    }
-
     public List<DocumentLink> documentLink(DocumentLinkParams params) {
         throw new RuntimeException("Unimplemented");
-    }
-
-    public DocumentDiagnosticReport textDocumentDiagnostic(DocumentDiagnosticParams params) {
-        return new DocumentDiagnosticReport(List.of());
     }
 
     public void doAsyncWork() {}

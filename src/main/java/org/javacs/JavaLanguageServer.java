@@ -85,10 +85,6 @@ class JavaLanguageServer extends LanguageServer {
     final ModuleCompilerRegistry moduleRegistry = new ModuleCompilerRegistry(this);
     volatile Path activeModuleFile;
 
-    // Guards cross-file diagnostic propagation: compiling a dependent file re-enters
-    // textDocumentDiagnostic -> propagate; this flag stops propagation at one level.
-    private boolean propagatingDiagnostics;
-
     // Gradle module graph — populated during createCompilers() for Gradle projects.
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
     ModuleGraph moduleGraph = ModuleGraph.EMPTY;
@@ -206,9 +202,7 @@ class JavaLanguageServer extends LanguageServer {
             appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
             publishExternalBinaryIndexSnapshot();
             refreshStateForCompilerRecreated();
-            propagatingDiagnostics = true;
-            try { lint(filterJavaFiles(FileStore.activeDocuments())); }
-            finally { propagatingDiagnostics = false; }
+            for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, -1, false);
         } finally {
             notifyWorkspaceInfo();
             LOG.info(String.format(
@@ -359,7 +353,6 @@ class JavaLanguageServer extends LanguageServer {
         var codeLensOptions = new JsonObject();
         c.add("codeLensProvider", codeLensOptions);
         c.addProperty("foldingRangeProvider", true);
-        c.addProperty("inlayHintProvider", true);
         var codeActionOptions = new JsonObject();
         codeActionOptions.addProperty("resolveProvider", true);
         c.add("codeActionProvider", codeActionOptions);
@@ -513,9 +506,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         if (refreshActiveDiagnostics) {
-            propagatingDiagnostics = true;
-            try { lint(filterJavaFiles(FileStore.activeDocuments())); }
-            finally { propagatingDiagnostics = false; }
+            for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, -1, false);
         }
         if (compilerInputsChanged) {
             recreateCompilersAndRefreshState("didChangeWatchedFiles");
@@ -784,18 +775,6 @@ class JavaLanguageServer extends LanguageServer {
         return new FoldProvider(compilerFor(file)).foldingRanges(file);
     }
 
-    @Override
-    public Optional<List<InlayHint>> inlayHint(InlayHintParams params) {
-        if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.of(List.of());
-        if (compiler == null) return Optional.of(List.of());
-        var file = Paths.get(params.textDocument.uri);
-        var requestCompiler = compilerFor(file);
-        try (var task = requestCompiler.compile(file)) {
-            return Optional.of(new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
-                    .inlayHints(task, file, params.range));
-        }
-    }
-
     private final RenameHandler renameHandler = new RenameHandler(this);
 
     @Override
@@ -813,87 +792,12 @@ class JavaLanguageServer extends LanguageServer {
         if (params != null && params.changes != null) didChangeWatchedFiles(params);
     }
 
-    @Override
-    public DocumentDiagnosticReport textDocumentDiagnostic(DocumentDiagnosticParams params) {
-        if (!FileStore.isJavaFile(params.textDocument.uri)) {
-            return new DocumentDiagnosticReport(List.of());
-        }
-        var file = Paths.get(params.textDocument.uri);
-        try {
-            if (compiler == null) {
-                return new DocumentDiagnosticReport(List.of());
-            }
-            LOG.info("[diagnostics] pull_compile_start file=" + file.getFileName());
-            var started = System.nanoTime();
-            DocumentDiagnosticReport report = null;
-            var sources = List.<JavaFileObject>of(new SourceFileObject(file));
-            var requestCompiler = compilerFor(file);
-            String compileProgressToken = null;
-            // A warm context answers in milliseconds; only announce a cold multi-module compile.
-            if (moduleRegistry.multiModule() && !requestCompiler.hasWarmContext()) {
-                compileProgressToken = progress.begin(
-                        "Compiling", "Compiling " + file.getFileName());
-            }
-            try (var task = requestCompiler.compile(sources)) {
-                var durationMs = Duration.ofNanos(System.nanoTime() - started).toMillis();
-                if (compileProgressToken != null) {
-                    progress.end(compileProgressToken, "Compiled");
-                    compileProgressToken = null;
-                }
-                var errorProvider = new ErrorProvider(task);
-                var errorReport = errorProvider.errors(Set.of(file.toUri()));
-                LOG.info(String.format(
-                        "[diagnostics] pull_compile_done file=%s duration=%dms errors=%d",
-                        file.getFileName(), durationMs, errorReport.compilerDiagnosticsCount()));
-
-                // Piggyback: compute inlay hints on the same attributed tree.
-                try {
-                    var hints = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
-                            .inlayHints(task, file, null);
-                    if (!hints.isEmpty()) {
-                        var payload = new JsonObject();
-                        payload.addProperty("uri", file.toUri().toString());
-                        payload.add("hints", new Gson().toJsonTree(hints));
-                        client.customNotification("java/inlayHints", payload);
-                    }
-                } catch (Exception hintError) {
-                    LOG.fine("[inlayHints] piggyback failed: " + hintError.getMessage());
-                }
-
-                for (var diagParams : errorReport.diagnostics()) {
-                    if (file.toUri().equals(diagParams.uri)) {
-                        client.publishDiagnostics(diagParams);
-                        report = new DocumentDiagnosticReport("full", null, diagParams.diagnostics);
-                        break;
-                    }
-                }
-                if (report == null) {
-                    client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
-                    report = new DocumentDiagnosticReport("full", null, List.of());
-                }
-            } finally {
-                if (compileProgressToken != null) {
-                    progress.end(compileProgressToken, "Compiled");
-                }
-            }
-            // Propagate AFTER the outer task closes — a dependent file in the same module would
-            // otherwise nest a compile on the same warm context (checkedOut=true -> failure).
-            propagateDiagnostics(file);
-            return report;
-        } catch (Exception e) {
-            LOG.warning("[diagnostics] pull_compile_failed file=" + file.getFileName()
-                    + " reason=" + e.getMessage());
-            return new DocumentDiagnosticReport(List.of());
-        }
-    }
-
     /**
      * After compiling {@code changed}, re-lint the active documents that reference its declared
      * types so cross-file errors surface without the client issuing one request per open buffer.
-     * Guarded by {@link #propagatingDiagnostics} so a propagated lint does not propagate again.
+     * Dependents are linted with propagate=false to prevent recursion.
      */
     private void propagateDiagnostics(Path changed) {
-        if (propagatingDiagnostics) return;
         try {
             var snapshot = completionSnapshotRef.get();
             if (snapshot == null) return;
@@ -921,22 +825,10 @@ class JavaLanguageServer extends LanguageServer {
             LOG.info(String.format(
                     "[diagnostics] propagate from=%s dependents=%d",
                     changed.getFileName(), dependents.size()));
-            propagatingDiagnostics = true;
-            lint(dependents);
+            for (var f : dependents) lint(f, -1, false);
         } catch (Exception e) {
             LOG.warning("[diagnostics] propagate_failed file=" + changed.getFileName()
                     + " reason=" + e.getMessage());
-        } finally {
-            propagatingDiagnostics = false;
-        }
-    }
-
-    /** Test helper: trigger diagnostics for a set of files synchronously. */
-    void lint(Collection<Path> files) {
-        for (var file : files) {
-            var params = new DocumentDiagnosticParams();
-            params.textDocument = new TextDocumentIdentifier(file.toUri());
-            textDocumentDiagnostic(params);
         }
     }
 
@@ -954,7 +846,7 @@ class JavaLanguageServer extends LanguageServer {
         // Index the active module and its dependency sources. Sibling modules are only visible
         // through their source, so a workspace-size shortcut here would leave completion empty.
         completionIndexScheduler.ensureIndexed(file);
-        lint(List.of(file));
+        lint(file, -1);
     }
 
     @Override
@@ -963,6 +855,66 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
         completionIndexScheduler.filesChanged(List.of(file));
+        int editLine = -1;
+        if (!params.contentChanges.isEmpty()) {
+            var range = params.contentChanges.getFirst().range;
+            if (range != null) editLine = range.start.line;
+        }
+        lint(file, editLine);
+    }
+
+    private void lint(Path file, int hintCenterLine) {
+        lint(file, hintCenterLine, true);
+    }
+
+    private void lint(Path file, int hintCenterLine, boolean propagate) {
+        if (compiler == null) return;
+        try {
+            var requestCompiler = compilerFor(file);
+            try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
+                publishFileDiagnostics(task, file);
+                Range hintRange = null;
+                if (hintCenterLine >= 0) {
+                    hintRange = new Range(
+                            new Position(Math.max(0, hintCenterLine - 50), 0),
+                            new Position(hintCenterLine + 50, 0));
+                }
+                pushHints(requestCompiler, task, file, hintRange);
+            }
+        } catch (Exception e) {
+            LOG.fine("[lint] failed file=" + file.getFileName() + " reason=" + e.getMessage());
+        }
+        if (propagate) propagateDiagnostics(file);
+    }
+
+    private void publishFileDiagnostics(CompileTask task, Path file) {
+        var errorReport = new ErrorProvider(task).errors(Set.of(file.toUri()));
+        for (var params : errorReport.diagnostics()) {
+            if (file.toUri().equals(params.uri)) {
+                client.publishDiagnostics(params);
+                return;
+            }
+        }
+        client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
+    }
+
+    private void pushHints(JavaCompilerService requestCompiler, CompileTask task, Path file, Range range) {
+        try {
+            var hints = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
+                    .inlayHints(task, file, range);
+            var payload = new JsonObject();
+            payload.addProperty("uri", file.toUri().toString());
+            payload.add("hints", new Gson().toJsonTree(hints));
+            if (range != null) {
+                var rangeObj = new JsonObject();
+                rangeObj.addProperty("startLine", range.start.line);
+                rangeObj.addProperty("endLine", range.end.line);
+                payload.add("range", rangeObj);
+            }
+            client.customNotification("java/inlayHints", payload);
+        } catch (Exception e) {
+            LOG.fine("[inlayHints] push_failed file=" + file.getFileName() + " reason=" + e.getMessage());
+        }
     }
 
     @Override
@@ -1047,6 +999,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         FileStore.save(file);
         completionIndexScheduler.filesChanged(List.of(file));
+        lint(file, -1);
     }
 
 }
