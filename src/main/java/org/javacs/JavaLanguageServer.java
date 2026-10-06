@@ -333,6 +333,7 @@ class JavaLanguageServer extends LanguageServer {
         completionOptions.addProperty("resolveProvider", true);
         var triggerCharacters = new JsonArray();
         triggerCharacters.add(".");
+        triggerCharacters.add(":");
         completionOptions.add("triggerCharacters", triggerCharacters);
         c.add("completionProvider", completionOptions);
         var signatureHelpOptions = new JsonObject();
@@ -864,6 +865,8 @@ class JavaLanguageServer extends LanguageServer {
         lint(file, editLine);
     }
 
+    private volatile Path pendingPropagation;
+
     private void lint(Path file, int hintCenterLine) {
         lint(file, hintCenterLine, true);
     }
@@ -885,7 +888,16 @@ class JavaLanguageServer extends LanguageServer {
         } catch (Exception e) {
             LOG.fine("[lint] failed file=" + file.getFileName() + " reason=" + e.getMessage());
         }
-        if (propagate) propagateDiagnostics(file);
+        if (propagate) pendingPropagation = file;
+    }
+
+    @Override
+    public void doAsyncWork() {
+        var file = pendingPropagation;
+        if (file != null) {
+            pendingPropagation = null;
+            propagateDiagnostics(file);
+        }
     }
 
     private void publishFileDiagnostics(CompileTask task, Path file) {
@@ -1000,7 +1012,8 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         FileStore.save(file);
         completionIndexScheduler.filesChanged(List.of(file));
-        lint(file, -1);
+        lint(file, -1, false);
+        propagateDiagnostics(file);
     }
 
 }

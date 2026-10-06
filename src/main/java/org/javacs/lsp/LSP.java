@@ -293,6 +293,7 @@ public class LSP {
                 break processMessages;
             }
             if (r == null) {
+                server.doAsyncWork();
                 continue;
             }
             if (r.method == null) {
