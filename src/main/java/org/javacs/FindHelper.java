@@ -125,7 +125,10 @@ public class FindHelper {
         }
         if (candidate instanceof IdentifierTree) {
             var simpleName = candidate.toString();
-            return erasedType.endsWith(simpleName);
+            if (erasedType.endsWith(simpleName)) {
+                return true;
+            }
+            return erasedType.equals("java.lang.Object");
         }
         if (candidate instanceof MemberSelectTree) {
             var qualifiedName = candidate.toString();

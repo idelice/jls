@@ -5,13 +5,14 @@ import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
+import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.logging.Logger;
-import org.javacs.ClassFileParameterNames;
+import org.javacs.FindHelper;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.ParseTask;
@@ -23,7 +24,6 @@ import org.javacs.lsp.ParameterInformation;
 import org.javacs.lsp.SignatureHelp;
 import org.javacs.lsp.SignatureInformation;
 import org.javacs.resolve.ParseTypeResolver;
-import org.javacs.resolve.TypeNames;
 
 public class SignatureProvider {
     private static final Logger LOG = Logger.getLogger("main");
@@ -78,10 +78,10 @@ public class SignatureProvider {
 
             var signatures = new ArrayList<SignatureInformation>();
             for (var member : overloads) {
-                var names = resolveParameterNames(member);
+                var method = findSourceMethod(member);
                 var info = new SignatureInformation();
-                info.label = buildLabel(member, names);
-                info.parameters = buildParameters(member, names);
+                info.label = buildLabel(member, method);
+                info.parameters = buildParameters(method);
                 signatures.add(info);
             }
 
@@ -188,49 +188,38 @@ public class SignatureProvider {
         return simpleName;
     }
 
-    private String buildLabel(IndexedMember member, String[] names) {
+    private MethodTree findSourceMethod(IndexedMember member) {
+        var source = compiler.findAnywhere(member.ownerType);
+        if (source.isEmpty()) throw new RuntimeException("no source");
+        var task = compiler.parse(source.get());
+        return FindHelper.findMethod(task, member.ownerType, member.name, member.erasedParameterTypes);
+    }
+
+    private String buildLabel(IndexedMember member, MethodTree method) {
         var sb = new StringBuilder();
         if (member.kind == CompletionItemKind.Constructor) {
             var owner = member.ownerType;
             sb.append(owner.substring(owner.lastIndexOf('.') + 1));
         } else {
-            sb.append(member.name);
+            sb.append(method.getName());
         }
         sb.append('(');
-        var params = member.erasedParameterTypes;
-        if (params != null) {
-            for (int i = 0; i < params.length; i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(TypeNames.simpleName(params[i]));
-                if (names != null && i < names.length && names[i] != null) {
-                    sb.append(' ').append(names[i]);
-                }
-            }
+        var params = method.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(params.get(i).getType()).append(' ').append(params.get(i).getName());
         }
         sb.append(')');
         return sb.toString();
     }
 
-    private List<ParameterInformation> buildParameters(IndexedMember member, String[] names) {
-        var params = member.erasedParameterTypes;
+    private List<ParameterInformation> buildParameters(MethodTree method) {
         var result = new ArrayList<ParameterInformation>();
-        if (params == null) return result;
-        for (int i = 0; i < params.length; i++) {
-            var type = TypeNames.simpleName(params[i]);
-            var name = (names != null && i < names.length && names[i] != null) ? names[i] : "arg" + i;
+        for (var p : method.getParameters()) {
             var info = new ParameterInformation();
-            info.label = type + " " + name;
+            info.label = p.getType() + " " + p.getName();
             result.add(info);
         }
         return result;
-    }
-
-    private String[] resolveParameterNames(IndexedMember member) {
-        if (member.parameterNames != null) return member.parameterNames;
-        if (member.erasedParameterTypes == null || member.erasedParameterTypes.length == 0) return null;
-        var classBytes = compiler.findClassFile(member.ownerType);
-        if (classBytes.isEmpty()) return null;
-        return ClassFileParameterNames.read(
-                classBytes.get(), member.name, member.erasedParameterTypes, member.isStatic);
     }
 }
