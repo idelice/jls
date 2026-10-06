@@ -1,7 +1,5 @@
 package org.javacs.provider;
 
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.gson.JsonNull;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
@@ -42,14 +40,21 @@ import java.util.Set;
 import java.util.StringJoiner;
 import java.util.TreeMap;
 import java.util.logging.Logger;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
+import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
+import javax.tools.JavaFileObject;
 
-import org.javacs.CacheAudit;
 import org.javacs.ClassFileParameterNames;
+import org.javacs.CompileTask;
+import org.javacs.ElementSignatureHelper;
 import org.javacs.CompilerProvider;
 import org.javacs.CompletionData;
 import org.javacs.FileStore;
@@ -57,6 +62,7 @@ import org.javacs.FindHelper;
 import org.javacs.JsonHelper;
 import org.javacs.MarkdownHelper;
 import org.javacs.ParseTask;
+import org.javacs.SourceFileObject;
 import org.javacs.StringSearch;
 import org.javacs.completion.FindCompletionsAt;
 import org.javacs.completion.PruneMethodBodies;
@@ -77,19 +83,9 @@ public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     private record MemberAccessContext(String receiver, String partial, boolean dotTrigger, boolean methodReference, int separatorEnd) { }
-    private record IndexedCompletionResult(CompletionList list, long resolveMs, String cacheState) {}
     private record AnnotationContext(String qualifiedAnnotationType, String partial) {}
     private record CompletionRequestContext(
             ParseTask task, String contents, long cursor, TreePath parsePath, MemberAccessContext memberAccess, AnnotationContext annotationContext, long parseMs) {}
-    private record MemberCompletionCacheKey(
-            long indexVersion,
-            String targetType,
-            boolean staticContext,
-            boolean enclosingInstanceAccess,
-            boolean methodReference,
-            String partial,
-            boolean endsWithParen,
-            String currentType) {}
 
     private final CompilerProvider compiler;
     private final TypeIndexRouter typeIndexRouter;
@@ -100,8 +96,6 @@ public class CompletionProvider {
     public static final int MAX_COMPLETION_ITEMS = 50;
     private static final Set<String> OBJECT_MEMBER_LABELS =
             Set.of("equals", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait");
-    private static final Cache<MemberCompletionCacheKey, CompletionList> MEMBER_COMPLETION_CACHE =
-            Caffeine.newBuilder().maximumSize(20_000).build();
 
     private static final String[] TOP_LEVEL_KEYWORDS = {
         "package",
@@ -220,18 +214,11 @@ public class CompletionProvider {
             list = completeParseOnly(request.task(), request.contents(), request.cursor(), request.memberAccess().partial);
             mode = "import_parse";
         } else if (request.memberAccess() != null) {
-            var indexed =
-
-                    completeMembersUsingIndex(
-                            request.task(),
-                            request.parsePath(),
-                            request.cursor(),
-                            request.memberAccess(),
-                            endsWithParen(request.contents(), (int) request.cursor()));
-            list = indexed.list();
-            resolveMs = indexed.resolveMs();
-            memberCacheState = indexed.cacheState();
-            mode = "member_index";
+            list = completeMembersUsingCompile(
+                    request.task(), request.contents(), request.cursor(),
+                    request.memberAccess(),
+                    endsWithParen(request.contents(), (int) request.cursor()));
+            mode = "member_compile";
         } else if (request.annotationContext() != null) {
             var partial = partialIdentifier(request.contents(), (int) request.cursor());
             list = completeParseOnly(request.task(), request.contents(), request.cursor(), partial);
@@ -386,183 +373,127 @@ public class CompletionProvider {
         return cursor;
     }
 
-    private IndexedCompletionResult completeMembersUsingIndex(
-            ParseTask parseTask,
-            TreePath parsePath,
-            long cursor,
-            MemberAccessContext memberAccess,
-            boolean endsWithParen) {
-        if (typeIndexRouter == null) {
-            return new IndexedCompletionResult(EMPTY, 0, "index_empty");
-        }
-        var index = typeIndexRouter;
-        var started = Instant.now();
-        var expression = memberReceiverExpression(parsePath);
-        if (expression == null && memberAccess.receiver().isEmpty()) {
-            expression = findExpressionEndingAt(parseTask, memberAccess.separatorEnd());
-        }
-        Optional<ParseTypeResolver.TypeResolution> resolved;
-        long resolveMs;
-        var importedType = index.resolveTypeName(memberAccess.receiver(), parseTask.root());
-        if (importedType.isPresent()) {
-            resolved = Optional.of(new ParseTypeResolver.TypeResolution(importedType.get(), true, false));
-            resolveMs = 0;
-        } else {
-            var resolver = new ParseTypeResolver(parseTask, compiler, index, cursor);
-            var resolveStarted = Instant.now();
-            resolved = resolver.resolve(expression, memberAccess.receiver());
-            resolveMs = Duration.between(resolveStarted, Instant.now()).toMillis();
-        }
-        if (resolved.isEmpty()) {
-            var cacheFallback = tryResolveMemberFromCompileCache(parseTask, cursor, memberAccess);
-            if (cacheFallback != null) {
-                LOG.fine(String.format("[completion] compile_cache_fallback receiver='%s' items=%d",
-                        memberAccess.receiver(), cacheFallback.items.size()));
-                return new IndexedCompletionResult(cacheFallback, resolveMs, "compile_cache_fallback");
-            }
-            LOG.fine(String.format("[completion] unresolved_type receiver='%s' expression=%s",
-                    memberAccess.receiver(), expression != null ? expression.getClass().getSimpleName() : "null"));
-            return new IndexedCompletionResult(EMPTY, resolveMs, "unresolved_type");
-        }
-        var target = resolved.get();
-        if (!target.arrayType() && !isQualifiedTypeName(target.qualifiedType())) {
-            return new IndexedCompletionResult(EMPTY, resolveMs, "non_fqn_type");
-        }
-        var currentType = new ParseTypeResolver(parseTask, compiler, index, cursor).currentEnclosingTypeName();
-        if (target.arrayType()) {
-            return new IndexedCompletionResult(
-                    completeArrayMemberSelect(target.staticContext()), resolveMs, "array_type");
-        }
-        var membersStarted = Instant.now();
-        var members =
-                memberAccess.methodReference() && target.staticContext()
-                        ? mergeMemberContexts(index, target.qualifiedType())
-                        : index.members(target.qualifiedType(), target.staticContext());
-        var membersMs = Duration.between(membersStarted, Instant.now()).toMillis();
-        if (members.isEmpty() && !target.staticContext()) {
-            return new IndexedCompletionResult(EMPTY, resolveMs + membersMs, "no_members");
-        }
-        var enclosingInstanceAccess =
-                target.staticContext()
-                        && isAccessibleEnclosingInstanceType(
-                                parseTask, parsePath, cursor, target.qualifiedType(), memberAccess.receiver);
-        var cacheKey =
-                new MemberCompletionCacheKey(
-                        completionIndexVersion,
-                        target.qualifiedType(),
-                        target.staticContext(),
-                        enclosingInstanceAccess,
-                        memberAccess.methodReference(),
-                        memberAccess.partial,
-                        endsWithParen,
-                        currentType.orElse(""));
-        var cached = MEMBER_COMPLETION_CACHE.getIfPresent(cacheKey);
-        if (cached != null) {
-            CacheAudit.hit("completion.member");
-            return new IndexedCompletionResult(
-                    copyCompletionList(cached),
-                    Duration.between(started, Instant.now()).toMillis(),
-                    "hit");
-        }
-        CacheAudit.miss("completion.member");
-
-        var buildStarted = Instant.now();
-        var list = new ArrayList<CompletionItem>();
-        var methods = new TreeMap<String, List<IndexedMember>>();
-        var methodPriority = new HashMap<String, Integer>();
-        for (var member : members) {
-            if (!isIndexMemberVisible(member, target.qualifiedType(), currentType)) continue;
-            if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
-            if (memberAccess.methodReference() && member.kind != CompletionItemKind.Method) continue;
-            if (member.kind == CompletionItemKind.Constructor) continue;
-            if (member.kind == CompletionItemKind.Method) {
-                methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
-                methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
-            } else {
-                var item = indexedMember(member);
-                item.sortText = sortKey(indexMemberPriority(member), item.label);
-                list.add(item);
-            }
-        }
-        byte[] ownerClassBytes = null;
-        if (!methods.isEmpty()) {
-            var ownerType = methods.firstEntry().getValue().getFirst().ownerType;
-            var bytes = compiler.findClassFile(ownerType);
-            if (bytes.isPresent()) ownerClassBytes = bytes.get();
-        }
-        for (var entry : methods.entrySet()) {
-            var method = indexedMethod(entry.getValue(), memberAccess.methodReference() ? false : !endsWithParen, ownerClassBytes);
-            method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
-            list.add(method);
-        }
-        // Nested types (e.g. IndexedMember.Origin) are stored in IndexedType.nestedTypes, not as
-        // IndexedMember entries. Add them in static-access context (e.g. ClassName.).
-        if (target.staticContext() && !memberAccess.methodReference()) {
-            typeIndexRouter.typeInfo(target.qualifiedType()).ifPresent(typeInfo -> {
-                for (var nested : typeInfo.nestedTypes) {
-                    var simpleName = TypeNames.simpleName(nested);
-                    if (simpleName == null || simpleName.isBlank()) continue;
-                    if (!matchesCompletionPrefix(simpleName, memberAccess.partial)) continue;
-                    var nestedKind = typeIndexRouter.typeInfo(nested)
-                            .map(t -> t.kind)
-                            .orElse(CompletionItemKind.Class);
+    private CompletionList completeMembersUsingCompile(
+            ParseTask parseTask, String contents, long cursor,
+            MemberAccessContext memberAccess, boolean endsWithParen) {
+        try {
+            var file = Paths.get(parseTask.root().getSourceFile().toUri());
+            var source = new SourceFileObject(file, contents, Instant.now());
+            try (var task = compiler.compile(List.of(source))) {
+                var trees = Trees.instance(task.task);
+                var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
+                if (path == null) return EMPTY;
+                Tree receiverExpr;
+                if (path.getLeaf() instanceof MemberSelectTree select) {
+                    receiverExpr = select.getExpression();
+                } else if (path.getLeaf() instanceof MemberReferenceTree ref) {
+                    receiverExpr = ref.getQualifierExpression();
+                } else {
+                    return EMPTY;
+                }
+                var exprPath = new TreePath(path, receiverExpr);
+                var type = trees.getTypeMirror(exprPath);
+                if (type == null || type.getKind() == TypeKind.ERROR) {
+                    return EMPTY;
+                }
+                var isStatic = trees.getElement(exprPath) instanceof TypeElement;
+                var scope = trees.getScope(path);
+                if (type instanceof ArrayType) {
+                    return completeArrayMemberSelect(isStatic);
+                }
+                if (type instanceof TypeVariable tv) {
+                    type = tv.getUpperBound();
+                }
+                if (!(type instanceof DeclaredType declared)) {
+                    return EMPTY;
+                }
+                var typeElement = (TypeElement) declared.asElement();
+                var methodReference = memberAccess.methodReference();
+                var list = new ArrayList<CompletionItem>();
+                var methods = new TreeMap<String, List<ExecutableElement>>();
+                for (var member : task.task.getElements().getAllMembers(typeElement)) {
+                    if (member.getKind() == ElementKind.CONSTRUCTOR) continue;
+                    if (!matchesCompletionPrefix(member.getSimpleName(), memberAccess.partial)) continue;
+                    if (!trees.isAccessible(scope, member, declared)) continue;
+                    if (methodReference) {
+                        if (member.getKind() != ElementKind.METHOD) continue;
+                    } else if (isStatic != member.getModifiers().contains(Modifier.STATIC)) {
+                        continue;
+                    }
+                    if (member.getKind() == ElementKind.METHOD) {
+                        methods.computeIfAbsent(member.getSimpleName().toString(), __ -> new ArrayList<>())
+                                .add((ExecutableElement) member);
+                    } else {
+                        var item = new CompletionItem();
+                        item.label = member.getSimpleName().toString();
+                        item.kind = elementKind(member);
+                        item.detail = memberDetail(member);
+                        list.add(item);
+                    }
+                }
+                byte[] ownerClassBytes = compiler.findClassFile(typeElement.getQualifiedName().toString())
+                        .orElse(null);
+                for (var entry : methods.entrySet()) {
+                    var overloads = entry.getValue();
+                    var first = overloads.getFirst();
                     var item = new CompletionItem();
-                    item.label = simpleName;
-                    item.kind = nestedKind;
-                    item.detail = target.qualifiedType();
-                    // Priority consistent with indexMemberPriority() for class/enum/interface kinds.
-                    item.sortText = sortKey(45, simpleName);
+                    item.label = first.getSimpleName().toString();
+                    item.kind = CompletionItemKind.Method;
+                    item.detail = methodDetail(first, ownerClassBytes);
+                    if (overloads.size() > 1) {
+                        item.detail += " (+" + (overloads.size() - 1) + " overloads)";
+                    }
+                    if (!endsWithParen && !methodReference) {
+                        if (overloads.size() == 1 && first.getParameters().isEmpty()) {
+                            item.insertText = first.getSimpleName() + "()";
+                            item.insertTextFormat = InsertTextFormat.PlainText;
+                        } else {
+                            item.insertText = first.getSimpleName() + "($0)";
+                            item.insertTextFormat = InsertTextFormat.Snippet;
+                            item.command = new Command();
+                            item.command.command = "editor.action.triggerParameterHints";
+                            item.command.title = "Trigger Parameter Hints";
+                        }
+                    }
+                    var data = new CompletionData();
+                    data.className = typeElement.getQualifiedName().toString();
+                    data.memberName = first.getSimpleName().toString();
+                    data.erasedParameterTypes = first.getParameters().stream()
+                            .map(p -> task.types.erasure(p.asType()).toString())
+                            .toArray(String[]::new);
+                    data.plusOverloads = Math.max(0, overloads.size() - 1);
+                    data.compilerId = compilerId;
+                    item.data = JsonHelper.GSON.toJsonTree(data);
                     list.add(item);
                 }
-            });
-        }
-        if (memberAccess.methodReference() && target.staticContext()) {
-            list.add(keyword("new"));
-        } else if (target.staticContext()) {
-            list.add(keyword("class"));
-            if (enclosingInstanceAccess) {
-                list.add(keyword("this"));
-                list.add(keyword("super"));
+                if (methodReference && isStatic) {
+                    list.add(keyword("new"));
+                } else if (isStatic) {
+                    list.add(keyword("class"));
+                }
+                sortCompletionItems(list);
+                return new CompletionList(false, list);
             }
+        } catch (Exception e) {
+            LOG.warning("[completion] compile_member_failed: " + e.getMessage());
+            return EMPTY;
         }
-        var result = new CompletionList(false, list);
-        var buildMs = Duration.between(buildStarted, Instant.now()).toMillis();
-        if (memberAccess.partial.isEmpty()
-                && !"java.lang.Object".equals(target.qualifiedType())
-                && isWeakObjectOnlyResult(result)) {
-            return new IndexedCompletionResult(
-                    EMPTY, resolveMs + membersMs + buildMs, "miss_drop_weak_object_only");
-        }
-        sortCompletionItems(list);
-        result = new CompletionList(false, list);
-        MEMBER_COMPLETION_CACHE.put(cacheKey, freezeCompletionList(result));
-        CacheAudit.load("completion.member");
-        CacheAudit.store("completion.member");
-        return new IndexedCompletionResult(
-                result, Duration.between(started, Instant.now()).toMillis(), "miss");
     }
 
-    private boolean isIndexMemberVisible(
-            IndexedMember member, String targetType, Optional<String> currentEnclosingType) {
-        if (!member.isPrivate) {
-            return true;
-        }
-        if (!Objects.equals(member.ownerType, targetType)) {
-            return false;
-        }
-        return currentEnclosingType.isPresent() && Objects.equals(currentEnclosingType.get(), targetType);
+    private static int elementKind(Element e) {
+        return switch (e.getKind()) {
+            case FIELD -> CompletionItemKind.Field;
+            case ENUM_CONSTANT -> CompletionItemKind.EnumMember;
+            default -> CompletionItemKind.Property;
+        };
     }
 
-    private Tree memberReceiverExpression(TreePath parsePath) {
-        for (var cursor = parsePath; cursor != null; cursor = cursor.getParentPath()) {
-            if (cursor.getLeaf() instanceof MemberSelectTree select) {
-                return select.getExpression();
-            }
-            if (cursor.getLeaf() instanceof MemberReferenceTree reference) {
-                return reference.getQualifierExpression();
-            }
-        }
-        return null;
+    private static String memberDetail(Element e) {
+        return ElementSignatureHelper.simpleTypeName(e.asType());
+    }
+
+    private String methodDetail(ExecutableElement m, byte[] classBytes) {
+        return ElementSignatureHelper.methodSignature(m, classBytes);
     }
 
     private boolean isQualifiedTypeName(String typeName) {
@@ -675,34 +606,6 @@ public class CompletionProvider {
             }
         }
         return false;
-    }
-
-    private boolean isWeakObjectOnlyResult(CompletionList list) {
-        if (list == null || list == NOT_SUPPORTED || list.items.isEmpty()) {
-            return false;
-        }
-        var sawMember = false;
-        for (var item : list.items) {
-            if (item == null || item.label == null) {
-                continue;
-            }
-            if (Objects.equals(item.kind, CompletionItemKind.Keyword)) {
-                continue;
-            }
-            sawMember = true;
-            if (!OBJECT_MEMBER_LABELS.contains(item.label)) {
-                return false;
-            }
-        }
-        return sawMember;
-    }
-
-    private CompletionList freezeCompletionList(CompletionList list) {
-        return new CompletionList(list.isIncomplete, List.copyOf(list.items));
-    }
-
-    private CompletionList copyCompletionList(CompletionList list) {
-        return new CompletionList(list.isIncomplete, new ArrayList<>(list.items));
     }
 
     private CompletionList completeParseOnly(ParseTask parseTask, String contents, long cursor, String partial) {
@@ -1550,78 +1453,6 @@ public class CompletionProvider {
         return false;
     }
 
-    /**
-     * Fallback: use the interactive compiler's cached ATTR result to resolve a member access
-     * when ParseTypeResolver can't infer the receiver type (lambdas, var, generics).
-     *
-     * <p>This is read-only from the cache — never triggers a new compile. Returns null on cache miss.
-     */
-    private CompletionList tryResolveMemberFromCompileCache(ParseTask parseTask, long cursor, MemberAccessContext memberAccess) {
-        var file = Paths.get(parseTask.root().getSourceFile().toUri());
-        try (var task = compiler.compile(file)) {
-            var trees = task.trees;
-            var pos = trees.getSourcePositions();
-            var root = task.root(file);
-            var found = new Object() { TreePath result; };
-            new TreePathScanner<Void, Void>() {
-                @Override
-                public Void visitIdentifier(IdentifierTree id, Void unused) {
-                    if (id.getName().contentEquals(memberAccess.receiver())) {
-                        long start = pos.getStartPosition(root, id);
-                        long end = pos.getEndPosition(root, id);
-                        if (start >= 0 && end >= 0 && end <= cursor && cursor - end <= 2) {
-                            found.result = getCurrentPath();
-                        }
-                    }
-                    return super.visitIdentifier(id, unused);
-                }
-            }.scan(root, null);
-            if (found.result == null) return null;
-            var element = trees.getElement(found.result);
-            if (element == null) return null;
-            var typeMirror = element.asType();
-            if (typeMirror == null || typeMirror.getKind() == TypeKind.ERROR) return null;
-            var qualifiedType = switch (typeMirror.getKind()) {
-                case DECLARED -> ((DeclaredType) typeMirror).asElement().toString();
-                case TYPEVAR -> {
-                    var bound = ((TypeVariable) typeMirror).getUpperBound();
-                    yield bound instanceof DeclaredType dt
-                            ? dt.asElement().toString()
-                            : "java.lang.Object";
-                }
-                default -> null;
-            };
-            if (qualifiedType == null || qualifiedType.isBlank()) return null;
-            var members = typeIndexRouter.members(qualifiedType, false);
-            if (members.isEmpty()) return null;
-            var list = new ArrayList<CompletionItem>();
-            var methods = new TreeMap<String, List<IndexedMember>>();
-            var methodPriority = new HashMap<String, Integer>();
-            for (var member : members) {
-                if (!matchesCompletionPrefix(member.name, memberAccess.partial)) continue;
-                if (member.kind == CompletionItemKind.Constructor) continue;
-                if (member.kind == CompletionItemKind.Method) {
-                    methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
-                    methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
-                } else {
-                    var item = indexedMember(member);
-                    item.sortText = sortKey(indexMemberPriority(member), item.label);
-                    list.add(item);
-                }
-            }
-            for (var entry : methods.entrySet()) {
-                var method = indexedMethod(entry.getValue(), true, null);
-                method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
-                list.add(method);
-            }
-            return list.isEmpty() ? null : new CompletionList(false, list);
-        } catch (Exception e) {
-            LOG.fine(String.format("[completion] compile_cache_fallback_failed reason=%s", e.getMessage()));
-            return null;
-        }
-    }
-
-
     private CompletionList completeArrayMemberSelect(boolean isStatic) {
         if (isStatic) {
             return EMPTY;
@@ -1669,89 +1500,6 @@ public class CompletionProvider {
             }
         }
         return false;
-    }
-
-    private boolean isAccessibleEnclosingInstanceType(
-            ParseTask parseTask, TreePath path, long cursor, String qualifiedType, String receiverName) {
-        if (path == null
-                || ((qualifiedType == null || qualifiedType.isBlank())
-                        && (receiverName == null || receiverName.isBlank()))) {
-            return false;
-        }
-        for (var classPath = enclosingClassPath(parseTask, cursor);
-                classPath != null;
-                classPath = parentEnclosingClassPath(classPath)) {
-            var classTree = (ClassTree) classPath.getLeaf();
-            var enclosingType = qualifiedEnclosingClassName(parseTask.root(), classPath);
-            if (!sameQualifiedType(qualifiedType, enclosingType)
-                    && !sameSimpleTypeName(receiverName, classTree.getSimpleName().toString())
-                    && !sameSimpleTypeName(qualifiedType, classTree.getSimpleName().toString())) {
-                continue;
-            }
-            return !hasStaticBoundaryBetween(path, classPath);
-        }
-        var nearestNamedClass = nearestNamedEnclosingClassPath(parseTask, cursor);
-        if (nearestNamedClass != null) {
-            var classTree = (ClassTree) nearestNamedClass.getLeaf();
-            var enclosingType = qualifiedEnclosingClassName(parseTask.root(), nearestNamedClass);
-            if ((sameQualifiedType(qualifiedType, enclosingType)
-                            || sameSimpleTypeName(receiverName, classTree.getSimpleName().toString())
-                            || sameSimpleTypeName(qualifiedType, classTree.getSimpleName().toString()))
-                    && !hasStaticBoundaryBetween(path, nearestNamedClass)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private TreePath parentEnclosingClassPath(TreePath classPath) {
-        if (classPath == null) {
-            return null;
-        }
-        for (var cursor = classPath.getParentPath(); cursor != null; cursor = cursor.getParentPath()) {
-            if (cursor.getLeaf() instanceof ClassTree) {
-                return cursor;
-            }
-        }
-        return null;
-    }
-
-    private TreePath nearestNamedEnclosingClassPath(ParseTask parseTask, long cursor) {
-        for (var classPath = enclosingClassPath(parseTask, cursor);
-                classPath != null;
-                classPath = parentEnclosingClassPath(classPath)) {
-            var classTree = (ClassTree) classPath.getLeaf();
-            if (!classTree.getSimpleName().contentEquals("")) {
-                return classPath;
-            }
-        }
-        return null;
-    }
-
-    private boolean hasStaticBoundaryBetween(TreePath path, TreePath targetClassPath) {
-        for (var cursor = path; cursor != null; cursor = cursor.getParentPath()) {
-            if (cursor.getLeaf() == targetClassPath.getLeaf()) {
-                return false;
-            }
-            var leaf = cursor.getLeaf();
-            if (leaf instanceof MethodTree methodTree
-                    && methodTree.getModifiers() != null
-                    && methodTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                return true;
-            }
-            if (leaf instanceof BlockTree blockTree) {
-                var parent = cursor.getParentPath();
-                if (parent != null && parent.getLeaf() instanceof ClassTree && blockTree.isStatic()) {
-                    return true;
-                }
-            }
-            if (leaf instanceof ClassTree classTree
-                    && classTree.getModifiers() != null
-                    && classTree.getModifiers().getFlags().contains(Modifier.STATIC)) {
-                return true;
-            }
-        }
-        return true;
     }
 
     private String qualifiedEnclosingClassName(CompilationUnitTree root, TreePath classPath) {
@@ -1817,13 +1565,6 @@ public class CompletionProvider {
             return false;
         }
         return left.equals(right) || left.replace('$', '.').equals(right.replace('$', '.'));
-    }
-
-    private boolean sameSimpleTypeName(String maybeQualified, String simpleName) {
-        if (maybeQualified == null || maybeQualified.isBlank() || simpleName == null || simpleName.isBlank()) {
-            return false;
-        }
-        return TypeNames.simpleName(maybeQualified.replace('$', '.')).equals(simpleName);
     }
 
     private static final CompletionList EMPTY = new CompletionList(false, List.of());
@@ -1985,13 +1726,6 @@ public class CompletionProvider {
                         .thenComparingInt(item -> item.kind));
     }
 
-    private List<IndexedMember> mergeMemberContexts(TypeIndexRouter index, String qualifiedType) {
-        var merged = new ArrayList<IndexedMember>();
-        merged.addAll(index.members(qualifiedType, true));
-        merged.addAll(index.members(qualifiedType, false));
-        return merged;
-    }
-
     private AnnotationContext findAnnotationContext(ParseTask task, long cursor) {
         if (typeIndexRouter == null) return null;
         var positions = Trees.instance(task.task()).getSourcePositions();
@@ -2094,64 +1828,4 @@ public class CompletionProvider {
         var partial = contents.substring(partialStart, effectiveCursor);
         return new MemberAccessContext(receiver, partial, partial.isEmpty(), methodReference, separatorEnd);
     }
-
-    /**
-     * Find the expression tree in the parse task whose end position is closest to (but not past)
-     * {@code separatorEnd}. Used as a fallback when FindCompletionsAt cannot match the cursor to a
-     * MemberSelectTree, which happens during error recovery for double-dot edits (e.g. {@code
-     * expr()..member}).
-     */
-    private Tree findExpressionEndingAt(ParseTask task, int separatorEnd) {
-        var pos = Trees.instance(task.task()).getSourcePositions();
-        var root = task.root();
-        var bestEnd = new long[]{-1};
-        var result = new Tree[]{null};
-        new TreeScanner<Void, Void>() {
-            @Override
-            public Void scan(Tree tree, Void p) {
-                if (tree == null) return null;
-                var end = pos.getEndPosition(root, tree);
-                // Use >= so that when multiple expressions share the same end position
-                // (e.g. a lambda and its body under javac error recovery), the innermost
-                // (deepest/last-scanned) one wins rather than the outermost wrapper.
-                if (end >= bestEnd[0] && end <= separatorEnd && isExpressionTree(tree)) {
-                    bestEnd[0] = end;
-                    result[0] = tree;
-                }
-                return super.scan(tree, p);
-            }
-
-            @Override
-            public Void visitErroneous(com.sun.source.tree.ErroneousTree node, Void p) {
-                // TreeScanner.visitErroneous returns null without recursing;
-                // we need to descend into error trees to find valid sub-expressions
-                // that javac wrapped (e.g. CompleteExpression inside "CompleteExpression..").
-                if (node.getErrorTrees() != null) {
-                    for (var e : node.getErrorTrees()) {
-                        scan(e, p);
-                    }
-                }
-                return null;
-            }
-        }.scan(root, null);
-        return result[0];
-    }
-
-    private boolean isExpressionTree(Tree tree) {
-        return switch (tree.getKind()) {
-            case METHOD_INVOCATION, MEMBER_SELECT, IDENTIFIER, NEW_CLASS, NEW_ARRAY,
-                    INT_LITERAL, LONG_LITERAL, FLOAT_LITERAL, DOUBLE_LITERAL,
-                    BOOLEAN_LITERAL, CHAR_LITERAL, STRING_LITERAL, NULL_LITERAL,
-                    TYPE_CAST, ARRAY_ACCESS, PARENTHESIZED,
-                    POSTFIX_INCREMENT, POSTFIX_DECREMENT, PREFIX_INCREMENT, PREFIX_DECREMENT,
-                    UNARY_PLUS, UNARY_MINUS, BITWISE_COMPLEMENT, LOGICAL_COMPLEMENT,
-                    MULTIPLY, DIVIDE, REMAINDER, PLUS, MINUS, LEFT_SHIFT, RIGHT_SHIFT,
-                    UNSIGNED_RIGHT_SHIFT, AND, XOR, OR, CONDITIONAL_AND, CONDITIONAL_OR,
-                    EQUAL_TO, NOT_EQUAL_TO, LESS_THAN, LESS_THAN_EQUAL, GREATER_THAN,
-                    GREATER_THAN_EQUAL, CONDITIONAL_EXPRESSION, ASSIGNMENT,
-                    MEMBER_REFERENCE, LAMBDA_EXPRESSION -> true;
-            default -> false;
-        };
-    }
-
 }

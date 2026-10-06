@@ -94,14 +94,15 @@ public class HoverProvider {
             sb.append(tp).append("> ");
         }
 
-        sb.append(simpleTypeName(method.getReturnType())).append(" ");
+        sb.append(ElementSignatureHelper.simpleTypeName(method.getReturnType())).append(" ");
         sb.append(method.getSimpleName()).append("(");
 
-        // Resolve real parameter names from source if javac gives synthetic arg0/arg1
         var paramElements = method.getParameters();
         String[] resolvedNames = null;
-        if (!paramElements.isEmpty() && hasSyntheticNames(paramElements)) {
-            resolvedNames = resolveParamNames(method);
+        if (!paramElements.isEmpty() && ElementSignatureHelper.hasSyntheticNames(paramElements)) {
+            var owner = ElementSignatureHelper.ownerQualifiedName(method);
+            var bytes = owner == null ? null : compiler.findClassFile(owner).orElse(null);
+            resolvedNames = ElementSignatureHelper.parameterNames(method, bytes);
         }
 
         var params = new StringJoiner(", ");
@@ -109,7 +110,7 @@ public class HoverProvider {
             var p = paramElements.get(i);
             var name = (resolvedNames != null && resolvedNames[i] != null)
                     ? resolvedNames[i] : p.getSimpleName().toString();
-            params.add(simpleTypeName(p.asType()) + " " + name);
+            params.add(ElementSignatureHelper.simpleTypeName(p.asType()) + " " + name);
         }
         sb.append(params).append(")");
         var thrown = method.getThrownTypes();
@@ -122,31 +123,8 @@ public class HoverProvider {
         return sb.toString();
     }
 
-    private static boolean hasSyntheticNames(java.util.List<? extends VariableElement> params) {
-        for (var p : params) {
-            var name = p.getSimpleName().toString();
-            if (name.matches("arg\\d+")) return true;
-        }
-        return false;
-    }
-
-    private String[] resolveParamNames(ExecutableElement method) {
-        var enclosing = method.getEnclosingElement();
-        if (!(enclosing instanceof TypeElement type)) return null;
-        var className = type.getQualifiedName().toString();
-        var classBytes = compiler.findClassFile(className);
-        if (classBytes.isEmpty()) return null;
-        var erasedTypes = new String[method.getParameters().size()];
-        for (int i = 0; i < erasedTypes.length; i++) {
-            erasedTypes[i] = method.getParameters().get(i).asType().toString();
-        }
-        return ClassFileParameterNames.read(
-                classBytes.get(), method.getSimpleName().toString(), erasedTypes,
-                method.getModifiers().contains(javax.lang.model.element.Modifier.STATIC));
-    }
-
     private String renderFieldSignature(VariableElement field) {
-        return simpleTypeName(field.asType()) + " " + field.getSimpleName();
+        return ElementSignatureHelper.simpleTypeName(field.asType()) + " " + field.getSimpleName();
     }
 
     private String renderClassSignature(TypeElement type) {
@@ -169,7 +147,7 @@ public class HoverProvider {
     }
 
     private String renderVariableSignature(VariableElement variable) {
-        return simpleTypeName(variable.asType()) + " " + variable.getSimpleName();
+        return ElementSignatureHelper.simpleTypeName(variable.asType()) + " " + variable.getSimpleName();
     }
 
     private TypeElement enclosingType(Element element) {
@@ -179,27 +157,6 @@ public class HoverProvider {
             current = current.getEnclosingElement();
         }
         return null;
-    }
-
-    private String simpleTypeName(TypeMirror type) {
-        return switch (type.getKind()) {
-            case DECLARED -> {
-                var declared = (DeclaredType) type;
-                var name = declared.asElement().getSimpleName().toString();
-                var args = declared.getTypeArguments();
-                if (args.isEmpty()) yield name;
-                var ja = new StringJoiner(", ");
-                for (var a : args) ja.add(simpleTypeName(a));
-                yield name + "<" + ja + ">";
-            }
-            case ARRAY -> {
-                var array = (ArrayType) type;
-                yield simpleTypeName(array.getComponentType()) + "[]";
-            }
-            case TYPEVAR -> type.toString();
-            case WILDCARD -> "?";
-            default -> type.toString();
-        };
     }
 
     private String getDocComment(Element element, CompileTask task) {
