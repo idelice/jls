@@ -48,7 +48,7 @@ require('lspconfig').jls.setup({
 - **Find implementation** — find implementations
 - **Type/call hierachy** — find type/call hierachy 
 - **Hover** — type information and Javadoc
-- **Diagnostics** — pull-based (real-time linting without keystroke lag)
+- **Diagnostics** — server-pushed (real-time linting without keystroke lag)
 - **Signature help** — parameter info for method calls
 - **Inlay hints** — parameter name hints at call sites
 - **Code actions** — refactoring, quick fixes, code generation
