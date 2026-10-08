@@ -572,7 +572,10 @@ class JavaLanguageServer extends LanguageServer {
         var column = position.position.character + 1;
         if (!FileStore.isJavaFile(uri)) return Optional.empty();
         var file = Paths.get(uri);
+        var started = Instant.now();
         var content = new HoverProvider(compilerFor(file)).hover(file, line, column);
+        LOG.fine(String.format("[perf] hover file=%s took=%dms",
+                file.getFileName(), Duration.between(started, Instant.now()).toMillis()));
         if (content == null) {
             return Optional.empty();
         }
@@ -598,6 +601,7 @@ class JavaLanguageServer extends LanguageServer {
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         List<Location> found;
+        var started = Instant.now();
         try {
             found = new DefinitionProvider(compilerFor(file),file, line, column).find();
         } catch (RuntimeException e) {
@@ -608,6 +612,8 @@ class JavaLanguageServer extends LanguageServer {
                     file.getFileName(), e.getClass().getSimpleName()));
             return Optional.empty();
         }
+        LOG.fine(String.format("[perf] definition file=%s took=%dms",
+                file.getFileName(), Duration.between(started, Instant.now()).toMillis()));
         if (found == DefinitionProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
@@ -622,6 +628,7 @@ class JavaLanguageServer extends LanguageServer {
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         try {
+            var started = Instant.now();
             var found = new ImplementationProvider(
                             compilerFor(file),
                             file,
@@ -631,6 +638,8 @@ class JavaLanguageServer extends LanguageServer {
                             this::canReferenceModule,
                             moduleRegistry::batchResolveModulesForFiles)
                     .find();
+            LOG.fine(String.format("[perf] implementation file=%s took=%dms",
+                    file.getFileName(), Duration.between(started, Instant.now()).toMillis()));
             return found == ImplementationProvider.NOT_SUPPORTED
                     ? Optional.empty()
                     : Optional.of(found);
@@ -649,9 +658,12 @@ class JavaLanguageServer extends LanguageServer {
         var line = position.position.line + 1;
         var column = position.position.character + 1;
         try {
+            var started = Instant.now();
             var found = new TypeDefinitionProvider(
                             compilerFor(file), moduleRegistry.typeIndexFor(file), file, line, column)
                     .find();
+            LOG.fine(String.format("[perf] type_definition file=%s took=%dms",
+                    file.getFileName(), Duration.between(started, Instant.now()).toMillis()));
             return found == TypeDefinitionProvider.NOT_SUPPORTED
                     ? Optional.empty()
                     : Optional.of(found);
