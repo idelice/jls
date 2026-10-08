@@ -801,33 +801,13 @@ class JavaLanguageServer extends LanguageServer {
      */
     private void propagateDiagnostics(Path changed) {
         try {
-            var snapshot = completionSnapshotRef.get();
-            if (snapshot == null) return;
-            var typeIndex = snapshot.typeIndex();
-            if (typeIndex == null) return;
-
             var active = new HashSet<>(filterJavaFiles(FileStore.activeDocuments()));
             active.remove(changed);
             if (active.isEmpty()) return;
-
-            var dependents = new LinkedHashSet<Path>();
-            for (var fqn : JavaCompilerService.declaredTypes(changed)) {
-                var simpleName = fqn.substring(fqn.lastIndexOf('.') + 1);
-                if (simpleName.isEmpty()) continue;
-                var candidates = typeIndex.filesContainingToken(simpleName);
-                if (candidates == null) continue;
-                for (var candidate : candidates) {
-                    if (active.contains(candidate) && StringSearch.containsWord(candidate, simpleName)) {
-                        dependents.add(candidate);
-                    }
-                }
-            }
-            if (dependents.isEmpty()) return;
-
             LOG.info(String.format(
                     "[diagnostics] propagate from=%s dependents=%d",
-                    changed.getFileName(), dependents.size()));
-            for (var f : dependents) lint(f, -1, false);
+                    changed.getFileName(), active.size()));
+            for (var f : active) lint(f, -1, false);
         } catch (Exception e) {
             LOG.warning("[diagnostics] propagate_failed file=" + changed.getFileName()
                     + " reason=" + e.getMessage());
@@ -866,6 +846,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private volatile Path pendingPropagation;
+    private long lastPropagatedIndexVersion;
 
     private void lint(Path file, int hintCenterLine) {
         lint(file, hintCenterLine, true);
@@ -894,10 +875,12 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public void doAsyncWork() {
         var file = pendingPropagation;
-        if (file != null) {
-            pendingPropagation = null;
-            propagateDiagnostics(file);
-        }
+        if (file == null) return;
+        var version = completionIndexVersion.get();
+        if (version == lastPropagatedIndexVersion) return;
+        pendingPropagation = null;
+        lastPropagatedIndexVersion = version;
+        propagateDiagnostics(file);
     }
 
     private void publishFileDiagnostics(CompileTask task, Path file) {

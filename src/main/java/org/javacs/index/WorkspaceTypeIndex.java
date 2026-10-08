@@ -779,7 +779,7 @@ public class WorkspaceTypeIndex {
                 sourceFileSnapshots.put(finalSourcePath, new SourceFileSnapshot(
                         finalSourcePath, finalSourceUri, packageName,
                         explicitImports, staticImports, declaredTypesInFile,
-                        Integer.toString(fileTokens.hashCode())));
+                        ""));
                 for (var token : fileTokens) {
                     tokenFiles.computeIfAbsent(token, __ -> new ObjectOpenHashSet<>()).add(finalSourcePath);
                 }
@@ -923,7 +923,6 @@ public class WorkspaceTypeIndex {
     private static String declarationKey(
             SourceFileSnapshot source, List<String> declaredTypes, Map<String, IndexedType> types) {
         var key = new StringBuilder();
-        appendDeclarationValue(key, source.declarationKey); // per-file body-token hash
         appendDeclarationValue(key, source.packageName);
         appendDeclarationValues(key, source.imports);
         appendDeclarationValues(key, source.staticImports);
