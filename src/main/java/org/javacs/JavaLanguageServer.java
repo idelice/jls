@@ -670,12 +670,18 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(position.textDocument.uri);
         var line = position.position.line + 1;
         var column = position.position.character + 1;
-        var found =
-                new ReferenceProvider(
-                                compilerFor(file), file, line, column, this::compilerFor,
-                                this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles,
-                                completionSnapshotRef.get().typeIndex()::filesContainingToken)
-                        .find();
+        var token = progress.begin("Finding references", file.getFileName().toString());
+        List<Location> found;
+        try {
+            found =
+                    new ReferenceProvider(
+                                    compilerFor(file), file, line, column, this::compilerFor,
+                                    this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles,
+                                    completionSnapshotRef.get().typeIndex()::filesContainingToken)
+                            .find();
+        } finally {
+            progress.end(token, null);
+        }
         if (found == ReferenceProvider.NOT_SUPPORTED) {
             return Optional.empty();
         }
