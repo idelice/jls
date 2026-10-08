@@ -5,6 +5,7 @@ import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -22,11 +23,14 @@ import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.tools.Diagnostic;
+import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
+import org.javacs.SourceFileObject;
+import org.javacs.completion.PruneBodiesWithoutToken;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.FindLombokReferences;
 import org.javacs.navigation.FindReferences;
@@ -146,7 +150,7 @@ public class ReferenceProvider {
         LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d source=%s",
                 className, files.length, postings != null ? "token_index" : "text_scan"));
         if (files.length == 0) return List.of();
-        return findReferences(files, compiler.findTypeDeclaration(className));
+        return findReferences(files, compiler.findTypeDeclaration(className), simpleName);
     }
 
     private List<Location> findMemberReferences(Set<String> classNames, String memberName, Path declaration, boolean packagePrivate) {
@@ -166,10 +170,10 @@ public class ReferenceProvider {
             LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", classNames, memberName, files.length));
         }
         if (files.length == 0) return List.of();
-        return findReferences(files, declaration);
+        return findReferences(files, declaration, memberName);
     }
 
-    private List<Location> findReferences(Path[] files, Path declaration) {
+    private List<Location> findReferences(Path[] files, Path declaration, String token) {
         // Batch pre-resolve all modules these candidate files belong to.
         // For multi-module Gradle/Maven: resolves all needed modules in fewer calls.
         // For single-module: no-op.
@@ -202,8 +206,14 @@ public class ReferenceProvider {
         }
         var locations = new LinkedHashMap<String, Location>();
         for (var entry : groups.entrySet()) {
-            entry.getValue().add(file);
-            try (var task = entry.getKey().compile(entry.getValue().toArray(Path[]::new))) {
+            var candidateCompiler = entry.getKey();
+            var sources = new ArrayList<JavaFileObject>();
+            for (var candidate : entry.getValue()) {
+                if (candidate.equals(file)) continue;
+                sources.add(prunedSource(candidateCompiler, candidate, token));
+            }
+            sources.add(new SourceFileObject(file));
+            try (var task = candidateCompiler.compile(sources)) {
                 for (var location : findReferences(task)) {
                     locations.put(location.uri + ":" + location.range, location);
                 }
@@ -211,6 +221,17 @@ public class ReferenceProvider {
         }
         LOG.fine(String.format("[ref] scan_complete groups=%d total_locations=%d", groups.size(), locations.size()));
         return new ArrayList<>(locations.values());
+    }
+
+    private JavaFileObject prunedSource(CompilerProvider candidateCompiler, Path candidate, String token) {
+        if (token == null || token.isBlank()) return new SourceFileObject(candidate);
+        try {
+            var parsed = candidateCompiler.parse(candidate);
+            var pruned = new PruneBodiesWithoutToken(parsed.task()).scan(parsed.root(), token);
+            return new SourceFileObject(candidate, pruned.toString(), Instant.now());
+        } catch (RuntimeException e) {
+            return new SourceFileObject(candidate);
+        }
     }
 
     private List<Location> findReferences(CompileTask task) {
