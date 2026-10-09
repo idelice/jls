@@ -24,6 +24,8 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
     final boolean lombokPresentOnClasspath;
     SourceFileManager fileManager;
     private long sourceRevision = -1;
+    private List<String> publicTopLevelTypesCache;
+    private long publicTopLevelTypesRevision = -1;
     final SourceFileManager docsFileManager;
     private Set<Path> sourceRoots = Set.of();
 
@@ -229,6 +231,9 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
 
     @Override
     public List<String> publicTopLevelTypes() {
+        if (publicTopLevelTypesCache != null && publicTopLevelTypesRevision == FileStore.sourceRevision()) {
+            return publicTopLevelTypesCache;
+        }
         var all = new ArrayList<String>();
         for (var file : FileStore.all()) {
             if (!isSourceVisible(file)) continue;
@@ -243,6 +248,8 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         }
         all.addAll(classPathClasses);
         all.addAll(jdkClasses);
+        publicTopLevelTypesCache = all;
+        publicTopLevelTypesRevision = FileStore.sourceRevision();
         return all;
     }
 

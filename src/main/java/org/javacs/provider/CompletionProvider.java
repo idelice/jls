@@ -639,7 +639,7 @@ public class CompletionProvider {
         var endsWithParen = endsWithParen(contents, (int) cursor);
         addKeywords(path, partial, list);
         addSyntacticLocalVariables(parseTask, cursor, partial, list);
-        addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, list);
+        addSyntacticEnclosingTypeMembers(parseTask, path, cursor, partial, endsWithParen, list);
         addIndexedEnclosingTypeMembers(parseTask, path, partial, list, endsWithParen);
         addEnclosingInstanceKeywords(path, list);
         addStaticImportsFromIndex(parseTask.root(), partial, false, list);
@@ -891,6 +891,8 @@ public class CompletionProvider {
                 }
                 var start = positions.getStartPosition(task.root(), t);
                 if (start < 0 || start >= cursor) return super.visitVariable(t, null);
+                var end = positions.getEndPosition(task.root(), t);
+                if (end >= cursor) return super.visitVariable(t, null);
                 var name = t.getName().toString();
                 if (name.isEmpty()) return super.visitVariable(t, null);
                 if (!StringSearch.matchesPartialName(name, partial)) return super.visitVariable(t, null);
@@ -916,7 +918,7 @@ public class CompletionProvider {
     }
 
     private void addSyntacticEnclosingTypeMembers(
-            ParseTask parseTask, TreePath path, long cursor, String partial, CompletionList list) {
+            ParseTask parseTask, TreePath path, long cursor, String partial, boolean endsWithParen, CompletionList list) {
         var classPath = enclosingClassPath(path);
         if (classPath == null) {
             classPath = enclosingClassPath(parseTask, cursor);
@@ -941,7 +943,7 @@ public class CompletionProvider {
                     if (!isSyntacticStaticMethod(method, staticContext)) {
                         continue;
                     }
-                    addSyntacticMethod(method, partial, list);
+                    addSyntacticMethod(method, partial, endsWithParen, list);
                     break;
                 case CLASS:
                 case INTERFACE:
@@ -1103,7 +1105,7 @@ public class CompletionProvider {
         list.items.add(field(name, syntacticType(field)));
     }
 
-    private void addSyntacticMethod(MethodTree method, String partial, CompletionList list) {
+    private void addSyntacticMethod(MethodTree method, String partial, boolean endsWithParen, CompletionList list) {
         var name = method.getName().toString();
         if (!matchesCompletionPrefix(name, partial)) {
             return;
@@ -1111,7 +1113,7 @@ public class CompletionProvider {
         if (containsCompletionLabel(list, name)) {
             return;
         }
-        list.items.add(syntacticMethod(name, method));
+        list.items.add(syntacticMethod(name, method, endsWithParen));
     }
 
     private void addSyntacticNestedType(Tree member, String partial, String ownerType, CompletionList list) {
@@ -1190,8 +1192,8 @@ public class CompletionProvider {
     }
 
     private boolean isSyntacticMethodPlaceholder(CompletionItem item) {
-        // Syntactic placeholders have no completion data (data is set on indexed items) and no
-        // insertText (indexed method items set insertText to "name()" or "name($0)").
+        // Syntactic placeholders have no completion data; indexed items set data (overloads,
+        // param types), so a present data field means the item is already index-backed.
         return item != null
                 && item.kind == CompletionItemKind.Method
                 && item.data == null;
@@ -1653,12 +1655,24 @@ public class CompletionProvider {
         return i;
     }
 
-    private CompletionItem syntacticMethod(String name, MethodTree method) {
+    private CompletionItem syntacticMethod(String name, MethodTree method, boolean endsWithParen) {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Method;
         i.detail = method.getReturnType() != null ? method.getReturnType().toString() : "void";
         i.sortText = sortKey(Priority.METHOD, i.label);
+        if (!endsWithParen) {
+            if (method.getParameters().isEmpty()) {
+                i.insertText = name + "()";
+                i.insertTextFormat = InsertTextFormat.PlainText;
+            } else {
+                i.insertText = name + "($0)";
+                i.insertTextFormat = InsertTextFormat.Snippet;
+                i.command = new Command();
+                i.command.command = "editor.action.triggerParameterHints";
+                i.command.title = "Trigger Parameter Hints";
+            }
+        }
         return i;
     }
 

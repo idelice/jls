@@ -205,6 +205,9 @@ public final class ParseTypeResolver {
         if (expression instanceof ParenthesizedTree parenthesized) {
             return resolveExpressionAtDepth(parenthesized.getExpression(), depth + 1);
         }
+        if (expression instanceof ParameterizedTypeTree parameterizedTypeTree) {
+            return resolveTypeTree(parameterizedTypeTree, root, false);
+        }
         if (expression instanceof IdentifierTree identifier) {
             var name = identifier.getName().toString();
             if ("this".equals(name)) {
