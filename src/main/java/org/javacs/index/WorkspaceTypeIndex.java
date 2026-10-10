@@ -602,7 +602,7 @@ public class WorkspaceTypeIndex {
      * <p>This is ~15x faster than {@link #from(CompileTask)} because it skips javac's
      * type-attribution phase. Member type names are raw strings from the parse tree (may be simple
      * names rather than fully qualified), but are sufficient for bootstrap completion candidate
-     * lists. {@link org.javacs.resolve.ParseTypeResolver} resolves these at query time.
+     * lists. The compiler resolves exact types at query time where needed.
      *
      * <p>Inherited members are resolved lazily at query time.
      *
@@ -1190,7 +1190,7 @@ public class WorkspaceTypeIndex {
      * Add a field member from the parse tree.
      *
      * <p>The type string is the raw parse-tree text (may include generics or be a simple name).
-     * {@link org.javacs.resolve.ParseTypeResolver} resolves these at query time.
+     * The compiler resolves exact types at query time where needed.
      */
     private static void addParseTreeField(
             String ownerQualifiedName, VariableTree variable, Map<String, IndexedMember> seen,

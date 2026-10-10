@@ -416,9 +416,9 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                                         null,
                                         false,
                                         IndexedMember.Provenance.EXTERNAL_BINARY);
-                        // Enrich with generic (non-erased) declared types so that
-                        // ParseTypeResolver can bind method-level type variables from
-                        // call-site Class<T> arguments (e.g. mapper.readValue(json, Foo.class)).
+                        // Enrich with generic (non-erased) declared types so the compiler can
+                        // bind method-level type variables from call-site Class<T> arguments
+                        // (e.g. mapper.readValue(json, Foo.class)).
                         try {
                             var genericReturn = method.getGenericReturnType().getTypeName();
                             var genericParams = method.getGenericParameterTypes();

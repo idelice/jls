@@ -74,7 +74,6 @@ import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.InsertTextFormat;
 import org.javacs.lsp.TextEdit;
-import org.javacs.resolve.ParseTypeResolver;
 import org.javacs.resolve.TypeNames;
 import org.javacs.rewrite.AddImport;
 
@@ -379,7 +378,7 @@ public class CompletionProvider {
         try {
             var file = Paths.get(parseTask.root().getSourceFile().toUri());
             var source = new SourceFileObject(file, contents, Instant.now());
-            try (var task = compiler.compile(List.of(source))) {
+            try (var task = compiler.compile(List.of(source), true)) {
                 var trees = Trees.instance(task.task);
                 var path = new FindCompletionsAt(task.task).scan(task.root(file), cursor);
                 if (path == null) return EMPTY;
@@ -1026,12 +1025,7 @@ public class CompletionProvider {
         if (switchExpression == null) {
             return null;
         }
-        var resolver = new ParseTypeResolver(parseTask, compiler, typeIndexRouter, cursor);
-        var resolved = resolver.resolve(switchExpression, null);
-        if (resolved.isEmpty()) {
-            return null;
-        }
-        var enumType = resolved.get().qualifiedType();
+        var enumType = resolveSwitchSelectorType(parseTask, cursor);
         if (enumType == null || enumType.isBlank()) {
             return null;
         }
@@ -1050,6 +1044,40 @@ public class CompletionProvider {
         }
         sortCompletionItems(list.items);
         return list;
+    }
+
+    /** Compile the file and return the qualified type of the switch selector enclosing the cursor. */
+    private String resolveSwitchSelectorType(ParseTask parseTask, long cursor) {
+        var file = Paths.get(parseTask.root().getSourceFile().toUri());
+        String contents;
+        try {
+            contents = parseTask.root().getSourceFile().getCharContent(true).toString();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+        var buffer = new PruneMethodBodies(parseTask.task()).scan(parseTask.root(), cursor);
+        var endOfLine = endOfLine(buffer, (int) cursor);
+        buffer.insert(endOfLine, ';');
+        var pruned = buffer.toString();
+        var source = new SourceFileObject(file, pruned, Instant.now());
+        try (CompileTask task = compiler.compile(List.of(source), true)) {
+            var root = task.root(source);
+            if (root == null) return null;
+            var path = new FindCompletionsAt(task.task).scan(root, cursor);
+            if (path == null) return null;
+            var selector = switchExpression(path);
+            if (selector == null) return null;
+            var selectorPath = task.trees.getPath(root, selector);
+            if (selectorPath == null) return null;
+            var type = task.trees.getTypeMirror(selectorPath);
+            if (type == null || type.getKind() == TypeKind.ERROR || !(type instanceof DeclaredType declared)) {
+                return null;
+            }
+            if (declared.asElement() instanceof TypeElement te) {
+                return te.getQualifiedName().toString();
+            }
+            return null;
+        }
     }
 
     private Tree switchExpression(TreePath path) {

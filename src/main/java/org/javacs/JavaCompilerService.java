@@ -102,7 +102,17 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
 
     @Override
     public CompileTask compile(Collection<? extends JavaFileObject> sources) {
-        var batch = new CompileBatch(this, sources);
+        return compile(sources, false);
+    }
+
+    /**
+     * Bounded compiles withhold disk sibling sources from SOURCE_PATH so a single interactive
+     * compile (completion/signature/hover) cannot transitively parse the whole module. A malformed
+     * buffer then costs one file, keeping the warm context cheap to rebuild after a failed analyze.
+     */
+    @Override
+    public CompileTask compile(Collection<? extends JavaFileObject> sources, boolean bounded) {
+        var batch = new CompileBatch(this, sources, bounded);
         return new CompileTask(batch.task, batch.trees, batch.elements, batch.types, batch.roots, batch.diagnostics, batch::close);
     }
 

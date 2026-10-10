@@ -36,6 +36,14 @@ public interface CompilerProvider {
 
     CompileTask compile(Collection<? extends JavaFileObject> sources);
 
+    /**
+     * Bounded compiles withhold disk sibling sources from SOURCE_PATH so one interactive compile
+     * cannot transitively parse the whole module. Defaults to an ordinary compile.
+     */
+    default CompileTask compile(Collection<? extends JavaFileObject> sources, boolean bounded) {
+        return compile(sources);
+    }
+
     default List<ParseTask> parseAll(Collection<Path> files) {
         var result = new ArrayList<ParseTask>(files.size());
         for (var file : files) {

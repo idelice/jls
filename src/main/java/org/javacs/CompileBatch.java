@@ -15,6 +15,7 @@ import javax.tools.*;
 public final class CompileBatch implements AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
     private final ReusableCompiler.Borrow borrow;
+    private final SourceFileManager fileManager;
     final JavacTask task;
     final Trees trees;
     final Elements elements;
@@ -23,37 +24,53 @@ public final class CompileBatch implements AutoCloseable {
     final List<Diagnostic<? extends JavaFileObject>> diagnostics = new ArrayList<>();
 
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
+        this(parent, files, false);
+    }
+
+    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean bounded) {
         if (files.isEmpty()) throw new IllegalArgumentException("No source files to analyze");
         parent.prepareFileManager();
-        borrow = parent.compiler.borrow(parent.fileManager, diagnostics::add,
-                options(parent.classPath, parent.addExports, parent.extraArgs), files);
-        task = borrow.task;
-        trees = Trees.instance(task);
-        elements = task.getElements();
-        types = task.getTypes();
-        var started = System.nanoTime();
-        var parsed = new HashSet<java.net.URI>();
-        var injector = new LombokStubInjector(borrow.task.getContext());
-        task.addTaskListener(new TaskListener() {
-            @Override public void finished(TaskEvent event) {
-                var unit = event.getCompilationUnit();
-                if (event.getKind() == TaskEvent.Kind.PARSE && unit != null
-                        && parsed.add(unit.getSourceFile().toUri())) injector.inject(unit);
-            }
-        });
+        fileManager = parent.fileManager;
+        // Bounded stays active for the whole CompileTask lifetime (javac completes symbols lazily,
+        // including during a provider's later getTypeMirror), and is cleared in close().
+        fileManager.setBounded(bounded);
+        boolean ok = false;
         try {
-            task.parse().forEach(roots::add);
-            analyze();
-        } catch (IOException | RuntimeException | Error failure) {
-            borrow.invalidate();
-            borrow.close();
-            if (failure instanceof RuntimeException runtime) throw runtime;
-            if (failure instanceof Error error) throw error;
-            throw new RuntimeException(failure);
+            borrow = parent.compiler.borrow(parent.fileManager, diagnostics::add,
+                    options(parent.classPath, parent.addExports, parent.extraArgs), files);
+            task = borrow.task;
+            trees = Trees.instance(task);
+            elements = task.getElements();
+            types = task.getTypes();
+            var started = System.nanoTime();
+            var parsed = new HashSet<java.net.URI>();
+            var injector = new LombokStubInjector(borrow.task.getContext());
+            task.addTaskListener(new TaskListener() {
+                @Override public void finished(TaskEvent event) {
+                    var unit = event.getCompilationUnit();
+                    if (event.getKind() == TaskEvent.Kind.PARSE && unit != null
+                            && parsed.add(unit.getSourceFile().toUri())) injector.inject(unit);
+                }
+            });
+            try {
+                task.parse().forEach(roots::add);
+                analyze();
+            } catch (IOException | RuntimeException | Error failure) {
+                borrow.invalidate();
+                borrow.close();
+                if (failure instanceof RuntimeException runtime) throw runtime;
+                if (failure instanceof Error error) throw error;
+                throw new RuntimeException(failure);
+            }
+            LOG.info("[analysis] context=" + borrow.id() + " reused=" + borrow.reused
+                    + " proc=none requested=" + files.size() + " parsed=" + parsed.size()
+                    + " diagnostics=" + diagnostics.size() + " ms=" + (System.nanoTime() - started) / 1_000_000);
+            ok = true;
+        } finally {
+            // On a thrown compile the task is already closed above; clear bounded now. On success,
+            // close() clears it after the provider finishes reading types.
+            if (!ok) fileManager.setBounded(false);
         }
-        LOG.info("[analysis] context=" + borrow.id() + " reused=" + borrow.reused
-                + " proc=none requested=" + files.size() + " parsed=" + parsed.size()
-                + " diagnostics=" + diagnostics.size() + " ms=" + (System.nanoTime() - started) / 1_000_000);
     }
 
     private void analyze() throws IOException {
@@ -66,7 +83,10 @@ public final class CompileBatch implements AutoCloseable {
         }
     }
 
-    @Override public void close() { borrow.close(); }
+    @Override public void close() {
+        fileManager.setBounded(false);
+        borrow.close();
+    }
 
     static List<String> options(Set<Path> classPath, Set<String> addExports, List<String> extraArgs) {
         var list = new ArrayList<String>();

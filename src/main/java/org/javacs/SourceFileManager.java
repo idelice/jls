@@ -11,12 +11,23 @@ import javax.tools.*;
 
 class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManager> {
     private final java.util.function.Predicate<String> workspaceType;
+    private boolean bounded;
 
     SourceFileManager() { this(name -> false); }
 
     SourceFileManager(java.util.function.Predicate<String> workspaceType) {
         super(createDelegateFileManager());
         this.workspaceType = workspaceType;
+    }
+
+    /**
+     * When bounded, SOURCE_PATH serves only open/dirty documents, so javac cannot transitively
+     * parse arbitrary sibling sources from disk. Unknown siblings resolve from already-entered
+     * symbols or degrade to a local "cannot find symbol" instead of pulling in the whole module.
+     * Single-threaded LSP dispatch makes toggling this per-compile safe.
+     */
+    void setBounded(boolean bounded) {
+        this.bounded = bounded;
     }
 
     private static StandardJavaFileManager createDelegateFileManager() {
@@ -42,6 +53,24 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
         }
         if (location != StandardLocation.SOURCE_PATH || !kinds.contains(JavaFileObject.Kind.SOURCE)) return listed;
 
+        if (bounded) {
+            // Only open/dirty documents in the package; no disk sibling scan, so attribution
+            // cannot cascade into parsing the whole module from source.
+            var open = new LinkedHashMap<java.net.URI, JavaFileObject>();
+            for (var path : FileStore.activeDocuments()) {
+                if (!isOnSourcePath(path)) continue;
+                if (FileStore.activeDocument(path) == null && !FileStore.isDirty(path)) continue;
+                var sourcePackage = sourcePackage(path);
+                if (sourcePackage == null) continue;
+                if (packageMatches(sourcePackage, packageName, recurse)) {
+                    open.putIfAbsent(path.toUri(), new SourceFileObject(path));
+                }
+            }
+            var sources = new ArrayList<JavaFileObject>(open.values());
+            addAuxiliaryTypes(open.values(), packageName, sources);
+            return sources;
+        }
+
         var result = new LinkedHashMap<java.net.URI, JavaFileObject>();
         for (var source : listed) {
             if (isModuleDeclaration(source)) continue;
@@ -57,23 +86,36 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
             if (Files.exists(path) || !isOnSourcePath(path)) continue;
             var sourcePackage = sourcePackage(path);
             if (sourcePackage == null) continue;
-            var packageMatches = recurse
-                    ? sourcePackage.equals(packageName) || sourcePackage.startsWith(packageName + ".")
-                    : sourcePackage.equals(packageName);
-            if (packageMatches) result.putIfAbsent(path.toUri(), new SourceFileObject(path));
+            if (packageMatches(sourcePackage, packageName, recurse)) {
+                result.putIfAbsent(path.toUri(), new SourceFileObject(path));
+            }
         }
-        var sources = new ArrayList<>(result.values());
-        for (var source : result.values()) {
+        var sources = new ArrayList<JavaFileObject>(result.values());
+        addAuxiliaryTypes(result.values(), packageName, sources);
+        return sources;
+    }
+
+    private boolean packageMatches(String sourcePackage, String packageName, boolean recurse) {
+        return recurse
+                ? sourcePackage.equals(packageName) || sourcePackage.startsWith(packageName + ".")
+                : sourcePackage.equals(packageName);
+    }
+
+    /** Add secondary top-level types declared in the given files so they resolve by name. */
+    private void addAuxiliaryTypes(
+            Collection<JavaFileObject> files, String packageName, List<JavaFileObject> sources) {
+        var prefix = packageName.isEmpty() ? "" : packageName + ".";
+        for (var source : files) {
             var path = filePath(source);
             if (path == null || !FileStore.contains(path)) continue;
             var primary = binaryName(path);
-            var prefix = packageName.isEmpty() ? "" : packageName + ".";
             for (var declared : JavaCompilerService.declaredTypes(path)) {
                 if (!declared.equals(primary) && declared.startsWith(prefix)
-                        && declared.indexOf('.', prefix.length()) < 0) sources.add(new AuxiliarySource(path, declared));
+                        && declared.indexOf('.', prefix.length()) < 0) {
+                    sources.add(new AuxiliarySource(path, declared));
+                }
             }
         }
-        return sources;
     }
 
     @Override
@@ -91,6 +133,15 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
         if (location == StandardLocation.CLASS_PATH && kind == JavaFileObject.Kind.CLASS
                 && workspaceType.test(className)) return null;
         if (location == StandardLocation.SOURCE_PATH && "module-info".equals(className)) return null;
+        if (bounded && location == StandardLocation.SOURCE_PATH) {
+            // Serve only open/dirty buffers; never read an arbitrary sibling source from disk.
+            for (var candidate : FileStore.activeDocuments()) {
+                if (isOnSourcePath(candidate) && className.equals(binaryName(candidate))) {
+                    return new SourceFileObject(candidate);
+                }
+            }
+            return null;
+        }
         var source = super.getJavaFileForInput(location, className, kind);
         if (location != StandardLocation.SOURCE_PATH || kind != JavaFileObject.Kind.SOURCE) return source;
         var path = filePath(source);
