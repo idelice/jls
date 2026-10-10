@@ -32,7 +32,6 @@ import org.javacs.lsp.Location;
 import org.javacs.navigation.NavigationHelper;
 import org.javacs.resolve.TypeNames;
 
-/** Finds workspace type and method implementations, verified by javac. */
 public final class ImplementationProvider {
     private static final Logger LOG = Logger.getLogger("main");
 

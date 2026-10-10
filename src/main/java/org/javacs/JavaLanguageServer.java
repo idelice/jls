@@ -105,7 +105,7 @@ class JavaLanguageServer extends LanguageServer {
     private final Set<String> shownWorkspaceWarnings = ConcurrentHashMap.newKeySet();
 
     /** Pairs a pending Rewrite with the compiler it was computed against. */
-    private record PendingRewrite(org.javacs.rewrite.Rewrite rewrite, CompilerProvider compiler) {}
+    private record PendingRewrite(Rewrite rewrite, CompilerProvider compiler) {}
 
     /** LRU cache of pending code actions keyed by UUID, used for codeAction/resolve. */
     private static final int REWRITE_REGISTRY_MAX = 200;
@@ -943,12 +943,12 @@ class JavaLanguageServer extends LanguageServer {
     public List<CodeAction> codeAction(CodeActionParams params) {
         var requestCompiler = compilerFor(Paths.get(params.textDocument.uri));
         // Forwarding map: provider stores Rewrite by UUID; we pair it with the compiler atomically.
-        var rewriteSink = new java.util.AbstractMap<String, org.javacs.rewrite.Rewrite>() {
-            @Override public org.javacs.rewrite.Rewrite put(String id, org.javacs.rewrite.Rewrite rw) {
+        var rewriteSink = new java.util.AbstractMap<String, Rewrite>() {
+            @Override public Rewrite put(String id, Rewrite rw) {
                 pendingRewrites.put(id, new PendingRewrite(rw, requestCompiler));
                 return null;
             }
-            @Override public Set<Map.Entry<String, org.javacs.rewrite.Rewrite>> entrySet() { return Set.of(); }
+            @Override public Set<Map.Entry<String, Rewrite>> entrySet() { return Set.of(); }
         };
         var provider = new CodeActionProvider(requestCompiler, rewriteSink);
         return params.context.diagnostics.isEmpty()
@@ -963,7 +963,7 @@ class JavaLanguageServer extends LanguageServer {
         var pending = pendingRewrites.remove(id);
         if (pending == null) return action;
         var edits = pending.rewrite().rewrite(pending.compiler() != null ? pending.compiler() : getOrCreateCompiler());
-        if (edits == null || edits == org.javacs.rewrite.Rewrite.CANCELLED) return action;
+        if (edits == null || edits == Rewrite.CANCELLED) return action;
         action.edit = new WorkspaceEdit();
         for (var entry : edits.entrySet()) {
             action.edit.changes.put(entry.getKey().toUri(), List.of(entry.getValue()));
