@@ -251,6 +251,10 @@ public class FindHelper {
         var pattern = Pattern.compile("\\b" + escaped + "\\b");
         var matcher = pattern.matcher(contents);
         matcher.region(start, end);
+        // Let \b see the characters just outside [start,end) so a name whose boundary sits exactly
+        // at the region edge (e.g. a chained call's identifier ending right before '(') still matches.
+        matcher.useTransparentBounds(true);
+        matcher.useAnchoringBounds(false);
         int firstMatch = -1;
         while (matcher.find()) {
             var nameStart = matcher.start();
@@ -265,35 +269,27 @@ public class FindHelper {
     }
 
     static boolean isInsideComment(CharSequence contents, int position) {
-        // Check line comment: scan backward to start of line, look for //
-        int lineStart = position;
-        while (lineStart > 0 && contents.charAt(lineStart - 1) != '\n') {
-            lineStart--;
-        }
-        for (int i = lineStart; i < position - 1; i++) {
+        boolean inLine = false, inBlock = false, inString = false, inChar = false;
+        for (int i = 0; i < position && i < contents.length(); i++) {
             char c = contents.charAt(i);
-            if (c == '/' && contents.charAt(i + 1) == '/') {
-                return true; // position is after // on same line
-            }
-            // Skip string literals to avoid false positives on "//" inside strings
-            if (c == '"') {
-                i++;
-                while (i < position && contents.charAt(i) != '"') {
-                    if (contents.charAt(i) == '\\') i++; // skip escaped char
-                    i++;
-                }
-            }
-        }
-        // Check block comment: scan backward from position for /* without closing */
-        for (int i = position - 1; i > 0; i--) {
-            char c = contents.charAt(i);
-            if (c == '/' && contents.charAt(i - 1) == '*') {
-                return false; // found */ before any /*, so we're outside
-            }
-            if (c == '*' && contents.charAt(i - 1) == '/') {
-                return true; // found /* without prior */, so we're inside
+            char next = i + 1 < contents.length() ? contents.charAt(i + 1) : '\0';
+            if (inLine) {
+                if (c == '\n') inLine = false;
+            } else if (inBlock) {
+                if (c == '*' && next == '/') { inBlock = false; i++; }
+            } else if (inString) {
+                if (c == '\\') i++;
+                else if (c == '"') inString = false;
+            } else if (inChar) {
+                if (c == '\\') i++;
+                else if (c == '\'') inChar = false;
+            } else {
+                if (c == '/' && next == '/') { inLine = true; i++; }
+                else if (c == '/' && next == '*') { inBlock = true; i++; }
+                else if (c == '"') inString = true;
+                else if (c == '\'') inChar = true;
             }
         }
-        return false;
+        return inLine || inBlock;
     }
 }

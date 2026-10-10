@@ -95,8 +95,14 @@ public class SignatureProvider {
             for (var member : overloads) {
                 var method = findSourceMethod(member);
                 var info = new SignatureInformation();
-                info.label = buildLabel(member, method);
-                info.parameters = buildParameters(method);
+                if (method != null) {
+                    info.label = buildLabel(member, method);
+                    info.parameters = buildParameters(method);
+                } else {
+                    // No source (e.g. a bytecode-only dependency jar): use the indexed signature.
+                    info.label = buildLabelFromIndex(member);
+                    info.parameters = buildParametersFromIndex(member);
+                }
                 signatures.add(info);
             }
 
@@ -241,7 +247,7 @@ public class SignatureProvider {
 
     private MethodTree findSourceMethod(IndexedMember member) {
         var source = compiler.findAnywhere(member.ownerType);
-        if (source.isEmpty()) throw new RuntimeException("no source");
+        if (source.isEmpty()) return null;
         var task = compiler.parse(source.get());
         return FindHelper.findMethod(task, member.ownerType, member.name, member.erasedParameterTypes);
     }
@@ -272,5 +278,54 @@ public class SignatureProvider {
             result.add(info);
         }
         return result;
+    }
+
+    /** Signature from the index member when no source is available (bytecode-only dependency). */
+    private String buildLabelFromIndex(IndexedMember member) {
+        var name = member.kind == CompletionItemKind.Constructor
+                ? member.ownerType.substring(member.ownerType.lastIndexOf('.') + 1)
+                : member.name;
+        var types = indexParameterTypes(member);
+        var names = member.parameterNames;
+        var sb = new StringBuilder(name).append('(');
+        for (int i = 0; i < types.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(simpleTypeName(types[i]));
+            if (names != null && i < names.length && names[i] != null && !names[i].isBlank()) {
+                sb.append(' ').append(names[i]);
+            }
+        }
+        return sb.append(')').toString();
+    }
+
+    private List<ParameterInformation> buildParametersFromIndex(IndexedMember member) {
+        var result = new ArrayList<ParameterInformation>();
+        var types = indexParameterTypes(member);
+        var names = member.parameterNames;
+        for (int i = 0; i < types.length; i++) {
+            var info = new ParameterInformation();
+            var type = simpleTypeName(types[i]);
+            info.label = (names != null && i < names.length && names[i] != null && !names[i].isBlank())
+                    ? type + " " + names[i]
+                    : type;
+            result.add(info);
+        }
+        return result;
+    }
+
+    private static String[] indexParameterTypes(IndexedMember member) {
+        if (member.declaredParameterTypes != null && member.declaredParameterTypes.length > 0) {
+            return member.declaredParameterTypes;
+        }
+        return member.erasedParameterTypes == null ? new String[0] : member.erasedParameterTypes;
+    }
+
+    private static String simpleTypeName(String type) {
+        if (type == null) return "";
+        var generic = type.indexOf('<');
+        var head = generic < 0 ? type : type.substring(0, generic);
+        var dot = head.lastIndexOf('.');
+        var simpleHead = dot < 0 ? head : head.substring(dot + 1);
+        return generic < 0 ? simpleHead : simpleHead + type.substring(generic);
     }
 }
