@@ -89,6 +89,13 @@ Code actions are computed lazily — the list appears instantly, edits are compu
 
 The server auto-detects dependencies from Maven (`pom.xml`), Gradle (`build.gradle`), or Bazel (`BUILD`).
 
+### Single file / no build system
+
+A loose `.java` file without any build system works out of the box: the JDK is always available, and
+any `*.jar` placed next to the file or under a sibling `lib/` directory (searched recursively) is
+added to the classpath automatically. Set `CLASSPATH` or use `.java-language-server.json` below for
+anything more specific.
+
 ### `.java-language-server.json`
 
 Place in your project root for project-specific settings that travel with the repo:
@@ -236,10 +243,10 @@ dap.configurations.java = {
 
 ## Architecture
 
-Features are split across two resolution strategies:
+Features are split across two resolution strategies and some times mixed to provide the best experience:
 
-- **Compile-based** (javac attribution): go-to-definition, hover, diagnostics, code actions, find-references
-- **Index-based** (parse + workspace index): autocomplete, signature help, inlay hints
+- **Compile-based** (javac attribution): go-to-definition, hover, diagnostics, code actions, find-references, member completion, signature help
+- **Index-based** (parse + workspace index): identifier completion, inlay hints
 
 ### Source-only analysis
 
