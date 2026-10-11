@@ -14,6 +14,19 @@ public class FindNameAt extends TreePathScanner<TreePath, Long> {
     }
 
     @Override
+    public TreePath scan(Tree tree, Long find) {
+        if (tree != null && root != null) {
+            var pos = trees.getSourcePositions();
+            var start = pos.getStartPosition(root, tree);
+            var end = pos.getEndPosition(root, tree);
+            if (start >= 0 && end >= 0 && (find < start || find > end)) {
+                return null;
+            }
+        }
+        return super.scan(tree, find);
+    }
+
+    @Override
     public TreePath visitCompilationUnit(CompilationUnitTree t, Long find) {
         root = t;
         return super.visitCompilationUnit(t, find);

@@ -114,25 +114,27 @@ class InferConfig {
         };
     }
 
-    /**
-     * With no build system, resolve jars sitting next to the sources: any {@code *.jar} in the
-     * workspace root or a {@code lib/} directory. The JDK is always available, so a loose file with
-     * jars dropped beside it resolves without a build. Returns empty when there are none.
-     */
     private Set<Path> standaloneClasspath() {
         var jars = new HashSet<Path>();
-        for (var dir : List.of(workspaceRoot, workspaceRoot.resolve("lib"))) {
-            if (!Files.isDirectory(dir)) continue;
-            try (var entries = Files.list(dir)) {
-                entries.filter(p -> p.getFileName().toString().endsWith(".jar")).forEach(jars::add);
-            } catch (IOException e) {
-                LOG.fine("standalone classpath scan failed for " + dir + ": " + e.getMessage());
-            }
-        }
+        // Root: shallow (one level) so we never walk a large source tree.
+        collectJars(workspaceRoot, 1, jars);
+        // lib/: deeper, bounded, so nested dependency layouts (lib/foo/bar.jar) resolve.
+        collectJars(workspaceRoot.resolve("lib"), 6, jars);
         if (!jars.isEmpty()) {
             LOG.info("[standalone] resolved " + jars.size() + " jar(s) from workspace root/lib");
         }
         return jars;
+    }
+
+    private static void collectJars(Path dir, int maxDepth, Set<Path> out) {
+        if (!Files.isDirectory(dir)) return;
+        try (var stream = Files.walk(dir, maxDepth)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".jar"))
+                    .forEach(out::add);
+        } catch (IOException e) {
+            LOG.fine("[standalone] jar scan failed for " + dir + ": " + e.getMessage());
+        }
     }
 
     private Set<Path> mavenClasspath() {

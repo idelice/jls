@@ -141,6 +141,9 @@ public class SignatureProvider {
             CompileTask task, CompilationUnitTree root, TreePath invokePath, MethodInvocationTree invoke) {
         var select = invoke.getMethodSelect();
         if (select instanceof IdentifierTree id) {
+            // Prefer the compiler-resolved owner (handles static imports, cross-module, inherited).
+            var resolved = resolveIdentifierOwner(task, invokePath, select, id.getName().toString());
+            if (!resolved.isEmpty()) return resolved;
             var results = resolveUnqualifiedMethod(root, id);
             if (results.isEmpty()) {
                 results = resolveStaticImportMethod(root, id.getName().toString());
@@ -151,6 +154,21 @@ public class SignatureProvider {
             return resolveQualifiedMethod(task, invokePath, ms);
         }
         return List.of();
+    }
+
+    private List<IndexedMember> resolveIdentifierOwner(
+            CompileTask task, TreePath invokePath, Tree methodSelect, String methodName) {
+        var selectPath = new TreePath(invokePath, methodSelect);
+        var element = task.trees.getElement(selectPath);
+        if (element == null) return List.of();
+        var owner = element.getEnclosingElement();
+        if (!(owner instanceof TypeElement type)) return List.of();
+        var ownerName = type.getQualifiedName().toString();
+        var isStatic = element.getModifiers().contains(javax.lang.model.element.Modifier.STATIC);
+        var overloads = index.methodOverloads(ownerName, methodName, isStatic);
+        if (!overloads.isEmpty()) return overloads;
+        // The element may be static-imported but recorded under instance context, or vice versa.
+        return index.methodOverloads(ownerName, methodName, !isStatic);
     }
 
     private List<IndexedMember> resolveStaticImportMethod(CompilationUnitTree root, String methodName) {
@@ -249,7 +267,13 @@ public class SignatureProvider {
         var source = compiler.findAnywhere(member.ownerType);
         if (source.isEmpty()) return null;
         var task = compiler.parse(source.get());
-        return FindHelper.findMethod(task, member.ownerType, member.name, member.erasedParameterTypes);
+        try {
+            return FindHelper.findMethod(task, member.ownerType, member.name, member.erasedParameterTypes);
+        } catch (RuntimeException notFound) {
+            // Source exists but this overload isn't located (e.g. erased-type mismatch); fall back
+            // to the indexed signature rather than aborting all overloads.
+            return null;
+        }
     }
 
     private String buildLabel(IndexedMember member, MethodTree method) {

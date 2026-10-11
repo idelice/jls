@@ -14,6 +14,7 @@ import com.sun.source.tree.VariableTree;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.util.Elements;
@@ -396,7 +397,14 @@ public class DefinitionProvider {
         return List.of(FindHelper.location(parse, path, memberName));
     }
 
+    private static boolean canOverride(ExecutableElement method) {
+        if (method.getKind() != ElementKind.METHOD) return false;
+        var mods = method.getModifiers();
+        return !mods.contains(Modifier.PRIVATE) && !mods.contains(Modifier.STATIC);
+    }
+
     private List<Location> navigateToDeclaration(CompileTask task, ExecutableElement method) {
+        if (!canOverride(method)) return List.of();
         var enclosing = (TypeElement) method.getEnclosingElement();
         var types = task.types;
         var elements = task.elements;
@@ -487,7 +495,7 @@ public class DefinitionProvider {
     }
 
     private List<Location> tryDeclarationNavigation(CompileTask task, Element element) {
-        if (element instanceof ExecutableElement method) {
+        if (element instanceof ExecutableElement method && canOverride(method)) {
             var decl = navigateToDeclaration(task, method);
             if (!decl.isEmpty()) return decl;
         }
@@ -518,7 +526,7 @@ public class DefinitionProvider {
             if (!decl.isEmpty()) return decl;
             return List.of();
         }
-        if (element instanceof ExecutableElement method) {
+        if (element instanceof ExecutableElement method && canOverride(method)) {
             var decl = navigateToDeclaration(task, method);
             if (!decl.isEmpty()) return decl;
         }

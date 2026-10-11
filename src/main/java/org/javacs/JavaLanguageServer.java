@@ -12,7 +12,6 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
@@ -284,9 +283,10 @@ class JavaLanguageServer extends LanguageServer {
         }
         var inferred = infer.compilerArgs();
         if (inferred.mixedModules()) {
-            warnUserOnce(
+            notifyUser(
                     "maven_mixed_release_fallback",
-                    "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.");
+                    "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.", 
+                    MessageType.Warning);
             return new InferConfig.CompilerArgs(userExtraArgs, "fallback_mixed_modules", true);
         }
         if (inferred.args().isEmpty()) {
@@ -307,18 +307,16 @@ class JavaLanguageServer extends LanguageServer {
         return false;
     }
 
-    private void warnUserOnce(String key, String message) {
+    private void notifyUser(String key, String message, int type) {
         if (!shownWorkspaceWarnings.add(key)) {
             return;
         }
         var params = new ShowMessageParams();
-        params.type = MessageType.Warning;
+        params.type = type;
         params.message = message;
         client.showMessage(params);
         LOG.warning(message);
     }
-
-
 
     @Override
     public InitializeResult initialize(InitializeParams params) {
@@ -865,6 +863,7 @@ class JavaLanguageServer extends LanguageServer {
 
     private volatile Path pendingPropagation;
     private long lastPropagatedIndexVersion;
+    private boolean serverReadyAnnounced;
 
     private void lint(Path file, int hintCenterLine) {
         lint(file, hintCenterLine, true);
@@ -883,6 +882,10 @@ class JavaLanguageServer extends LanguageServer {
                             new Position(hintCenterLine + 50, 0));
                 }
                 pushHints(requestCompiler, task, file, hintRange);
+            }
+            if (!serverReadyAnnounced) {
+                serverReadyAnnounced = true;
+                notifyUser("JLS", "Server ready", MessageType.Info);
             }
         } catch (Exception e) {
             LOG.fine("[lint] failed file=" + file.getFileName() + " reason=" + e.getMessage());
@@ -1016,5 +1019,4 @@ class JavaLanguageServer extends LanguageServer {
         lint(file, -1, false);
         propagateDiagnostics(file);
     }
-
 }
