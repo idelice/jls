@@ -137,6 +137,7 @@ public class NavigationHelper {
             case CLASS:
             case ENUM:
             case INTERFACE:
+            case RECORD:
                 return true;
             default:
                 return false;
