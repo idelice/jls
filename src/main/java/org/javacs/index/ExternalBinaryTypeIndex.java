@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Modifier;
 import java.lang.classfile.ClassFile;
+import java.lang.classfile.Attributes;
 import java.lang.classfile.constantpool.ConstantPoolException;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
@@ -345,6 +346,19 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                                     null,
                                     false,
                                     IndexedMember.Provenance.EXTERNAL_BINARY);
+                    // field.get triggers <clinit>; restrict to static final primitive/String
+                    // and swallow failures so a bad initializer never breaks indexing.
+                    var mods = field.getModifiers();
+                    if (Modifier.isStatic(mods) && Modifier.isFinal(mods)
+                            && (field.getType().isPrimitive() || field.getType() == String.class)) {
+                        try {
+                            var value = field.get(null);
+                            if (value != null) {
+                                member = member.withConstantValue(TypeNames.formatConstant(value));
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
                     seen.putIfAbsent(memberKey(member), member);
                 } catch (TypeNotPresentException | LinkageError ex) {
                     LOG.fine(
@@ -630,6 +644,12 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                             null,
                             false,
                             IndexedMember.Provenance.EXTERNAL_BINARY);
+            if (staticMember && field.flags().has(AccessFlag.FINAL)) {
+                var cv = field.findAttribute(Attributes.constantValue()).orElse(null);
+                if (cv != null && cv.constant() != null) {
+                    member = member.withConstantValue(TypeNames.formatConstant(cv.constant().constantValue()));
+                }
+            }
             seenMembers.putIfAbsent(memberKey(member), member);
         }
 
@@ -798,7 +818,8 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                 member.sourceUri,
                 member.declarationRange,
                 member.declarationOwnerType,
-                member.targetDeclarationKey);
+                member.targetDeclarationKey,
+                member.constantValue);
     }
 
     private IndexedType applySourceLinks(IndexedType raw) {
@@ -939,7 +960,8 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                                                 qualifiedName,
                                                 CompletionItemKind.Field,
                                                 fieldName,
-                                                null)));
+                                                null),
+                                        null));
                     }
                 }
                 if (accessorInfo.hasSetter()) {
@@ -994,7 +1016,8 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                                                 qualifiedName,
                                                 CompletionItemKind.Field,
                                                 fieldName,
-                                                null)));
+                                                null),
+                                        null));
                     }
                 }
             }

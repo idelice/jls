@@ -128,4 +128,10 @@ public final class TypeNames {
         return name != null && !name.isBlank()
                 && (!Character.isLowerCase(name.charAt(0)) || name.indexOf('.') >= 0);
     }
+
+    public static String formatConstant(Object value) {
+        if (value instanceof String s) return "\"" + s + "\"";
+        if (value instanceof Character c) return "'" + c + "'";
+        return String.valueOf(value);
+    }
 }

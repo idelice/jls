@@ -5,6 +5,7 @@ import java.util.List;
 
 public class CompletionItem {
     public String label;
+    public CompletionItemLabelDetails labelDetails;
     public int kind;
     public String detail;
     public MarkupContent documentation;

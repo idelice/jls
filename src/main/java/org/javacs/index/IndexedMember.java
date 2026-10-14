@@ -63,6 +63,7 @@ public final class IndexedMember {
     public final Range declarationRange;
     public final String declarationOwnerType;
     public final String targetDeclarationKey;
+    public final String constantValue;
 
     public IndexedMember(
             String ownerType,
@@ -139,7 +140,8 @@ public final class IndexedMember {
                 null,
                 null,
                 ownerType,
-                canonicalKey);
+                canonicalKey,
+                null);
     }
 
     public IndexedMember(
@@ -192,7 +194,8 @@ public final class IndexedMember {
                 sourceUri,
                 declarationRange,
                 ownerType,
-                canonicalKey);
+                canonicalKey,
+                null);
     }
 
     public IndexedMember(
@@ -221,7 +224,8 @@ public final class IndexedMember {
             URI sourceUri,
             Range declarationRange,
             String declarationOwnerType,
-            String targetDeclarationKey) {
+            String targetDeclarationKey,
+            String constantValue) {
         this.ownerType = ownerType;
         this.name = name;
         this.kind = kind;
@@ -248,6 +252,7 @@ public final class IndexedMember {
         this.declarationRange = declarationRange;
         this.declarationOwnerType = declarationOwnerType != null ? declarationOwnerType : ownerType;
         this.targetDeclarationKey = targetDeclarationKey != null ? targetDeclarationKey : canonicalKey;
+        this.constantValue = constantValue;
     }
 
     public IndexedMember withNavigation(String declarationOwnerType, String targetDeclarationKey) {
@@ -257,7 +262,7 @@ public final class IndexedMember {
                 parameterNames, erasedParameterTypes, declaredParameterTypes,
                 canonicalKey, logicalKey, backingFieldName, synthetic,
                 origin, provenance, modifiers, sourceUri, declarationRange,
-                declarationOwnerType, targetDeclarationKey);
+                declarationOwnerType, targetDeclarationKey, constantValue);
     }
 
     public IndexedMember withDeclaredTypes(String newDeclaredReturnType, String[] newDeclaredParameterTypes) {
@@ -267,7 +272,17 @@ public final class IndexedMember {
                 parameterNames, erasedParameterTypes, newDeclaredParameterTypes,
                 canonicalKey, logicalKey, backingFieldName, synthetic,
                 origin, provenance, modifiers, sourceUri, declarationRange,
-                declarationOwnerType, targetDeclarationKey);
+                declarationOwnerType, targetDeclarationKey, constantValue);
+    }
+
+    public IndexedMember withConstantValue(String newConstantValue) {
+        return new IndexedMember(
+                ownerType, name, kind, isStatic, isPrivate, isProtected, isPublic, isAbstract,
+                priority, detail, returnType, declaredReturnType,
+                parameterNames, erasedParameterTypes, declaredParameterTypes,
+                canonicalKey, logicalKey, backingFieldName, synthetic,
+                origin, provenance, modifiers, sourceUri, declarationRange,
+                declarationOwnerType, targetDeclarationKey, newConstantValue);
     }
 
     public static String canonicalKey(

@@ -2,6 +2,7 @@ package org.javacs.index;
 
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
@@ -1240,6 +1241,15 @@ public class WorkspaceTypeIndex {
                 canonicalKey, canonicalKey, null, generated,
                 origin, Set.copyOf(flags), null, null);
 
+        // Interface fields are implicitly final with no explicit FINAL flag. Parse-only:
+        // only direct literal initializers, no reference resolution or constant folding.
+        var effectivelyFinal = flags.contains(Modifier.FINAL) || enclosingIsInterface;
+        if (isStatic && effectivelyFinal
+                && variable.getInitializer() instanceof LiteralTree literal
+                && literal.getValue() != null) {
+            next = next.withConstantValue(TypeNames.formatConstant(literal.getValue()));
+        }
+
         seen.putIfAbsent(memberStorageKey(next), next);
     }
 
@@ -1331,7 +1341,8 @@ public class WorkspaceTypeIndex {
                 member.parameterNames, member.erasedParameterTypes, member.declaredParameterTypes,
                 member.canonicalKey, member.logicalKey, member.backingFieldName, member.synthetic,
                 member.origin, member.provenance, member.modifiers, member.sourceUri,
-                member.declarationRange, member.declarationOwnerType, member.targetDeclarationKey);
+                member.declarationRange, member.declarationOwnerType, member.targetDeclarationKey,
+                member.constantValue);
     }
 
 

@@ -46,6 +46,7 @@ import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.Name;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
@@ -71,6 +72,7 @@ import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.Command;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
+import org.javacs.lsp.CompletionItemLabelDetails;
 import org.javacs.lsp.CompletionList;
 import org.javacs.lsp.InsertTextFormat;
 import org.javacs.lsp.TextEdit;
@@ -427,6 +429,11 @@ public class CompletionProvider {
                         item.label = member.getSimpleName().toString();
                         item.kind = elementKind(member);
                         item.detail = memberDetail(member);
+                        if (member instanceof VariableElement ve && ve.getConstantValue() != null) {
+                            item.labelDetails = new CompletionItemLabelDetails();
+                            item.labelDetails.detail = " = " + TypeNames.formatConstant(ve.getConstantValue());
+                        }
+                        item.deprecated = task.task.getElements().isDeprecated(member);
                         list.add(item);
                     }
                 }
@@ -529,6 +536,11 @@ public class CompletionProvider {
         item.label = member.name;
         item.kind = member.kind;
         item.detail = resolveDetail(member, null);
+        if (member.constantValue != null) {
+            // Already display-formatted at index time; don't re-run formatConstant.
+            item.labelDetails = new CompletionItemLabelDetails();
+            item.labelDetails.detail = " = " + member.constantValue;
+        }
         item.insertText = member.name;
         item.insertTextFormat = InsertTextFormat.PlainText;
         var data = new CompletionData();
