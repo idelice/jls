@@ -95,24 +95,11 @@ public class HoverProvider {
         }
 
         sb.append(ElementSignatureHelper.simpleTypeName(method.getReturnType())).append(" ");
-        sb.append(method.getSimpleName()).append("(");
+        sb.append(method.getSimpleName());
 
-        var paramElements = method.getParameters();
-        String[] resolvedNames = null;
-        if (!paramElements.isEmpty() && ElementSignatureHelper.hasSyntheticNames(paramElements)) {
-            var owner = ElementSignatureHelper.ownerQualifiedName(method);
-            var bytes = owner == null ? null : compiler.findClassFile(owner).orElse(null);
-            resolvedNames = ElementSignatureHelper.parameterNames(method, bytes);
-        }
-
-        var params = new StringJoiner(", ");
-        for (int i = 0; i < paramElements.size(); i++) {
-            var p = paramElements.get(i);
-            var name = (resolvedNames != null && resolvedNames[i] != null)
-                    ? resolvedNames[i] : p.getSimpleName().toString();
-            params.add(ElementSignatureHelper.simpleTypeName(p.asType()) + " " + name);
-        }
-        sb.append(params).append(")");
+        var owner = ElementSignatureHelper.ownerQualifiedName(method);
+        var bytes = owner == null ? null : compiler.findClassFile(owner).orElse(null);
+        sb.append(ElementSignatureHelper.methodParams(method, bytes));
         var thrown = method.getThrownTypes();
         if (!thrown.isEmpty()) {
             sb.append(" throws ");
