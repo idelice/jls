@@ -50,6 +50,11 @@ public final class ElementSignatureHelper {
     }
 
     public static String methodSignature(ExecutableElement method, byte[] ownerClassBytes) {
+        return simpleTypeName(method.getReturnType()) + " " + method.getSimpleName()
+                + methodParams(method, ownerClassBytes);
+    }
+
+    public static String methodParams(ExecutableElement method, byte[] ownerClassBytes) {
         var paramElements = method.getParameters();
         String[] resolvedNames = hasSyntheticNames(paramElements)
                 ? parameterNames(method, ownerClassBytes) : null;
@@ -60,7 +65,7 @@ public final class ElementSignatureHelper {
                     ? resolvedNames[i] : p.getSimpleName().toString();
             params.add(simpleTypeName(p.asType()) + " " + name);
         }
-        return simpleTypeName(method.getReturnType()) + " " + method.getSimpleName() + "(" + params + ")";
+        return "(" + params + ")";
     }
 
     public static String ownerQualifiedName(ExecutableElement method) {

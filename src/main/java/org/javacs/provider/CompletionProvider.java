@@ -79,7 +79,6 @@ import org.javacs.lsp.TextEdit;
 import org.javacs.resolve.TypeNames;
 import org.javacs.rewrite.AddImport;
 
-/** Completion entrypoint that stays on the parse/index path without compiling on each request. */
 public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
@@ -95,8 +94,6 @@ public class CompletionProvider {
 
     public static final CompletionList NOT_SUPPORTED = new CompletionList(false, List.of());
     public static final int MAX_COMPLETION_ITEMS = 50;
-    private static final Set<String> OBJECT_MEMBER_LABELS =
-            Set.of("equals", "getClass", "hashCode", "notify", "notifyAll", "toString", "wait");
 
     private static final String[] TOP_LEVEL_KEYWORDS = {
         "package",
@@ -338,8 +335,6 @@ public class CompletionProvider {
     }
 
     private CompletionList finalizeCompletionList(ParseTask task, CompletionList list) {
-        // Some sentinel paths use immutable lists (List.of()).
-        // Completion post-processing mutates/sorts the list, so ensure mutability.
         if (!(list.items instanceof ArrayList)) {
             list.items = new ArrayList<>(list.items);
         }
@@ -428,17 +423,18 @@ public class CompletionProvider {
                         var item = new CompletionItem();
                         item.label = member.getSimpleName().toString();
                         item.kind = elementKind(member);
-                        item.detail = memberDetail(member);
-                        if (member instanceof VariableElement ve && ve.getConstantValue() != null) {
-                            item.labelDetails = new CompletionItemLabelDetails();
-                            item.labelDetails.detail = " = " + TypeNames.formatConstant(ve.getConstantValue());
-                        }
+                        var fieldType = memberDetail(member);
+                        item.detail = fieldType;
+                        var value = member instanceof VariableElement ve && ve.getConstantValue() != null
+                                ? " = " + TypeNames.formatConstant(ve.getConstantValue()) : null;
+                        setLabelDetails(item, value, fieldType);
                         item.deprecated = task.task.getElements().isDeprecated(member);
                         list.add(item);
                     }
                 }
                 byte[] ownerClassBytes = compiler.findClassFile(typeElement.getQualifiedName().toString())
                         .orElse(null);
+                var sourceByType = new HashMap<String, ParseTask>();
                 for (var entry : methods.entrySet()) {
                     var overloads = entry.getValue();
                     var first = overloads.getFirst();
@@ -449,6 +445,16 @@ public class CompletionProvider {
                     if (overloads.size() > 1) {
                         item.detail += " (+" + (overloads.size() - 1) + " overloads)";
                     }
+                    var returnType = ElementSignatureHelper.simpleTypeName(first.getReturnType());
+                    if (overloads.size() > 1) {
+                        returnType += " (+" + (overloads.size() - 1) + " overloads)";
+                    }
+                    var params = ElementSignatureHelper.methodParams(first, ownerClassBytes);
+                    if (ElementSignatureHelper.hasSyntheticNames(first.getParameters())) {
+                        var fromSource = sourceMethodParams(first, task, sourceByType);
+                        if (fromSource != null) params = fromSource;
+                    }
+                    setLabelDetails(item, params, returnType);
                     if (!endsWithParen && !methodReference) {
                         if (overloads.size() == 1 && first.getParameters().isEmpty()) {
                             item.insertText = first.getSimpleName() + "()";
@@ -498,8 +504,64 @@ public class CompletionProvider {
         return ElementSignatureHelper.simpleTypeName(e.asType());
     }
 
+    private static void setLabelDetails(CompletionItem item, String detail, String description) {
+        if (detail == null && description == null) return;
+        item.labelDetails = new CompletionItemLabelDetails();
+        item.labelDetails.detail = detail;
+        item.labelDetails.description = description;
+    }
+
+    private String indexMethodParams(IndexedMember member, byte[] classBytes) {
+        var types = member.erasedParameterTypes;
+        if (types == null || types.length == 0) return "()";
+        var names = member.parameterNames;
+        if (names == null) {
+            if (classBytes == null) {
+                classBytes = compiler.findClassFile(member.ownerType).orElse(null);
+            }
+            if (classBytes != null) {
+                names = ClassFileParameterNames.read(classBytes, member.name, types, member.isStatic);
+            }
+        }
+        var params = new StringJoiner(", ");
+        for (int i = 0; i < types.length; i++) {
+            var name = (names != null && i < names.length && names[i] != null) ? names[i] : "arg" + i;
+            params.add(TypeNames.simpleName(types[i]) + " " + name);
+        }
+        return "(" + params + ")";
+    }
+
     private String methodDetail(ExecutableElement m, byte[] classBytes) {
         return ElementSignatureHelper.methodSignature(m, classBytes);
+    }
+
+    private ParseTask ownerSource(String ownerType, Map<String, ParseTask> memo) {
+        if (memo.containsKey(ownerType)) return memo.get(ownerType);
+        var parsed = compiler.findAnywhere(ownerType).map(compiler::parse).orElse(null);
+        memo.put(ownerType, parsed);
+        return parsed;
+    }
+
+    private String sourceMethodParams(ExecutableElement method, CompileTask task, Map<String, ParseTask> memo) {
+        if (!(method.getEnclosingElement() instanceof TypeElement owner)) return null;
+        var ownerType = owner.getQualifiedName().toString();
+        var ownerParse = ownerSource(ownerType, memo);
+        if (ownerParse == null) return null;
+        MethodTree tree;
+        try {
+            tree = FindHelper.findMethod(
+                    ownerParse, ownerType, method.getSimpleName().toString(),
+                    FindHelper.erasedParameterTypes(task, method));
+        } catch (RuntimeException notFound) {
+            return null;
+        }
+        var params = method.getParameters();
+        var out = new StringJoiner(", ");
+        for (int i = 0; i < params.size(); i++) {
+            out.add(ElementSignatureHelper.simpleTypeName(params.get(i).asType())
+                    + " " + tree.getParameters().get(i).getName());
+        }
+        return "(" + out + ")";
     }
 
     private boolean isQualifiedTypeName(String typeName) {
@@ -536,11 +598,15 @@ public class CompletionProvider {
         item.label = member.name;
         item.kind = member.kind;
         item.detail = resolveDetail(member, null);
-        if (member.constantValue != null) {
-            // Already display-formatted at index time; don't re-run formatConstant.
-            item.labelDetails = new CompletionItemLabelDetails();
-            item.labelDetails.detail = " = " + member.constantValue;
+        String description = null;
+        if (member.kind == CompletionItemKind.Field || member.kind == CompletionItemKind.EnumMember) {
+            if (member.returnType != null) {
+                item.detail = member.returnType;
+                description = member.returnType;
+            }
         }
+        var value = member.constantValue != null ? " = " + member.constantValue : null;
+        setLabelDetails(item, value, description);
         item.insertText = member.name;
         item.insertTextFormat = InsertTextFormat.PlainText;
         var data = new CompletionData();
@@ -557,6 +623,11 @@ public class CompletionProvider {
         item.label = first.name;
         item.kind = CompletionItemKind.Method;
         item.detail = resolveDetail(first, classBytes);
+        var returnType = first.returnType != null ? TypeNames.simpleName(first.returnType) : "void";
+        if (overloads.size() > 1) {
+            returnType += " (+" + (overloads.size() - 1) + " overloads)";
+        }
+        setLabelDetails(item, indexMethodParams(first, classBytes), returnType);
         if (addParens) {
             var noArgs =
                     overloads.size() == 1
@@ -582,7 +653,6 @@ public class CompletionProvider {
         return item;
     }
 
-    /** Rebuild the detail string with real parameter names from the classfile LVT when the index only has types. */
     private String resolveDetail(IndexedMember member, byte[] classBytes) {
         if (member.parameterNames != null || member.erasedParameterTypes == null
                 || member.erasedParameterTypes.length == 0 || member.kind == CompletionItemKind.Field) {
@@ -1650,6 +1720,7 @@ public class CompletionProvider {
         i.label = TypeNames.simpleName(className);
         i.kind = CompletionItemKind.Class;
         i.detail = className;
+        setLabelDetails(i, null, className);
         i.sortText = sortKey(Priority.IMPORTED_CLASS, i.label);
         var data = new CompletionData();
         data.className = className;
@@ -1672,7 +1743,6 @@ public class CompletionProvider {
         var i = new CompletionItem();
         i.label = keyword;
         i.kind = CompletionItemKind.Keyword;
-        i.detail = "keyword";
         i.sortText = sortKey(Priority.KEYWORD, i.label);
         return i;
     }
@@ -1681,7 +1751,8 @@ public class CompletionProvider {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Variable;
-        i.detail = type != null ? type : "local";
+        i.detail = type;
+        setLabelDetails(i, null, type);
         i.sortText = sortKey(Priority.LOCAL, i.label);
         return i;
     }
@@ -1690,7 +1761,8 @@ public class CompletionProvider {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Field;
-        i.detail = type != null ? type : "field";
+        i.detail = type;
+        setLabelDetails(i, null, type);
         i.sortText = sortKey(Priority.FIELD, i.label);
         return i;
     }
@@ -1699,7 +1771,13 @@ public class CompletionProvider {
         var i = new CompletionItem();
         i.label = name;
         i.kind = CompletionItemKind.Method;
-        i.detail = method.getReturnType() != null ? method.getReturnType().toString() : "void";
+        var returnType = method.getReturnType() != null ? method.getReturnType().toString() : "void";
+        i.detail = returnType;
+        var params = new StringJoiner(", ");
+        for (var p : method.getParameters()) {
+            params.add(p.getType() + " " + p.getName());
+        }
+        setLabelDetails(i, "(" + params + ")", returnType);
         i.sortText = sortKey(Priority.METHOD, i.label);
         if (!endsWithParen) {
             if (method.getParameters().isEmpty()) {
@@ -1722,7 +1800,8 @@ public class CompletionProvider {
         i.kind = kind == Tree.Kind.INTERFACE || kind == Tree.Kind.ANNOTATION_TYPE
                 ? CompletionItemKind.Interface
                 : kind == Tree.Kind.ENUM ? CompletionItemKind.Enum : CompletionItemKind.Class;
-        i.detail = ownerType != null ? ownerType : "member type";
+        i.detail = ownerType;
+        setLabelDetails(i, null, ownerType);
         i.sortText = sortKey(Priority.IMPORTED_CLASS, i.label);
         return i;
     }
@@ -1837,6 +1916,7 @@ public class CompletionProvider {
             item.label = member.name;
             item.kind = CompletionItemKind.Property;
             item.detail = member.declaredReturnType != null ? member.declaredReturnType : "";
+            setLabelDetails(item, null, member.declaredReturnType);
             item.insertText = member.name + " = ";
             item.insertTextFormat = InsertTextFormat.PlainText;
             item.sortText = sortKey(Priority.FIELD, member.name);
