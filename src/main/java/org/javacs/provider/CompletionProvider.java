@@ -1,6 +1,7 @@
 package org.javacs.provider;
 
 import com.google.gson.JsonNull;
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
@@ -23,19 +24,18 @@ import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.StringJoiner;
 import java.util.TreeMap;
@@ -51,7 +51,6 @@ import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
-import javax.tools.JavaFileObject;
 
 import org.javacs.ClassFileParameterNames;
 import org.javacs.CompileTask;
@@ -82,10 +81,9 @@ import org.javacs.rewrite.AddImport;
 public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
-    private record MemberAccessContext(String receiver, String partial, boolean dotTrigger, boolean methodReference, int separatorEnd) { }
+    private record MemberAccessContext(String receiver, String partial, boolean methodReference) { }
     private record AnnotationContext(String qualifiedAnnotationType, String partial) {}
-    private record CompletionRequestContext(
-            ParseTask task, String contents, long cursor, TreePath parsePath, MemberAccessContext memberAccess, AnnotationContext annotationContext, long parseMs) {}
+    private record CompletionPrep(ParseTask task, String contents, long cursor, long parseMs) {}
 
     private final CompilerProvider compiler;
     private final TypeIndexRouter typeIndexRouter;
@@ -200,43 +198,46 @@ public class CompletionProvider {
 
     public CompletionList complete(Path file, int line, int column) {
         var started = Instant.now();
-        var request = prepareRequestContext(file, line, column);
-        if (request == null) {
+        var prep = prepare(file, line, column);
+        if (prep == null) {
             return NOT_SUPPORTED;
         }
+        var parsePath = new FindCompletionsAt(prep.task().task()).scan(prep.task().root(), prep.cursor());
+        var memberAccess = memberAccessContext(prep.contents(), (int) prep.cursor());
+        var annotationContext = findAnnotationContext(prep.task(), prep.cursor());
         CompletionList list;
         String mode;
         long resolveMs = 0;
         String memberCacheState = "n/a";
-        if (request.memberAccess() != null && isImportOrPackageContext(request.parsePath())) {
-            list = completeParseOnly(request.task(), request.contents(), request.cursor(), request.memberAccess().partial);
+        if (memberAccess != null && isImportOrPackageContext(parsePath)) {
+            list = completeParseRoute(prep.task(), prep.contents(), prep.cursor(), memberAccess.partial);
             mode = "import_parse";
-        } else if (request.memberAccess() != null) {
+        } else if (memberAccess != null) {
             list = completeMembersUsingCompile(
-                    request.task(), request.contents(), request.cursor(),
-                    request.memberAccess(),
-                    endsWithParen(request.contents(), (int) request.cursor()));
+                prep.task(), prep.contents(), prep.cursor(),
+                memberAccess,
+                endsWithParen(prep.contents(), (int) prep.cursor()));
             mode = "member_compile";
-        } else if (request.annotationContext() != null) {
-            var partial = partialIdentifier(request.contents(), (int) request.cursor());
-            list = completeParseOnly(request.task(), request.contents(), request.cursor(), partial);
-            var attrs = completeAnnotationAttributes(request.annotationContext());
-            list.items.addAll(0, attrs.items);
+        } else if (annotationContext != null) {
+            list = completeParseRoute(
+                prep.task(), prep.contents(), prep.cursor(), partialIdentifier(prep.contents(), (int) prep.cursor()));
+            list.items.addAll(0, completeAnnotationAttributes(annotationContext).items);
             mode = "annotation";
         } else {
-            list = completeParseOnly(
-                    request.task(), request.contents(), request.cursor(), partialIdentifier(request.contents(), (int) request.cursor()));
+            list = completeParseRoute(
+                prep.task(), prep.contents(), prep.cursor(), 
+                partialIdentifier(prep.contents(), (int) prep.cursor()));
             mode = "identifier_parse";
         }
         if (list == NOT_SUPPORTED) {
             return NOT_SUPPORTED;
         }
-        list = finalizeCompletionList(request.task(), list);
-        logCompletionFlow(file, mode, request.parseMs(), resolveMs, memberCacheState, started);
+        list = finalizeCompletionList(prep.task(), list);
+        logCompletionFlow(file, mode, prep.parseMs(), resolveMs, memberCacheState, started);
         return list;
     }
 
-    private CompletionRequestContext prepareRequestContext(Path file, int line, int column) {
+    private CompletionPrep prepare(Path file, int line, int column) {
         var parseStarted = Instant.now();
         var task = compiler.parse(file);
         var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
@@ -247,26 +248,14 @@ public class CompletionProvider {
             if (isInComment(source, cursor)) {
                 return null;
             }
-        } catch (java.io.IOException e) {
+        } catch (IOException e) {
             throw new RuntimeException(e);
         }
         var contents = new PruneMethodBodies(task.task()).scan(task.root(), cursor);
         var endOfLine = endOfLine(contents, (int) cursor);
         contents.insert(endOfLine, ';');
         var pruned = contents.toString();
-        var parsePath = new FindCompletionsAt(task.task()).scan(task.root(), cursor);
-        var memberAccess = memberAccessContext(pruned, (int) cursor);
-        if (memberAccess == null) {
-            var start = Math.max(0, (int) cursor - 20);
-            var end = Math.min(pruned.length(), (int) cursor + 10);
-            LOG.fine(String.format("[completion] memberAccess=null cursor=%d context='%s'",
-                    cursor, pruned.substring(start, end).replace("\n", "\\n")));
-        } else {
-            LOG.fine(String.format("[completion] memberAccess receiver='%s' partial='%s'",
-                    memberAccess.receiver(), memberAccess.partial()));
-        }
-        var annotationContext = findAnnotationContext(task, cursor);
-        return new CompletionRequestContext(task, pruned, cursor, parsePath, memberAccess, annotationContext, parseMs);
+        return new CompletionPrep(task, pruned, cursor, parseMs);
     }
 
     private static boolean isInComment(String source, long cursorOffset) {
@@ -339,7 +328,6 @@ public class CompletionProvider {
             list.items = new ArrayList<>(list.items);
         }
         addTopLevelSnippets(task, list);
-        sortCompletionItems(list.items);
         return list;
     }
 
@@ -483,7 +471,6 @@ public class CompletionProvider {
                 } else if (isStatic) {
                     list.add(keyword("class"));
                 }
-                sortCompletionItems(list);
                 return new CompletionList(false, list);
             }
         } catch (Exception e) {
@@ -689,7 +676,8 @@ public class CompletionProvider {
         return false;
     }
 
-    private CompletionList completeParseOnly(ParseTask parseTask, String contents, long cursor, String partial) {
+    // shared parse-only router: syntactic-member / import / enum-case / identifier
+    private CompletionList completeParseRoute(ParseTask parseTask, String contents, long cursor, String partial) {
         var path = new FindCompletionsAt(parseTask.task()).scan(parseTask.root(), cursor);
         if (path == null) return new CompletionList();
 
@@ -710,7 +698,6 @@ public class CompletionProvider {
             ParseTask parseTask, long cursor, String receiver, String partial) {
         var list = new CompletionList();
         addSyntacticMemberUsages(parseTask, cursor, receiver, partial, list);
-        sortCompletionItems(list.items);
         return list;
     }
 
@@ -728,8 +715,6 @@ public class CompletionProvider {
         if (!list.isIncomplete && !partial.isEmpty() && Character.isUpperCase(partial.charAt(0))) {
             addClassNames(parseTask.root(), Trees.instance(parseTask.task()).getSourcePositions(), partial, list);
         }
-        boostExactMatches(parseTask.root(), list.items, partial);
-        sortCompletionItems(list.items);
         return list;
     }
 
@@ -832,41 +817,6 @@ public class CompletionProvider {
         }
     }
 
-    private void boostExactMatches(CompilationUnitTree root, List<CompletionItem> items, String partial) {
-        if (partial == null || partial.isBlank()) {
-            return;
-        }
-        for (var item : items) {
-            if (item.label == null) continue;
-            if (!item.label.equalsIgnoreCase(partial)) continue;
-            var existingPriority = parseSortPriority(item.sortText);
-            var exactPriority = isDirectImportedType(root, item) ? Priority.EXACT_IMPORTED_MATCH : Priority.EXACT_MATCH;
-            item.sortText =
-                    String.format(
-                            "%03d:%03d:%s",
-                            exactPriority, existingPriority, item.label.toLowerCase());
-        }
-    }
-
-    private boolean isDirectImportedType(CompilationUnitTree root, CompletionItem item) {
-        if (root == null || item == null || item.label == null) {
-            return false;
-        }
-        if (!Objects.equals(item.kind, CompletionItemKind.Class)
-                && !Objects.equals(item.kind, CompletionItemKind.Interface)) {
-            return false;
-        }
-        for (var i : root.getImports()) {
-            if (i.isStatic()) continue;
-            var imported = i.getQualifiedIdentifier().toString();
-            if (imported.endsWith(".*")) continue;
-            if (TypeNames.simpleName(imported).equals(item.label)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private void resolveDetail(CompletionItem item, CompletionData data, Tree tree) {
         if (tree instanceof MethodTree method) {
             var parameters = new StringJoiner(", ");
@@ -902,21 +852,6 @@ public class CompletionProvider {
             throw new RuntimeException("no type");
         }
         throw new RuntimeException("no className");
-    }
-
-    private int parseSortPriority(String sortText) {
-        if (sortText == null) {
-            return Priority.PACKAGE_MEMBER;
-        }
-        var colon = sortText.indexOf(':');
-        if (colon <= 0) {
-            return Priority.PACKAGE_MEMBER;
-        }
-        try {
-            return Integer.parseInt(sortText.substring(0, colon));
-        } catch (NumberFormatException e) {
-            return Priority.PACKAGE_MEMBER;
-        }
     }
 
     private boolean matchesCompletionPrefix(CharSequence candidate, String partial) {
@@ -1124,7 +1059,6 @@ public class CompletionProvider {
         if (list.items.isEmpty()) {
             return null;
         }
-        sortCompletionItems(list.items);
         return list;
     }
 
@@ -1442,7 +1376,6 @@ public class CompletionProvider {
 
     private void addClassNames(
             CompilationUnitTree root, SourcePositions sourcePositions, String partial, CompletionList list) {
-        var packageName = Objects.toString(root.getPackageName(), "");
         var uniques = new HashSet<String>();
         for (var item : list.items) {
             if (item == null) {
@@ -1807,18 +1740,15 @@ public class CompletionProvider {
     }
 
     private static class Priority {
-        static final int EXACT_IMPORTED_MATCH = -2;
-        static final int EXACT_MATCH = -1;
-        static int iota = 0;
-        static final int SNIPPET = iota++;
-        static final int LOCAL = iota++;
-        static final int FIELD = iota++;
-        static final int METHOD = iota++;
-        static final int INHERITED_METHOD = iota++;
-        static final int IMPORTED_CLASS = iota++;
-        static final int NOT_IMPORTED_CLASS = iota++;
-        static final int KEYWORD = iota++;
-        static final int PACKAGE_MEMBER = iota++;
+        static final int SNIPPET = 0;
+        static final int LOCAL = 1;
+        static final int FIELD = 2;
+        static final int METHOD = 3;
+        static final int INHERITED_METHOD = 4;
+        static final int IMPORTED_CLASS = 45;
+        static final int NOT_IMPORTED_CLASS = 47;
+        static final int KEYWORD = 95;
+        static final int PACKAGE_MEMBER = 99;
     }
 
     private boolean isAccessorMethodName(String name) {
@@ -1852,21 +1782,14 @@ public class CompletionProvider {
         return String.format("%03d:%s", priority, safe.toLowerCase());
     }
 
-    private void sortCompletionItems(List<CompletionItem> items) {
-        items.sort(
-                Comparator.comparing((CompletionItem item) -> item.sortText == null ? sortKey(Priority.PACKAGE_MEMBER, item.label) : item.sortText)
-                        .thenComparing(item -> item.label == null ? "" : item.label, String.CASE_INSENSITIVE_ORDER)
-                        .thenComparingInt(item -> item.kind));
-    }
-
     private AnnotationContext findAnnotationContext(ParseTask task, long cursor) {
         if (typeIndexRouter == null) return null;
         var positions = Trees.instance(task.task()).getSourcePositions();
         var root = task.root();
-        var result = new com.sun.source.tree.AnnotationTree[1];
+        var result = new AnnotationTree[1];
         new TreeScanner<Void, Void>() {
             @Override
-            public Void visitAnnotation(com.sun.source.tree.AnnotationTree node, Void p) {
+            public Void visitAnnotation(AnnotationTree node, Void p) {
                 var start = positions.getStartPosition(root, node);
                 var end = positions.getEndPosition(root, node);
                 if (start <= cursor && cursor <= end) {
@@ -1922,7 +1845,6 @@ public class CompletionProvider {
             item.sortText = sortKey(Priority.FIELD, member.name);
             list.add(item);
         }
-        sortCompletionItems(list);
         return new CompletionList(false, list);
     }
 
@@ -1960,6 +1882,6 @@ public class CompletionProvider {
         }
         var receiver = receiverStart < receiverEnd ? contents.substring(receiverStart, receiverEnd) : "";
         var partial = contents.substring(partialStart, effectiveCursor);
-        return new MemberAccessContext(receiver, partial, partial.isEmpty(), methodReference, separatorEnd);
+        return new MemberAccessContext(receiver, partial, methodReference);
     }
 }
