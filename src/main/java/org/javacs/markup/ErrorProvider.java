@@ -4,30 +4,24 @@ import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import java.io.IOException;
 import java.net.URI;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.TypeElement;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
-import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
-import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
-    private static final Logger LOG = Logger.getLogger("main");
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
                     "compiler.err.expected",
@@ -39,38 +33,14 @@ public class ErrorProvider {
     private record DiagnosticFilterResult(
             List<Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
 
-    public record ErrorReport(
-            List<PublishDiagnosticsParams> diagnostics,
-            int compiledRoots,
-            int requestedRoots,
-            int processedRoots,
-            int compilerDiagnosticsCount,
-            int warningDiagnosticsCount,
-            long convertMs,
-            long warningMs) {}
-
     public ErrorProvider(CompileTask task) {
         this.task = task;
     }
 
-    /** Compatibility overload for existing callers; diagnostics now come directly from javac. */
-    public ErrorProvider(CompileTask task, CompilerProvider compiler) {
-        this(task);
-    }
-
-    /** Compatibility overload for existing callers; diagnostics now come directly from javac. */
-    public ErrorProvider(CompileTask task, CompilerProvider compiler, TypeIndexRouter typeIndex) {
-        this(task);
-    }
-
-    public ErrorReport errors(Set<URI> requestedUris) {
+    public List<PublishDiagnosticsParams> errors(Set<URI> requestedUris) {
         var requested = requestedUris == null ? Set.<URI>of() : new LinkedHashSet<>(requestedUris);
         var result = new ArrayList<PublishDiagnosticsParams>();
-        long convertNanos = 0;
-        long warningNanos = 0;
         var processedRoots = 0;
-        var compilerDiagnosticsCount = 0;
-        var warningDiagnosticsCount = 0;
         for (var root : task.roots) {
             var uri = root.getSourceFile().toUri();
             if (!requested.isEmpty() && !requested.contains(uri)) {
@@ -81,33 +51,18 @@ public class ErrorProvider {
             result.add(params);
             // Skip diagnostics for JAR-based files (they are not user code)
             if (isJarOrCachedSource(uri)) {
-                LOG.fine("Skipping diagnostics for JAR source: " + uri);
                 continue;
             }
             processedRoots++;
-            var convertStarted = System.nanoTime();
             var filtered = filterCompilerDiagnostics(compilerErrors(root), root);
-            convertNanos += System.nanoTime() - convertStarted;
             var filteredDiagnostics = filtered.compilerDiagnostics();
             params.diagnostics.addAll(filteredDiagnostics);
-            compilerDiagnosticsCount += filtered.compilerDiagnostics().size();
             if (!filtered.syntaxSuppressed()) {
-                var warningStarted = System.nanoTime();
                 var unused = unusedWarnings(root);
-                warningNanos += System.nanoTime() - warningStarted;
                 params.diagnostics.addAll(unused);
-                warningDiagnosticsCount += unused.size();
             }
         }
-        return new ErrorReport(
-                List.copyOf(result),
-                task.roots.size(),
-                requested.size(),
-                processedRoots,
-                compilerDiagnosticsCount,
-                warningDiagnosticsCount,
-                convertNanos / 1_000_000,
-                warningNanos / 1_000_000);
+        return List.copyOf(result);
     }
 
     private boolean isJarOrCachedSource(URI uri) {

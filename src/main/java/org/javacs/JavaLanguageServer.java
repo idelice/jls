@@ -844,7 +844,22 @@ class JavaLanguageServer extends LanguageServer {
         // Index the active module and its dependency sources. Sibling modules are only visible
         // through their source, so a workspace-size shortcut here would leave completion empty.
         completionIndexScheduler.ensureIndexed(file);
-        lint(file, -1);
+        if (compiler != null) {
+            try {
+                var requestCompiler = compilerFor(file);
+                try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
+                    publishFileDiagnostics(task, file);
+                    pushHints(requestCompiler, task, file, null);
+                }
+                if (!serverReadyAnnounced) {
+                    serverReadyAnnounced = true;
+                    notifyUser("JLS", "Server ready", MessageType.Info);
+                }
+            } catch (Exception e) {
+                LOG.fine("[didOpen] lint failed file=" + file.getFileName() + " reason=" + e.getMessage());
+            }
+            pendingPropagation = file;
+        }
     }
 
     @Override
@@ -858,16 +873,28 @@ class JavaLanguageServer extends LanguageServer {
             var range = params.contentChanges.getFirst().range;
             if (range != null) editLine = range.start.line;
         }
-        lint(file, editLine);
+        if (editLine >= 0 && compiler != null) {
+            try {
+                var requestCompiler = compilerFor(file);
+                try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
+                    publishFileDiagnostics(task, file);
+                    var hintRange = new Range(
+                            new Position(Math.max(0, editLine - 50), 0),
+                            new Position(editLine + 50, 0));
+                    pushHints(requestCompiler, task, file, hintRange);
+                }
+            } catch (Exception e) {
+                LOG.fine("[didChange] lint failed file=" + file.getFileName() + " reason=" + e.getMessage());
+            }
+            pendingPropagation = file;
+        } else {
+            lint(file, editLine, true);
+        }
     }
 
     private volatile Path pendingPropagation;
     private long lastPropagatedIndexVersion;
     private boolean serverReadyAnnounced;
-
-    private void lint(Path file, int hintCenterLine) {
-        lint(file, hintCenterLine, true);
-    }
 
     private void lint(Path file, int hintCenterLine, boolean propagate) {
         if (compiler == null) return;
@@ -875,13 +902,6 @@ class JavaLanguageServer extends LanguageServer {
             var requestCompiler = compilerFor(file);
             try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
                 publishFileDiagnostics(task, file);
-                Range hintRange = null;
-                if (hintCenterLine >= 0) {
-                    hintRange = new Range(
-                            new Position(Math.max(0, hintCenterLine - 50), 0),
-                            new Position(hintCenterLine + 50, 0));
-                }
-                pushHints(requestCompiler, task, file, hintRange);
             }
             if (!serverReadyAnnounced) {
                 serverReadyAnnounced = true;
@@ -905,8 +925,8 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void publishFileDiagnostics(CompileTask task, Path file) {
-        var errorReport = new ErrorProvider(task).errors(Set.of(file.toUri()));
-        for (var params : errorReport.diagnostics()) {
+        var diagnostics = new ErrorProvider(task).errors(Set.of(file.toUri()));
+        for (var params : diagnostics) {
             if (file.toUri().equals(params.uri)) {
                 client.publishDiagnostics(params);
                 return;
