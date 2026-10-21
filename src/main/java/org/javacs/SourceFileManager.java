@@ -2,20 +2,22 @@ package org.javacs;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.function.Predicate;
 import java.util.logging.Logger;
 import javax.tools.*;
 
 class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManager> {
-    private final java.util.function.Predicate<String> workspaceType;
+    private final Predicate<String> workspaceType;
     private boolean bounded;
 
     SourceFileManager() { this(name -> false); }
 
-    SourceFileManager(java.util.function.Predicate<String> workspaceType) {
+    SourceFileManager(Predicate<String> workspaceType) {
         super(createDelegateFileManager());
         this.workspaceType = workspaceType;
     }
@@ -56,7 +58,7 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
         if (bounded) {
             // Only open/dirty documents in the package; no disk sibling scan, so attribution
             // cannot cascade into parsing the whole module from source.
-            var open = new LinkedHashMap<java.net.URI, JavaFileObject>();
+            var open = new LinkedHashMap<URI, JavaFileObject>();
             for (var path : FileStore.activeDocuments()) {
                 if (!isOnSourcePath(path)) continue;
                 if (FileStore.activeDocument(path) == null && !FileStore.isDirty(path)) continue;
@@ -71,7 +73,7 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
             return sources;
         }
 
-        var result = new LinkedHashMap<java.net.URI, JavaFileObject>();
+        var result = new LinkedHashMap<URI, JavaFileObject>();
         for (var source : listed) {
             if (isModuleDeclaration(source)) continue;
             var path = filePath(source);

@@ -15,7 +15,7 @@ import org.javacs.completion.ExternalBinaryDecompiler;
 class JavaCompilerService implements CompilerProvider, AutoCloseable {
     private static final Logger LOG = Logger.getLogger("main");
 
-    final Set<Path> classPath;
+    Set<Path> classPath;
     final Set<Path> docPath;
     final Set<String> addExports;
     final List<String> extraArgs;
@@ -30,7 +30,7 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
     private Set<Path> sourceRoots = Set.of();
 
     JavaCompilerService(Set<Path> classPath, Set<Path> docPath, Set<String> addExports, Collection<String> extraArgs) {
-        this.classPath = Set.copyOf(classPath);
+        this.classPath = new LinkedHashSet<>(classPath);
         this.docPath = Set.copyOf(docPath);
         this.addExports = Set.copyOf(addExports);
         this.extraArgs = List.copyOf(extraArgs);
@@ -57,6 +57,13 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    void addClassPathEntries(Set<Path> entries) {
+        if (entries.isEmpty() || classPath.containsAll(entries)) return;
+        classPath.addAll(entries);
+        decompiler = null;
+        compiler.discard("classpath_extended");
     }
 
     static boolean lombokPresentOnClasspath(Collection<Path> classPath) {

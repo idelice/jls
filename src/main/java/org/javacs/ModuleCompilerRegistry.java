@@ -93,6 +93,7 @@ final class ModuleCompilerRegistry implements AutoCloseable {
             var mainCompiler = server.getOrCreateCompiler();
             if (mainCompiler != null && mainCompiler != next) {
                 mainCompiler.addDocPathEntries(inputs.sources());
+                mainCompiler.addClassPathEntries(next.classPath);
             }
             LOG.info("[module] ready id=" + key + " sources=" + inputs.sourceRoots().size()
                     + " dependencies=" + next.classPath.size() + " workspace_binaries=0 ms="
