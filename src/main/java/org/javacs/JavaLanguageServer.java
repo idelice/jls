@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
-import org.javacs.completion.PruneMethodBodies;
+import org.javacs.action.FindMethodDeclarationAt;
 import org.javacs.provider.CompletionProvider;
 import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.provider.SignatureProvider;
@@ -878,11 +878,11 @@ class JavaLanguageServer extends LanguageServer {
                 var requestCompiler = compilerFor(file);
                 try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
                     publishFileDiagnostics(task, file);
+                    pushHints(file, task, requestCompiler, editLine);
                 }
             } catch (Exception e) {
                 LOG.fine("[didChange] lint failed file=" + file.getFileName() + " reason=" + e.getMessage());
             }
-            pendingHints = new PendingHints(file, editLine, System.nanoTime());
             pendingPropagation = file;
         } else {
             lint(file, true);
@@ -890,8 +890,6 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private volatile Path pendingPropagation;
-    private record PendingHints(Path file, int editLine, long nanoTime) {}
-    private volatile PendingHints pendingHints;
     private long lastPropagatedIndexVersion;
     private boolean serverReadyAnnounced;
 
@@ -914,12 +912,6 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void doAsyncWork() {
-        var hints = pendingHints;
-        if (hints != null && (System.nanoTime() - hints.nanoTime) >= 400_000_000L) {
-            pendingHints = null;
-            pushHints(hints.file, null, null, hints.editLine);
-        }
-
         var file = pendingPropagation;
         if (file == null) return;
         var version = completionIndexVersion.get();
@@ -945,22 +937,33 @@ class JavaLanguageServer extends LanguageServer {
      * When called without (deferred from didChange), does a pruned compile around editLine.
      */
     private void pushHints(Path file, CompileTask existingTask, JavaCompilerService existingCompiler, int editLine) {
+        var started = System.currentTimeMillis();
         try {
-            if (existingTask != null) {
-                var provider = new InlayHintProvider(existingCompiler, moduleRegistry.typeIndexFor(file));
-                client.customNotification("java/inlayHints", provider.inlayHints(existingTask, file, null));
-            } else {
-                var requestCompiler = compilerFor(file);
-                var parseTask = requestCompiler.parse(file);
-                var source = parseTask.root().getSourceFile().getCharContent(true).toString();
-                var cursor = (long) FileStore.offset(source, editLine + 1, 1);
-                var pruned = new PruneMethodBodies(parseTask.task()).scan(parseTask.root(), cursor).toString();
-                try (var task = requestCompiler.compile(
-                        List.<JavaFileObject>of(new SourceFileObject(file, pruned, Instant.now())))) {
-                    var provider = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file));
-                    client.customNotification("java/inlayHints", provider.inlayHints(task, file, null));
+            Range range = null;
+            if (editLine >= 0) {
+                var root = existingTask.root(file);
+                if (root != null) {
+                    var cursor = LspPosition.offset(root, new Position(editLine, 0));
+                    if (cursor >= 0) {
+                        var method = new FindMethodDeclarationAt(existingTask.trees).scan(root, cursor);
+                        if (method != null) {
+                            var pos = existingTask.trees.getSourcePositions();
+                            var startPos = pos.getStartPosition(root, method);
+                            var endPos = pos.getEndPosition(root, method);
+                            if (startPos >= 0 && endPos >= 0) {
+                                range = new Range(LspPosition.position(root, startPos), LspPosition.position(root, endPos));
+                            }
+                        }
+                    }
                 }
             }
+            var provider = new InlayHintProvider(existingCompiler, moduleRegistry.typeIndexFor(file));
+            var payload = provider.inlayHints(existingTask, file, range);
+            client.customNotification("java/inlayHints", payload);
+            LOG.fine("[hints] file=" + file.getFileName()
+                    + " range=" + (range == null ? "full" : range.start.line + ".." + range.end.line)
+                    + " hints=" + payload.getAsJsonArray("hints").size()
+                    + " ms=" + (System.currentTimeMillis() - started));
         } catch (Exception e) {
             LOG.fine("[hints] push failed file=" + file.getFileName() + " reason=" + e.getMessage());
         }
