@@ -1,5 +1,6 @@
 package org.javacs.provider;
 
+import com.google.gson.JsonObject;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.NewClassTree;
@@ -18,6 +19,7 @@ import org.javacs.ClassFileParameterNames;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.JsonHelper;
 import org.javacs.LspPosition;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.InlayHint;
@@ -33,12 +35,23 @@ public class InlayHintProvider {
         this.typeIndex = typeIndex;
     }
 
-    public List<InlayHint> inlayHints(CompileTask task, Path file, Range range) {
+    public JsonObject inlayHints(CompileTask task, Path file, Range range) {
+        List<InlayHint> hints;
         try {
-            return scanTree(task, file, range);
+            hints = scanTree(task, file, range);
         } catch (RuntimeException | AssertionError e) {
-            return List.of();
+            hints = List.of();
         }
+        var payload = new JsonObject();
+        payload.addProperty("uri", file.toUri().toString());
+        payload.add("hints", JsonHelper.GSON.toJsonTree(hints));
+        if (range != null) {
+            var rangeObj = new JsonObject();
+            rangeObj.addProperty("startLine", range.start.line);
+            rangeObj.addProperty("endLine", range.end.line);
+            payload.add("range", rangeObj);
+        }
+        return payload;
     }
 
     private List<InlayHint> scanTree(CompileTask task, Path file, Range range) {

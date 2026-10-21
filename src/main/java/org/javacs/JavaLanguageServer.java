@@ -1,6 +1,5 @@
 package org.javacs;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.nio.file.Files;
@@ -17,6 +16,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
+import org.javacs.completion.PruneMethodBodies;
 import org.javacs.provider.CompletionProvider;
 import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.provider.SignatureProvider;
@@ -201,7 +201,7 @@ class JavaLanguageServer extends LanguageServer {
             appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
             publishExternalBinaryIndexSnapshot();
             refreshStateForCompilerRecreated();
-            for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, -1, false);
+            for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, false);
         } finally {
             notifyWorkspaceInfo();
             LOG.info(String.format(
@@ -505,7 +505,7 @@ class JavaLanguageServer extends LanguageServer {
             }
         }
         if (refreshActiveDiagnostics) {
-            for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, -1, false);
+            for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, false);
         }
         if (compilerInputsChanged) {
             recreateCompilersAndRefreshState("didChangeWatchedFiles");
@@ -823,7 +823,7 @@ class JavaLanguageServer extends LanguageServer {
             LOG.info(String.format(
                     "[diagnostics] propagate from=%s dependents=%d",
                     changed.getFileName(), active.size()));
-            for (var f : active) lint(f, -1, false);
+            for (var f : active) lint(f, false);
         } catch (Exception e) {
             LOG.warning("[diagnostics] propagate_failed file=" + changed.getFileName()
                     + " reason=" + e.getMessage());
@@ -849,7 +849,7 @@ class JavaLanguageServer extends LanguageServer {
                 var requestCompiler = compilerFor(file);
                 try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
                     publishFileDiagnostics(task, file);
-                    pushHints(requestCompiler, task, file, null);
+                    pushHints(file, task, requestCompiler, -1);
                 }
                 if (!serverReadyAnnounced) {
                     serverReadyAnnounced = true;
@@ -878,25 +878,24 @@ class JavaLanguageServer extends LanguageServer {
                 var requestCompiler = compilerFor(file);
                 try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {
                     publishFileDiagnostics(task, file);
-                    var hintRange = new Range(
-                            new Position(Math.max(0, editLine - 50), 0),
-                            new Position(editLine + 50, 0));
-                    pushHints(requestCompiler, task, file, hintRange);
                 }
             } catch (Exception e) {
                 LOG.fine("[didChange] lint failed file=" + file.getFileName() + " reason=" + e.getMessage());
             }
+            pendingHints = new PendingHints(file, editLine, System.nanoTime());
             pendingPropagation = file;
         } else {
-            lint(file, editLine, true);
+            lint(file, true);
         }
     }
 
     private volatile Path pendingPropagation;
+    private record PendingHints(Path file, int editLine, long nanoTime) {}
+    private volatile PendingHints pendingHints;
     private long lastPropagatedIndexVersion;
     private boolean serverReadyAnnounced;
 
-    private void lint(Path file, int hintCenterLine, boolean propagate) {
+    private void lint(Path file, boolean propagate) {
         if (compiler == null) return;
         try {
             var requestCompiler = compilerFor(file);
@@ -915,6 +914,12 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void doAsyncWork() {
+        var hints = pendingHints;
+        if (hints != null && (System.nanoTime() - hints.nanoTime) >= 400_000_000L) {
+            pendingHints = null;
+            pushHints(hints.file, null, null, hints.editLine);
+        }
+
         var file = pendingPropagation;
         if (file == null) return;
         var version = completionIndexVersion.get();
@@ -935,22 +940,29 @@ class JavaLanguageServer extends LanguageServer {
         client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
     }
 
-    private void pushHints(JavaCompilerService requestCompiler, CompileTask task, Path file, Range range) {
+    /**
+     * Push inlay hints. When called with an existing task (didOpen), scans the full file.
+     * When called without (deferred from didChange), does a pruned compile around editLine.
+     */
+    private void pushHints(Path file, CompileTask existingTask, JavaCompilerService existingCompiler, int editLine) {
         try {
-            var hints = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file))
-                    .inlayHints(task, file, range);
-            var payload = new JsonObject();
-            payload.addProperty("uri", file.toUri().toString());
-            payload.add("hints", new Gson().toJsonTree(hints));
-            if (range != null) {
-                var rangeObj = new JsonObject();
-                rangeObj.addProperty("startLine", range.start.line);
-                rangeObj.addProperty("endLine", range.end.line);
-                payload.add("range", rangeObj);
+            if (existingTask != null) {
+                var provider = new InlayHintProvider(existingCompiler, moduleRegistry.typeIndexFor(file));
+                client.customNotification("java/inlayHints", provider.inlayHints(existingTask, file, null));
+            } else {
+                var requestCompiler = compilerFor(file);
+                var parseTask = requestCompiler.parse(file);
+                var source = parseTask.root().getSourceFile().getCharContent(true).toString();
+                var cursor = (long) FileStore.offset(source, editLine + 1, 1);
+                var pruned = new PruneMethodBodies(parseTask.task()).scan(parseTask.root(), cursor).toString();
+                try (var task = requestCompiler.compile(
+                        List.<JavaFileObject>of(new SourceFileObject(file, pruned, Instant.now())))) {
+                    var provider = new InlayHintProvider(requestCompiler, moduleRegistry.typeIndexFor(file));
+                    client.customNotification("java/inlayHints", provider.inlayHints(task, file, null));
+                }
             }
-            client.customNotification("java/inlayHints", payload);
         } catch (Exception e) {
-            LOG.fine("[inlayHints] push_failed file=" + file.getFileName() + " reason=" + e.getMessage());
+            LOG.fine("[hints] push failed file=" + file.getFileName() + " reason=" + e.getMessage());
         }
     }
 
@@ -1036,7 +1048,7 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         FileStore.save(file);
         completionIndexScheduler.filesChanged(List.of(file));
-        lint(file, -1, false);
+        lint(file, false);
         propagateDiagnostics(file);
     }
 }

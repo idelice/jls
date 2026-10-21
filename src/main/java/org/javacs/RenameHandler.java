@@ -1,6 +1,5 @@
 package org.javacs;
 
-import com.google.gson.Gson;
 import com.sun.tools.javac.code.Flags;
 import com.sun.tools.javac.code.Symbol;
 import java.io.IOException;
@@ -97,7 +96,7 @@ final class RenameHandler {
                 var notificationParams = new HashMap<String, String>();
                 notificationParams.put("oldPath", oldPath);
                 notificationParams.put("newPath", newPath);
-                client.customNotification("java/renameFile", new Gson().toJsonTree(notificationParams));
+                client.customNotification("java/renameFile", JsonHelper.GSON.toJsonTree(notificationParams));
             }
         }
         return response;
