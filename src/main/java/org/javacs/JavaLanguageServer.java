@@ -942,11 +942,17 @@ class JavaLanguageServer extends LanguageServer {
             Range range = null;
             if (editLine >= 0) {
                 var root = existingTask.root(file);
-                if (root != null) {
+                if (root == null) {
+                    return;
+                } else {
                     var cursor = LspPosition.offset(root, new Position(editLine, 0));
-                    if (cursor >= 0) {
+                    if (cursor < 0) {
+                        return;
+                    } else {
                         var method = new FindMethodDeclarationAt(existingTask.trees).scan(root, cursor);
-                        if (method != null) {
+                        if (method == null) {
+                            return;
+                        } else {
                             var pos = existingTask.trees.getSourcePositions();
                             var startPos = pos.getStartPosition(root, method);
                             var endPos = pos.getEndPosition(root, method);
