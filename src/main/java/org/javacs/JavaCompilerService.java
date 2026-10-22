@@ -5,7 +5,6 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
-import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -410,31 +409,19 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
     @Override
     public Optional<byte[]> findClassFile(String qualifiedName) {
         if (ownsSourceType(qualifiedName)) return Optional.empty();
-        var relative = qualifiedName.replace('.', '/') + ".class";
-        for (var root : classPath) {
-            if (Files.isDirectory(root)) {
-                var classFile = root.resolve(relative);
-                if (Files.exists(classFile)) {
-                    try {
-                        return Optional.of(Files.readAllBytes(classFile));
-                    } catch (IOException e) {
-                        LOG.fine("[classfile] failed to read " + classFile + ": " + e.getMessage());
-                    }
-                }
-            } else if (root.toString().endsWith(".jar") && Files.exists(root)) {
-                try (var jar = new JarFile(root.toFile())) {
-                    var entry = jar.getEntry(relative);
-                    if (entry != null) {
-                        try (var in = jar.getInputStream(entry)) {
-                            return Optional.of(in.readAllBytes());
-                        }
-                    }
-                } catch (IOException e) {
-                    LOG.fine("[classfile] failed to read " + relative + " from " + root.getFileName() + ": " + e.getMessage());
+        try {
+            var fo = fileManager.getJavaFileForInput(
+                    StandardLocation.CLASS_PATH, qualifiedName, JavaFileObject.Kind.CLASS);
+            if (fo != null) {
+                try (var in = fo.openInputStream()) {
+                    return Optional.of(in.readAllBytes());
                 }
             }
+        } catch (IOException e) {
+            LOG.fine("[classfile] file manager lookup failed for " + qualifiedName + ": " + e.getMessage());
         }
         // JDK classes are not on the project classpath — fall back to the system classloader.
+        var relative = qualifiedName.replace('.', '/') + ".class";
         try (var in = ClassLoader.getSystemResourceAsStream(relative)) {
             if (in != null) return Optional.of(in.readAllBytes());
         } catch (IOException e) {

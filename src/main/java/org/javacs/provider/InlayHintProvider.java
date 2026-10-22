@@ -77,7 +77,7 @@ public class InlayHintProvider {
             }
             var hints = new ArrayList<InlayHint>();
 
-            new TreePathScanner<Void, Void>() {
+            var scanner = new TreePathScanner<Void, Void>() {
                 @Override
                 public Void scan(Tree tree, Void unused) {
                     if (tree == null) return null;
@@ -170,7 +170,8 @@ public class InlayHintProvider {
                     }
                     return false;
                 }
-            }.scan(root, null);
+            };
+            scanner.scan(root, null);
 
             return hints;
     }

@@ -423,7 +423,11 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         if (compiler == null) return List.of();
         var file = Paths.get(params.textDocument.uri);
-        return new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
+        var started = Instant.now();
+        var result = new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
+        LOG.fine(String.format("[perf] document_symbol file=%s symbols=%d took=%dms",
+                file.getFileName(), result.size(), Duration.between(started, Instant.now()).toMillis()));
+        return result;
     }
 
     @Override
@@ -587,7 +591,10 @@ class JavaLanguageServer extends LanguageServer {
         var file = Paths.get(params.textDocument.uri);
         var line = params.position.line + 1;
         var column = params.position.character + 1;
+        var started = Instant.now();
         var signatureProvider = new SignatureProvider(compilerFor(file), moduleRegistry.typeIndexFor(file)).signatureHelp(file, line, column);
+        LOG.fine(String.format("[perf] signature_help file=%s took=%dms",
+                file.getFileName(), Duration.between(started, Instant.now()).toMillis()));
         if (signatureProvider == SignatureProvider.NOT_SUPPORTED) return Optional.empty();
         return Optional.of(signatureProvider);
     }
@@ -683,12 +690,16 @@ class JavaLanguageServer extends LanguageServer {
         var token = progress.begin("Finding references", file.getFileName().toString());
         List<Location> found;
         try {
+            var started = Instant.now();
             found =
                     new ReferenceProvider(
                                     compilerFor(file), file, line, column, this::compilerFor,
                                     this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles,
                                     completionSnapshotRef.get().typeIndex()::filesContainingToken)
                             .find();
+            LOG.fine(String.format("[perf] references file=%s results=%d took=%dms",
+                    file.getFileName(), found == ReferenceProvider.NOT_SUPPORTED ? 0 : found.size(),
+                    Duration.between(started, Instant.now()).toMillis()));
         } finally {
             progress.end(token, null);
         }
@@ -790,7 +801,11 @@ class JavaLanguageServer extends LanguageServer {
     public List<FoldingRange> foldingRange(FoldingRangeParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
         var file = Paths.get(params.textDocument.uri);
-        return new FoldProvider(compilerFor(file)).foldingRanges(file);
+        var started = Instant.now();
+        var result = new FoldProvider(compilerFor(file)).foldingRanges(file);
+        LOG.fine(String.format("[perf] folding_range file=%s ranges=%d took=%dms",
+                file.getFileName(), result.size(), Duration.between(started, Instant.now()).toMillis()));
+        return result;
     }
 
     private final RenameHandler renameHandler = new RenameHandler(this);
@@ -802,7 +817,12 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public WorkspaceEdit rename(RenameParams params) {
-        return renameHandler.rename(params, client);
+        var started = Instant.now();
+        var result = renameHandler.rename(params, client);
+        LOG.fine(String.format("[perf] rename file=%s took=%dms",
+                Paths.get(params.textDocument.uri).getFileName(),
+                Duration.between(started, Instant.now()).toMillis()));
+        return result;
     }
 
     @Override
@@ -985,7 +1005,9 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public List<CodeAction> codeAction(CodeActionParams params) {
-        var requestCompiler = compilerFor(Paths.get(params.textDocument.uri));
+        var started = Instant.now();
+        var file = Paths.get(params.textDocument.uri);
+        var requestCompiler = compilerFor(file);
         // Forwarding map: provider stores Rewrite by UUID; we pair it with the compiler atomically.
         var rewriteSink = new java.util.AbstractMap<String, Rewrite>() {
             @Override public Rewrite put(String id, Rewrite rw) {
@@ -995,9 +1017,12 @@ class JavaLanguageServer extends LanguageServer {
             @Override public Set<Map.Entry<String, Rewrite>> entrySet() { return Set.of(); }
         };
         var provider = new CodeActionProvider(requestCompiler, rewriteSink);
-        return params.context.diagnostics.isEmpty()
+        var result = params.context.diagnostics.isEmpty()
                 ? provider.codeActionsForCursor(params)
                 : provider.codeActionForDiagnostics(params);
+        LOG.fine(String.format("[perf] code_action file=%s actions=%d took=%dms",
+                file.getFileName(), result.size(), Duration.between(started, Instant.now()).toMillis()));
+        return result;
     }
 
     @Override
