@@ -1,10 +1,13 @@
 package org.javacs;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.logging.Logger;
+import javax.tools.JavaFileObject;
+import javax.tools.StandardLocation;
 import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.WorkspaceTypeIndex;
@@ -94,6 +97,10 @@ final class ModuleCompilerRegistry implements AutoCloseable {
             if (mainCompiler != null && mainCompiler != next) {
                 mainCompiler.addDocPathEntries(inputs.sources());
                 mainCompiler.addClassPathEntries(next.classPath);
+                // Warm the docs file manager's ZIP indexes so first definition doesn't stall.
+                try { mainCompiler.docsFileManager.list(
+                        StandardLocation.SOURCE_PATH, "", Set.of(JavaFileObject.Kind.SOURCE), false);
+                } catch (IOException ignored) {}
             }
             LOG.info("[module] ready id=" + key + " sources=" + inputs.sourceRoots().size()
                     + " dependencies=" + next.classPath.size() + " workspace_binaries=0 ms="
