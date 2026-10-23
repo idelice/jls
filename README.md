@@ -49,7 +49,7 @@ require('lspconfig').jls.setup({
 - **Type/call hierachy** — find type/call hierachy 
 - **Hover** — type information and Javadoc
 - **Diagnostics** — server-pushed (real-time linting without keystroke lag)
-- **Signature help** — parameter info for method calls
+- **Signature help** — parameter info for methods and constructors
 - **Inlay hints** — parameter name hints at call sites
 - **Code actions** — refactoring, quick fixes, code generation
 - **Rename** — classes, methods, variables across workspace
