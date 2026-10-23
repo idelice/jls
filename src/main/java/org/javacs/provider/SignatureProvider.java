@@ -2,6 +2,7 @@ package org.javacs.provider;
 
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
@@ -14,8 +15,10 @@ import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.logging.Logger;
+import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
@@ -77,19 +80,21 @@ public class SignatureProvider {
                 return NOT_SUPPORTED;
             }
 
-            var activeParameter = activeParameterFromText(pruned, invocationStart, cursor);
-
             List<IndexedMember> overloads;
-            int activeSignature;
+            List<? extends ExpressionTree> arguments;
             if (attrPath.getLeaf() instanceof MethodInvocationTree invoke) {
                 overloads = resolveOverloads(task, root, attrPath, invoke);
-                activeSignature = Math.min(overloads.size() - 1, Math.max(0, activeParameter));
+                arguments = invoke.getArguments();
             } else if (attrPath.getLeaf() instanceof NewClassTree nc) {
                 overloads = resolveConstructors(task, root, attrPath, nc);
-                activeSignature = Math.min(overloads.size() - 1, Math.max(0, activeParameter));
+                arguments = nc.getArguments();
             } else {
                 return NOT_SUPPORTED;
             }
+
+            if (overloads.isEmpty()) return NOT_SUPPORTED;
+            var activeParameter = activeParameterAt(task, root, arguments, pruned, invocationStart, cursor);
+            var activeSignature = selectOverload(task, attrPath, overloads, arguments, activeParameter);
 
             var signatures = new ArrayList<SignatureInformation>();
             for (var member : overloads) {
@@ -106,6 +111,8 @@ public class SignatureProvider {
                 signatures.add(info);
             }
 
+            var parameterCount = signatures.get(activeSignature).parameters.size();
+            activeParameter = Math.min(activeParameter, Math.max(0, parameterCount - 1));
             return new SignatureHelp(signatures, activeSignature, activeParameter);
         } catch (RuntimeException | AssertionError e) {
             LOG.fine(
@@ -125,16 +132,98 @@ public class SignatureProvider {
         return cursor;
     }
 
-    private static int activeParameterFromText(String content, long openParen, long cursor) {
-        int depth = 0;
-        int commas = 0;
-        for (long i = openParen; i < cursor && i < content.length(); i++) {
-            char c = content.charAt((int) i);
-            if (c == '(' || c == '[' || c == '{') depth++;
-            else if ((c == ')' || c == ']' || c == '}') && depth > 0) depth--;
-            else if (c == ',' && depth == 0) commas++;
+    private static int activeParameterAt(
+            CompileTask task, CompilationUnitTree root, List<? extends ExpressionTree> arguments,
+            String content, long openParen, long cursor) {
+        var positions = task.trees.getSourcePositions();
+        long previousEnd = openParen;
+        int previous = 0;
+        for (int i = 0; i < arguments.size(); i++) {
+            long start = positions.getStartPosition(root, arguments.get(i));
+            long end = positions.getEndPosition(root, arguments.get(i));
+            if (start < 0 || end < start) continue;
+            if (cursor < start) break;
+            if (cursor <= end) return i;
+            previousEnd = end;
+            previous = i;
         }
-        return commas;
+        var gap = content.substring((int) previousEnd, (int) cursor)
+                .replaceAll("(?s)/\\*.*?(?:\\*/|$)|//[^\\r\\n]*", "");
+        return previous + (gap.indexOf(',') >= 0 ? 1 : 0);
+    }
+
+    private static int selectOverload(
+            CompileTask task, TreePath invocation, List<IndexedMember> overloads,
+            List<? extends ExpressionTree> arguments, int activeParameter) {
+        var resolved = task.trees.getElement(invocation);
+        if (resolved instanceof ExecutableElement method) {
+            int selected = overloadIndex(task, method, overloads);
+            if (selected >= 0) return selected;
+        }
+
+        // An unfinished call may have no applicable javac symbol yet. Prefer a type-compatible
+        // overload with room for the arguments; if none fits, keep the closest arity visible.
+        int required = Math.max(arguments.size(), activeParameter > 0 ? activeParameter + 1 : 0);
+        int closest = 0;
+        int closestCount = indexParameterTypes(overloads.getFirst()).length;
+        for (int i = 1; i < overloads.size(); i++) {
+            int count = indexParameterTypes(overloads.get(i)).length;
+            if ((count >= required && count < closestCount)
+                    || (closestCount < required && count > closestCount)) {
+                closest = i;
+                closestCount = count;
+            }
+        }
+        if (resolved == null || !(resolved.getEnclosingElement() instanceof TypeElement owner)) return closest;
+        int compatible = -1;
+        int compatibleCount = Integer.MAX_VALUE;
+        for (var element : task.elements.getAllMembers(owner)) {
+            if (!(element instanceof ExecutableElement method)) continue;
+            int selected = overloadIndex(task, method, overloads);
+            if (selected < 0) continue;
+            int count = method.getParameters().size();
+            int capacity = method.isVarArgs() ? Math.max(count, required) : count;
+            if (compatible >= 0 && !((capacity >= required && capacity < compatibleCount)
+                    || (compatibleCount < required && capacity > compatibleCount))) continue;
+            if (acceptsArguments(task, invocation, method, arguments)) {
+                compatible = selected;
+                compatibleCount = capacity;
+            }
+        }
+        return compatible >= 0 ? compatible : closest;
+    }
+
+    private static int overloadIndex(CompileTask task, ExecutableElement method, List<IndexedMember> overloads) {
+        if (!method.getSimpleName().contentEquals(overloads.getFirst().name)) return -1;
+        var owner = (TypeElement) method.getEnclosingElement();
+        var parameterTypes = FindHelper.erasedParameterTypes(task, method);
+        for (int i = 0; i < overloads.size(); i++) {
+            var member = overloads.get(i);
+            if (owner.getQualifiedName().contentEquals(member.ownerType)
+                    && method.getSimpleName().contentEquals(member.name)
+                    && Arrays.equals(parameterTypes, member.erasedParameterTypes)) return i;
+        }
+        return -1;
+    }
+
+    private static boolean acceptsArguments(
+            CompileTask task, TreePath invocation, ExecutableElement method,
+            List<? extends ExpressionTree> arguments) {
+        var parameters = method.getParameters();
+        if (parameters.isEmpty()) return arguments.isEmpty();
+        for (int i = 0; i < arguments.size(); i++) {
+            if (i >= parameters.size() && !method.isVarArgs()) break;
+            var argument = arguments.get(i);
+            if (argument.getKind() == Tree.Kind.ERRONEOUS) continue;
+            var type = task.trees.getTypeMirror(new TreePath(invocation, argument));
+            if (type == null || type.getKind() == TypeKind.ERROR || type.getKind() == TypeKind.NONE) continue;
+            var target = parameters.get(Math.min(i, parameters.size() - 1)).asType();
+            if (method.isVarArgs() && i >= parameters.size() - 1
+                    && target instanceof javax.lang.model.type.ArrayType array
+                    && !task.types.isAssignable(type, target)) target = array.getComponentType();
+            if (!task.types.isAssignable(type, target)) return false;
+        }
+        return true;
     }
 
     private List<IndexedMember> resolveOverloads(
