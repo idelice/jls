@@ -86,7 +86,7 @@ public class ErrorProvider {
             if (d.getStartPosition() == -1 || d.getEndPosition() == -1) continue;
             if ("compiler.warn.proc.messager".equals(d.getCode())) continue;
 
-            result.add(lspDiagnostic(d));
+            result.add(lspDiagnostic(d, root));
         }
         return result;
     }
@@ -220,12 +220,12 @@ public class ErrorProvider {
      * lspDiagnostic(d) converts d to LSP format, with its position shifted appropriately for the latest version
      * of the file.
      */
-    private Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d) {
+    private Diagnostic lspDiagnostic(javax.tools.Diagnostic<? extends JavaFileObject> d, CompilationUnitTree root) {
         var start = d.getStartPosition();
         var end = d.getEndPosition();
         var severity = severity(d.getKind());
         var code = d.getCode();
-        var message = simplifyMessage(d.getMessage(null));
+        var message = DiagnosticFormatter.format(d, task, root);
         var result = new Diagnostic();
         result.severity = severity;
         result.code = code;
@@ -251,17 +251,6 @@ public class ErrorProvider {
             default:
                 return DiagnosticSeverity.Hint;
         }
-    }
-
-    private static final Pattern QUALIFIED_NAME = Pattern.compile("\\b([a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+)\\.([A-Z][\\w]*)");
-    private static final Pattern CANT_RESOLVE = Pattern.compile("(?s)cannot find symbol\\s+symbol:\\s+(?:variable|method|class)\\s+(\\S+).*");
-
-    private static String simplifyMessage(String message) {
-        var m = CANT_RESOLVE.matcher(message);
-        if (m.matches()) {
-            return "cannot resolve symbol '" + m.group(1) + "'";
-        }
-        return QUALIFIED_NAME.matcher(message).replaceAll("$3");
     }
 
     private Diagnostic warnUnused(Element unusedEl) {
