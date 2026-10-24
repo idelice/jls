@@ -22,6 +22,7 @@ import org.javacs.lsp.*;
 
 public class ErrorProvider {
     final CompileTask task;
+    private final boolean richFormatter;
     private static final Set<String> SYNTAX_BLOCKING_CODES =
             Set.of(
                     "compiler.err.expected",
@@ -33,8 +34,9 @@ public class ErrorProvider {
     private record DiagnosticFilterResult(
             List<Diagnostic> compilerDiagnostics, boolean syntaxSuppressed, int droppedCount) {}
 
-    public ErrorProvider(CompileTask task) {
+    public ErrorProvider(CompileTask task, boolean richFormatter) {
         this.task = task;
+        this.richFormatter = richFormatter;
     }
 
     public List<PublishDiagnosticsParams> errors(Set<URI> requestedUris) {
@@ -225,7 +227,9 @@ public class ErrorProvider {
         var end = d.getEndPosition();
         var severity = severity(d.getKind());
         var code = d.getCode();
-        var message = DiagnosticFormatter.format(d, task, root);
+        var message = richFormatter
+                ? DiagnosticFormatter.format(d, task, root)
+                : DiagnosticFormatter.formatPlain(d);
         var result = new Diagnostic();
         result.severity = severity;
         result.code = code;

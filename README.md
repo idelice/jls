@@ -48,7 +48,7 @@ require('lspconfig').jls.setup({
 - **Find implementation** — find implementations
 - **Type/call hierachy** — find type/call hierachy 
 - **Hover** — type information and Javadoc
-- **Diagnostics** — server-pushed (real-time linting without keystroke lag)
+- **Diagnostics** — shows errors/warnings from javac
 - **Signature help** — parameter info for methods and constructors
 - **Inlay hints** — parameter name hints at call sites
 - **Code actions** — refactoring, quick fixes, code generation
@@ -85,20 +85,78 @@ Code actions are computed lazily — the list appears instantly, edits are compu
 - Remove unused variable/field/class/method/throws
 - Suppress 'unchecked' warning
 
-## Project Configuration
+## Configuration
+
+The server accepts these settings under `settings.java` in any LSP client.
+The example shows every setting with its default value:
+
+```lua
+settings = {
+    java = {
+        richFormatter = true,
+        inlayHints = false,
+        externalDependencies = {},
+        classPath = {},
+        docPath = {},
+        extraCompilerArgs = {},
+        addExports = {},
+    },
+}
+```
+
+The empty Lua tables above represent empty JSON arrays (`[]`).
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `richFormatter` | `true` | Readable diagnostic messages. Set `false` for the previous messages. |
+| `inlayHints` | `false` | Compute and push parameter name hints through `java/inlayHints`. The client must support this notification to display them. |
+| `externalDependencies` | `[]` | Maven coordinates to look up in local Maven/Gradle caches, such as `"junit:junit:4.12"`. Empty by default; build dependencies are discovered automatically. |
+| `classPath` | `[]` | Explicit classpath entries. When empty, dependencies are discovered from the build or environment. |
+| `docPath` | `[]` | Source JARs/directories for documentation and navigation when an explicit `classPath` is supplied. Otherwise, source paths are discovered from the build. |
+| `extraCompilerArgs` | `[]` | Additional javac arguments, such as `"--release 21"`. The Java level is inferred from the build unless explicitly overridden. |
+| `addExports` | `[]` | Additional `--add-exports` values, such as `"jdk.compiler/com.sun.tools.javac.api"`. |
+
+Settings are read once at startup and reused for the server's lifetime. The initial
+client settings must arrive before the first compiler request; clients that send
+no settings use the defaults. Later configuration notifications are ignored.
+Restart JLS after changing client settings or `.java-language-server.json`.
+
+### With nvim-jls
+
+`settings` passes server settings through. The plugin maps `rich_formatter.enabled`
+to `richFormatter` and `inlay_hints.enabled` to `inlayHints`:
+
+```lua
+require("jls").setup({
+    rich_formatter = { enabled = true },
+    inlay_hints = { enabled = false },
+    settings = {
+        java = {
+            extraCompilerArgs = { "--release 21" },
+            addExports = { "jdk.compiler/com.sun.tools.javac.api" },
+        },
+    },
+})
+```
+
+Use these plugin options with nvim-jls: they override the corresponding values in
+`settings.java`. Disabling inlay hints stops both server hint computation and client display.
+Client options such as `jvm_args` and `auto_restart` are documented
+in the [nvim-jls configuration](https://github.com/idelice/nvim-jls#configuration).
+
+### Build configuration
 
 The server auto-detects dependencies from Maven (`pom.xml`), Gradle (`build.gradle`), or Bazel (`BUILD`).
 
-### Single file / no build system
-
-A loose `.java` file without any build system works out of the box: the JDK is always available, and
-any `*.jar` placed next to the file or under a sibling `lib/` directory (searched recursively) is
-added to the classpath automatically. Set `CLASSPATH` or use `.java-language-server.json` below for
-anything more specific.
+A loose `.java` file without a build system uses the JDK and any `*.jar` next to
+that file or under a sibling `lib/` directory (searched recursively). Use
+`settings.java.classPath` for an explicit classpath, or `CLASSPATH` to override
+automatic classpath discovery.
 
 ### `.java-language-server.json`
 
-Place in your project root for project-specific settings that travel with the repo:
+The project-root file supports `addExports` and `extraCompilerArgs`. Both default
+to `[]` and are combined with their corresponding client settings:
 
 ```json
 {
@@ -108,26 +166,11 @@ Place in your project root for project-specific settings that travel with the re
     ],
     "extraCompilerArgs": [
         "--release 21"
-    ],
-    "externalDependencies": [
-        "junit:junit:4.12"
-    ],
-    "classPath": [
-        "lib/some-dependency.jar"
-    ],
-    "docPath": [
-        "lib/some-dependency-sources.jar"
     ]
 }
 ```
 
-| Field | Purpose |
-|-------|---------|
-| `addExports` | `--add-exports` flags passed to javac (e.g. for internal JDK APIs) |
-| `extraCompilerArgs` | Additional javac arguments |
-| `externalDependencies` | Maven coordinates to resolve |
-| `classPath` | Explicit JAR paths |
-| `docPath` | Source JAR paths for hover/navigation |
+The other settings in the table must be supplied through the LSP client.
 
 ### Private repositories
 

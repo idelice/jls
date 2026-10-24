@@ -8,111 +8,74 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
 
-/**
- * Pure JSON config parsing for project and client settings.
- * Reads .java-language-server.json from the workspace root and extracts
- * typed configuration values from the client-provided settings object.
- */
+/** Startup configuration. Parsed once, then shared by the server and its providers. */
 final class ServerSettings {
     private static final Logger LOG = Logger.getLogger("main");
 
-    private final Path workspaceRoot;
-    private final JsonObject settings;
+    private boolean initialized;
+    private boolean richFormatter = true;
+    private boolean inlayHints;
+    private Set<String> externalDependencies = Set.of();
+    private Set<Path> classPath = Set.of();
+    private Set<Path> docPath = Set.of();
+    private List<String> extraCompilerArgs = List.of();
+    private Set<String> addExports = Set.of();
 
-    ServerSettings(Path workspaceRoot, JsonObject settings) {
-        this.workspaceRoot = workspaceRoot;
-        this.settings = settings;
-    }
-
-    Set<String> externalDependencies() {
-        if (!settings.has("externalDependencies")) return Set.of();
-        var array = settings.getAsJsonArray("externalDependencies");
-        var strings = new HashSet<String>();
-        for (var each : array) {
-            strings.add(each.getAsString());
-        }
-        return strings;
-    }
-
-    Set<Path> classPath() {
-        if (!settings.has("classPath")) return Set.of();
-        var array = settings.getAsJsonArray("classPath");
-        var paths = new HashSet<Path>();
-        for (var each : array) {
-            paths.add(Paths.get(each.getAsString()).toAbsolutePath());
-        }
-        return paths;
-    }
-
-    List<String> extraCompilerArgs() {
+    void initialize(Path workspaceRoot, JsonObject client) {
+        if (initialized) return;
+        var project = readProjectSettings(workspaceRoot);
+        richFormatter = !client.has("richFormatter") || client.get("richFormatter").getAsBoolean();
+        inlayHints = client.has("inlayHints") && client.get("inlayHints").getAsBoolean();
+        externalDependencies = strings(client, "externalDependencies");
+        classPath = paths(client, "classPath");
+        docPath = paths(client, "docPath");
         var args = new ArrayList<String>();
-        var file = projectSettings();
-        if (file.has("extraCompilerArgs")) {
-            for (var each : file.getAsJsonArray("extraCompilerArgs"))
-                args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
-        }
-        if (settings.has("extraCompilerArgs")) {
-            for (var each : settings.getAsJsonArray("extraCompilerArgs"))
-                args.addAll(Arrays.asList(each.getAsString().trim().split("\\s+")));
-        }
-        return List.copyOf(args);
+        addCompilerArgs(args, project);
+        addCompilerArgs(args, client);
+        extraCompilerArgs = List.copyOf(args);
+        var exports = new HashSet<>(strings(project, "addExports"));
+        exports.addAll(strings(client, "addExports"));
+        addExports = Set.copyOf(exports);
+        initialized = true;
     }
 
-    Set<Path> docPath() {
-        if (!settings.has("docPath")) return Set.of();
-        var array = settings.getAsJsonArray("docPath");
-        var paths = new HashSet<Path>();
-        for (var each : array) {
-            paths.add(Paths.get(each.getAsString()).toAbsolutePath());
-        }
-        return paths;
+    boolean richFormatter() { return richFormatter; }
+    boolean inlayHints() { return inlayHints; }
+    Set<String> externalDependencies() { return externalDependencies; }
+    Set<Path> classPath() { return classPath; }
+    Set<Path> docPath() { return docPath; }
+    List<String> extraCompilerArgs() { return extraCompilerArgs; }
+    Set<String> addExports() { return addExports; }
+
+    private static Set<String> strings(JsonObject source, String key) {
+        if (!source.has(key)) return Set.of();
+        var result = new HashSet<String>();
+        for (var value : source.getAsJsonArray(key)) result.add(value.getAsString());
+        return Set.copyOf(result);
     }
 
-    Set<String> addExports() {
-        var merged = new HashSet<String>();
-        var file = projectSettings();
-        if (file.has("addExports")) {
-            for (var each : file.getAsJsonArray("addExports")) merged.add(each.getAsString());
-        }
-        if (settings.has("addExports")) {
-            for (var each : settings.getAsJsonArray("addExports")) merged.add(each.getAsString());
-        }
-        return merged;
+    private static Set<Path> paths(JsonObject source, String key) {
+        var result = new HashSet<Path>();
+        for (var value : strings(source, key)) result.add(Paths.get(value).toAbsolutePath());
+        return Set.copyOf(result);
     }
 
-    /** Read .java-language-server.json from the workspace root, or empty object if absent/invalid. */
-    JsonObject projectSettings() {
-        if (workspaceRoot == null) return new JsonObject();
+    private static void addCompilerArgs(List<String> args, JsonObject source) {
+        if (!source.has("extraCompilerArgs")) return;
+        for (var value : source.getAsJsonArray("extraCompilerArgs")) {
+            args.addAll(Arrays.asList(value.getAsString().trim().split("\\s+")));
+        }
+    }
+
+    private static JsonObject readProjectSettings(Path workspaceRoot) {
         var file = workspaceRoot.resolve(".java-language-server.json");
         if (!Files.exists(file)) return new JsonObject();
         try {
-            var text = Files.readString(file);
-            var parsed = JsonParser.parseString(text);
+            var parsed = JsonParser.parseString(Files.readString(file));
             return parsed.isJsonObject() ? parsed.getAsJsonObject() : new JsonObject();
         } catch (Exception e) {
             LOG.warning("Failed to read .java-language-server.json: " + e.getMessage());
             return new JsonObject();
         }
-    }
-
-    /** Snapshot compiler-affecting settings for change detection. */
-    static JsonObject compilerSettingsSnapshot(JsonObject source) {
-        var snapshot = new JsonObject();
-        if (source == null) {
-            return snapshot;
-        }
-        copySettingIfPresent(source, snapshot, "externalDependencies");
-        copySettingIfPresent(source, snapshot, "classPath");
-        copySettingIfPresent(source, snapshot, "extraCompilerArgs");
-        copySettingIfPresent(source, snapshot, "docPath");
-        copySettingIfPresent(source, snapshot, "addExports");
-        return snapshot;
-    }
-
-    private static void copySettingIfPresent(JsonObject source, JsonObject target, String key) {
-        if (!source.has(key)) {
-            return;
-        }
-        target.add(key, source.get(key).deepCopy());
     }
 }

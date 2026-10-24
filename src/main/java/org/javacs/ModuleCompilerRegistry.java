@@ -23,8 +23,6 @@ final class ModuleCompilerRegistry implements AutoCloseable {
     InferConfig inferredConfig;
     boolean moduleScopedMaven;
     boolean moduleScopedGradle;
-    Set<String> configuredAddExports = Set.of();
-    List<String> configuredUserCompilerArgs = List.of();
 
     static final class ModuleCompiler implements AutoCloseable {
         final JavaCompilerService compiler;
@@ -88,7 +86,7 @@ final class ModuleCompilerRegistry implements AutoCloseable {
             var inputs = resolveInputs(module, module.isTestSource(file));
             includeSources(inputs.sourceRoots());
             var next = new JavaCompilerService(server.moduleGraph.externalClasspath(inputs.classpath()),
-                    inputs.sources(), configuredAddExports, compilerArguments(module));
+                    inputs.sources(), server.settings.addExports(), compilerArguments(module));
             next.setSourceRoots(inputs.sourceRoots());
             moduleCompilers.put(key, new ModuleCompiler(next, inputs.sourceRoots()));
             // Make source JARs available to the main (fallback) compiler so definition
@@ -144,7 +142,7 @@ final class ModuleCompilerRegistry implements AutoCloseable {
     }
 
     private List<String> compilerArguments(ModuleGraph.ModuleInfo module) {
-        var args = new ArrayList<>(configuredUserCompilerArgs);
+        var args = new ArrayList<>(server.settings.extraCompilerArgs());
         if (!JavaLanguageServer.hasExplicitJavaLevelOverride(args)) {
             if (!module.compilerArgs().isEmpty()) args.addAll(module.compilerArgs());
             else if (module.sourceCompatibility() != null) {

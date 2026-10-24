@@ -88,8 +88,7 @@ class JavaLanguageServer extends LanguageServer {
     // Null until first compiler initialization; EMPTY for non-Gradle projects.
     ModuleGraph moduleGraph = ModuleGraph.EMPTY;
 
-    private JsonObject appliedCompilerSettings = new JsonObject();
-    private JsonObject settings = new JsonObject();
+    final ServerSettings settings = new ServerSettings();
     ProgressReporter progress;
 
     final ScheduledExecutorService completionIndexExecutor =
@@ -117,16 +116,14 @@ class JavaLanguageServer extends LanguageServer {
                         }
                     });
 
-    /** Return the current compiler. Compiler recreation happens at explicit event boundaries. */
+    /** Initialize once on first use if the client did not send startup settings. */
     synchronized JavaCompilerService getOrCreateCompiler() {
-        if (compiler == null) {
-            LOG.warning("Compiler has not been initialized");
-            return null;
-        }
+        if (compiler == null) initializeCompilers(new JsonObject());
         return compiler;
     }
 
     synchronized JavaCompilerService compilerFor(Path file) {
+        getOrCreateCompiler();
         return moduleRegistry.compilerFor(file);
     }
 
@@ -164,10 +161,15 @@ class JavaLanguageServer extends LanguageServer {
                 currentSnapshot.workspaceIndex(), externalIndex, currentSnapshot.version());
     }
 
-    private synchronized void initializeCompilers() {
-        createCompilers();
-        appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
-        publishExternalBinaryIndexSnapshot();
+    private synchronized void initializeCompilers(JsonObject clientSettings) {
+        if (compiler != null) return;
+        settings.initialize(workspaceRoot, clientSettings);
+        try {
+            createCompilers();
+            publishExternalBinaryIndexSnapshot();
+        } finally {
+            notifyWorkspaceInfo();
+        }
     }
 
     private void notifyWorkspaceInfo() {
@@ -193,12 +195,15 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private synchronized void recreateCompilersAndRefreshState(String trigger) {
+        if (compiler == null) {
+            getOrCreateCompiler();
+            return;
+        }
         var started = Instant.now();
         MavenTooling.invalidateCacheInputsSnapshot();
         completionIndexScheduler.reset(trigger);
         try {
             createCompilers();
-            appliedCompilerSettings = ServerSettings.compilerSettingsSnapshot(settings);
             publishExternalBinaryIndexSnapshot();
             refreshStateForCompilerRecreated();
             for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, false);
@@ -236,13 +241,10 @@ class JavaLanguageServer extends LanguageServer {
         var started = System.nanoTime();
         var token = progress.begin("Configure javac", "Reading build metadata");
         try {
-            var configured = new ServerSettings(workspaceRoot, settings);
-            var infer = new InferConfig(workspaceRoot, configured.externalDependencies());
+            var infer = new InferConfig(workspaceRoot, settings.externalDependencies());
             moduleGraph = infer.moduleGraph();
             moduleRegistry.inferredConfig = infer;
-            moduleRegistry.configuredUserCompilerArgs = List.copyOf(configured.extraCompilerArgs());
-            moduleRegistry.configuredAddExports = Set.copyOf(configured.addExports());
-            var explicit = !configured.classPath().isEmpty();
+            var explicit = !settings.classPath().isEmpty();
             moduleRegistry.moduleScopedMaven = !explicit && !moduleGraph.modules().isEmpty()
                     && infer.buildSystem() == InferConfig.BuildSystem.MAVEN;
             moduleRegistry.moduleScopedGradle = !explicit && !moduleGraph.modules().isEmpty()
@@ -251,10 +253,10 @@ class JavaLanguageServer extends LanguageServer {
             var roots = new LinkedHashSet<Path>();
             for (var module : moduleGraph.modules().values()) roots.addAll(module.sourceDirs());
             if (!roots.isEmpty()) FileStore.setWorkspaceRoots(roots);
-            var classpath = explicit ? configured.classPath() : scoped ? Set.<Path>of() : infer.classPath();
-            var docs = explicit ? configured.docPath() : scoped ? Set.<Path>of() : infer.buildDocPath();
-            var args = scoped ? configured.extraCompilerArgs() : selectCompilerArgs(configured.extraCompilerArgs(), infer).args();
-            compiler = new JavaCompilerService(moduleGraph.externalClasspath(classpath), docs, configured.addExports(), args);
+            var classpath = explicit ? settings.classPath() : scoped ? Set.<Path>of() : infer.classPath();
+            var docs = explicit ? settings.docPath() : scoped ? Set.<Path>of() : infer.buildDocPath();
+            var args = scoped ? settings.extraCompilerArgs() : selectCompilerArgs(settings.extraCompilerArgs(), infer).args();
+            compiler = new JavaCompilerService(moduleGraph.externalClasspath(classpath), docs, settings.addExports(), args);
             if (!roots.isEmpty()) compiler.setSourceRoots(roots);
             LOG.info("[analysis] configured proc=none workspace_binaries=0 modules=" + moduleGraph.modules().size()
                     + " sources=" + roots.size() + " ms=" + (System.nanoTime() - started) / 1_000_000);
@@ -391,12 +393,8 @@ class JavaLanguageServer extends LanguageServer {
         options.add("watchers", watchers);
         client.registerCapability("workspace/didChangeWatchedFiles", options);
         LOG.info(String.format("[perf] client_attached workspace=%s watchers=%d", workspaceRoot, watchFiles.length));
-        try {
-            initializeCompilers();
-        } finally {
-            notifyWorkspaceInfo();
-        }
-
+        // Neovim sends its startup settings after this notification. Compiler setup
+        // starts with those settings, or on first use for clients without settings.
     }
 
     @Override
@@ -421,7 +419,6 @@ class JavaLanguageServer extends LanguageServer {
     @Override
     public List<SymbolInformation> documentSymbol(DocumentSymbolParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
-        if (compiler == null) return List.of();
         var file = Paths.get(params.textDocument.uri);
         var started = Instant.now();
         var result = new SymbolProvider(getOrCreateCompiler()).documentSymbols(file);
@@ -432,17 +429,14 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didChangeConfiguration(DidChangeConfigurationParams change) {
+        if (compiler != null) return; // Startup settings only; later changes require a restart.
         var java = change.settings.getAsJsonObject().get("java");
         LOG.info(String.format("Received java settings %s", java));
         var nextSettings = new JsonObject();
         if (java != null && !java.isJsonNull()) {
             nextSettings = java.getAsJsonObject();
         }
-        var nextCompilerSettings = ServerSettings.compilerSettingsSnapshot(nextSettings);
-        settings = nextSettings;
-        if (!nextCompilerSettings.equals(appliedCompilerSettings)) {
-            recreateCompilersAndRefreshState("didChangeConfiguration");
-        }
+        initializeCompilers(nextSettings);
     }
 
     @Override
@@ -942,7 +936,7 @@ class JavaLanguageServer extends LanguageServer {
     }
 
     private void publishFileDiagnostics(CompileTask task, Path file) {
-        var diagnostics = new ErrorProvider(task).errors(Set.of(file.toUri()));
+        var diagnostics = new ErrorProvider(task, settings.richFormatter()).errors(Set.of(file.toUri()));
         for (var params : diagnostics) {
             if (file.toUri().equals(params.uri)) {
                 client.publishDiagnostics(params);
@@ -952,11 +946,9 @@ class JavaLanguageServer extends LanguageServer {
         client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
     }
 
-    /**
-     * Push inlay hints. When called with an existing task (didOpen), scans the full file.
-     * When called without (deferred from didChange), does a pruned compile around editLine.
-     */
+    /** Reuse the diagnostic compilation for full-file hints on open, or the edited method on change. */
     private void pushHints(Path file, CompileTask existingTask, JavaCompilerService existingCompiler, int editLine) {
+        if (!settings.inlayHints()) return;
         var started = System.currentTimeMillis();
         try {
             Range range = null;

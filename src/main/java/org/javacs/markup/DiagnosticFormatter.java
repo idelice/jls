@@ -7,30 +7,42 @@ import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.util.TreePath;
+import com.sun.tools.javac.api.BasicJavacTask;
 import com.sun.tools.javac.api.ClientCodeWrapper;
+import com.sun.tools.javac.api.DiagnosticFormatter.Configuration.DiagnosticPart;
 import com.sun.tools.javac.code.Type;
+import com.sun.tools.javac.util.BasicDiagnosticFormatter;
+import com.sun.tools.javac.util.BasicDiagnosticFormatter.BasicConfiguration.BasicFormatKind;
 import com.sun.tools.javac.util.JCDiagnostic;
+import com.sun.tools.javac.util.Log;
+import com.sun.tools.javac.util.RichDiagnosticFormatter;
 import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.StringJoiner;
 import java.util.TreeSet;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
-import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.element.TypeParameterElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.type.TypeVariable;
 import javax.lang.model.util.ElementFilter;
 import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
 import org.javacs.CompileTask;
 
 final class DiagnosticFormatter {
-    private static final int MAX_PARAMETERS = 7;
+    private static final Logger LOG = Logger.getLogger("main");
     private static final Pattern QUALIFIED_NAME = Pattern.compile("\\b([a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+)\\.([A-Z][\\w]*)");
     private static final Pattern CANT_RESOLVE = Pattern.compile("(?s)cannot find symbol\\s+symbol:\\s+(?:variable|method|class)\\s+(\\S+).*");
 
@@ -39,26 +51,80 @@ final class DiagnosticFormatter {
 
     private DiagnosticFormatter() {}
 
-    static String format(Diagnostic<? extends JavaFileObject> diagnostic, CompileTask task,
-            CompilationUnitTree root) {
-        var javac = unwrap(diagnostic);
-        var formatted = javac == null ? null : switch (diagnostic.getCode()) {
-            case "compiler.err.cant.apply.symbols", "compiler.err.cant.apply.symbol" ->
-                    formatArgumentMismatch(javac, task, root);
-            case "compiler.err.prob.found.req" -> formatIncompatibleTypes(javac);
-            case "compiler.err.ref.ambiguous" -> formatAmbiguousCall(javac);
-            case "compiler.err.does.not.override.abstract" -> formatMissingImplementation(javac);
-            default -> null;
-        };
-        if (formatted != null) return formatted;
+    static String formatPlain(Diagnostic<? extends JavaFileObject> diagnostic) {
         return simplifyMessage(diagnostic.getMessage(null));
     }
 
-    private static String formatIncompatibleTypes(JCDiagnostic diagnostic) {
+    static String format(Diagnostic<? extends JavaFileObject> diagnostic, CompileTask task,
+            CompilationUnitTree root) {
+        var javac = unwrap(diagnostic);
+        if (javac != null) {
+            try {
+                var formatted = formatKnownDiagnostic(javac, task, root);
+                if (formatted != null) return formatted;
+            } catch (RuntimeException | AssertionError failure) {
+                LOG.fine("[diagnostics] custom_format_failed code=" + diagnostic.getCode() + " reason=" + failure);
+            }
+        }
+        // Preserve the existing concise unknown-symbol message.
+        var original = diagnostic.getMessage(null);
+        var missing = CANT_RESOLVE.matcher(original);
+        if (missing.matches()) return "cannot resolve symbol '" + missing.group(1) + "'";
+        if (javac != null) {
+            try {
+                return formatRichDiagnostic(javac, task);
+            } catch (RuntimeException | AssertionError failure) {
+                LOG.fine("[diagnostics] rich_format_failed code=" + diagnostic.getCode() + " reason=" + failure);
+            }
+        }
+        // A final plain-text fallback must not strip names that distinguish conflicting types.
+        return original;
+    }
+
+    private static String formatKnownDiagnostic(JCDiagnostic diagnostic, CompileTask task, CompilationUnitTree root) {
+        return switch (diagnostic.getCode()) {
+            case "compiler.err.cant.apply.symbols", "compiler.err.cant.apply.symbol" ->
+                    formatArgumentMismatch(diagnostic, task, root);
+            case "compiler.err.prob.found.req" -> formatIncompatibleTypes(diagnostic, task);
+            case "compiler.err.ref.ambiguous" -> formatAmbiguousCall(diagnostic, task);
+            case "compiler.err.does.not.override.abstract" -> formatMissingImplementation(diagnostic);
+            default -> null;
+        };
+    }
+
+    private static String formatRichDiagnostic(JCDiagnostic diagnostic, CompileTask task) {
+        var context = ((BasicJavacTask) task.task).getContext();
+        var formatter = Log.instance(context).getDiagnosticFormatter();
+        if (!(formatter instanceof RichDiagnosticFormatter rich)
+                || !(rich.getDelegatedFormatter() instanceof BasicDiagnosticFormatter basic)) {
+            return formatter.formatMessage(diagnostic, Locale.ROOT);
+        }
+        var configuration = basic.getConfiguration();
+        var visible = EnumSet.noneOf(DiagnosticPart.class);
+        visible.addAll(configuration.getVisible());
+        var formats = new EnumMap<BasicFormatKind, String>(BasicFormatKind.class);
+        for (var kind : BasicFormatKind.values()) formats.put(kind, configuration.getFormat(kind));
+        try {
+            // LSP already carries the source location. Keep only message/details and rich clauses.
+            var messageParts = visible.clone();
+            messageParts.remove(DiagnosticPart.SOURCE);
+            configuration.setVisible(messageParts);
+            for (var kind : BasicFormatKind.values()) configuration.setFormat(kind, "%m");
+            return rich.format(diagnostic, Locale.ROOT);
+        } finally {
+            configuration.setVisible(visible);
+            formats.forEach(configuration::setFormat);
+        }
+    }
+
+    private static String formatIncompatibleTypes(JCDiagnostic diagnostic, CompileTask task) {
         var args = diagnostic.getArgs();
         if (args.length != 1 || !(args[0] instanceof JCDiagnostic reason)) return null;
         var mismatch = typeMismatch(reason);
         if (mismatch != null) {
+            var typeParameters = formatDistinctTypeParameters(mismatch);
+            if (typeParameters != null) return typeParameters;
+            if (needsRichTypeNames(mismatch, task)) return null;
             var message = formatRequiredProvided(mismatch);
             if (reason.getCode().equals("compiler.misc.possible.loss.of.precision")) {
                 message += "\n\nConversion may lose precision.";
@@ -67,12 +133,39 @@ final class DiagnosticFormatter {
         }
         return switch (reason.getCode()) {
             case "compiler.misc.incompatible.ret.type.in.mref", "compiler.misc.incompatible.ret.type.in.lambda" ->
-                    formatReturnTypeMismatch(reason);
-            case "compiler.misc.incompatible.bounds" -> formatInferenceBounds(reason);
+                    formatReturnTypeMismatch(reason, task);
+            case "compiler.misc.incompatible.bounds" -> formatInferenceBounds(reason, task);
             case "compiler.misc.not.a.functional.intf", "compiler.misc.not.a.functional.intf.1" ->
                     formatFunctionalInterface(reason);
             default -> null;
         };
+    }
+
+    private static String formatDistinctTypeParameters(TypeMismatch mismatch) {
+        if (!(mismatch.found() instanceof TypeVariable found)
+                || !(mismatch.required() instanceof TypeVariable required)
+                || !(found.asElement() instanceof TypeParameterElement foundParameter)
+                || !(required.asElement() instanceof TypeParameterElement requiredParameter)
+                || foundParameter.equals(requiredParameter)
+                || !foundParameter.getSimpleName().contentEquals(requiredParameter.getSimpleName())) return null;
+        var from = typeParameterDeclaration(foundParameter);
+        var to = typeParameterDeclaration(requiredParameter);
+        if (from == null || to == null || from.equals(to)) return null;
+        return "Cannot convert " + from + " to " + to
+                + ".\n\nThese are different type parameters despite sharing the same name.";
+    }
+
+    private static String typeParameterDeclaration(TypeParameterElement parameter) {
+        var declaration = parameter.getGenericElement();
+        if (declaration instanceof ExecutableElement method && method.getKind() == ElementKind.METHOD) {
+            return "type parameter " + parameter.getSimpleName() + " declared by method '" + method.getSimpleName() + "'";
+        }
+        if (declaration instanceof TypeElement type) {
+            var name = type.getQualifiedName().isEmpty() ? type.getSimpleName() : type.getQualifiedName();
+            return "type parameter " + parameter.getSimpleName() + " declared by "
+                    + (type.getKind().isInterface() ? "interface '" : "class '") + name + "'";
+        }
+        return null;
     }
 
     private static String formatRequiredProvided(TypeMismatch mismatch) {
@@ -80,11 +173,11 @@ final class DiagnosticFormatter {
                 + "\nProvided: " + distinctTypeName(mismatch.found(), mismatch.required());
     }
 
-    private static String formatReturnTypeMismatch(JCDiagnostic reason) {
+    private static String formatReturnTypeMismatch(JCDiagnostic reason, CompileTask task) {
         var args = reason.getArgs();
         if (args.length != 1 || !(args[0] instanceof JCDiagnostic conversion)) return null;
         var mismatch = typeMismatch(conversion);
-        if (mismatch == null) return null;
+        if (mismatch == null || needsRichTypeNames(mismatch, task)) return null;
         var context = reason.getCode().equals("compiler.misc.incompatible.ret.type.in.mref")
                 ? "Method reference" : "Lambda";
         var message = formatRequiredProvided(mismatch) + "\n\n" + context + " has an incompatible return type.";
@@ -94,7 +187,7 @@ final class DiagnosticFormatter {
         return message;
     }
 
-    private static String formatInferenceBounds(JCDiagnostic reason) {
+    private static String formatInferenceBounds(JCDiagnostic reason, CompileTask task) {
         var args = reason.getArgs();
         if (args.length != 3 || !(args[1] instanceof JCDiagnostic first)
                 || !(args[2] instanceof JCDiagnostic second)) return null;
@@ -105,6 +198,7 @@ final class DiagnosticFormatter {
             provided = singleBound(first, "compiler.misc.lower.bounds");
         }
         if (required == null || provided == null) return null;
+        if (needsRichTypeNames(new TypeMismatch(provided, required), task)) return null;
         return "Incompatible type argument " + args[0] + "\n" + formatRequiredProvided(new TypeMismatch(provided, required))
                 + "\n\n" + simplifyMessage(reason.getMessage(java.util.Locale.ROOT));
     }
@@ -137,11 +231,13 @@ final class DiagnosticFormatter {
                 + "\nA lambda or method reference requires a functional interface with one abstract method.";
     }
 
-    private static String formatAmbiguousCall(JCDiagnostic diagnostic) {
+    private static String formatAmbiguousCall(JCDiagnostic diagnostic, CompileTask task) {
         var args = diagnostic.getArgs();
         // JDK 25 Resolve.AmbiguityError: name, first kind/symbol/location, second kind/symbol/location.
         if (args.length != 7 || !(args[2] instanceof ExecutableElement first)
                 || !(args[5] instanceof ExecutableElement second)) return null;
+        if (simpleType(first.asType()).equals(simpleType(second.asType()))
+                && !task.types.isSameType(first.asType(), second.asType())) return null;
         return "Ambiguous call to '" + args[0] + "': multiple candidates match.\n\nCandidates:\n  "
                 + formatMethod(first, ((ExecutableType) first.asType()).getParameterTypes(),
                         first.getKind() == ElementKind.CONSTRUCTOR)
@@ -170,18 +266,20 @@ final class DiagnosticFormatter {
     private static String formatArgumentMismatch(JCDiagnostic diagnostic, CompileTask task,
             com.sun.source.tree.CompilationUnitTree root) {
         if (diagnostic == null) return null;
-        var call = invocationPath(diagnostic, root);
+        var call = invocationTree(diagnostic, root);
         if (call == null) return null;
-        var arguments = arguments(call.getLeaf());
-        var candidates = candidates(diagnostic, task, call.getLeaf() instanceof NewClassTree);
+        var arguments = arguments(call);
+        var candidates = candidates(diagnostic, task, call instanceof NewClassTree);
         if (candidates.isEmpty()) return null;
+        var comparableSort = formatComparableSortMismatch(candidates, task);
+        if (comparableSort != null) return comparableSort;
         // Never replace a richer inference/accessibility error with a generic mismatch message.
         if (candidates.stream().anyMatch(c -> !isArityMismatch(c.reason()) && typeMismatch(c.reason()) == null)) return null;
 
-        boolean constructor = call.getLeaf() instanceof NewClassTree;
+        boolean constructor = call instanceof NewClassTree;
         var message = new StringBuilder("No matching ")
                 .append(constructor ? "constructor: " : "method: ")
-                .append(callLabel(call.getLeaf(), arguments));
+                .append(callLabel(call, arguments));
         if (candidates.stream().allMatch(c -> isArityMismatch(c.reason()))) {
             message.append("\n\n").append(formatArgumentCounts(arguments.size(), candidates, constructor));
         }
@@ -200,12 +298,48 @@ final class DiagnosticFormatter {
         return message.toString();
     }
 
-    private static TreePath invocationPath(JCDiagnostic diagnostic, CompilationUnitTree root) {
+    private static String formatComparableSortMismatch(List<Candidate> candidates, CompileTask task) {
+        Candidate rejected = null;
+        for (var candidate : candidates) {
+            if (isArityMismatch(candidate.reason())) continue;
+            if (rejected != null) return null;
+            rejected = candidate;
+        }
+        if (rejected == null || !rejected.method().getSimpleName().contentEquals("sort")
+                || !(rejected.method().getEnclosingElement() instanceof TypeElement owner)
+                || !owner.getQualifiedName().contentEquals("java.util.Collections")
+                || !rejected.reason().getCode().equals("compiler.misc.incompatible.bounds")) return null;
+        var bounds = rejected.reason().getArgs();
+        if (bounds.length != 3) return null;
+        TypeMirror provided = null;
+        TypeMirror required = null;
+        for (int i = 1; i < bounds.length; i++) {
+            if (!(bounds[i] instanceof JCDiagnostic bound)) return null;
+            var equality = singleBound(bound, "compiler.misc.eq.bounds");
+            var upper = singleBound(bound, "compiler.misc.upper.bounds");
+            if (equality != null) provided = equality;
+            if (upper != null) required = upper;
+        }
+        if (!(provided instanceof DeclaredType) || !(required instanceof DeclaredType comparable)
+                || !(comparable.asElement() instanceof TypeElement type)
+                || !type.getQualifiedName().contentEquals("java.lang.Comparable")
+                || task.types.isSubtype(provided, task.types.erasure(required))) return null;
+        // javac has already identified the failed bound. Do not summarize incompatible
+        // Comparable<T> implementations or other inference failures as a missing interface.
+        var name = simpleType(provided);
+        return "Cannot sort these elements: " + name + " does not implement Comparable.\n\n"
+                + "Provide a Comparator<" + name + "> or make " + name + " implement Comparable.";
+    }
+
+    private static Tree invocationTree(JCDiagnostic diagnostic, CompilationUnitTree root) {
         var position = diagnostic.getDiagnosticPosition();
         if (position == null || position.getTree() == null) return null;
+        if (position.getTree() instanceof NewClassTree || position.getTree() instanceof MethodInvocationTree) {
+            return position.getTree();
+        }
         var path = TreePath.getPath(root, position.getTree());
         while (path != null) {
-            if (path.getLeaf() instanceof NewClassTree || path.getLeaf() instanceof MethodInvocationTree) return path;
+            if (path.getLeaf() instanceof NewClassTree || path.getLeaf() instanceof MethodInvocationTree) return path.getLeaf();
             path = path.getParentPath();
         }
         return null;
@@ -224,7 +358,7 @@ final class DiagnosticFormatter {
             name = select instanceof MemberSelectTree member ? member.getIdentifier().toString() : select.toString();
         }
         var labels = new StringJoiner(", ", name + "(", ")");
-        for (var argument : arguments) labels.add(argument.toString().replaceAll("\\s+", " "));
+        for (var argument : arguments) labels.add(argument.toString());
         return labels.toString();
     }
 
@@ -301,7 +435,7 @@ final class DiagnosticFormatter {
     private static String formatMethod(ExecutableElement method, List<? extends TypeMirror> types, boolean constructor) {
         var name = constructor ? method.getEnclosingElement().getSimpleName() : method.getSimpleName();
         var parameters = new StringJoiner(", ", name + "(", ")");
-        for (int i = 0; i < Math.min(types.size(), MAX_PARAMETERS); i++) {
+        for (int i = 0; i < types.size(); i++) {
             var type = types.get(i);
             var label = method.isVarArgs() && i == types.size() - 1 && type instanceof ArrayType array
                     ? simpleType(array.getComponentType()) + "..." : simpleType(type);
@@ -309,7 +443,6 @@ final class DiagnosticFormatter {
             if (!parameterName.matches("arg\\d+")) label += " " + parameterName;
             parameters.add(label);
         }
-        if (types.size() > MAX_PARAMETERS) parameters.add("…");
         return parameters.toString();
     }
 
@@ -330,6 +463,7 @@ final class DiagnosticFormatter {
     private static String formatTypeMismatch(Candidate candidate, List<? extends ExpressionTree> arguments,
             JCDiagnostic diagnostic, CompileTask task, CompilationUnitTree root) {
         var mismatch = typeMismatch(candidate.reason());
+        if (needsRichTypeNames(mismatch, task)) return null;
         var position = candidate.reason().getDiagnosticPosition();
         long offset = position == null ? diagnostic.getPosition() : position.getPreferredPosition();
         var positions = task.trees.getSourcePositions();
@@ -356,6 +490,14 @@ final class DiagnosticFormatter {
         // Keep package names or capture identities when shortening would erase the distinction.
         if (label.equals(simpleType(other)) && !type.toString().equals(other.toString())) return type.toString();
         return label;
+    }
+
+    private static boolean needsRichTypeNames(TypeMismatch mismatch, CompileTask task) {
+        boolean sameName = mismatch.required().toString().equals(mismatch.found().toString());
+        boolean sameCaptureLabel = mismatch.required() instanceof Type.CapturedType
+                && mismatch.found() instanceof Type.CapturedType
+                && simpleType(mismatch.required()).equals(simpleType(mismatch.found()));
+        return (sameName || sameCaptureLabel) && !task.types.isSameType(mismatch.required(), mismatch.found());
     }
 
     private static String simplifyMessage(String message) {
