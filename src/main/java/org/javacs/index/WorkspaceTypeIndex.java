@@ -634,6 +634,7 @@ public class WorkspaceTypeIndex {
         var typeSources = new Object2ObjectOpenHashMap<String, Path>();
         var typeSourceUris = new Object2ObjectOpenHashMap<String, java.net.URI>();
         var typeKinds = new Object2ObjectOpenHashMap<String, Integer>();
+        var annotationTypes = new ObjectOpenHashSet<String>();
         var typeModifiers = new Object2ObjectOpenHashMap<String, Set<Modifier>>();
         var nestedTypesByOwner = new Object2ObjectOpenHashMap<String, Set<String>>();
         var sourceFileSnapshots = new Object2ObjectLinkedOpenHashMap<Path, SourceFileSnapshot>();
@@ -728,6 +729,7 @@ public class WorkspaceTypeIndex {
                     qualifiedNameStack.push(qualified);
                     allQualifiedNames.add(qualified);
                     typeKinds.put(qualified, parseTreeKindToCompletionItemKind(tree.getKind()));
+                    if (tree.getKind() == Tree.Kind.ANNOTATION_TYPE) annotationTypes.add(qualified);
                     typeModifiers.put(qualified, Set.copyOf(tree.getModifiers().getFlags()));
                     declaredTypesInFile.add(qualified);
                     if (finalSourcePath != null) {
@@ -862,6 +864,7 @@ public class WorkspaceTypeIndex {
                     typeInterfacesList.getOrDefault(qualifiedName, List.of()),
                     nestedTypes,
                     typeKinds.getOrDefault(qualifiedName, CompletionItemKind.Class),
+                    annotationTypes.contains(qualifiedName),
                     typeModifiers.getOrDefault(qualifiedName, Set.of()),
                     null,
                     IndexedMember.Provenance.WORKSPACE));

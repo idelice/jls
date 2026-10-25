@@ -5,11 +5,10 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.VariableTree;
 import java.io.IOException;
-import java.io.InputStream;
 import java.lang.reflect.Modifier;
 import java.lang.classfile.ClassFile;
+import java.lang.classfile.ClassModel;
 import java.lang.classfile.Attributes;
-import java.lang.classfile.constantpool.ConstantPoolException;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.MethodTypeDesc;
 import java.lang.reflect.AccessFlag;
@@ -17,7 +16,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -32,7 +30,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.StringJoiner;
-import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.function.Function;
@@ -172,6 +169,16 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
         }
         if (!knownClassNames.contains(qualifiedName)) return Optional.empty();
         return lookup(typeCache, qualifiedName, this::loadLinkedTypeInfo, "external_binary.type");
+    }
+
+    public boolean isAnnotationType(String qualifiedName) {
+        if (!knownClassNames.contains(qualifiedName)) return false;
+        var indexed = rawTypeCache.getIfPresent(qualifiedName);
+        if (indexed != null && indexed.isPresent()) return indexed.get().annotationType;
+        return lookup(classFileCache, qualifiedName, this::loadBinaryClassModel,
+                        "external_binary.classfile")
+                .map(type -> type.classFile().flags().has(AccessFlag.ANNOTATION))
+                .orElse(false);
     }
 
     public boolean containsType(String qualifiedName) {
@@ -525,6 +532,7 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                             null,
                             superclass,
                             interfaces,
+                            binaryClass.isAnnotation(),
                             IndexedMember.Provenance.EXTERNAL_BINARY);
             return Optional.of(linked);
         } catch (ClassNotFoundException | LinkageError ex) {
@@ -545,10 +553,11 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                         new IndexedType(
                                 fallback.get().qualifiedName(),
                                 fallback.get().simpleName(),
-                                fallback.get().members(),
+                                binaryMembers(fallback.get()),
                                 null,
                                 null,
                                 List.of(),
+                                fallback.get().classFile().flags().has(AccessFlag.ANNOTATION),
                                 IndexedMember.Provenance.EXTERNAL_BINARY));
             }
             LOG.fine(String.format("[external-binary] miss type=%s reason=%s", qualifiedName, ex.getClass().getSimpleName()));
@@ -574,46 +583,21 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
         return loaded;
     }
     private Optional<BinaryClassModel> loadBinaryClassModel(String qualifiedName) {
-        var relative = qualifiedName.replace('.', '/') + ".class";
-        for (var root : classPathRoots) {
-            try {
-                if (Files.isDirectory(root)) {
-                    var classFile = root.resolve(relative);
-                    if (!Files.isRegularFile(classFile)) {
-                        continue;
-                    }
-                    try (var in = Files.newInputStream(classFile)) {
-                        return Optional.of(parseBinaryClassModel(qualifiedName, in));
-                    }
-                }
-                if (!Files.isRegularFile(root)) {
-                    continue;
-                }
-                try (var jar = new JarFile(root.toFile())) {
-                    var entry = jar.getJarEntry(relative);
-                    if (entry == null) {
-                        continue;
-                    }
-                    try (var in = jar.getInputStream(entry)) {
-                        return Optional.of(parseBinaryClassModel(qualifiedName, in));
-                    }
-                }
-            } catch (IOException | ConstantPoolException ex) {
-                LOG.fine(
-                        String.format(
-                                "[external-binary] classfile miss type=%s root=%s reason=%s",
-                                qualifiedName,
-                                root.getFileName(),
-                                ex.getClass().getSimpleName()));
-            }
+        if (compiler == null) return Optional.empty();
+        try {
+            return compiler.findClassFile(qualifiedName)
+                    .map(bytes -> new BinaryClassModel(
+                            qualifiedName, TypeNames.simpleName(qualifiedName),
+                            ClassFile.of().parse(bytes)));
+        } catch (IllegalArgumentException ex) {
+            LOG.fine("[external-binary] invalid classfile type=" + qualifiedName + ": " + ex.getMessage());
+            return Optional.empty();
         }
-        return Optional.empty();
     }
 
-    private BinaryClassModel parseBinaryClassModel(String qualifiedName, InputStream input)
-            throws IOException, ConstantPoolException {
-        var classFile = ClassFile.of().parse(input.readAllBytes());
-        var simpleName = TypeNames.simpleName(qualifiedName);
+    private List<IndexedMember> binaryMembers(BinaryClassModel binary) {
+        var classFile = binary.classFile();
+        var qualifiedName = binary.qualifiedName();
         var seenMembers = new LinkedHashMap<String, IndexedMember>();
 
         for (var field : classFile.fields()) {
@@ -724,7 +708,7 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
 
         var members = new ArrayList<>(seenMembers.values());
         IndexedMember.sort(members);
-        return new BinaryClassModel(qualifiedName, simpleName, members);
+        return members;
     }
 
     private int memberPriority(String targetType, String declaringType) {
@@ -833,8 +817,14 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
                 raw.simpleName,
                 linkedMembers,
                 raw.sourcePath,
+                raw.sourceUri,
                 raw.superclass,
                 raw.interfaces,
+                raw.nestedTypes,
+                raw.kind,
+                raw.annotationType,
+                raw.modifiers,
+                raw.declarationRange,
                 raw.provenance);
     }
 
@@ -1152,7 +1142,7 @@ public final class ExternalBinaryTypeIndex implements AutoCloseable {
     }
 
     private record BinaryClassModel(
-            String qualifiedName, String simpleName, List<IndexedMember> members) {}
+            String qualifiedName, String simpleName, ClassModel classFile) {}
     private record SourceLombokMetadata(
             Map<String, String> accessorToField,
             List<IndexedMember> syntheticAccessors) {}

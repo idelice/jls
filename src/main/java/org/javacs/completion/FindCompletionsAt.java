@@ -1,10 +1,15 @@
 package org.javacs.completion;
 
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.CaseTree;
+import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ErroneousTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.ImportTree;
+import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.util.JavacTask;
@@ -15,6 +20,8 @@ import com.sun.source.util.Trees;
 public class FindCompletionsAt extends TreePathScanner<TreePath, Long> {
     private final JavacTask task;
     private CompilationUnitTree root;
+    private TreePath enclosingScope;
+    private TreePath enclosingAnnotation;
 
     public FindCompletionsAt(JavacTask task) {
         this.task = task;
@@ -23,7 +30,46 @@ public class FindCompletionsAt extends TreePathScanner<TreePath, Long> {
     @Override
     public TreePath visitCompilationUnit(CompilationUnitTree t, Long find) {
         root = t;
-        return reduce(super.visitCompilationUnit(t, find), getCurrentPath());
+        enclosingScope = null;
+        enclosingAnnotation = null;
+        var found = super.visitCompilationUnit(t, find);
+        if (found != null) return found;
+        if (enclosingAnnotation != null) return enclosingAnnotation;
+        return enclosingScope == null ? getCurrentPath() : enclosingScope;
+    }
+
+    @Override
+    public TreePath visitAnnotation(AnnotationTree tree, Long cursor) {
+        var positions = Trees.instance(task).getSourcePositions();
+        var start = positions.getStartPosition(root, tree);
+        var end = positions.getEndPosition(root, tree);
+        if (start <= cursor && cursor <= end) enclosingAnnotation = getCurrentPath();
+        return super.visitAnnotation(tree, cursor);
+    }
+
+    @Override
+    public TreePath visitClass(ClassTree tree, Long cursor) {
+        rememberScope(tree, cursor);
+        return super.visitClass(tree, cursor);
+    }
+
+    @Override
+    public TreePath visitMethod(MethodTree tree, Long cursor) {
+        rememberScope(tree, cursor);
+        return super.visitMethod(tree, cursor);
+    }
+
+    @Override
+    public TreePath visitBlock(BlockTree tree, Long cursor) {
+        rememberScope(tree, cursor);
+        return super.visitBlock(tree, cursor);
+    }
+
+    private void rememberScope(com.sun.source.tree.Tree tree, long cursor) {
+        var positions = Trees.instance(task).getSourcePositions();
+        var start = positions.getStartPosition(root, tree);
+        var end = positions.getEndPosition(root, tree);
+        if (start >= 0 && start <= cursor && (end < 0 || cursor <= end)) enclosingScope = getCurrentPath();
     }
 
     @Override
@@ -35,6 +81,15 @@ public class FindCompletionsAt extends TreePathScanner<TreePath, Long> {
             return getCurrentPath();
         }
         return super.visitIdentifier(t, find);
+    }
+
+    @Override
+    public TreePath visitLiteral(LiteralTree tree, Long cursor) {
+        var positions = Trees.instance(task).getSourcePositions();
+        var start = positions.getStartPosition(root, tree);
+        var end = positions.getEndPosition(root, tree);
+        if (start <= cursor && cursor < end) return getCurrentPath();
+        return super.visitLiteral(tree, cursor);
     }
 
     @Override

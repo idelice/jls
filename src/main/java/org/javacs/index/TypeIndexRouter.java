@@ -161,6 +161,14 @@ public record TypeIndexRouter(WorkspaceTypeIndex workspace, ExternalBinaryTypeIn
         return external.containsType(qualifiedName) ? EXTERNAL : NONE;
     }
 
+    public boolean isAnnotationType(String qualifiedName) {
+        var workspaceType = workspace.typeInfo(qualifiedName);
+        if (workspaceType.isPresent() || isWorkspaceOwnedType(qualifiedName)) {
+            return workspaceType.map(type -> type.annotationType).orElse(false);
+        }
+        return external.isAnnotationType(qualifiedName);
+    }
+
     public Optional<IndexedType> typeInfo(String qualifiedName) {
         var workspaceType = workspace.typeInfo(qualifiedName);
         if (workspaceType.isPresent() || isWorkspaceOwnedType(qualifiedName)) {

@@ -334,6 +334,7 @@ class JavaLanguageServer extends LanguageServer {
         var triggerCharacters = new JsonArray();
         triggerCharacters.add(".");
         triggerCharacters.add(":");
+        triggerCharacters.add("@");
         completionOptions.add("triggerCharacters", triggerCharacters);
         c.add("completionProvider", completionOptions);
         var signatureHelpOptions = new JsonObject();

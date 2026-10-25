@@ -1,6 +1,7 @@
 package org.javacs;
 
 import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -46,7 +47,7 @@ public class SourceFileObject extends SimpleJavaFileObject {
         this.dynamicLastModified = false;
     }
 
-    private static java.net.URI sourceUri(Path path) {
+    private static URI sourceUri(Path path) {
         if (!FileStore.isJavaFile(path)) throw new RuntimeException(path + " is not a java source");
         return path.toUri();
     }

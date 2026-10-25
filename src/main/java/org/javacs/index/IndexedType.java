@@ -31,6 +31,7 @@ public final class IndexedType {
     public final String packageName;
     public final List<String> enclosingTypes;
     public final int kind;
+    public final boolean annotationType;
     public final Set<Modifier> modifiers;
     public final Range declarationRange;
     public final IndexedMember.Provenance provenance;
@@ -42,6 +43,7 @@ public final class IndexedType {
             Path sourcePath,
             String superclass,
             List<String> interfaces,
+            boolean annotationType,
             IndexedMember.Provenance provenance) {
         this(
                 qualifiedName,
@@ -53,6 +55,7 @@ public final class IndexedType {
                 interfaces,
                 List.of(),
                 CompletionItemKind.Class,
+                annotationType,
                 Set.of(),
                 null,
                 provenance);
@@ -68,6 +71,7 @@ public final class IndexedType {
             List<String> interfaces,
             List<String> nestedTypes,
             int kind,
+            boolean annotationType,
             Set<Modifier> modifiers,
             Range declarationRange,
             IndexedMember.Provenance provenance) {
@@ -84,6 +88,7 @@ public final class IndexedType {
         this.packageName = packageOf(qualifiedName);
         this.enclosingTypes = Collections.unmodifiableList(new ArrayList<>(enclosingTypesOf(qualifiedName)));
         this.kind = kind;
+        this.annotationType = annotationType;
         this.modifiers = modifiers == null ? Set.of() : Set.copyOf(modifiers);
         this.declarationRange = declarationRange;
         this.provenance =
