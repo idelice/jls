@@ -34,6 +34,7 @@ public class HoverProvider {
 
             var element = task.trees.getElement(path);
             if (element == null) return null;
+            if (element.asType().getKind() == TypeKind.ERROR) return null;
 
             var markdown = new StringBuilder();
 
