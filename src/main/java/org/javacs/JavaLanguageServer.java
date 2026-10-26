@@ -234,10 +234,14 @@ class JavaLanguageServer extends LanguageServer {
 
     /** Configure source ownership once; module dependencies resolve when a file needs them. */
     private void createCompilers() {
-        Objects.requireNonNull(workspaceRoot, "Workspace has not been initialized");
         moduleRegistry.clear();
         if (compiler != null) compiler.close();
         pendingRewrites.clear();
+        if (workspaceRoot == null) {
+            compiler = new JavaCompilerService(
+                    settings.classPath(), settings.docPath(), settings.addExports(), settings.extraCompilerArgs());
+            return;
+        }
         var started = System.nanoTime();
         var token = progress.begin("Configure javac", "Reading build metadata");
         try {
@@ -322,9 +326,9 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public InitializeResult initialize(InitializeParams params) {
-        this.workspaceRoot = Paths.get(params.rootUri);
+        this.workspaceRoot = params.rootUri == null ? null : Paths.get(params.rootUri);
         this.progress = new ProgressReporter(client, ProgressReporter.supportsWorkDoneProgress(params.capabilities));
-        FileStore.setWorkspaceRoots(Set.of(Paths.get(params.rootUri)));
+        FileStore.setWorkspaceRoots(workspaceRoot == null ? Set.of() : Set.of(workspaceRoot));
 
         var c = new JsonObject();
         c.addProperty("textDocumentSync", 2); // Incremental
@@ -384,6 +388,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void initialized() {
+        if (workspaceRoot == null) return;
         var options = new JsonObject();
         var watchers = new JsonArray();
         for (var pattern : watchFiles) {
@@ -442,6 +447,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
+        if (workspaceRoot == null) return;
         var activeDocuments = FileStore.activeDocuments();
         var refreshActiveDiagnostics = false;
         var compilerInputsChanged = false;
@@ -847,15 +853,25 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public void didOpenTextDocument(DidOpenTextDocumentParams params) {
+        if (workspaceRoot == null && !FileStore.isJavaFile(params.textDocument.uri)) return;
         var file = Paths.get(params.textDocument.uri);
+        var newStandaloneFile = workspaceRoot == null && !FileStore.isWorkspaceFile(file);
+        if (newStandaloneFile) {
+            // File roots admit these sources without walking their containing directories.
+            var files = new HashSet<>(FileStore.workspaceRoots());
+            files.add(file);
+            FileStore.setWorkspaceRoots(files);
+        }
         if (FileStore.isJavaFile(params.textDocument.uri)) {
             activeModuleFile = file;
             var module = moduleGraph.moduleForFile(file).orElse(null);
             if (module != null) moduleRegistry.includeSources(module.sourceDirs());
         }
         FileStore.open(params);
+        if (newStandaloneFile && compiler != null) compiler.setSourceRoots(FileStore.sourceRoots());
         if (FileStore.isWorkspaceJavaFile(params.textDocument.uri)) compilerFor(file);
         if (!FileStore.isWorkspaceJavaFile(params.textDocument.uri)) return;
+        if (newStandaloneFile) completionIndexScheduler.filesChanged(List.of(file));
         // Index the active module and its dependency sources. Sibling modules are only visible
         // through their source, so a workspace-size shortcut here would leave completion empty.
         completionIndexScheduler.ensureIndexed(file);

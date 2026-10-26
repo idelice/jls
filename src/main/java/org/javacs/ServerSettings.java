@@ -68,6 +68,7 @@ final class ServerSettings {
     }
 
     private static JsonObject readProjectSettings(Path workspaceRoot) {
+        if (workspaceRoot == null) return new JsonObject();
         var file = workspaceRoot.resolve(".java-language-server.json");
         if (!Files.exists(file)) return new JsonObject();
         try {
