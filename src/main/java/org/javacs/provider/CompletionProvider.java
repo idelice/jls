@@ -486,10 +486,11 @@ public class CompletionProvider {
         }
         var names = ElementSignatureHelper.parameterNames(task, first, ownerClassBytes);
         if (java.util.Arrays.stream(names).anyMatch(name -> name.matches("arg\\d+"))) {
-            var sourceMethod = sourceMethod(first, task, sourceByType);
-            if (sourceMethod != null && sourceMethod.getParameters().size() == names.length)
-                names = sourceMethod.getParameters().stream().map(parameter -> parameter.getName().toString())
-                        .toArray(String[]::new);
+            var declaringOwner = ElementSignatureHelper.ownerQualifiedName(first);
+            var source = declaringOwner == null ? null : ownerSource(declaringOwner, sourceByType);
+            if (source != null) {
+                names = ElementSignatureHelper.parameterNamesFromSource(task, first, source, names);
+            }
         }
         var data = new CompletionData();
         data.className = ownerType;
@@ -507,41 +508,6 @@ public class CompletionProvider {
         var parsed = source.map(compiler::parse).orElse(null);
         memo.put(ownerType, parsed);
         return parsed;
-    }
-
-    private MethodTree sourceMethod(ExecutableElement method, CompileTask task, Map<String, ParseTask> memo) {
-        if (!(method.getEnclosingElement() instanceof TypeElement owner)) return null;
-        var ownerType = owner.getQualifiedName().toString();
-        var ownerParse = ownerSource(ownerType, memo);
-        if (ownerParse == null) return null;
-        try {
-            return FindHelper.findMethod(ownerParse, ownerType, method.getSimpleName().toString(),
-                    FindHelper.erasedParameterTypes(task, method));
-        } catch (RuntimeException notFound) {
-            return null;
-        }
-    }
-
-    private int indexMemberPriority(IndexedMember member) {
-        if (member.kind == CompletionItemKind.Method) {
-            if (isUtilityMethodName(member.name)) return 90; // always sink utility methods
-            if (member.priority == 2) return 80; // java.lang.Object methods near end
-            if (member.isStatic) return 30;
-            if (member.priority == 0 && isAccessorMethodName(member.name)) return 10;
-            if (member.priority == 0) return 20;
-            return 60;
-        }
-        if (member.kind == CompletionItemKind.Field) {
-            if (member.isStatic) return 40;
-            if (member.priority == 0) return 35;
-            return 50;
-        }
-        if (member.kind == CompletionItemKind.Class
-                || member.kind == CompletionItemKind.Interface
-                || member.kind == CompletionItemKind.Enum) {
-            return 45;
-        }
-        return Priority.PACKAGE_MEMBER;
     }
 
     private CompletionItem indexedMember(IndexedMember member) {
@@ -574,7 +540,7 @@ public class CompletionProvider {
         var insertionLines = new TreeMap<String, Integer>();
         collectImports(parseTask, importedTypes, staticImports, insertionLines);
         var positions = new HashMap<String, Integer>();
-        var scope = enclosingScopes(path);
+        var scope = FindHelper.findEnclosingTypeScopes(path);
         if (!constructor) {
             addKeywords(path, partial, list);
             for (int i = 0; i < list.items.size(); i++) positions.put(list.items.get(i).label, i);
@@ -600,7 +566,7 @@ public class CompletionProvider {
         for (int i = 0; i < list.items.size(); i++) {
           positions.put(list.items.get(i).label, i);
         }
-        var scope = enclosingScopes(path);
+        var scope = FindHelper.findEnclosingTypeScopes(path);
         var paren = endsWithParen(prep.contents(), (int) prep.cursor());
         addSyntacticLocalVariables(prep.task(), prep.cursor(), partial, positions, list);
         addSyntacticEnclosingTypeMembers(prep.task(), scope, partial, paren, false, false, !annotationValues, positions, list);
@@ -619,22 +585,6 @@ public class CompletionProvider {
                 list.items.add(keyword(literal));
             }
         }
-    }
-
-    private static Map<TreePath, Boolean> enclosingScopes(TreePath path) {
-        var scopes = new LinkedHashMap<TreePath, Boolean>();
-        var staticContext = false;
-        for (; path != null; path = path.getParentPath()) {
-            var leaf = path.getLeaf();
-            if (leaf instanceof MethodTree method && method.getModifiers().getFlags().contains(Modifier.STATIC)
-                    || leaf instanceof VariableTree variable && variable.getModifiers().getFlags().contains(Modifier.STATIC)
-                    || leaf instanceof BlockTree block && block.isStatic()) staticContext = true;
-            if (leaf instanceof ClassTree type) {
-                scopes.put(path, staticContext);
-                if (type.getModifiers().getFlags().contains(Modifier.STATIC)) staticContext = true;
-            }
-        }
-        return scopes;
     }
 
     private void addTopLevelSnippets(ParseTask task, CompletionList list) {
@@ -796,7 +746,7 @@ public class CompletionProvider {
                 if (member.getKind() != ElementKind.ENUM_CONSTANT
                         || !matchesCompletionPrefix(member.getSimpleName(), partial)
                         || !names.add(member.getSimpleName().toString())) continue;
-                var item = dependencyMemberCompletion(task, member);
+                var item = dependencyMemberCompletion(member, task.elements.isDeprecated(member), compilerId);
                 if (qualify) qualify(item, enumType + "." + member.getSimpleName(), false);
                 item.sortText = sortKey(Priority.FIELD, item.label);
                 list.items.add(item);
@@ -881,40 +831,13 @@ public class CompletionProvider {
                 }
             } else if ((!typesOnly || member instanceof TypeElement)
                     && positions.putIfAbsent(member.getSimpleName().toString(), list.items.size()) == null) {
-                var item = dependencyMemberCompletion(task, member);
+                var item = dependencyMemberCompletion(member, task.elements.isDeprecated(member), compilerId);
                 if (addParentheses && member instanceof TypeElement type && type.getKind() == ElementKind.CLASS)
                     setInvocation(item, item.label, false);
                 item.sortText = sortKey(dependencyMemberPriority(member, ownerType), item.label);
                 list.items.add(item);
             }
         }
-    }
-
-    private CompletionItem dependencyMemberCompletion(CompileTask task, Element member) {
-        var item = CompletionItems.compiledMember(member, task.elements.isDeprecated(member));
-        if (member.getEnclosingElement() instanceof TypeElement owner) {
-            var data = new CompletionData();
-            data.className = owner.getQualifiedName().toString();
-            data.memberName = member.getSimpleName().toString();
-            data.compilerId = compilerId;
-            item.data = JsonHelper.GSON.toJsonTree(data);
-        }
-        return item;
-    }
-
-    private int dependencyMemberPriority(Element member, String requestedType) {
-        var owner = member.getEnclosingElement() instanceof TypeElement type
-                ? type.getQualifiedName().toString() : "";
-        var isStatic = member.getModifiers().contains(Modifier.STATIC);
-        if (member.getKind() == ElementKind.METHOD) {
-            if (isUtilityMethodName(member.getSimpleName().toString())) return 90;
-            if (owner.equals("java.lang.Object")) return 80;
-            if (isStatic) return 30;
-            if (owner.equals(requestedType)) return isAccessorMethodName(member.getSimpleName().toString()) ? 10 : 20;
-            return 60;
-        }
-        if (member.getKind() == ElementKind.FIELD) return isStatic ? 40 : owner.equals(requestedType) ? 35 : 50;
-        return member instanceof TypeElement ? 45 : Priority.PACKAGE_MEMBER;
     }
 
     private List<Element> findMatchingDependencyMembers(
@@ -1450,32 +1373,6 @@ public class CompletionProvider {
         }
 
         return list;
-    }
-
-    private boolean isAccessorMethodName(String name) {
-        if (name == null || name.isBlank()) {
-            return false;
-        }
-        if (name.startsWith("get") && name.length() > 3) {
-            return Character.isUpperCase(name.charAt(3));
-        }
-        if (name.startsWith("set") && name.length() > 3) {
-            return Character.isUpperCase(name.charAt(3));
-        }
-        if (name.startsWith("is") && name.length() > 2) {
-            return Character.isUpperCase(name.charAt(2));
-        }
-        return false;
-    }
-
-    private boolean isUtilityMethodName(String name) {
-        if (name == null) {
-            return false;
-        }
-        return "toString".equals(name)
-                || "hashCode".equals(name)
-                || "equals".equals(name)
-                || "canEqual".equals(name);
     }
 
     private AnnotationContext findAnnotationContext(CompletionPrep prep, TreePath path, String partial) {

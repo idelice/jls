@@ -6,6 +6,9 @@ import java.util.List;
 import java.util.StringJoiner;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
 import org.javacs.CompletionData;
 import org.javacs.ElementSignatureHelper;
@@ -154,19 +157,87 @@ final class CompletionItems {
         return item;
     }
 
+    static CompletionItem dependencyMemberCompletion(Element member, boolean deprecated, String compilerId) {
+        var item = compiledMember(member, deprecated);
+        if (member.getEnclosingElement() instanceof TypeElement owner) {
+            var data = new CompletionData();
+            data.className = owner.getQualifiedName().toString();
+            data.memberName = member.getSimpleName().toString();
+            data.compilerId = compilerId;
+            item.data = JsonHelper.GSON.toJsonTree(data);
+        }
+        return item;
+    }
+
+    static int dependencyMemberPriority(Element member, String requestedType) {
+        var owner = member.getEnclosingElement() instanceof TypeElement type
+                ? type.getQualifiedName().toString() : "";
+        var isStatic = member.getModifiers().contains(Modifier.STATIC);
+        if (member.getKind() == ElementKind.METHOD) {
+            if (isUtilityMethodName(member.getSimpleName().toString())) return 90;
+            if (owner.equals("java.lang.Object")) return 80;
+            if (isStatic) return 30;
+            if (owner.equals(requestedType)) return isAccessorMethodName(member.getSimpleName().toString()) ? 10 : 20;
+            return 60;
+        }
+        if (member.getKind() == ElementKind.FIELD) return isStatic ? 40 : owner.equals(requestedType) ? 35 : 50;
+        return member instanceof TypeElement ? 45 : Priority.PACKAGE_MEMBER;
+    }
+
+    static int indexMemberPriority(IndexedMember member) {
+        if (member.kind == CompletionItemKind.Method) {
+            if (isUtilityMethodName(member.name)) return 90; // always sink utility methods
+            if (member.priority == 2) return 80; // java.lang.Object methods near end
+            if (member.isStatic) return 30;
+            if (member.priority == 0 && isAccessorMethodName(member.name)) return 10;
+            if (member.priority == 0) return 20;
+            return 60;
+        }
+        if (member.kind == CompletionItemKind.Field) {
+            if (member.isStatic) return 40;
+            if (member.priority == 0) return 35;
+            return 50;
+        }
+        if (member.kind == CompletionItemKind.Class
+                || member.kind == CompletionItemKind.Interface
+                || member.kind == CompletionItemKind.Enum) {
+            return 45;
+        }
+        return Priority.PACKAGE_MEMBER;
+    }
+
+    private static boolean isAccessorMethodName(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        if (name.startsWith("get") && name.length() > 3) {
+            return Character.isUpperCase(name.charAt(3));
+        }
+        if (name.startsWith("set") && name.length() > 3) {
+            return Character.isUpperCase(name.charAt(3));
+        }
+        if (name.startsWith("is") && name.length() > 2) {
+            return Character.isUpperCase(name.charAt(2));
+        }
+        return false;
+    }
+
+    private static boolean isUtilityMethodName(String name) {
+        if (name == null) {
+            return false;
+        }
+        return "toString".equals(name)
+                || "hashCode".equals(name)
+                || "equals".equals(name)
+                || "canEqual".equals(name);
+    }
+
     static CompletionItem compiledMethod(ExecutableElement method, String[] parameterNames,
             CompletionData data, boolean addParentheses) {
         var item = new CompletionItem();
         item.label = method.getSimpleName().toString();
         item.kind = CompletionItemKind.Method;
-        var parameters = new StringJoiner(", ", "(", ")");
-        for (int i = 0; i < method.getParameters().size(); i++) {
-            var parameter = method.getParameters().get(i);
-            var name = parameterNames != null && i < parameterNames.length
-                    ? parameterNames[i] : parameter.getSimpleName().toString();
-            parameters.add(ElementSignatureHelper.simpleTypeName(parameter.asType()) + " " + name);
-        }
-        var params = parameters.toString();
+        var params = ElementSignatureHelper.methodParams(method, parameterNames);
         var returnType = ElementSignatureHelper.simpleTypeName(method.getReturnType());
         item.detail = returnType + " " + item.label + params + overloadSuffix(data.plusOverloads);
         setLabelDetails(item, params, returnType + overloadSuffix(data.plusOverloads));

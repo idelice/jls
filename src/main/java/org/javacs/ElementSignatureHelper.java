@@ -44,17 +44,6 @@ public final class ElementSignatureHelper {
         return false;
     }
 
-    public static String[] parameterNames(ExecutableElement method, byte[] ownerClassBytes) {
-        if (ownerClassBytes == null) return null;
-        var erasedTypes = new String[method.getParameters().size()];
-        for (int i = 0; i < erasedTypes.length; i++) {
-            erasedTypes[i] = method.getParameters().get(i).asType().toString();
-        }
-        return ClassFileParameterNames.read(
-                ownerClassBytes, method.getSimpleName().toString(), erasedTypes,
-                method.getModifiers().contains(Modifier.STATIC));
-    }
-
     public static String[] parameterNames(CompileTask task, ExecutableElement method, byte[] ownerClassBytes) {
         var names = method.getParameters().stream()
                 .map(parameter -> parameter.getSimpleName().toString()).toArray(String[]::new);
@@ -64,21 +53,26 @@ public final class ElementSignatureHelper {
         return fromDebugInfo == null ? names : fromDebugInfo;
     }
 
-    public static String methodSignature(ExecutableElement method, byte[] ownerClassBytes) {
-        return simpleTypeName(method.getReturnType()) + " " + method.getSimpleName()
-                + methodParams(method, ownerClassBytes);
+    public static String[] parameterNamesFromSource(
+            CompileTask task, ExecutableElement method, ParseTask source, String[] fallback) {
+        try {
+            var declaration = FindHelper.findMethod(source, ownerQualifiedName(method),
+                    method.getSimpleName().toString(), FindHelper.erasedParameterTypes(task, method));
+            if (declaration.getParameters().size() != fallback.length) return fallback;
+            return declaration.getParameters().stream()
+                    .map(parameter -> parameter.getName().toString()).toArray(String[]::new);
+        } catch (RuntimeException missingDeclaration) {
+            return fallback;
+        }
     }
 
-    public static String methodParams(ExecutableElement method, byte[] ownerClassBytes) {
-        var paramElements = method.getParameters();
-        String[] resolvedNames = hasSyntheticNames(paramElements)
-                ? parameterNames(method, ownerClassBytes) : null;
+    public static String methodParams(ExecutableElement method, String[] parameterNames) {
         var params = new StringJoiner(", ");
-        for (int i = 0; i < paramElements.size(); i++) {
-            var p = paramElements.get(i);
-            var name = (resolvedNames != null && i < resolvedNames.length && resolvedNames[i] != null)
-                    ? resolvedNames[i] : p.getSimpleName().toString();
-            params.add(simpleTypeName(p.asType()) + " " + name);
+        for (int i = 0; i < method.getParameters().size(); i++) {
+            var parameter = method.getParameters().get(i);
+            var name = parameterNames != null && i < parameterNames.length && parameterNames[i] != null
+                    ? parameterNames[i] : parameter.getSimpleName().toString();
+            params.add(simpleTypeName(parameter.asType()) + " " + name);
         }
         return "(" + params + ")";
     }

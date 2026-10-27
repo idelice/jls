@@ -1,9 +1,6 @@
 package org.javacs.provider;
 
 import com.sun.source.tree.ClassTree;
-import com.sun.source.tree.BlockTree;
-import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.VariableTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
@@ -169,23 +166,13 @@ public class SignatureProvider {
                     }
                     sourceChecked = true;
                 }
-                if (ownerSource != null) names = readSourceParameterNames(task, method, ownerSource, names);
+                if (ownerSource != null) {
+                    names = ElementSignatureHelper.parameterNamesFromSource(task, method, ownerSource, names);
+                }
             }
             signatures.add(buildCompiledSignature(method, names));
         }
         return signatures;
-    }
-
-    private static String[] readSourceParameterNames(
-            CompileTask task, ExecutableElement method, ParseTask source, String[] fallback) {
-        try {
-            var declaration = FindHelper.findMethod(source, ElementSignatureHelper.ownerQualifiedName(method),
-                    method.getSimpleName().toString(), FindHelper.erasedParameterTypes(task, method));
-            return declaration.getParameters().stream()
-                    .map(parameter -> parameter.getName().toString()).toArray(String[]::new);
-        } catch (RuntimeException missingDeclaration) {
-            return fallback;
-        }
     }
 
     private static SignatureInformation buildCompiledSignature(ExecutableElement method, String[] names) {
@@ -249,18 +236,13 @@ public class SignatureProvider {
             return owners;
         }
         if (!(select instanceof IdentifierTree identifier)) return owners;
-        boolean staticOnly = false;
-        for (var enclosing = invocation.getParentPath(); enclosing != null; enclosing = enclosing.getParentPath()) {
-            var leaf = enclosing.getLeaf();
-            if (leaf instanceof MethodTree method && method.getModifiers().getFlags().contains(Modifier.STATIC)
-                    || leaf instanceof VariableTree variable && variable.getModifiers().getFlags().contains(Modifier.STATIC)
-                    || leaf instanceof BlockTree block && block.isStatic()) staticOnly = true;
-            if (!(leaf instanceof ClassTree classTree)) continue;
+        for (var scope : FindHelper.findEnclosingTypeScopes(invocation.getParentPath()).entrySet()) {
+            var enclosing = scope.getKey();
+            var classTree = (ClassTree) enclosing.getLeaf();
             var element = task.trees.getElement(enclosing);
             var ownerName = element instanceof TypeElement owner
                     ? owner.getQualifiedName().toString() : qualifiedClassName(root, classTree);
-            if (ownerName != null) owners.putIfAbsent(ownerName, staticOnly);
-            if (classTree.getModifiers().getFlags().contains(Modifier.STATIC)) staticOnly = true;
+            if (ownerName != null) owners.putIfAbsent(ownerName, scope.getValue());
         }
         for (var imported : root.getImports()) {
             if (!imported.isStatic()) continue;

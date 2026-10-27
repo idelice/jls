@@ -52,7 +52,7 @@ public class HoverProvider {
                 }
             }
 
-            var sig = renderSignature(element);
+            var sig = renderSignature(element, task);
             var doc = getDocComment(element, task);
 
             markdown.append("```java\n").append(sig).append("\n```");
@@ -68,9 +68,9 @@ public class HoverProvider {
         }
     }
 
-    private String renderSignature(Element element) {
+    private String renderSignature(Element element, CompileTask task) {
         return switch (element.getKind()) {
-            case METHOD, CONSTRUCTOR -> renderMethodSignature((ExecutableElement) element);
+            case METHOD, CONSTRUCTOR -> renderMethodSignature((ExecutableElement) element, task);
             case FIELD, ENUM_CONSTANT -> renderFieldSignature((VariableElement) element);
             case CLASS, INTERFACE, ENUM, ANNOTATION_TYPE, RECORD -> renderClassSignature((TypeElement) element);
             case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER -> renderVariableSignature(
@@ -79,7 +79,7 @@ public class HoverProvider {
         };
     }
 
-    private String renderMethodSignature(ExecutableElement method) {
+    private String renderMethodSignature(ExecutableElement method, CompileTask task) {
         var sb = new StringBuilder();
         var modifiers = method.getModifiers().stream()
                 .map(m -> m.toString().toLowerCase())
@@ -98,9 +98,13 @@ public class HoverProvider {
         sb.append(ElementSignatureHelper.simpleTypeName(method.getReturnType())).append(" ");
         sb.append(method.getSimpleName());
 
-        var owner = ElementSignatureHelper.ownerQualifiedName(method);
-        var bytes = owner == null ? null : compiler.findClassFile(owner).orElse(null);
-        sb.append(ElementSignatureHelper.methodParams(method, bytes));
+        byte[] bytes = null;
+        if (ElementSignatureHelper.hasSyntheticNames(method.getParameters())) {
+            var owner = ElementSignatureHelper.ownerQualifiedName(method);
+            if (owner != null) bytes = compiler.findClassFile(owner).orElse(null);
+        }
+        var names = ElementSignatureHelper.parameterNames(task, method, bytes);
+        sb.append(ElementSignatureHelper.methodParams(method, names));
         var thrown = method.getThrownTypes();
         if (!thrown.isEmpty()) {
             sb.append(" throws ");

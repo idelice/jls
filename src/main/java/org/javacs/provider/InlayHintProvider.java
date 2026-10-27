@@ -12,6 +12,7 @@ import com.sun.tools.javac.code.Symbol;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
@@ -76,6 +77,8 @@ public class InlayHintProvider {
                 rangeEnd = endOffset < 0 ? fileLength : endOffset;
             }
             var hints = new ArrayList<InlayHint>();
+            var parameterNamesByMethod = new HashMap<ExecutableElement, String[]>();
+            var classBytesByOwner = new HashMap<String, byte[]>();
 
             var scanner = new TreePathScanner<Void, Void>() {
                 @Override
@@ -161,12 +164,20 @@ public class InlayHintProvider {
                 }
 
                 private String[] parameterNames(ExecutableElement method) {
+                    var knownNames = parameterNamesByMethod.get(method);
+                    if (knownNames != null) return knownNames;
                     byte[] bytes = null;
                     if (ElementSignatureHelper.hasSyntheticNames(method.getParameters())
                             && method.getEnclosingElement() instanceof TypeElement owner) {
-                        bytes = compiler.findClassFile(owner.getQualifiedName().toString()).orElse(null);
+                        var ownerName = owner.getQualifiedName().toString();
+                        if (!classBytesByOwner.containsKey(ownerName)) {
+                            classBytesByOwner.put(ownerName, compiler.findClassFile(ownerName).orElse(null));
+                        }
+                        bytes = classBytesByOwner.get(ownerName);
                     }
-                    return ElementSignatureHelper.parameterNames(task, method, bytes);
+                    var names = ElementSignatureHelper.parameterNames(task, method, bytes);
+                    parameterNamesByMethod.put(method, names);
+                    return names;
                 }
             };
             scanner.scan(root, null);

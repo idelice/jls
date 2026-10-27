@@ -1,6 +1,7 @@
 package org.javacs;
 
 import com.sun.source.tree.ArrayTypeTree;
+import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.IdentifierTree;
@@ -20,11 +21,13 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import org.javacs.CacheAudit;
 import org.javacs.lsp.Location;
@@ -33,6 +36,23 @@ import org.javacs.lsp.Range;
 public class FindHelper {
     private static final Map<URI, URI> jarUriCache = new ConcurrentHashMap<>();
     private static Path jarCacheDir;
+
+    /** Enclosing classes from inner to outer; true means only static members are available. */
+    public static Map<TreePath, Boolean> findEnclosingTypeScopes(TreePath path) {
+        var scopes = new LinkedHashMap<TreePath, Boolean>();
+        var staticContext = false;
+        for (; path != null; path = path.getParentPath()) {
+            var leaf = path.getLeaf();
+            if (leaf instanceof MethodTree method && method.getModifiers().getFlags().contains(Modifier.STATIC)
+                    || leaf instanceof VariableTree variable && variable.getModifiers().getFlags().contains(Modifier.STATIC)
+                    || leaf instanceof BlockTree block && block.isStatic()) staticContext = true;
+            if (leaf instanceof ClassTree type) {
+                scopes.put(path, staticContext);
+                if (type.getModifiers().getFlags().contains(Modifier.STATIC)) staticContext = true;
+            }
+        }
+        return scopes;
+    }
 
     public static String[] erasedParameterTypes(CompileTask task, ExecutableElement method) {
         var types = task.types;
