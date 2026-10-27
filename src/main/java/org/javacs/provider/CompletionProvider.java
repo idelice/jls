@@ -34,17 +34,20 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Logger;
+import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
@@ -55,7 +58,6 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
 
-import org.javacs.ClassFileParameterNames;
 import org.javacs.CompileTask;
 import org.javacs.ElementSignatureHelper;
 import org.javacs.CompilerProvider;
@@ -70,7 +72,7 @@ import org.javacs.StringSearch;
 import org.javacs.completion.FindCompletionsAt;
 import org.javacs.completion.PruneMethodBodies;
 import org.javacs.index.IndexedMember;
-import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.CompletionItem;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.CompletionList;
@@ -82,11 +84,12 @@ public class CompletionProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     private record MemberAccessContext(String partial, boolean methodReference) { }
-    private record AnnotationContext(String qualifiedAnnotationType, String partial, boolean attributePosition, String attributeName) {}
-    private record CompletionPrep(ParseTask task, String contents, long cursor, long parseMs) {}
+    private record AnnotationContext(String annotationType, String partial, boolean attributePosition, String attributeName) {}
+    private record CompletionPrep(ParseTask task, String contents, long cursor) {}
+
 
     private final CompilerProvider compiler;
-    private final TypeIndexRouter typeIndexRouter;
+    private final WorkspaceTypeIndex workspaceIndex;
     private final long completionIndexVersion;
     private final String compilerId;
 
@@ -97,11 +100,11 @@ public class CompletionProvider {
 
     public CompletionProvider(
             CompilerProvider compiler,
-            TypeIndexRouter typeIndexRouter,
+            WorkspaceTypeIndex workspaceIndex,
             long completionIndexVersion,
             String compilerId) {
         this.compiler = compiler;
-        this.typeIndexRouter = typeIndexRouter == null ? TypeIndexRouter.EMPTY : typeIndexRouter;
+        this.workspaceIndex = workspaceIndex == null ? WorkspaceTypeIndex.EMPTY : workspaceIndex;
         this.completionIndexVersion = Math.max(0L, completionIndexVersion);
         this.compilerId = compilerId;
     }
@@ -132,84 +135,104 @@ public class CompletionProvider {
 
     public CompletionList complete(Path file, int line, int column) {
         var started = Instant.now();
-        var prep = prepare(file, line, column);
-        if (prep == null) {
-            return NOT_SUPPORTED;
+        var route = "PREPARE";
+        try {
+            var prep = prepare(file, line, column);
+            if (prep == null) return NOT_SUPPORTED;
+            var path = new FindCompletionsAt(prep.task().task()).scan(prep.task().root(), prep.cursor());
+            if (path != null && (path.getLeaf().getKind() == Tree.Kind.STRING_LITERAL
+                    || path.getLeaf().getKind() == Tree.Kind.CHAR_LITERAL)) {
+                route = "LITERAL";
+                return EMPTY;
+            }
+            var partial = partialIdentifier(prep.task(), path, prep.contents(), (int) prep.cursor());
+            var member = memberAccessContext(path, partial, prep.contents(), (int) prep.cursor());
+            var annotation = findAnnotationContext(prep, path, partial);
+            boolean annotationName = isAnnotationName(prep, path, partial);
+            boolean importContext = isImportOrPackageContext(path);
+            CompletionList list;
+            if (importContext && path.getLeaf().getKind() == Tree.Kind.IMPORT) {
+                route = "IMPORT";
+                list = completePackage(qualifiedPartialIdentifier(prep.task(), path, prep.contents(), (int) prep.cursor()),
+                        false, false, null);
+            } else if (member != null && !importContext && !annotationName) {
+                route = "MEMBER";
+                list = completeMember(prep.task(), prep.contents(), prep.cursor(), member,
+                        endsWithParen(prep.contents(), (int) prep.cursor()), annotation != null);
+            } else if (!annotationName && switchExpression(path) != null && annotation == null) {
+                route = "ENUM_CASE";
+                list = completeEnumCase(prep, path, partial);
+            } else {
+                route = annotationName ? "ANNOTATION_NAME" : annotation != null ? "ANNOTATION" : "IDENTIFIER";
+                var source = new SourceFileObject(file, prep.contents(), Instant.now());
+                try (var task = compiler.compile(List.of(source), true)) {
+                    if (annotationName) list = completeAnnotationName(prep, partial, task);
+                    else if (annotation != null) list = completeAnnotation(prep, path, partial, annotation, task);
+                    else list = completeIdentifier(prep.task(), path, prep.contents(), prep.cursor(), partial, task);
+                }
+            }
+            if (list == NOT_SUPPORTED) return NOT_SUPPORTED;
+            if (!route.equals("ANNOTATION_NAME")) list = finalizeCompletionList(prep.task(), list);
+            return list;
+        } finally {
+            LOG.fine(String.format("[perf] completion_flow file=%s route=%s index_version=%d took=%dms",
+                    file.getFileName(), route, completionIndexVersion,
+                    Duration.between(started, Instant.now()).toMillis()));
         }
-        var path = new FindCompletionsAt(prep.task().task()).scan(prep.task().root(), prep.cursor());
-        if (path != null && (path.getLeaf().getKind() == Tree.Kind.STRING_LITERAL
-                || path.getLeaf().getKind() == Tree.Kind.CHAR_LITERAL)) {
-            logCompletionFlow(file, "LITERAL", prep.parseMs(), started);
-            return EMPTY;
-        }
-        var partial = partialIdentifier(prep.task(), path, prep.contents(), (int) prep.cursor());
-        var member = memberAccessContext(path, partial, prep.contents(), (int) prep.cursor());
-        var annotation = findAnnotationContext(prep, path, partial);
-        CompletionList list;
-        String route;
-        if (isImportOrPackageContext(path) && path.getLeaf().getKind() == Tree.Kind.IMPORT) {
-            route = "IMPORT";
-            list = completePackage(qualifiedPartialIdentifier(prep.task(), path, prep.contents(), (int) prep.cursor()), false, false);
-        } else if (isAnnotationName(prep, path, partial)) {
-            route = "ANNOTATION_NAME";
-            list = completeAnnotationName(prep, partial);
-        } else if (member != null && !isImportOrPackageContext(path)) {
-            route = "MEMBER";
-            list = completeMember(prep.task(), prep.contents(), prep.cursor(), member,
-                    endsWithParen(prep.contents(), (int) prep.cursor()), annotation != null);
-        } else if (annotation != null) {
-            route = "ANNOTATION";
-            list = completeAnnotation(prep, path, partial, annotation);
-        } else if (switchExpression(path) != null) {
-            route = "ENUM_CASE";
-            list = completeEnumCase(prep, path, partial);
-        } else {
-            route = "IDENTIFIER";
-            list = completeIdentifier(prep.task(), path, prep.contents(), prep.cursor(), partial);
-        }
-        if (list == NOT_SUPPORTED) {
-            return NOT_SUPPORTED;
-        }
-        if (!route.equals("ANNOTATION_NAME")) list = finalizeCompletionList(prep.task(), list);
-        logCompletionFlow(file, route, prep.parseMs(), started);
-        return list;
     }
 
     private CompletionList completeAnnotation(
-            CompletionPrep prep, TreePath path, String partial, AnnotationContext annotation) {
+            CompletionPrep prep, TreePath path, String partial, AnnotationContext annotation,
+            CompileTask task) {
+        var annotationType = resolveCompletionTypeName(task, annotation.annotationType(), prep.task().root());
         var list = new CompletionList();
         if (annotation.attributePosition()) {
-          list.items.addAll(completeAnnotationAttributes(annotation).items);
-        }
-        if (!annotation.attributePosition()) {
-            var attribute = typeIndexRouter.member(annotation.qualifiedAnnotationType(), annotation.attributeName(), false);
-            var expected = attribute.flatMap(m -> typeIndexRouter.resolveTypeName(m.returnType, prep.task().root()));
-            if (expected.isPresent()) {
-                var enumType = expected.get();
+            list.items.addAll(completeAnnotationAttributes(annotationType, partial, task).items);
+        } else if (annotationType != null) {
+            var attributeType = workspaceIndex.member(annotationType, annotation.attributeName(), false)
+                    .map(m -> m.returnType).orElse(null);
+            if (attributeType == null && !workspaceIndex.ownsTypeOrEnclosingType(annotationType)) {
+                for (var method : findAnnotationAttributes(task, annotationType)) {
+                    if (method.getSimpleName().contentEquals(annotation.attributeName())) {
+                        attributeType = method.getReturnType().toString();
+                        break;
+                    }
+                }
+            }
+            var enumType = resolveCompletionTypeName(task, attributeType, prep.task().root());
+            if (enumType != null) {
                 var simpleName = TypeNames.simpleName(enumType);
                 if (matchesCompletionPrefix(simpleName, partial)) {
                     var item = CompletionItems.classItem(enumType, compilerId, false);
                     item.sortText = sortKey(Priority.LOCAL, item.label);
-                    var imported = typeIndexRouter.resolveTypeName(simpleName, prep.task().root());
-                    if (imported.isPresent() && !imported.get().equals(enumType)) {
-                        qualify(item, enumType, false);
-                    } else if (imported.isEmpty()) {
-                        item.additionalTextEdits = List.of(AddImport.createTextEdits(enumType, prep.task().root(),
-                                Trees.instance(prep.task().task()).getSourcePositions())[0]);
-                    }
+                    var imported = resolveCompletionTypeName(task, simpleName, prep.task().root());
+                    if (imported != null && !imported.equals(enumType)) qualify(item, enumType, false);
+                    else if (imported == null) item.additionalTextEdits = List.of(AddImport.createTextEdits(enumType,
+                            prep.task().root(), Trees.instance(prep.task().task()).getSourcePositions())[0]);
                     list.items.add(item);
                 }
-                for (var member : typeIndexRouter.members(enumType, true)) {
-                    if (!isEnumCaseConstant(member, enumType)) continue;
-                    if (!matchesCompletionPrefix(member.name, partial)) continue;
-                    var item = indexedMember(member);
-                    qualify(item, enumType + "." + member.name, false);
-                    list.items.add(item);
-                }
+                addEnumConstants(task, enumType, partial, true, list);
             }
         }
-        addExpressionCandidates(prep, path, partial, list, true);
+        addExpressionCandidates(prep, path, partial, list, true, task);
         return list;
+    }
+
+    private String resolveCompletionTypeName(CompileTask task, String name, CompilationUnitTree root) {
+        var indexed = workspaceIndex.resolveTypeName(name, root);
+        if (indexed.isPresent()) return indexed.get();
+        if (name == null || name.isBlank()) return null;
+        var raw = TypeNames.normalize(name);
+        if (raw.contains(".")) return findCompletionTypeElement(task, raw) == null ? null : raw;
+        return TypeNames.resolveSimpleName(raw, root, type -> findCompletionTypeElement(task, type) != null).orElse(null);
+    }
+
+    private TypeElement findCompletionTypeElement(CompileTask task, String name) {
+        try {
+            return task.elements.getTypeElement(name);
+        } catch (RuntimeException unavailableType) {
+            return null;
+        }
     }
 
     private boolean isAnnotationName(CompletionPrep prep, TreePath path, String partial) {
@@ -232,14 +255,14 @@ public class CompletionProvider {
         return scanner.token().pos == start - 1 && scanner.token().kind == TokenKind.MONKEYS_AT;
     }
 
-    private CompletionList completeAnnotationName(CompletionPrep prep, String partial) {
+    private CompletionList completeAnnotationName(CompletionPrep prep, String partial, CompileTask task) {
         var qualified = qualifiedPartialIdentifier(prep.task(), null, prep.contents(), (int) prep.cursor());
-        if (qualified.indexOf('.') >= 0) return completePackage(qualified, false, true);
+        if (qualified.indexOf('.') >= 0) return completePackage(qualified, false, true, task);
         var list = new CompletionList();
         var imports = new LinkedHashMap<String, String>();
         var insertionLines = new TreeMap<String, Integer>();
         collectImports(prep.task(), imports, new ArrayList<>(), insertionLines);
-        addTypesAndPackages(prep.task().root(), imports, insertionLines, partial, false, true, list);
+        addTypesAndPackages(prep.task().root(), imports, insertionLines, partial, false, true, list, task);
         return list;
     }
 
@@ -253,9 +276,7 @@ public class CompletionProvider {
     }
 
     private CompletionPrep prepare(Path file, int line, int column) {
-        var parseStarted = Instant.now();
         var task = compiler.parse(file);
-        var parseMs = Duration.between(parseStarted, Instant.now()).toMillis();
         long cursor;
         try {
             var source = task.root().getSourceFile().getCharContent(true).toString();
@@ -268,7 +289,7 @@ public class CompletionProvider {
         }
         var contents = new PruneMethodBodies(task.task()).scan(task.root(), cursor);
         var pruned = contents.toString();
-        return new CompletionPrep(task, pruned, cursor, parseMs);
+        return new CompletionPrep(task, pruned, cursor);
     }
 
     private static boolean isInComment(String source, long cursorOffset) {
@@ -344,18 +365,6 @@ public class CompletionProvider {
         return list;
     }
 
-    private void logCompletionFlow(
-            Path file, String route, long parseMs, Instant started) {
-        LOG.info(
-                String.format(
-                        "[perf] completion_flow file=%s route=%s index_version=%d parse=%dms took=%dms",
-                        file.getFileName(),
-                        route,
-                        completionIndexVersion,
-                        parseMs,
-                        Duration.between(started, Instant.now()).toMillis()));
-    }
-
     private int endOfLine(CharSequence contents, int cursor) {
         while (cursor < contents.length()) {
             var c = contents.charAt(cursor);
@@ -393,7 +402,7 @@ public class CompletionProvider {
                 var receiver = trees.getElement(exprPath);
                 if (receiver instanceof javax.lang.model.element.PackageElement packageElement) {
                     return completePackage(packageElement.getQualifiedName() + "." + memberAccess.partial(),
-                            isConstructorType(path) && !endsWithParen, false);
+                            isConstructorType(path) && !endsWithParen, false, task);
                 }
                 var type = trees.getTypeMirror(exprPath);
                 if (type == null || type.getKind() == TypeKind.ERROR) {
@@ -430,7 +439,8 @@ public class CompletionProvider {
         var methodReference = memberAccess.methodReference();
         var list = new ArrayList<CompletionItem>();
         var methods = new TreeMap<String, List<ExecutableElement>>();
-        for (var member : task.task.getElements().getAllMembers(typeElement)) {
+        var members = task.elements.getAllMembers(typeElement);
+        for (var member : members) {
             if (member.getKind() == ElementKind.CONSTRUCTOR
                     || inAnnotation && member.getKind() == ElementKind.METHOD) continue;
             if (!matchesCompletionPrefix(member.getSimpleName(), memberAccess.partial)) continue;
@@ -447,13 +457,12 @@ public class CompletionProvider {
                 list.add(CompletionItems.compiledMember(member, task.task.getElements().isDeprecated(member)));
             }
         }
-        byte[] ownerClassBytes = methods.isEmpty() ? null
-                : compiler.findClassFile(typeElement.getQualifiedName().toString()).orElse(null);
+        var bytesByOwner = new HashMap<String, byte[]>();
         var sourceByType = new HashMap<String, ParseTask>();
         for (var entry : methods.entrySet()) {
             var overloads = entry.getValue();
             list.add(compiledMethod(task, typeElement.getQualifiedName().toString(), overloads,
-                    ownerClassBytes, sourceByType, !endsWithParen && !methodReference));
+                    bytesByOwner, sourceByType, !endsWithParen && !methodReference));
         }
         if (methodReference && isStatic && !inAnnotation) {
             list.add(keyword("new"));
@@ -464,32 +473,38 @@ public class CompletionProvider {
     }
 
     private CompletionItem compiledMethod(CompileTask task, String ownerType,
-            List<ExecutableElement> overloads, byte[] ownerClassBytes,
+            List<ExecutableElement> overloads, Map<String, byte[]> bytesByOwner,
             Map<String, ParseTask> sourceByType, boolean addParentheses) {
         var first = overloads.getFirst();
-        var sourceMethod = ElementSignatureHelper.hasSyntheticNames(first.getParameters())
-                ? sourceMethod(first, task, sourceByType) : null;
+        byte[] ownerClassBytes = null;
+        if (ElementSignatureHelper.hasSyntheticNames(first.getParameters())) {
+            var declaringOwner = ElementSignatureHelper.ownerQualifiedName(first);
+            if (!bytesByOwner.containsKey(declaringOwner)) {
+                bytesByOwner.put(declaringOwner, compiler.findClassFile(declaringOwner).orElse(null));
+            }
+            ownerClassBytes = bytesByOwner.get(declaringOwner);
+        }
+        var names = ElementSignatureHelper.parameterNames(task, first, ownerClassBytes);
+        if (java.util.Arrays.stream(names).anyMatch(name -> name.matches("arg\\d+"))) {
+            var sourceMethod = sourceMethod(first, task, sourceByType);
+            if (sourceMethod != null && sourceMethod.getParameters().size() == names.length)
+                names = sourceMethod.getParameters().stream().map(parameter -> parameter.getName().toString())
+                        .toArray(String[]::new);
+        }
         var data = new CompletionData();
         data.className = ownerType;
         data.memberName = first.getSimpleName().toString();
         data.erasedParameterTypes = FindHelper.erasedParameterTypes(task, first);
         data.plusOverloads = overloads.size() - 1;
         data.compilerId = compilerId;
-        return CompletionItems.compiledMethod(first, ownerClassBytes, sourceMethod, data, addParentheses);
-    }
-
-    private String[] indexParameterNames(IndexedMember member, byte[] classBytes) {
-        if (member.parameterNames != null) return member.parameterNames;
-        var types = member.erasedParameterTypes;
-        if (types == null || types.length == 0 || member.kind == CompletionItemKind.Field) return null;
-        if (classBytes == null) classBytes = compiler.findClassFile(member.ownerType).orElse(null);
-        return classBytes == null ? null
-                : ClassFileParameterNames.read(classBytes, member.name, types, member.isStatic);
+        var item = CompletionItems.compiledMethod(first, names, data, addParentheses);
+        return item;
     }
 
     private ParseTask ownerSource(String ownerType, Map<String, ParseTask> memo) {
         if (memo.containsKey(ownerType)) return memo.get(ownerType);
-        var parsed = compiler.findAnywhere(ownerType).map(compiler::parse).orElse(null);
+        var source = compiler.findAnywhere(ownerType);
+        var parsed = source.map(compiler::parse).orElse(null);
         memo.put(ownerType, parsed);
         return parsed;
     }
@@ -534,12 +549,7 @@ public class CompletionProvider {
     }
 
     private CompletionItem indexedMember(IndexedMember member, boolean addParentheses) {
-        return CompletionItems.indexedMember(member, indexParameterNames(member, null), compilerId, addParentheses);
-    }
-
-    private CompletionItem indexedMethod(List<IndexedMember> overloads, boolean addParens, byte[] classBytes) {
-        return CompletionItems.indexedMethod(overloads, indexParameterNames(overloads.getFirst(), classBytes),
-                compilerId, addParens);
+        return CompletionItems.indexedMember(member, member.parameterNames, compilerId, addParentheses);
     }
 
     private boolean isImportOrPackageContext(TreePath path) {
@@ -553,7 +563,7 @@ public class CompletionProvider {
     }
 
     private CompletionList completeIdentifier(
-            ParseTask parseTask, TreePath path, String contents, long cursor, String partial) {
+            ParseTask parseTask, TreePath path, String contents, long cursor, String partial, CompileTask task) {
         var list = new CompletionList();
         if (path == null) return list;
         var endsWithParen = endsWithParen(contents, (int) cursor);
@@ -571,21 +581,21 @@ public class CompletionProvider {
             addSyntacticLocalVariables(parseTask, cursor, partial, positions, list);
         }
         addSyntacticEnclosingTypeMembers(parseTask, scope, partial, endsWithParen, addParentheses, constructor, true, positions, list);
-        addIndexedEnclosingTypeMembers(parseTask, scope, partial, list, endsWithParen, addParentheses, constructor, true, positions);
+        addEnclosingTypeMemberCompletions(parseTask, scope, partial, list, endsWithParen, addParentheses, constructor, true, positions, task);
         if (!constructor && !scope.isEmpty() && !scope.values().iterator().next()) {
             if (positions.putIfAbsent("this", list.items.size()) == null) list.items.add(keyword("this"));
             if (positions.putIfAbsent("super", list.items.size()) == null) list.items.add(keyword("super"));
         }
-        addStaticImportsFromIndex(staticImports, partial, endsWithParen, addParentheses, constructor, true, positions, list);
+        addStaticImportCompletions(staticImports, partial, endsWithParen, addParentheses, constructor, true, positions, list, task);
         addImportedTypeNames(importedTypes, partial, addParentheses, positions, list);
         if (!list.isIncomplete && !partial.isEmpty()) {
-            addTypesAndPackages(parseTask.root(), importedTypes, insertionLines, partial, addParentheses, false, list);
+            addTypesAndPackages(parseTask.root(), importedTypes, insertionLines, partial, addParentheses, false, list, task);
         }
         return list;
     }
 
     private void addExpressionCandidates(
-            CompletionPrep prep, TreePath path, String partial, CompletionList list, boolean annotationValues) {
+            CompletionPrep prep, TreePath path, String partial, CompletionList list, boolean annotationValues, CompileTask task) {
         var positions = new HashMap<String, Integer>();
         for (int i = 0; i < list.items.size(); i++) {
           positions.put(list.items.get(i).label, i);
@@ -594,15 +604,15 @@ public class CompletionProvider {
         var paren = endsWithParen(prep.contents(), (int) prep.cursor());
         addSyntacticLocalVariables(prep.task(), prep.cursor(), partial, positions, list);
         addSyntacticEnclosingTypeMembers(prep.task(), scope, partial, paren, false, false, !annotationValues, positions, list);
-        addIndexedEnclosingTypeMembers(prep.task(), scope, partial, list, paren, false, false, !annotationValues, positions);
+        addEnclosingTypeMemberCompletions(prep.task(), scope, partial, list, paren, false, false, !annotationValues, positions, task);
         var importedTypes = new LinkedHashMap<String, String>();
         var staticImports = new ArrayList<MemberSelectTree>();
         var insertionLines = new TreeMap<String, Integer>();
         collectImports(prep.task(), importedTypes, staticImports, insertionLines);
-        addStaticImportsFromIndex(staticImports, partial, paren, false, false, !annotationValues, positions, list);
+        addStaticImportCompletions(staticImports, partial, paren, false, false, !annotationValues, positions, list, task);
         addImportedTypeNames(importedTypes, partial, false, positions, list);
         if (!partial.isEmpty()) {
-            addTypesAndPackages(prep.task().root(), importedTypes, insertionLines, partial, false, false, list);
+            addTypesAndPackages(prep.task().root(), importedTypes, insertionLines, partial, false, false, list, task);
         }
         for (var literal : List.of("true", "false")) {
             if (matchesCompletionPrefix(literal, partial) && positions.putIfAbsent(literal, list.items.size()) == null) {
@@ -726,42 +736,34 @@ public class CompletionProvider {
         throw new RuntimeException("no className");
     }
 
-    /**
-     * Enrich parse-only identifier completions with members that come from enclosing source types
-     * and their supertypes. This keeps the fast parse/index path while restoring inherited and
-     * outer-scope members that are not present in the local syntax tree alone.
-     */
-    private void addIndexedEnclosingTypeMembers(
+    private void addEnclosingTypeMemberCompletions(
             ParseTask parseTask, Map<TreePath, Boolean> scopes, String partial, CompletionList list,
-            boolean endsWithParen, boolean addParentheses, boolean typesOnly, boolean includeMethods, Map<String, Integer> positions) {
-        var methods = new TreeMap<String, List<IndexedMember>>();
+            boolean endsWithParen, boolean addParentheses, boolean typesOnly, boolean includeMethods,
+            Map<String, Integer> positions, CompileTask task) {
+        var indexedMethods = new TreeMap<String, List<IndexedMember>>();
+        var dependencyMethods = new TreeMap<String, List<ExecutableElement>>();
         var methodPriority = new HashMap<String, Integer>();
         for (var entry : scopes.entrySet()) {
-            var cursor = entry.getKey();
-            var qualifiedType = qualifiedEnclosingClassName(parseTask.root(), cursor);
-            if (qualifiedType != null) {
-                addIndexedMembers(qualifiedType, partial, true, positions, methods, methodPriority, addParentheses, typesOnly, includeMethods, list);
-                if (!entry.getValue()) {
-                    addIndexedMembers(qualifiedType, partial, false, positions, methods, methodPriority, addParentheses, typesOnly, includeMethods, list);
-                }
+            var qualifiedType = qualifiedEnclosingClassName(parseTask.root(), entry.getKey());
+            if (qualifiedType == null) continue;
+            addIndexedMembers(qualifiedType, partial, true, positions, indexedMethods, methodPriority,
+                    addParentheses, typesOnly, includeMethods, list);
+            if (!entry.getValue()) {
+                addIndexedMembers(qualifiedType, partial, false, positions, indexedMethods, methodPriority,
+                        addParentheses, typesOnly, includeMethods, list);
             }
+            addDependencyMemberCompletions(task, qualifiedType, partial, entry.getValue(), null, positions,
+                    dependencyMethods, methodPriority, addParentheses, typesOnly, includeMethods, list);
         }
-        for (var entry : methods.entrySet()) {
-            var method = indexedMethod(entry.getValue(), !endsWithParen, null);
-            method.sortText =
-                    sortKey(
-                            methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
-            var previous = positions.putIfAbsent(method.label, list.items.size());
-            if (previous == null) list.items.add(method);
-            else if (list.items.get(previous).kind == CompletionItemKind.Method) list.items.set(previous, method);
-        }
+        appendMethodCompletions(task, indexedMethods, dependencyMethods, methodPriority,
+                !endsWithParen, true, positions, list);
     }
 
     private CompletionList completeEnumCase(CompletionPrep prep, TreePath parsePath, String partial) {
         var file = Paths.get(prep.task().root().getSourceFile().toUri());
         var source = new SourceFileObject(file, terminateCompletionLine(prep.contents(), prep.cursor()), Instant.now());
         var list = new CompletionList();
-        try (CompileTask task = compiler.compile(List.of(source), true)) {
+        try (var task = compiler.compile(List.of(source), true)) {
             var root = task.root(source);
             var path = root == null ? null : new FindCompletionsAt(task.task).scan(root, prep.cursor());
             var selector = switchExpression(path);
@@ -769,21 +771,39 @@ public class CompletionProvider {
             var type = selectorPath == null ? null : task.trees.getTypeMirror(selectorPath);
             if (type instanceof DeclaredType declared && type.getKind() != TypeKind.ERROR
                     && declared.asElement() instanceof TypeElement owner && owner.getKind() == ElementKind.ENUM) {
-                var enumType = owner.getQualifiedName().toString();
-                var seen = new HashSet<String>();
-                for (var member : typeIndexRouter.members(enumType, true)) {
-                    if (!matchesCompletionPrefix(member.name, partial)) continue;
-                    if (!isEnumCaseConstant(member, enumType)) continue;
-                    if (!seen.add(member.name)) continue;
-                    var item = indexedMember(member);
-                    item.sortText = sortKey(Priority.FIELD, item.label);
-                    list.items.add(item);
-                }
+                addEnumConstants(task, owner.getQualifiedName().toString(), partial, false, list);
                 return list;
             }
+            addExpressionCandidates(prep, parsePath, partial, list, false, task);
+            return list;
         }
-        addExpressionCandidates(prep, parsePath, partial, list, false);
-        return list;
+    }
+
+    private void addEnumConstants(CompileTask task, String enumType, String partial, boolean qualify,
+            CompletionList list) {
+        var names = new HashSet<String>();
+        for (var member : workspaceIndex.members(enumType, true)) {
+            if (!isEnumCaseConstant(member, enumType) || !matchesCompletionPrefix(member.name, partial)) continue;
+            var item = indexedMember(member);
+            if (qualify) qualify(item, enumType + "." + member.name, false);
+            item.sortText = sortKey(Priority.FIELD, item.label);
+            list.items.add(item);
+            names.add(member.name);
+        }
+        try {
+            var type = task.elements.getTypeElement(enumType);
+            if (type != null) for (var member : type.getEnclosedElements()) {
+                if (member.getKind() != ElementKind.ENUM_CONSTANT
+                        || !matchesCompletionPrefix(member.getSimpleName(), partial)
+                        || !names.add(member.getSimpleName().toString())) continue;
+                var item = dependencyMemberCompletion(task, member);
+                if (qualify) qualify(item, enumType + "." + member.getSimpleName(), false);
+                item.sortText = sortKey(Priority.FIELD, item.label);
+                list.items.add(item);
+            }
+        } catch (RuntimeException unavailableType) {
+            // Keep completions already collected when a dependency cannot be completed.
+        }
     }
 
     private Tree switchExpression(TreePath path) {
@@ -811,40 +831,170 @@ public class CompletionProvider {
                 && sameQualifiedType(enumType, member.returnType);
     }
 
-    private void addStaticImportsFromIndex(
-            List<MemberSelectTree> staticImports, String partial, boolean endsWithParen, boolean addParentheses, boolean typesOnly, boolean includeMethods, Map<String, Integer> positions, CompletionList list) {
-        var methods = new TreeMap<String, List<IndexedMember>>();
+    private void addStaticImportCompletions(
+            List<MemberSelectTree> staticImports, String partial, boolean endsWithParen, boolean addParentheses,
+            boolean typesOnly, boolean includeMethods, Map<String, Integer> positions, CompletionList list,
+            CompileTask task) {
+        var indexedMethods = new TreeMap<String, List<IndexedMember>>();
+        var dependencyMethods = new TreeMap<String, List<ExecutableElement>>();
         var methodPriority = new HashMap<String, Integer>();
-        outer:
         for (var id : staticImports) {
-            var ownerType = id.getExpression().toString();
             if (!importMatchesPartial(id.getIdentifier(), partial)) continue;
-            for (var member : typeIndexRouter.members(ownerType, true)) {
+            var ownerType = id.getExpression().toString();
+            var members = workspaceIndex.members(ownerType, true);
+            for (var member : members) {
                 if (!includeMethods && (member.kind == CompletionItemKind.Method
                         || member.kind == CompletionItemKind.Constructor)) continue;
-                if (typesOnly && member.kind != CompletionItemKind.Class
-                        && member.kind != CompletionItemKind.Interface && member.kind != CompletionItemKind.Enum) continue;
-                if (!memberMatchesImport(id.getIdentifier(), member.name)) continue;
-                if (!matchesCompletionPrefix(member.name, partial)) continue;
+                if (typesOnly && !isTypeKind(member.kind)) continue;
+                if (!memberMatchesImport(id.getIdentifier(), member.name)
+                        || !matchesCompletionPrefix(member.name, partial)) continue;
                 if (member.kind == CompletionItemKind.Method) {
-                    methods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
+                    indexedMethods.computeIfAbsent(member.name, __ -> new ArrayList<>()).add(member);
                     methodPriority.merge(member.name, indexMemberPriority(member), Math::min);
                 } else if (positions.putIfAbsent(member.name, list.items.size()) == null) {
                     var item = indexedMember(member, addParentheses);
                     item.sortText = sortKey(indexMemberPriority(member), item.label);
                     list.items.add(item);
                 }
-                if (list.items.size() + methods.size() > MAX_COMPLETION_ITEMS) {
-                    list.isIncomplete = true;
-                    break outer;
-                }
+            }
+            addDependencyMemberCompletions(task, ownerType, partial, true, id.getIdentifier(), positions,
+                    dependencyMethods, methodPriority, addParentheses, typesOnly, includeMethods, list);
+            if (list.items.size() + indexedMethods.size() + dependencyMethods.size() > MAX_COMPLETION_ITEMS) {
+                list.isIncomplete = true;
+                break;
             }
         }
-        for (var entry : methods.entrySet()) {
-            if (positions.putIfAbsent(entry.getKey(), list.items.size()) != null) continue;
-            var method = indexedMethod(entry.getValue(), !endsWithParen, null);
-            method.sortText = sortKey(methodPriority.getOrDefault(entry.getKey(), Priority.INHERITED_METHOD), method.label);
-            list.items.add(method);
+        appendMethodCompletions(task, indexedMethods, dependencyMethods, methodPriority,
+                !endsWithParen, false, positions, list);
+    }
+
+    private void addDependencyMemberCompletions(
+            CompileTask task, String ownerType, String partial, boolean staticOnly, Name importedMember,
+            Map<String, Integer> positions, Map<String, List<ExecutableElement>> methods, Map<String, Integer> methodPriority,
+            boolean addParentheses, boolean typesOnly, boolean includeMethods, CompletionList list) {
+        for (var member : findMatchingDependencyMembers(task, ownerType, partial, staticOnly)) {
+            if (importedMember != null && !memberMatchesImport(importedMember, member.getSimpleName().toString())) continue;
+            if (member instanceof ExecutableElement method) {
+                if (includeMethods && !typesOnly) {
+                    methods.computeIfAbsent(member.getSimpleName().toString(), __ -> new ArrayList<>()).add(method);
+                    methodPriority.merge(member.getSimpleName().toString(), dependencyMemberPriority(member, ownerType), Math::min);
+                }
+            } else if ((!typesOnly || member instanceof TypeElement)
+                    && positions.putIfAbsent(member.getSimpleName().toString(), list.items.size()) == null) {
+                var item = dependencyMemberCompletion(task, member);
+                if (addParentheses && member instanceof TypeElement type && type.getKind() == ElementKind.CLASS)
+                    setInvocation(item, item.label, false);
+                item.sortText = sortKey(dependencyMemberPriority(member, ownerType), item.label);
+                list.items.add(item);
+            }
+        }
+    }
+
+    private CompletionItem dependencyMemberCompletion(CompileTask task, Element member) {
+        var item = CompletionItems.compiledMember(member, task.elements.isDeprecated(member));
+        if (member.getEnclosingElement() instanceof TypeElement owner) {
+            var data = new CompletionData();
+            data.className = owner.getQualifiedName().toString();
+            data.memberName = member.getSimpleName().toString();
+            data.compilerId = compilerId;
+            item.data = JsonHelper.GSON.toJsonTree(data);
+        }
+        return item;
+    }
+
+    private int dependencyMemberPriority(Element member, String requestedType) {
+        var owner = member.getEnclosingElement() instanceof TypeElement type
+                ? type.getQualifiedName().toString() : "";
+        var isStatic = member.getModifiers().contains(Modifier.STATIC);
+        if (member.getKind() == ElementKind.METHOD) {
+            if (isUtilityMethodName(member.getSimpleName().toString())) return 90;
+            if (owner.equals("java.lang.Object")) return 80;
+            if (isStatic) return 30;
+            if (owner.equals(requestedType)) return isAccessorMethodName(member.getSimpleName().toString()) ? 10 : 20;
+            return 60;
+        }
+        if (member.getKind() == ElementKind.FIELD) return isStatic ? 40 : owner.equals(requestedType) ? 35 : 50;
+        return member instanceof TypeElement ? 45 : Priority.PACKAGE_MEMBER;
+    }
+
+    private List<Element> findMatchingDependencyMembers(
+            CompileTask task, String ownerType, String partial, boolean staticOnly) {
+        var result = new LinkedHashSet<Element>();
+        var pending = new ArrayDeque<String>();
+        var visited = new HashSet<String>();
+        pending.add(ownerType);
+        while (!pending.isEmpty()) {
+            var name = pending.removeFirst();
+            if (!visited.add(name)) continue;
+            var workspaceType = workspaceIndex.typeInfo(name).orElse(null);
+            if (workspaceType != null) {
+                pending.addAll(workspaceType.directSupertypes);
+                if (workspaceType.superclass == null && workspaceType.kind != CompletionItemKind.Interface)
+                    pending.add(workspaceType.kind == CompletionItemKind.Enum ? "java.lang.Enum" : "java.lang.Object");
+                continue;
+            }
+            if (workspaceIndex.ownsTypeOrEnclosingType(name)) continue;
+            try {
+                var type = task.elements.getTypeElement(name);
+                if (type == null || type.asType().getKind() == TypeKind.ERROR) continue;
+                var members = task.elements.getAllMembers(type);
+                for (var member : members) {
+                    if (member.getKind() == ElementKind.CONSTRUCTOR
+                            || !member.getModifiers().contains(Modifier.PUBLIC)
+                            || staticOnly && !member.getModifiers().contains(Modifier.STATIC)
+                            || !matchesCompletionPrefix(member.getSimpleName(), partial)
+                            || task.elements.getOrigin(member) == javax.lang.model.util.Elements.Origin.SYNTHETIC) continue;
+                    if (!(member.getEnclosingElement() instanceof TypeElement declaring)
+                            || workspaceIndex.ownsTypeOrEnclosingType(declaring.getQualifiedName().toString())
+                            || task.trees.getPath(declaring) != null) continue;
+                    result.add(member);
+                }
+            } catch (RuntimeException unavailableType) {
+                // Continue with the other dependency types when this one cannot be completed.
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    private void appendMethodCompletions(
+            CompileTask task, Map<String, List<IndexedMember>> indexedMethods,
+            Map<String, List<ExecutableElement>> dependencyMethods, Map<String, Integer> priorities,
+            boolean addParentheses, boolean replaceSyntacticMethods, Map<String, Integer> positions,
+            CompletionList list) {
+        var names = new java.util.TreeSet<String>(indexedMethods.keySet());
+        names.addAll(dependencyMethods.keySet());
+        var sourceByType = new HashMap<String, ParseTask>();
+        var bytesByOwner = new HashMap<String, byte[]>();
+        for (var name : names) {
+            var previous = positions.get(name);
+            if (previous != null && (!replaceSyntacticMethods
+                    || list.items.get(previous).kind != CompletionItemKind.Method)) continue;
+            var indexed = indexedMethods.getOrDefault(name, List.of());
+            var dependencies = dependencyMethods.getOrDefault(name, List.of());
+            var signatures = new HashSet<String>();
+            for (var member : indexed) signatures.add(workspaceIndex.visibleMemberKey(member,
+                    type -> workspaceIndex.ownsTypeOrEnclosingType(type) || compiler.isTopLevelTypeOnClasspath(type)));
+            var uniqueDependencies = new ArrayList<ExecutableElement>();
+            for (var method : dependencies) {
+                var key = IndexedMember.canonicalKey("", CompletionItemKind.Method, name,
+                        FindHelper.erasedParameterTypes(task, method));
+                if (signatures.add(key)) uniqueDependencies.add(method);
+            }
+            CompletionItem item;
+            if (!indexed.isEmpty()) {
+                item = CompletionItems.indexedMethod(indexed, indexed.getFirst().parameterNames,
+                        compilerId, addParentheses, signatures.size());
+                item.sortText = sortKey(priorities.getOrDefault(name, Priority.INHERITED_METHOD), name);
+            } else {
+                if (uniqueDependencies.isEmpty()) continue;
+                var owner = ElementSignatureHelper.ownerQualifiedName(uniqueDependencies.getFirst());
+                item = compiledMethod(task, owner, uniqueDependencies, bytesByOwner, sourceByType, addParentheses);
+                item.sortText = sortKey(priorities.getOrDefault(name, Priority.INHERITED_METHOD), name);
+            }
+            if (previous == null) {
+                positions.put(name, list.items.size());
+                list.items.add(item);
+            } else list.items.set(previous, item);
         }
     }
 
@@ -858,7 +1008,7 @@ public class CompletionProvider {
 
     private void addTypesAndPackages(
             CompilationUnitTree root, Map<String, String> importedTypes, TreeMap<String, Integer> insertionLines,
-            String partial, boolean addParentheses, boolean annotationOnly, CompletionList list) {
+            String partial, boolean addParentheses, boolean annotationOnly, CompletionList list, CompileTask task) {
         var uniques = new HashSet<String>();
         var names = new HashSet<String>();
         for (var item : list.items) {
@@ -875,7 +1025,8 @@ public class CompletionProvider {
                 uniques.add(item.detail);
             }
         }
-        for (var className : compiler.publicTopLevelTypes()) {
+        var typeNames = compiler.publicTopLevelTypes();
+        for (var className : typeNames) {
             var separator = className.indexOf('.');
             if (separator > 0 && (!annotationOnly || !partial.isEmpty())) {
                 var packageName = className.substring(0, separator);
@@ -889,7 +1040,7 @@ public class CompletionProvider {
             }
             if (!annotationOnly && (partial.isEmpty() || !Character.isUpperCase(partial.charAt(0)))) continue;
             if (!partial.isEmpty() && !StringSearch.matchesPartialName(TypeNames.simpleName(className), partial)) continue;
-            if (annotationOnly && !typeIndexRouter.isAnnotationType(className)) continue;
+            if (annotationOnly && !isAnnotationCompletionCandidate(task, className)) continue;
             if (!uniques.add(className)) {
                 continue;
             }
@@ -970,7 +1121,8 @@ public class CompletionProvider {
             Map<String, List<IndexedMember>> methods,
             Map<String, Integer> methodPriority,
             boolean addParentheses, boolean typesOnly, boolean includeMethods, CompletionList list) {
-        for (var member : typeIndexRouter.members(qualifiedType, staticContext)) {
+        var indexed = workspaceIndex.members(qualifiedType, staticContext);
+        for (var member : indexed) {
             if (!includeMethods && (member.kind == CompletionItemKind.Method
                     || member.kind == CompletionItemKind.Constructor)) continue;
             if (!matchesCompletionPrefix(member.name, partial)) continue;
@@ -1268,10 +1420,11 @@ public class CompletionProvider {
         return packageName.isEmpty() ? qualified : packageName + "." + qualified;
     }
 
-    private CompletionList completePackage(String path, boolean addParentheses, boolean annotationOnly) {
+    private CompletionList completePackage(String path, boolean addParentheses, boolean annotationOnly, CompileTask task) {
         var names = new HashSet<String>();
         var list = new CompletionList();
-        for (var className : compiler.publicTopLevelTypes()) {
+        var typeNames = compiler.publicTopLevelTypes();
+        for (var className : typeNames) {
             if (className.startsWith(path)) {
                 var start = path.lastIndexOf('.');
                 var end = className.indexOf('.', path.length());
@@ -1279,7 +1432,7 @@ public class CompletionProvider {
                 var segment = className.substring(start + 1, end);
                 if (names.contains(segment)) continue;
                 var isClass = end == className.length();
-                if (isClass && annotationOnly && !typeIndexRouter.isAnnotationType(className)) continue;
+                if (isClass && annotationOnly && !isAnnotationCompletionCandidate(task, className)) continue;
                 names.add(segment);
                 if (isClass) {
                     var item = CompletionItems.classItem(className, compilerId, addParentheses);
@@ -1295,6 +1448,7 @@ public class CompletionProvider {
                 }
             }
         }
+
         return list;
     }
 
@@ -1364,24 +1518,47 @@ public class CompletionProvider {
             if (!attributePosition) attributeName = assignment.getVariable().toString();
         }
         var typeName = annotation.getAnnotationType().toString();
-        var qualified = typeIndexRouter.resolveTypeName(typeName, root);
-        return new AnnotationContext(qualified.orElse(""), partial, attributePosition, attributeName);
+        return new AnnotationContext(typeName, partial, attributePosition, attributeName);
     }
 
     private static final Set<String> ANNOTATION_INHERITED_METHODS =
             Set.of("annotationType", "toString", "equals", "hashCode");
 
-    private CompletionList completeAnnotationAttributes(AnnotationContext ctx) {
-        var members = typeIndexRouter.members(ctx.qualifiedAnnotationType(), false);
-        if (members.isEmpty()) return new CompletionList(false, List.of());
-        var list = new ArrayList<CompletionItem>();
-        for (var member : members) {
-            if (member.kind != CompletionItemKind.Method) continue;
-            if (ANNOTATION_INHERITED_METHODS.contains(member.name)) continue;
-            if (!matchesCompletionPrefix(member.name, ctx.partial())) continue;
-            list.add(annotationAttribute(member));
+    private CompletionList completeAnnotationAttributes(
+            String annotationType, String partial, CompileTask task) {
+        var list = new CompletionList();
+        if (annotationType == null) return list;
+        if (workspaceIndex.ownsTypeOrEnclosingType(annotationType)) {
+            for (var member : workspaceIndex.members(annotationType, false)) {
+                if (member.kind == CompletionItemKind.Method && !ANNOTATION_INHERITED_METHODS.contains(member.name)
+                        && matchesCompletionPrefix(member.name, partial)) list.items.add(annotationAttribute(member));
+            }
+        } else {
+            for (var method : findAnnotationAttributes(task, annotationType)) {
+                if (matchesCompletionPrefix(method.getSimpleName(), partial)) list.items.add(annotationAttribute(method));
+            }
         }
-        return new CompletionList(false, list);
+        return list;
+    }
+
+    private List<ExecutableElement> findAnnotationAttributes(
+            CompileTask task, String annotationType) {
+        try {
+            var type = task.elements.getTypeElement(annotationType);
+            return type == null ? List.of() : List.copyOf(javax.lang.model.util.ElementFilter.methodsIn(type.getEnclosedElements()));
+        } catch (RuntimeException unavailableType) {
+            return List.of();
+        }
+    }
+
+    private boolean isAnnotationCompletionCandidate(CompileTask task, String name) {
+        try {
+            if (workspaceIndex.ownsTypeOrEnclosingType(name)) return workspaceIndex.isAnnotationType(name);
+            var type = task.elements.getTypeElement(name);
+            return type != null && type.getKind() == ElementKind.ANNOTATION_TYPE;
+        } catch (RuntimeException unavailableType) {
+            return false;
+        }
     }
 
     private MemberAccessContext memberAccessContext(TreePath path, String partial, String contents, int cursor) {

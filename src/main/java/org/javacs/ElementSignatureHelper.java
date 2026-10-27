@@ -9,6 +9,7 @@ import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
+import javax.lang.model.type.WildcardType;
 
 public final class ElementSignatureHelper {
 
@@ -26,7 +27,12 @@ public final class ElementSignatureHelper {
                 yield name + "<" + ja + ">";
             }
             case ARRAY -> simpleTypeName(((ArrayType) type).getComponentType()) + "[]";
-            case WILDCARD -> "?";
+            case WILDCARD -> {
+                var wildcard = (WildcardType) type;
+                if (wildcard.getExtendsBound() != null) yield "? extends " + simpleTypeName(wildcard.getExtendsBound());
+                if (wildcard.getSuperBound() != null) yield "? super " + simpleTypeName(wildcard.getSuperBound());
+                yield "?";
+            }
             default -> type.toString();
         };
     }
@@ -47,6 +53,15 @@ public final class ElementSignatureHelper {
         return ClassFileParameterNames.read(
                 ownerClassBytes, method.getSimpleName().toString(), erasedTypes,
                 method.getModifiers().contains(Modifier.STATIC));
+    }
+
+    public static String[] parameterNames(CompileTask task, ExecutableElement method, byte[] ownerClassBytes) {
+        var names = method.getParameters().stream()
+                .map(parameter -> parameter.getSimpleName().toString()).toArray(String[]::new);
+        if (!hasSyntheticNames(method.getParameters()) || ownerClassBytes == null) return names;
+        var fromDebugInfo = ClassFileParameterNames.read(ownerClassBytes, method.getSimpleName().toString(),
+                FindHelper.erasedParameterTypes(task, method), method.getModifiers().contains(Modifier.STATIC));
+        return fromDebugInfo == null ? names : fromDebugInfo;
     }
 
     public static String methodSignature(ExecutableElement method, byte[] ownerClassBytes) {

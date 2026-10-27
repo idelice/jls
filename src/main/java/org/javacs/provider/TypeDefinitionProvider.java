@@ -18,7 +18,7 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
 import org.javacs.SourceFileObject;
-import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.NavigationHelper;
 
@@ -27,19 +27,19 @@ public final class TypeDefinitionProvider {
     public static final List<Location> NOT_SUPPORTED = List.of();
 
     private final CompilerProvider compiler;
-    private final TypeIndexRouter typeIndex;
+    private final WorkspaceTypeIndex typeIndex;
     private final Path file;
     private final int line;
     private final int column;
 
     public TypeDefinitionProvider(
             CompilerProvider compiler,
-            TypeIndexRouter typeIndex,
+            WorkspaceTypeIndex typeIndex,
             Path file,
             int line,
             int column) {
         this.compiler = compiler;
-        this.typeIndex = typeIndex == null ? TypeIndexRouter.EMPTY : typeIndex;
+        this.typeIndex = typeIndex == null ? WorkspaceTypeIndex.EMPTY : typeIndex;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -125,8 +125,7 @@ public final class TypeDefinitionProvider {
         var decompiled = compiler.decompileClass(qualifiedName)
                 .or(() -> qualifiedName.equals(sourceOwner)
                         ? java.util.Optional.empty()
-                        : compiler.decompileClass(sourceOwner))
-                .or(() -> typeIndex.externalDecompiledSourcePath(qualifiedName));
+                        : compiler.decompileClass(sourceOwner));
         if (decompiled.isPresent()) {
             var parse = compiler.parse(new SourceFileObject(decompiled.get()));
             var location = locateInParse(parse, qualifiedName);

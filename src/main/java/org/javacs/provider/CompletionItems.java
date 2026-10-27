@@ -141,6 +141,9 @@ final class CompletionItems {
         item.kind = switch (member.getKind()) {
             case FIELD -> CompletionItemKind.Field;
             case ENUM_CONSTANT -> CompletionItemKind.EnumMember;
+            case CLASS, RECORD -> CompletionItemKind.Class;
+            case INTERFACE, ANNOTATION_TYPE -> CompletionItemKind.Interface;
+            case ENUM -> CompletionItemKind.Enum;
             default -> CompletionItemKind.Property;
         };
         item.detail = ElementSignatureHelper.simpleTypeName(member.asType());
@@ -151,22 +154,19 @@ final class CompletionItems {
         return item;
     }
 
-    static CompletionItem compiledMethod(ExecutableElement method, byte[] classBytes,
-            MethodTree sourceMethod, CompletionData data, boolean addParentheses) {
+    static CompletionItem compiledMethod(ExecutableElement method, String[] parameterNames,
+            CompletionData data, boolean addParentheses) {
         var item = new CompletionItem();
         item.label = method.getSimpleName().toString();
         item.kind = CompletionItemKind.Method;
-        String params;
-        if (sourceMethod == null) {
-            params = ElementSignatureHelper.methodParams(method, classBytes);
-        } else {
-            var rendered = new StringJoiner(", ", "(", ")");
-            for (int i = 0; i < method.getParameters().size(); i++) {
-                rendered.add(ElementSignatureHelper.simpleTypeName(method.getParameters().get(i).asType())
-                        + " " + sourceMethod.getParameters().get(i).getName());
-            }
-            params = rendered.toString();
+        var parameters = new StringJoiner(", ", "(", ")");
+        for (int i = 0; i < method.getParameters().size(); i++) {
+            var parameter = method.getParameters().get(i);
+            var name = parameterNames != null && i < parameterNames.length
+                    ? parameterNames[i] : parameter.getSimpleName().toString();
+            parameters.add(ElementSignatureHelper.simpleTypeName(parameter.asType()) + " " + name);
         }
+        var params = parameters.toString();
         var returnType = ElementSignatureHelper.simpleTypeName(method.getReturnType());
         item.detail = returnType + " " + item.label + params + overloadSuffix(data.plusOverloads);
         setLabelDetails(item, params, returnType + overloadSuffix(data.plusOverloads));
@@ -199,7 +199,7 @@ final class CompletionItems {
     }
 
     static CompletionItem indexedMethod(List<IndexedMember> overloads, String[] names,
-            String compilerId, boolean addParentheses) {
+            String compilerId, boolean addParentheses, int overloadCount) {
         var first = overloads.getFirst();
         var item = new CompletionItem();
         item.label = first.name;
@@ -207,14 +207,14 @@ final class CompletionItems {
         var params = indexMethodParams(first, names);
         item.detail = indexedDetail(first, names, params);
         var returnType = first.returnType != null ? TypeNames.simpleName(first.returnType) : "void";
-        setLabelDetails(item, params, returnType + overloadSuffix(overloads.size() - 1));
-        if (addParentheses) setInvocation(item, first.name, overloads.size() == 1
+        setLabelDetails(item, params, returnType + overloadSuffix(overloadCount - 1));
+        if (addParentheses) setInvocation(item, first.name, overloadCount == 1
                 && (first.erasedParameterTypes == null || first.erasedParameterTypes.length == 0));
         var data = new CompletionData();
         data.className = first.ownerType;
         data.memberName = first.name;
         data.erasedParameterTypes = first.erasedParameterTypes == null ? new String[0] : first.erasedParameterTypes;
-        data.plusOverloads = overloads.size() - 1;
+        data.plusOverloads = overloadCount - 1;
         data.compilerId = compilerId;
         item.data = JsonHelper.GSON.toJsonTree(data);
         return item;
@@ -247,6 +247,17 @@ final class CompletionItems {
         setLabelDetails(item, null, member.declaredReturnType);
         qualify(item, member.name + " = ", false);
         item.sortText = sortKey(Priority.SNIPPET, member.name);
+        return item;
+    }
+
+    static CompletionItem annotationAttribute(ExecutableElement method) {
+        var item = new CompletionItem();
+        item.label = method.getSimpleName().toString();
+        item.kind = CompletionItemKind.Property;
+        item.detail = method.getReturnType().toString();
+        setLabelDetails(item, null, item.detail);
+        qualify(item, item.label + " = ", false);
+        item.sortText = sortKey(Priority.SNIPPET, item.label);
         return item;
     }
 

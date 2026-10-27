@@ -18,6 +18,8 @@ public interface CompilerProvider {
         return Set.of();
     }
 
+    boolean isTopLevelTypeOnClasspath(String name);
+
     Iterable<Path> search(String query);
 
     Optional<JavaFileObject> findAnywhere(String className);

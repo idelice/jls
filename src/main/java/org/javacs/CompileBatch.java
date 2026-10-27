@@ -23,10 +23,6 @@ public final class CompileBatch implements AutoCloseable {
     final List<CompilationUnitTree> roots = new ArrayList<>();
     final List<Diagnostic<? extends JavaFileObject>> diagnostics = new ArrayList<>();
 
-    CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files) {
-        this(parent, files, false);
-    }
-
     CompileBatch(JavaCompilerService parent, Collection<? extends JavaFileObject> files, boolean bounded) {
         if (files.isEmpty()) throw new IllegalArgumentException("No source files to analyze");
         parent.prepareFileManager();
@@ -97,7 +93,6 @@ public final class CompileBatch implements AutoCloseable {
         }
 
         Collections.addAll(list, "-XDshould-stop.ifError=FLOW");
-
         Collections.addAll(list, "-Xmaxerrs", "9999");
         Collections.addAll(list, "-Xmaxwarns", "9999");
         Collections.addAll(
@@ -121,7 +116,7 @@ public final class CompileBatch implements AutoCloseable {
             }
         }
 
-        Collections.addAll(list, "-proc:none", "-implicit:none", "-Xprefer:source");
+        Collections.addAll(list, "-proc:none", "-implicit:none", "-Xprefer:source", "-parameters");
         return list;
     }
 

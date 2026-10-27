@@ -1,37 +1,49 @@
 package org.javacs.provider;
 
 import com.sun.source.tree.ClassTree;
+import com.sun.source.tree.BlockTree;
+import com.sun.source.tree.MethodTree;
+import com.sun.source.tree.VariableTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.IdentifierTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
-import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.ParameterizedTypeTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.util.TreePath;
-import com.sun.source.util.Trees;
 import java.nio.file.Path;
+import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
 import java.util.logging.Logger;
 import javax.lang.model.element.ExecutableElement;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.ArrayType;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeVariable;
+import javax.lang.model.util.ElementFilter;
+import javax.lang.model.util.Elements;
 import org.javacs.CompileTask;
 import org.javacs.FindHelper;
+import org.javacs.ElementSignatureHelper;
+import org.javacs.ParseTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.SourceFileObject;
 import org.javacs.completion.FindInvocationAt;
 import org.javacs.completion.PruneMethodBodies;
 import org.javacs.index.IndexedMember;
-import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.ParameterInformation;
 import org.javacs.lsp.SignatureHelp;
@@ -41,86 +53,160 @@ public class SignatureProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
-    private final TypeIndexRouter index;
+    private final WorkspaceTypeIndex index;
 
     public static final SignatureHelp NOT_SUPPORTED = new SignatureHelp(List.of(), -1, -1);
 
-    public SignatureProvider(CompilerProvider compiler, TypeIndexRouter index) {
+    public SignatureProvider(CompilerProvider compiler, WorkspaceTypeIndex index) {
         this.compiler = compiler;
-        this.index = index == null ? TypeIndexRouter.EMPTY : index;
+        this.index = index == null ? WorkspaceTypeIndex.EMPTY : index;
     }
 
     public SignatureHelp signatureHelp(Path file, int line, int column) {
-        var parse = compiler.parse(file);
-        String content;
         try {
-            content = parse.root().getSourceFile().getCharContent(true).toString();
-        } catch (java.io.IOException e) {
-            throw new RuntimeException(e);
-        }
-        long cursor = FileStore.offset(content, line, column);
-        var buffer = new PruneMethodBodies(parse.task()).scan(parse.root(), cursor);
-        var endOfLine = endOfLine(buffer, (int) cursor);
-        buffer.insert(endOfLine, ';');
-        var pruned = buffer.toString();
-        var source = new SourceFileObject(file, pruned, Instant.now());
-        try (var task = compiler.compile(List.of(source), true)) {
-            var root = task.root(source);
-            if (root == null) return NOT_SUPPORTED;
-            var attrPath = new FindInvocationAt(task.task).scan(root, (Long) cursor);
-            if (attrPath == null) return NOT_SUPPORTED;
-
-            var sourcePos = Trees.instance(task.task).getSourcePositions();
-            long invocationStart;
-            if (attrPath.getLeaf() instanceof MethodInvocationTree inv) {
-                invocationStart = sourcePos.getEndPosition(root, inv.getMethodSelect()) + 1;
-            } else if (attrPath.getLeaf() instanceof NewClassTree nc) {
-                invocationStart = sourcePos.getEndPosition(root, nc.getIdentifier()) + 1;
-            } else {
-                return NOT_SUPPORTED;
-            }
-
-            List<IndexedMember> overloads;
-            List<? extends ExpressionTree> arguments;
-            if (attrPath.getLeaf() instanceof MethodInvocationTree invoke) {
-                overloads = resolveOverloads(task, root, attrPath, invoke);
-                arguments = invoke.getArguments();
-            } else if (attrPath.getLeaf() instanceof NewClassTree nc) {
-                overloads = resolveConstructors(task, root, attrPath, nc);
-                arguments = nc.getArguments();
-            } else {
-                return NOT_SUPPORTED;
-            }
-
-            if (overloads.isEmpty()) return NOT_SUPPORTED;
-            var activeParameter = activeParameterAt(task, root, arguments, pruned, invocationStart, cursor);
-            var activeSignature = selectOverload(task, attrPath, overloads, arguments, activeParameter);
-
-            var signatures = new ArrayList<SignatureInformation>();
-            for (var member : overloads) {
-                var method = findSourceMethod(member);
-                var info = new SignatureInformation();
-                if (method != null) {
-                    info.label = buildLabel(member, method);
-                    info.parameters = buildParameters(method);
-                } else {
-                    // No source (e.g. a bytecode-only dependency jar): use the indexed signature.
-                    info.label = buildLabelFromIndex(member);
-                    info.parameters = buildParametersFromIndex(member);
+            var parse = compiler.parse(file);
+            var content = parse.root().getSourceFile().getCharContent(true).toString();
+            long cursor = FileStore.offset(content, line, column);
+            var buffer = new PruneMethodBodies(parse.task()).scan(parse.root(), cursor);
+            buffer.insert(endOfLine(buffer, (int) cursor), ';');
+            var pruned = buffer.toString();
+            var source = new SourceFileObject(file, pruned, Instant.now());
+            try (var task = compiler.compile(List.of(source), true)) {
+                var root = task.root(source);
+                if (root == null) return NOT_SUPPORTED;
+                var invocation = new FindInvocationAt(task.task).scan(root, (Long) cursor);
+                if (invocation == null) {
+                    return NOT_SUPPORTED;
                 }
-                signatures.add(info);
+                var positions = task.trees.getSourcePositions();
+                List<? extends ExpressionTree> arguments;
+                List<ExecutableElement> methods = List.of();
+                List<IndexedMember> workspaceOverloads = List.of();
+                long invocationStart;
+                if (invocation.getLeaf() instanceof MethodInvocationTree invoke) {
+                    arguments = invoke.getArguments();
+                    invocationStart = positions.getEndPosition(root, invoke.getMethodSelect()) + 1;
+                    var methodName = invoke.getMethodSelect() instanceof IdentifierTree identifier
+                            ? identifier.getName().toString() : ((MemberSelectTree) invoke.getMethodSelect()).getIdentifier().toString();
+                    for (var candidate : findMethodOwnersWithStaticContext(task, root, invocation, invoke).entrySet()) {
+                        boolean staticOnly = candidate.getValue();
+                        methods = findAccessibleMethodOverloads(task, invocation, candidate.getKey(), methodName, staticOnly);
+                        if (!methods.isEmpty()) break;
+                        workspaceOverloads = staticOnly ? index.methodOverloads(candidate.getKey(), methodName, true)
+                                : new ArrayList<>(index.methodOverloads(candidate.getKey(), methodName, false));
+                        if (!staticOnly) workspaceOverloads.addAll(index.methodOverloads(candidate.getKey(), methodName, true));
+                        if (!workspaceOverloads.isEmpty()) break;
+                    }
+                } else if (invocation.getLeaf() instanceof NewClassTree constructor) {
+                    arguments = constructor.getArguments();
+                    invocationStart = positions.getEndPosition(root, constructor.getIdentifier()) + 1;
+                    var ownerName = constructorTypeName(task, invocation, root, constructor);
+                    var owner = ownerName == null ? null : task.elements.getTypeElement(ownerName);
+                    var scope = task.trees.getScope(invocation);
+                    methods = owner == null || !(owner.asType() instanceof DeclaredType declared) ? List.of()
+                            : ElementFilter.constructorsIn(owner.getEnclosedElements()).stream()
+                                    .filter(method -> task.trees.isAccessible(scope, method, declared)).toList();
+                    if (methods.isEmpty() && ownerName != null) workspaceOverloads = index.constructors(ownerName);
+                } else {
+                    return NOT_SUPPORTED;
+                }
+                if (methods.isEmpty() && workspaceOverloads.isEmpty()) {
+                    return NOT_SUPPORTED;
+                }
+                var activeParameter = activeParameterAt(task, root, arguments, pruned, invocationStart, cursor);
+                var activeSignature = methods.isEmpty()
+                        ? selectWorkspaceOverload(task, invocation, workspaceOverloads, arguments, activeParameter)
+                        : selectCompiledOverload(task, invocation, methods, arguments, activeParameter);
+                List<SignatureInformation> signatures;
+                if (methods.isEmpty()) {
+                    signatures = new ArrayList<>();
+                    for (var member : workspaceOverloads) {
+                        var info = new SignatureInformation();
+                        info.label = buildLabelFromIndex(member);
+                        info.parameters = buildParametersFromIndex(member);
+                        signatures.add(info);
+                    }
+                } else {
+                    signatures = renderCompiledSignatures(task, methods);
+                }
+                var count = signatures.get(activeSignature).parameters.size();
+                activeParameter = Math.min(activeParameter, Math.max(0, count - 1));
+                return new SignatureHelp(signatures, activeSignature, activeParameter);
             }
-
-            var parameterCount = signatures.get(activeSignature).parameters.size();
-            activeParameter = Math.min(activeParameter, Math.max(0, parameterCount - 1));
-            return new SignatureHelp(signatures, activeSignature, activeParameter);
-        } catch (RuntimeException | AssertionError e) {
-            LOG.fine(
-                    String.format(
-                            "[perf] signature_help_skip file=%s reason=%s message=%s",
-                            file.getFileName(), e.getClass().getSimpleName(), e.getMessage()));
+        } catch (IOException | RuntimeException | AssertionError failure) {
+            LOG.fine(String.format("[perf] signature_help_skip file=%s reason=%s message=%s",
+                    file.getFileName(), failure.getClass().getSimpleName(), failure.getMessage()));
             return NOT_SUPPORTED;
         }
+    }
+
+    private List<SignatureInformation> renderCompiledSignatures(
+            CompileTask task, List<ExecutableElement> methods) {
+        String previousOwner = null;
+        byte[] ownerClassBytes = null;
+        ParseTask ownerSource = null;
+        boolean sourceChecked = false, classBytesChecked = false;
+        var signatures = new ArrayList<SignatureInformation>();
+        for (var method : methods) {
+            var ownerName = ElementSignatureHelper.ownerQualifiedName(method);
+            if (!Objects.equals(ownerName, previousOwner)) {
+                previousOwner = ownerName;
+                ownerClassBytes = null;
+                ownerSource = null;
+                sourceChecked = false;
+                classBytesChecked = false;
+            }
+            if (ElementSignatureHelper.hasSyntheticNames(method.getParameters()) && !classBytesChecked) {
+                ownerClassBytes = compiler.findClassFile(ownerName).orElse(null);
+                classBytesChecked = true;
+            }
+            var names = ElementSignatureHelper.parameterNames(task, method, ownerClassBytes);
+            if (Arrays.stream(names).anyMatch(name -> name.matches("arg\\d+"))) {
+                if (!sourceChecked) {
+                    var found = compiler.findAnywhere(ownerName);
+                    if (found.isPresent()) {
+                        ownerSource = compiler.parse(found.get());
+                    }
+                    sourceChecked = true;
+                }
+                if (ownerSource != null) names = readSourceParameterNames(task, method, ownerSource, names);
+            }
+            signatures.add(buildCompiledSignature(method, names));
+        }
+        return signatures;
+    }
+
+    private static String[] readSourceParameterNames(
+            CompileTask task, ExecutableElement method, ParseTask source, String[] fallback) {
+        try {
+            var declaration = FindHelper.findMethod(source, ElementSignatureHelper.ownerQualifiedName(method),
+                    method.getSimpleName().toString(), FindHelper.erasedParameterTypes(task, method));
+            return declaration.getParameters().stream()
+                    .map(parameter -> parameter.getName().toString()).toArray(String[]::new);
+        } catch (RuntimeException missingDeclaration) {
+            return fallback;
+        }
+    }
+
+    private static SignatureInformation buildCompiledSignature(ExecutableElement method, String[] names) {
+        var info = new SignatureInformation();
+        info.parameters = new ArrayList<>();
+        var name = method.getKind() == ElementKind.CONSTRUCTOR
+                ? method.getEnclosingElement().getSimpleName() : method.getSimpleName();
+        var label = new StringBuilder(name).append('(');
+        for (int i = 0; i < method.getParameters().size(); i++) {
+            var parameter = new ParameterInformation();
+            parameter.label = ElementSignatureHelper.simpleTypeName(method.getParameters().get(i).asType());
+            if (method.isVarArgs() && i == method.getParameters().size() - 1 && parameter.label.endsWith("[]")) {
+                parameter.label = parameter.label.substring(0, parameter.label.length() - 2) + "...";
+            }
+            if (!names[i].matches("arg\\d+")) parameter.label += " " + names[i];
+            if (i > 0) label.append(", ");
+            label.append(parameter.label);
+            info.parameters.add(parameter);
+        }
+        info.label = label.append(')').toString();
+        return info;
     }
 
     private static int endOfLine(CharSequence contents, int cursor) {
@@ -152,7 +238,80 @@ public class SignatureProvider {
         return previous + (gap.indexOf(',') >= 0 ? 1 : 0);
     }
 
-    private static int selectOverload(
+    private Map<String, Boolean> findMethodOwnersWithStaticContext(
+            CompileTask task, CompilationUnitTree root, TreePath invocation, MethodInvocationTree invoke) {
+        var owners = new LinkedHashMap<String, Boolean>();
+        var select = invoke.getMethodSelect();
+        if (select instanceof MemberSelectTree memberSelect) {
+            var receiver = new TreePath(invocation, memberSelect.getExpression());
+            var ownerName = receiverTypeName(task, receiver);
+            if (ownerName != null) owners.put(ownerName, task.trees.getElement(receiver) instanceof TypeElement);
+            return owners;
+        }
+        if (!(select instanceof IdentifierTree identifier)) return owners;
+        boolean staticOnly = false;
+        for (var enclosing = invocation.getParentPath(); enclosing != null; enclosing = enclosing.getParentPath()) {
+            var leaf = enclosing.getLeaf();
+            if (leaf instanceof MethodTree method && method.getModifiers().getFlags().contains(Modifier.STATIC)
+                    || leaf instanceof VariableTree variable && variable.getModifiers().getFlags().contains(Modifier.STATIC)
+                    || leaf instanceof BlockTree block && block.isStatic()) staticOnly = true;
+            if (!(leaf instanceof ClassTree classTree)) continue;
+            var element = task.trees.getElement(enclosing);
+            var ownerName = element instanceof TypeElement owner
+                    ? owner.getQualifiedName().toString() : qualifiedClassName(root, classTree);
+            if (ownerName != null) owners.putIfAbsent(ownerName, staticOnly);
+            if (classTree.getModifiers().getFlags().contains(Modifier.STATIC)) staticOnly = true;
+        }
+        for (var imported : root.getImports()) {
+            if (!imported.isStatic()) continue;
+            var name = imported.getQualifiedIdentifier().toString();
+            if (name.endsWith(".*") || name.endsWith("." + identifier.getName())) {
+                owners.putIfAbsent(name.substring(0, name.lastIndexOf('.')), true);
+            }
+        }
+        return owners;
+    }
+
+    private List<ExecutableElement> findAccessibleMethodOverloads(
+            CompileTask task, TreePath invocation, String ownerName, String methodName, boolean staticOnly) {
+        var owner = task.elements.getTypeElement(ownerName);
+        if (owner == null || !(owner.asType() instanceof DeclaredType declared)) return List.of();
+        var scope = task.trees.getScope(invocation);
+        return ElementFilter.methodsIn(task.elements.getAllMembers(owner)).stream()
+                .filter(method -> method.getSimpleName().contentEquals(methodName))
+                .filter(method -> task.elements.getOrigin(method) != Elements.Origin.SYNTHETIC)
+                .filter(method -> !staticOnly || method.getModifiers().contains(Modifier.STATIC))
+                .filter(method -> task.trees.isAccessible(scope, method, declared)).toList();
+    }
+
+    private static int selectCompiledOverload(
+            CompileTask task, TreePath invocation, List<ExecutableElement> methods,
+            List<? extends ExpressionTree> arguments, int activeParameter) {
+        var resolved = task.trees.getElement(invocation);
+        var exact = methods.indexOf(resolved);
+        if (exact >= 0) return exact;
+        int required = Math.max(arguments.size(), activeParameter > 0 ? activeParameter + 1 : 0);
+        int closest = 0, compatible = -1, compatibleCapacity = Integer.MAX_VALUE;
+        int closestCount = methods.getFirst().getParameters().size();
+        for (int i = 0; i < methods.size(); i++) {
+            var method = methods.get(i);
+            int count = method.getParameters().size();
+            if ((count >= required && count < closestCount) || (closestCount < required && count > closestCount)) {
+                closest = i;
+                closestCount = count;
+            }
+            int capacity = method.isVarArgs() ? Math.max(count, required) : count;
+            if (compatible >= 0 && !((capacity >= required && capacity < compatibleCapacity)
+                    || (compatibleCapacity < required && capacity > compatibleCapacity))) continue;
+            if (acceptsArguments(task, invocation, method, arguments)) {
+                compatible = i;
+                compatibleCapacity = capacity;
+            }
+        }
+        return compatible >= 0 ? compatible : closest;
+    }
+
+    private static int selectWorkspaceOverload(
             CompileTask task, TreePath invocation, List<IndexedMember> overloads,
             List<? extends ExpressionTree> arguments, int activeParameter) {
         var resolved = task.trees.getElement(invocation);
@@ -174,23 +333,7 @@ public class SignatureProvider {
                 closestCount = count;
             }
         }
-        if (resolved == null || !(resolved.getEnclosingElement() instanceof TypeElement owner)) return closest;
-        int compatible = -1;
-        int compatibleCount = Integer.MAX_VALUE;
-        for (var element : task.elements.getAllMembers(owner)) {
-            if (!(element instanceof ExecutableElement method)) continue;
-            int selected = overloadIndex(task, method, overloads);
-            if (selected < 0) continue;
-            int count = method.getParameters().size();
-            int capacity = method.isVarArgs() ? Math.max(count, required) : count;
-            if (compatible >= 0 && !((capacity >= required && capacity < compatibleCount)
-                    || (compatibleCount < required && capacity > compatibleCount))) continue;
-            if (acceptsArguments(task, invocation, method, arguments)) {
-                compatible = selected;
-                compatibleCount = capacity;
-            }
-        }
-        return compatible >= 0 ? compatible : closest;
+        return closest;
     }
 
     private static int overloadIndex(CompileTask task, ExecutableElement method, List<IndexedMember> overloads) {
@@ -219,91 +362,11 @@ public class SignatureProvider {
             if (type == null || type.getKind() == TypeKind.ERROR || type.getKind() == TypeKind.NONE) continue;
             var target = parameters.get(Math.min(i, parameters.size() - 1)).asType();
             if (method.isVarArgs() && i >= parameters.size() - 1
-                    && target instanceof javax.lang.model.type.ArrayType array
+                    && target instanceof ArrayType array
                     && !task.types.isAssignable(type, target)) target = array.getComponentType();
             if (!task.types.isAssignable(type, target)) return false;
         }
         return true;
-    }
-
-    private List<IndexedMember> resolveOverloads(
-            CompileTask task, CompilationUnitTree root, TreePath invokePath, MethodInvocationTree invoke) {
-        var select = invoke.getMethodSelect();
-        if (select instanceof IdentifierTree id) {
-            // Prefer the compiler-resolved owner (handles static imports, cross-module, inherited).
-            var resolved = resolveIdentifierOwner(task, invokePath, select, id.getName().toString());
-            if (!resolved.isEmpty()) return resolved;
-            var results = resolveUnqualifiedMethod(root, id);
-            if (results.isEmpty()) {
-                results = resolveStaticImportMethod(root, id.getName().toString());
-            }
-            return results;
-        }
-        if (select instanceof MemberSelectTree ms) {
-            return resolveQualifiedMethod(task, invokePath, ms);
-        }
-        return List.of();
-    }
-
-    private List<IndexedMember> resolveIdentifierOwner(
-            CompileTask task, TreePath invokePath, Tree methodSelect, String methodName) {
-        var selectPath = new TreePath(invokePath, methodSelect);
-        var element = task.trees.getElement(selectPath);
-        if (element == null) return List.of();
-        var owner = element.getEnclosingElement();
-        if (!(owner instanceof TypeElement type)) return List.of();
-        var ownerName = type.getQualifiedName().toString();
-        var isStatic = element.getModifiers().contains(javax.lang.model.element.Modifier.STATIC);
-        var overloads = index.methodOverloads(ownerName, methodName, isStatic);
-        if (!overloads.isEmpty()) return overloads;
-        // The element may be static-imported but recorded under instance context, or vice versa.
-        return index.methodOverloads(ownerName, methodName, !isStatic);
-    }
-
-    private List<IndexedMember> resolveStaticImportMethod(CompilationUnitTree root, String methodName) {
-        for (var imp : root.getImports()) {
-            if (!imp.isStatic()) continue;
-            var imported = imp.getQualifiedIdentifier().toString();
-            if (imported.endsWith(".*")) {
-                var ownerType = imported.substring(0, imported.length() - 2);
-                var results = index.methodOverloads(ownerType, methodName, true);
-                if (!results.isEmpty()) return results;
-            } else if (imported.endsWith("." + methodName)) {
-                var ownerType = imported.substring(0, imported.lastIndexOf('.'));
-                var results = index.methodOverloads(ownerType, methodName, true);
-                if (!results.isEmpty()) return results;
-            }
-        }
-        return List.of();
-    }
-
-    private List<IndexedMember> resolveUnqualifiedMethod(CompilationUnitTree root, IdentifierTree id) {
-        for (var decl : root.getTypeDecls()) {
-            if (!(decl instanceof ClassTree ct)) continue;
-            var qualifiedName = qualifiedClassName(root, ct);
-            if (qualifiedName == null) continue;
-            var results = index.methodOverloads(qualifiedName, id.getName().toString(), false);
-            if (!results.isEmpty()) return results;
-            results = index.methodOverloads(qualifiedName, id.getName().toString(), true);
-            if (!results.isEmpty()) return results;
-        }
-        return List.of();
-    }
-
-    private List<IndexedMember> resolveQualifiedMethod(
-            CompileTask task, TreePath invokePath, MemberSelectTree ms) {
-        var receiverPath = new TreePath(invokePath, ms.getExpression());
-        var qualifiedType = receiverTypeName(task, receiverPath);
-        if (qualifiedType == null) return List.of();
-        var isStatic = task.trees.getElement(receiverPath) instanceof TypeElement;
-        return index.methodOverloads(qualifiedType, ms.getIdentifier().toString(), isStatic);
-    }
-
-    private List<IndexedMember> resolveConstructors(
-            CompileTask task, CompilationUnitTree root, TreePath newClassPath, NewClassTree nc) {
-        var qualifiedType = constructorTypeName(task, newClassPath, root, nc);
-        if (qualifiedType == null) return List.of();
-        return index.constructors(qualifiedType);
     }
 
     /** Attributed type of a receiver expression, as a qualified name, or null if unresolved. */
@@ -321,11 +384,6 @@ public class SignatureProvider {
         return null;
     }
 
-    /**
-     * Qualified type of a {@code new X(...)}. For a diamond {@code new X<>(...)} with no inferable
-     * arguments the attributed mirror is an error type, so fall back to resolving the raw type name
-     * off the tree (the constructor overloads live on the raw type regardless of type arguments).
-     */
     private String constructorTypeName(
             CompileTask task, TreePath newClassPath, CompilationUnitTree root, NewClassTree nc) {
         var fromMirror = receiverTypeName(task, new TreePath(newClassPath, nc.getIdentifier()));
@@ -352,48 +410,7 @@ public class SignatureProvider {
         return simpleName;
     }
 
-    private MethodTree findSourceMethod(IndexedMember member) {
-        var source = compiler.findAnywhere(member.ownerType);
-        if (source.isEmpty()) return null;
-        var task = compiler.parse(source.get());
-        try {
-            return FindHelper.findMethod(task, member.ownerType, member.name, member.erasedParameterTypes);
-        } catch (RuntimeException notFound) {
-            // Source exists but this overload isn't located (e.g. erased-type mismatch); fall back
-            // to the indexed signature rather than aborting all overloads.
-            return null;
-        }
-    }
-
-    private String buildLabel(IndexedMember member, MethodTree method) {
-        var sb = new StringBuilder();
-        if (member.kind == CompletionItemKind.Constructor) {
-            var owner = member.ownerType;
-            sb.append(owner.substring(owner.lastIndexOf('.') + 1));
-        } else {
-            sb.append(method.getName());
-        }
-        sb.append('(');
-        var params = method.getParameters();
-        for (int i = 0; i < params.size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(params.get(i).getType()).append(' ').append(params.get(i).getName());
-        }
-        sb.append(')');
-        return sb.toString();
-    }
-
-    private List<ParameterInformation> buildParameters(MethodTree method) {
-        var result = new ArrayList<ParameterInformation>();
-        for (var p : method.getParameters()) {
-            var info = new ParameterInformation();
-            info.label = p.getType() + " " + p.getName();
-            result.add(info);
-        }
-        return result;
-    }
-
-    /** Signature from the index member when no source is available (bytecode-only dependency). */
+    /** Fallback for workspace declarations unavailable to this bounded compilation. */
     private String buildLabelFromIndex(IndexedMember member) {
         var name = member.kind == CompletionItemKind.Constructor
                 ? member.ownerType.substring(member.ownerType.lastIndexOf('.') + 1)

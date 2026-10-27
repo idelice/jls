@@ -236,6 +236,11 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
     }
 
     @Override
+    public boolean isTopLevelTypeOnClasspath(String name) {
+        return jdkClasses.contains(name) || classPathClasses.contains(name);
+    }
+
+    @Override
     public Set<String> imports() {
         var all = new HashSet<String>();
         for (var f : FileStore.all()) {

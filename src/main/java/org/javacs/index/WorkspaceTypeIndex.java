@@ -178,6 +178,10 @@ public class WorkspaceTypeIndex {
         return typesByQualifiedName.containsKey(qualifiedName);
     }
 
+    public boolean isAnnotationType(String qualifiedName) {
+        return typeInfo(qualifiedName).map(type -> type.annotationType).orElse(false);
+    }
+
     public List<Path> filesContainingToken(String simpleName) {
         // A module-scoped snapshot cannot rule out matches in other workspace files.
         var postings = filesByToken.get(simpleName);
@@ -319,6 +323,13 @@ public class WorkspaceTypeIndex {
         addDirectMembers(type, staticContext, list, seen);
         addInheritedMembers(qualifiedName, staticContext, list, seen);
         return list;
+    }
+
+    public List<IndexedMember> methodOverloads(String ownerType, String methodName, boolean staticContext) {
+        return members(ownerType, staticContext).stream()
+                .filter(member -> member.name.equals(methodName)
+                        && (member.kind == CompletionItemKind.Method || member.kind == CompletionItemKind.Constructor))
+                .toList();
     }
 
     public List<IndexedMember> constructors(String qualifiedName) {
@@ -1368,7 +1379,7 @@ public class WorkspaceTypeIndex {
                 && (classDecl.mods.flags & Flags.GENERATED_MEMBER) != 0;
     }
 
-    String visibleMemberKey(IndexedMember member, Predicate<String> containsType) {
+    public String visibleMemberKey(IndexedMember member, Predicate<String> containsType) {
         if (member.kind != CompletionItemKind.Method) return member.canonicalKey;
         var params = member.erasedParameterTypes == null ? new String[0] : member.erasedParameterTypes.clone();
         var owner = typesByQualifiedName.get(member.ownerType);

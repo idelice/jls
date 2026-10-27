@@ -94,7 +94,7 @@ final class CompletionIndexScheduler {
         }
     }
 
-    /** Drop the index. The compiler that produced it, and its external index, are gone. */
+    /** Drop workspace declarations when compiler inputs change. */
     void reset(String reason) {
         synchronized (server) {
             LOG.info("[index] reset reason=" + reason + " previous_scope=" + scope);
@@ -174,7 +174,7 @@ final class CompletionIndexScheduler {
             Iterable<ParseTask> parsed = () -> files.stream().map(compiler::parse).iterator();
             var index = WorkspaceTypeIndex.fromParseTrees(
                     parsed,
-                    (source, name) -> server.externalIndexForIndexing(source, compiler).containsType(name),
+                    (source, name) -> server.isClasspathTypeForIndexing(source, compiler, name),
                     (source, declaration) -> server.canReferenceModule(declaration, source));
             List<Path> drained;
             synchronized (server) {
@@ -237,7 +237,7 @@ final class CompletionIndexScheduler {
                                     .filter(type -> !replaced.contains(type.sourcePath))
                                     .filter(type -> server.canReferenceModule(type.sourcePath, source))
                                     .isPresent()
-                            || server.externalIndexForIndexing(source, compiler).containsType(name);
+                            || server.isClasspathTypeForIndexing(source, compiler, name);
             var delta = WorkspaceTypeIndex.fromParseTrees(
                     parseTasks, knownType,
                     (source, declaration) -> server.canReferenceModule(declaration, source));

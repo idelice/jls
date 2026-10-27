@@ -8,8 +8,6 @@ import java.util.concurrent.Executors;
 import java.util.logging.Logger;
 import javax.tools.JavaFileObject;
 import javax.tools.StandardLocation;
-import org.javacs.index.ExternalBinaryTypeIndex;
-import org.javacs.index.TypeIndexRouter;
 import org.javacs.index.WorkspaceTypeIndex;
 
 /** Resolves build metadata and owns one analysis environment per module/source scope. */
@@ -26,27 +24,24 @@ final class ModuleCompilerRegistry implements AutoCloseable {
 
     static final class ModuleCompiler implements AutoCloseable {
         final JavaCompilerService compiler;
-        final ExternalBinaryTypeIndex externalIndex;
         final Set<Path> sourceRoots;
         private long indexVersion = -1;
         private WorkspaceTypeIndex workspaceIndex = WorkspaceTypeIndex.EMPTY;
 
         ModuleCompiler(JavaCompilerService compiler, Set<Path> sourceRoots) {
             this.compiler = compiler;
-            this.externalIndex = new ExternalBinaryTypeIndex(compiler);
             this.sourceRoots = Set.copyOf(sourceRoots);
         }
 
-        synchronized TypeIndexRouter typeIndex(JavaLanguageServer.CompletionSnapshot snapshot) {
+        synchronized WorkspaceTypeIndex typeIndex(JavaLanguageServer.CompletionSnapshot snapshot) {
             if (indexVersion != snapshot.version()) {
                 workspaceIndex = snapshot.workspaceIndex().restrictTo(sourceRoots);
                 indexVersion = snapshot.version();
             }
-            return new TypeIndexRouter(workspaceIndex, externalIndex);
+            return workspaceIndex;
         }
 
         @Override public void close() {
-            externalIndex.close();
             compiler.close();
         }
     }
@@ -202,22 +197,22 @@ final class ModuleCompilerRegistry implements AutoCloseable {
         }
     }
 
-    TypeIndexRouter typeIndexFor(Path file) {
+    WorkspaceTypeIndex typeIndexFor(Path file) {
         var snapshot = server.completionSnapshotRef.get();
         var context = moduleCompilers.get(moduleCompilerKey(file));
-        return context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
+        return context == null ? snapshot.workspaceIndex() : context.typeIndex(snapshot);
     }
 
-    ExternalBinaryTypeIndex externalIndexForIndexing(Path file, JavaCompilerService parsingCompiler) {
-        if (!moduleScopedMaven && !moduleScopedGradle) return server.completionSnapshotRef.get().externalIndex();
+    boolean isClasspathTypeForIndexing(Path file, JavaCompilerService parsingCompiler, String name) {
+        if (!moduleScopedMaven && !moduleScopedGradle) return parsingCompiler.isTopLevelTypeOnClasspath(name);
         var context = moduleCompilers.get(moduleCompilerKey(file));
-        if (context != null) return context.externalIndex;
+        if (context != null) return context.compiler.isTopLevelTypeOnClasspath(name);
         for (var candidate : moduleCompilers.values()) {
             if (candidate.compiler == parsingCompiler && candidate.sourceRoots.stream().anyMatch(file::startsWith)) {
-                return candidate.externalIndex;
+                return candidate.compiler.isTopLevelTypeOnClasspath(name);
             }
         }
-        return ExternalBinaryTypeIndex.EMPTY;
+        return false;
     }
 
     CompilerProvider compilerForClass(String className) {

@@ -18,10 +18,8 @@ import javax.tools.JavaFileObject;
 import org.javacs.action.CodeActionProvider;
 import org.javacs.action.FindMethodDeclarationAt;
 import org.javacs.provider.CompletionProvider;
-import org.javacs.index.ExternalBinaryTypeIndex;
 import org.javacs.provider.SignatureProvider;
 import org.javacs.index.WorkspaceTypeIndex;
-import org.javacs.index.TypeIndexRouter;
 import org.javacs.fold.FoldProvider;
 import org.javacs.provider.HoverProvider;
 import org.javacs.provider.SymbolProvider;
@@ -53,22 +51,16 @@ class JavaLanguageServer extends LanguageServer {
 
     record CompletionSnapshot(
             WorkspaceTypeIndex workspaceIndex,
-            ExternalBinaryTypeIndex externalIndex,
-            TypeIndexRouter typeIndex,
             long version) {
         private static final CompletionSnapshot EMPTY =
-                create(WorkspaceTypeIndex.EMPTY, ExternalBinaryTypeIndex.EMPTY, 0);
+                create(WorkspaceTypeIndex.EMPTY, 0);
 
         private static CompletionSnapshot create(
                 WorkspaceTypeIndex workspaceIndex,
-                ExternalBinaryTypeIndex externalIndex,
                 long version) {
             var safeWorkspace = workspaceIndex == null ? WorkspaceTypeIndex.EMPTY : workspaceIndex;
-            var safeExternal = externalIndex == null  ? ExternalBinaryTypeIndex.EMPTY : externalIndex;
             return new CompletionSnapshot(
                     safeWorkspace,
-                    safeExternal,
-                    new TypeIndexRouter(safeWorkspace, safeExternal),
                     Math.max(0L, version));
         }
     }
@@ -127,9 +119,8 @@ class JavaLanguageServer extends LanguageServer {
         return moduleRegistry.compilerFor(file);
     }
 
-    ExternalBinaryTypeIndex externalIndexForIndexing(
-            Path file, JavaCompilerService parsingCompiler) {
-        return moduleRegistry.externalIndexForIndexing(file, parsingCompiler);
+    boolean isClasspathTypeForIndexing(Path file, JavaCompilerService parsingCompiler, String name) {
+        return moduleRegistry.isClasspathTypeForIndexing(file, parsingCompiler, name);
     }
 
     boolean canReferenceModule(Path declaration, Path candidate) {
@@ -137,28 +128,10 @@ class JavaLanguageServer extends LanguageServer {
     }
 
 
-    /** Replace the workspace declarations, keeping the external (dependency) index. */
+    /** Publish immutable workspace declarations. */
     void publishCompletionSnapshot(WorkspaceTypeIndex workspaceIndex, long version) {
-        var current = completionSnapshotRef.get();
-        publishCompletionSnapshot(workspaceIndex, current.externalIndex(), version);
-    }
-
-    void publishCompletionSnapshot(
-            WorkspaceTypeIndex workspaceIndex, ExternalBinaryTypeIndex externalIndex, long version) {
-        var snapshot = CompletionSnapshot.create(workspaceIndex, externalIndex, version);
-        completionIndexVersion.set(snapshot.version());
-        completionSnapshotRef.set(snapshot);
-    }
-
-
-
-    private void publishExternalBinaryIndexSnapshot() {
-        var currentSnapshot = completionSnapshotRef.get();
-        // Use the module-scoped compiler when available — scanning 107k classes from
-        // the union classpath is too slow. The active module's ~15k classes is sufficient.
-        var externalIndex = new ExternalBinaryTypeIndex(getOrCreateCompiler());
-        publishCompletionSnapshot(
-                currentSnapshot.workspaceIndex(), externalIndex, currentSnapshot.version());
+        completionIndexVersion.set(Math.max(0L, version));
+        completionSnapshotRef.set(CompletionSnapshot.create(workspaceIndex, version));
     }
 
     private synchronized void initializeCompilers(JsonObject clientSettings) {
@@ -166,7 +139,6 @@ class JavaLanguageServer extends LanguageServer {
         settings.initialize(workspaceRoot, clientSettings);
         try {
             createCompilers();
-            publishExternalBinaryIndexSnapshot();
         } finally {
             notifyWorkspaceInfo();
         }
@@ -204,7 +176,6 @@ class JavaLanguageServer extends LanguageServer {
         completionIndexScheduler.reset(trigger);
         try {
             createCompilers();
-            publishExternalBinaryIndexSnapshot();
             refreshStateForCompilerRecreated();
             for (var f : filterJavaFiles(FileStore.activeDocuments())) lint(f, false);
         } finally {
@@ -291,7 +262,7 @@ class JavaLanguageServer extends LanguageServer {
         if (inferred.mixedModules()) {
             notifyUser(
                     "maven_mixed_release_fallback",
-                    "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.", 
+                    "JLS detected mixed Maven module Java levels and fell back to the runtime/default compiler behavior for this workspace.",
                     MessageType.Warning);
             return new InferConfig.CompilerArgs(userExtraArgs, "fallback_mixed_modules", true);
         }
@@ -536,17 +507,16 @@ class JavaLanguageServer extends LanguageServer {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return Optional.empty();
         var file = Paths.get(params.textDocument.uri);
         var started = Instant.now();
-        // Completion is answered from the index. Until it covers this module, report an incomplete
-        // list so the client asks again, instead of doing the work on the LSP thread.
         completionIndexScheduler.ensureIndexed(file);
         if (!completionIndexScheduler.awaitReady(INDEX_WAIT_MS)) {
             LOG.info("[completion] index_not_ready file=" + file.getFileName() + " — returning incomplete");
             return Optional.of(new CompletionList(true, List.of()));
         }
         var snapshot = completionSnapshotRef.get();
-        var provider = new CompletionProvider(
-                compilerFor(file), moduleRegistry.typeIndexFor(file), snapshot.version(),
-                moduleRegistry.moduleCompilerKey(file));
+        var requestCompiler = compilerFor(file);
+        var index = moduleRegistry.typeIndexFor(file);
+        var scope = moduleRegistry.moduleCompilerKey(file);
+        var provider = new CompletionProvider(requestCompiler, index, snapshot.version(), scope);
         var list = provider.complete(file, params.position.line + 1, params.position.character + 1);
         if (list == CompletionProvider.NOT_SUPPORTED) return Optional.empty();
         LOG.fine(String.format("[perf] completion_request file=%s took=%dms",
@@ -562,7 +532,7 @@ class JavaLanguageServer extends LanguageServer {
                 : JsonHelper.GSON.fromJson(unresolved.data, CompletionData.class);
         var context = data == null ? null : moduleRegistry.moduleCompilers.get(data.compilerId);
         var requestCompiler = context == null ? getOrCreateCompiler() : context.compiler;
-        var index = context == null ? snapshot.typeIndex() : context.typeIndex(snapshot);
+        var index = context == null ? snapshot.workspaceIndex() : context.typeIndex(snapshot);
         new CompletionProvider(requestCompiler, index, snapshot.version(), data == null ? null : data.compilerId)
                 .resolveCompletionItem(unresolved);
         return unresolved;
@@ -696,7 +666,7 @@ class JavaLanguageServer extends LanguageServer {
                     new ReferenceProvider(
                                     compilerFor(file), file, line, column, this::compilerFor,
                                     this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles,
-                                    completionSnapshotRef.get().typeIndex()::filesContainingToken)
+                                    completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
                             .find();
             LOG.fine(String.format("[perf] references file=%s results=%d took=%dms",
                     file.getFileName(), found == ReferenceProvider.NOT_SUPPORTED ? 0 : found.size(),
@@ -743,7 +713,7 @@ class JavaLanguageServer extends LanguageServer {
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
                         moduleRegistry::includeReferenceSources,
-                        completionSnapshotRef.get().typeIndex()::filesContainingToken)
+                        completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
                 .prepare(file, position.position.line + 1, position.position.character + 1);
     }
 
@@ -756,7 +726,7 @@ class JavaLanguageServer extends LanguageServer {
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
                         moduleRegistry::includeReferenceSources,
-                        completionSnapshotRef.get().typeIndex()::filesContainingToken)
+                        completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
                 .incomingCalls(params.item);
     }
 
@@ -769,7 +739,7 @@ class JavaLanguageServer extends LanguageServer {
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
                         moduleRegistry::includeReferenceSources,
-                        completionSnapshotRef.get().typeIndex()::filesContainingToken)
+                        completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
                 .outgoingCalls(params.item);
     }
 

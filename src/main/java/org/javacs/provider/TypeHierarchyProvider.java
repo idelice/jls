@@ -3,15 +3,17 @@ package org.javacs.provider;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.logging.Logger;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.TypeKind;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
-import org.javacs.index.TypeIndexRouter;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.SymbolKind;
@@ -23,12 +25,12 @@ public final class TypeHierarchyProvider {
     private static final Logger LOG = Logger.getLogger("main");
 
     private final CompilerProvider compiler;
-    private final Function<Path, TypeIndexRouter> typeIndexForFile;
+    private final Function<Path, WorkspaceTypeIndex> typeIndexForFile;
     private final Function<Path, CompilerProvider> compilerForFile;
 
     public TypeHierarchyProvider(
             CompilerProvider compiler,
-            Function<Path, TypeIndexRouter> typeIndexForFile,
+            Function<Path, WorkspaceTypeIndex> typeIndexForFile,
             Function<Path, CompilerProvider> compilerForFile) {
         this.compiler = compiler;
         this.typeIndexForFile = typeIndexForFile;
@@ -70,9 +72,26 @@ public final class TypeHierarchyProvider {
         var file = Path.of(item.uri);
         try {
             var index = typeIndexForFile.apply(file);
-            var names = supertypes
-                    ? index.directSupertypes(qualifiedName)
-                    : index.workspaceSubTypes(qualifiedName);
+            var names = new LinkedHashSet<String>();
+            var indexed = index.ownsTypeOrEnclosingType(qualifiedName);
+            if (!supertypes) {
+                names.addAll(index.subtypes(qualifiedName));
+            } else if (indexed) {
+                names.addAll(index.directSupertypes(qualifiedName));
+            } else {
+                try (var task = compilerForFile.apply(file).compile(file)) {
+                    var type = task.elements.getTypeElement(qualifiedName);
+                    if (type != null && type.asType().getKind() != TypeKind.ERROR) {
+                        var superclass = type.getSuperclass();
+                        if (superclass.getKind() != TypeKind.NONE) {
+                            names.add(task.types.erasure(superclass).toString());
+                        }
+                        for (var implemented : type.getInterfaces()) {
+                            names.add(task.types.erasure(implemented).toString());
+                        }
+                    }
+                }
+            }
             var items = new ArrayList<TypeHierarchyItem>();
             for (var name : names) {
                 var built = typeHierarchyItemFor(name, file);
@@ -108,7 +127,8 @@ public final class TypeHierarchyProvider {
     /** Parse the declaring source of an external type to get its declaration location. */
     private Location parseTypeLocation(Path contextFile, String qualifiedName) {
         var provider = compilerForFile.apply(contextFile);
-        var found = provider.findAnywhere(qualifiedName);
+        var found = provider.findAnywhere(qualifiedName)
+                .or(() -> provider.decompileClass(qualifiedName).map(org.javacs.SourceFileObject::new));
         if (found.isEmpty()) return null;
         var parse = provider.parse(found.get());
         try {
