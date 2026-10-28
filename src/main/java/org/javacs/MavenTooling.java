@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
@@ -890,7 +891,7 @@ public final class MavenTooling {
                 if (!Files.isExecutable(candidate)) {
                     try {
                         var perms = Files.getPosixFilePermissions(candidate);
-                        perms.add(java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE);
+                        perms.add(PosixFilePermission.OWNER_EXECUTE);
                         Files.setPosixFilePermissions(candidate, perms);
                         LOG.info("[maven] set executable bit on wrapper: " + candidate);
                     } catch (IOException | UnsupportedOperationException e) {
