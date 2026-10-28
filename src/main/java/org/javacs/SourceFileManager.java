@@ -133,7 +133,9 @@ class SourceFileManager extends ForwardingJavaFileManager<StandardJavaFileManage
     public JavaFileObject getJavaFileForInput(Location location, String className, JavaFileObject.Kind kind)
             throws IOException {
         if (location == StandardLocation.CLASS_PATH && kind == JavaFileObject.Kind.CLASS
-                && workspaceType.test(className)) return null;
+                && workspaceType.test(className)) {
+            return null;
+        }
         if (location == StandardLocation.SOURCE_PATH && "module-info".equals(className)) return null;
         if (bounded && location == StandardLocation.SOURCE_PATH) {
             // Serve only open/dirty buffers; never read an arbitrary sibling source from disk.

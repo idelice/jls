@@ -17,7 +17,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.logging.Logger;
-import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.w3c.dom.Document;
@@ -32,52 +31,25 @@ import org.w3c.dom.NodeList;
 public final class MavenTooling {
     private static final Logger LOG = Logger.getLogger("main");
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-    private static final int CACHE_VERSION = 6;
+    private static final int CACHE_VERSION = 7;
 
     static final Path NOT_FOUND = Paths.get("");
 
-    private static final Pattern DEPENDENCY = Pattern.compile(
-            "^(?:\\[INFO\\]\\s+)?\\s*(.*:.*:.*:.*:.*):((?:/|[A-Za-z]:\\\\).*?)( \\(optional\\))?( -- module .*)?$");
-
-    private static final String DEPENDENCY_LIST = "dependency:list";
-    private static final String DEPENDENCY_SOURCES = "dependency:sources";
     private static final String EFFECTIVE_POM =
             "org.apache.maven.plugins:maven-help-plugin:3.5.2:effective-pom";
 
     private MavenTooling() {}
 
-    static final class CompilerArgs {
-        final List<String> args;
-        final String source;
-        final boolean mixedModules;
-
-        CompilerArgs(List<String> args, String source, boolean mixedModules) {
-            this.args = List.copyOf(args);
-            this.source = source;
-            this.mixedModules = mixedModules;
-        }
-
-        static CompilerArgs none() { return new CompilerArgs(List.of(), "none", false); }
-        List<String> args() { return args; }
-        String source() { return source; }
-        boolean mixedModules() { return mixedModules; }
-    }
-
     static final record FileFingerprint(String path, long size, long contentHash) {
         FileFingerprint() { this(null, 0, 0); }
     }
 
-    static final record MavenInferenceCacheEntry(List<FileFingerprint> pomInputs, FileFingerprint settings, List<String> dependencies) {}
     static final record MavenInferenceCacheFile(
             int version,
-            Map<String, MavenInferenceCacheEntry> entries,
-            MavenCompilerLevelCacheEntry compilerLevel,
-            MavenModuleGraphCacheEntry moduleGraph) {}
-    static final record MavenCompilerLevelCacheEntry(List<FileFingerprint> pomInputs, FileFingerprint settings, List<String> args, String source, boolean mixedModules) {}
-    static final record MavenModuleGraphCacheEntry(
-            List<FileFingerprint> pomInputs,
             FileFingerprint settings,
-            List<CachedMavenModule> modules) {}
+            List<FileFingerprint> pomInputs,
+            List<CachedMavenModule> modules,
+            Map<String, List<String>> dependencyGoals) {}
     static final record CachedMavenModule(
             String projectPath,
             String projectDir,
@@ -113,7 +85,6 @@ public final class MavenTooling {
                 + " poms=" + cachedInputsSnapshot.pomInputs().size());
     }
 
-    /** Invalidate the snapshot (forces recomputation on next access). */
     static void invalidateCacheInputsSnapshot() {
         cachedInputsSnapshot = null;
         cachedInputsWorkspaceRoot = null;
@@ -135,7 +106,6 @@ public final class MavenTooling {
         }
     }
     static final record MavenWorkspace(Path buildRoot, ModuleGraph graph) {}
-    private record ResolvedMavenModel(ModuleGraph graph, CompilerArgs compilerArgs) {}
 
     // =========================================================================
     // Module Graph Resolution
@@ -145,7 +115,8 @@ public final class MavenTooling {
             Path workspaceRoot, Path mavenHome, Map<String, String> envVars) {
         var pom = normalizePath(workspaceRoot).resolve("pom.xml");
         if (!Files.exists(pom)) return ModuleGraph.EMPTY;
-        return resolveMavenModel(pom, mavenHome, envVars).graph();
+        refreshCacheInputsSnapshot(workspaceRoot, mavenHome);
+        return resolveMavenModel(pom, mavenHome, envVars);
     }
 
     static MavenWorkspace resolveWorkspace(
@@ -153,11 +124,16 @@ public final class MavenTooling {
         var workspace = normalizePath(workspaceRoot);
         var buildRoot = normalizePath(candidateBuildRoot);
         var graph = resolveModuleGraph(buildRoot, mavenHome, envVars);
-        if (ownsWorkspace(graph, workspace)) return new MavenWorkspace(buildRoot, graph);
+        if (ownsWorkspace(graph, workspace)) {
+            return new MavenWorkspace(buildRoot, graph);
+        }
 
         var projectRoot = findProjectRoot(workspace);
-        if (projectRoot == null || projectRoot.equals(buildRoot)) return new MavenWorkspace(buildRoot, graph);
-        return new MavenWorkspace(projectRoot, resolveModuleGraph(projectRoot, mavenHome, envVars));
+        if (projectRoot == null || projectRoot.equals(buildRoot)) {
+            return new MavenWorkspace(buildRoot, graph);
+        }
+        var result = new MavenWorkspace(projectRoot, resolveModuleGraph(projectRoot, mavenHome, envVars));
+        return result;
     }
 
     private static boolean ownsWorkspace(ModuleGraph graph, Path workspace) {
@@ -172,7 +148,9 @@ public final class MavenTooling {
 
     static ModuleGraph parseEffectivePomModuleGraph(Path workspaceRoot, Document document) {
         var projectElements = effectiveProjects(document);
-        if (projectElements.isEmpty()) return ModuleGraph.EMPTY;
+        if (projectElements.isEmpty()) {
+            return ModuleGraph.EMPTY;
+        }
 
         var projects = projectElements.stream().map(EffectiveProject::new).toList();
         EffectiveProject rootProject;
@@ -180,7 +158,9 @@ public final class MavenTooling {
             rootProject = projects.getFirst();
         } else {
             rootProject = findEffectiveProject(workspaceRoot.resolve("pom.xml"), projects, Set.of());
-            if (rootProject == null) return ModuleGraph.EMPTY;
+            if (rootProject == null) {
+                return ModuleGraph.EMPTY;
+            }
         }
 
         var modules = new LinkedHashMap<String, ResolvedModule>();
@@ -190,7 +170,9 @@ public final class MavenTooling {
                 rootProject,
                 projects,
                 modules,
-                new HashSet<>())) return ModuleGraph.EMPTY;
+                new HashSet<>())) {
+            return ModuleGraph.EMPTY;
+        }
 
         var coordinates = new HashMap<String, String>();
         for (var entry : modules.entrySet()) coordinates.put(entry.getValue().project.coordinates(), entry.getKey());
@@ -215,7 +197,7 @@ public final class MavenTooling {
                     .filter(Objects::nonNull)
                     .toList();
             var compilerArgs = parseCompilerArgs(project.element);
-            var sourceCompatibility = compilerArgs.args().size() < 2 ? null : compilerArgs.args().get(1);
+            var sourceCompatibility = compilerArgs.size() < 2 ? null : compilerArgs.get(1);
             result.put(entry.getKey(), new ModuleGraph.ModuleInfo(
                     entry.getKey(),
                     module.directory,
@@ -227,14 +209,14 @@ public final class MavenTooling {
                     dependencies,
                     testDependencies,
                     sourceCompatibility,
-                    compilerArgs.args(),
+                    compilerArgs,
                     project.artifactId,
                     project.coordinates()));
         }
         return new ModuleGraph(Collections.unmodifiableMap(result));
     }
 
-    private static ResolvedMavenModel resolveMavenModel(
+    private static ModuleGraph resolveMavenModel(
             Path pomXml, Path mavenHome, Map<String, String> envVars) {
         var cacheHome = cacheHome(envVars);
         var cached = loadCachedMavenModel(pomXml, mavenHome, cacheHome);
@@ -246,30 +228,21 @@ public final class MavenTooling {
         CacheAudit.miss("infer_config.maven_model");
 
         var effectivePom = mvnEffectivePom(pomXml, envVars);
-        if (effectivePom == NOT_FOUND) return new ResolvedMavenModel(ModuleGraph.EMPTY, CompilerArgs.none());
+        if (effectivePom == NOT_FOUND) {
+            return ModuleGraph.EMPTY;
+        }
         try {
             var document = parseXml(effectivePom);
-            if (document == null) return new ResolvedMavenModel(ModuleGraph.EMPTY, CompilerArgs.none());
-            var model = new ResolvedMavenModel(
-                    parseEffectivePomModuleGraph(normalizePath(pomXml).getParent(), document),
-                    compilerArgs(effectiveProjects(document)));
-            storeCachedMavenModel(pomXml, mavenHome, cacheHome, model);
+            if (document == null) {
+                return ModuleGraph.EMPTY;
+            }
+            var graph = parseEffectivePomModuleGraph(normalizePath(pomXml).getParent(), document);
+            storeCachedMavenModel(pomXml, mavenHome, cacheHome, graph);
             CacheAudit.store("infer_config.maven_model");
-            return model;
+            return graph;
         } finally {
             deleteIfExists(effectivePom);
         }
-    }
-
-    private static CompilerArgs compilerArgs(List<Element> projects) {
-        var levels = new LinkedHashMap<List<String>, CompilerArgs>();
-        for (var project : projects) {
-            if ("pom".equals(textOf(project, "packaging"))) continue;
-            var args = parseCompilerArgs(project);
-            if (!args.args().isEmpty()) levels.putIfAbsent(args.args(), args);
-        }
-        if (levels.size() > 1) return new CompilerArgs(List.of(), "fallback_mixed_modules", true);
-        return levels.isEmpty() ? CompilerArgs.none() : levels.values().iterator().next();
     }
 
     private record ResolvedModule(Path directory, EffectiveProject project) {}
@@ -468,76 +441,6 @@ public final class MavenTooling {
     // Dependency Resolution
     // =========================================================================
 
-    static MavenDependencies resolveDependencies(Path pomXml, Path mavenHome, Map<String, String> envVars, String modulePath) {
-        Objects.requireNonNull(pomXml, "pom.xml path is null");
-        Objects.requireNonNull(mavenHome, "mavenHome is null");
-        var started = Instant.now();
-        var cacheHome = cacheHome(envVars);
-
-        var cachedClasspath = loadCachedMavenDependencies(pomXml, DEPENDENCY_LIST, mavenHome, cacheHome, modulePath);
-        var cachedSources = loadCachedMavenDependencies(pomXml, DEPENDENCY_SOURCES, mavenHome, cacheHome, modulePath);
-        if (cachedClasspath != null && cachedSources != null) {
-            CacheAudit.hit("infer_config.maven_dependencies");
-            CacheAudit.load("infer_config.maven_dependencies");
-            LOG.info(String.format(
-                    "[perf] infer_config_maven goal=combined source=cache_disk classpath=%d sources=%d took=%dms",
-                    cachedClasspath.size(), cachedSources.size(),
-                    Duration.between(started, Instant.now()).toMillis()));
-            return new MavenDependencies(cachedClasspath, cachedSources);
-        }
-        CacheAudit.miss("infer_config.maven_dependencies");
-
-        try {
-            var cmd = new ArrayList<>(List.of(
-                findMvnCommand(normalizePath(pomXml).getParent(), envVars),
-                "--batch-mode", "-U",
-                DEPENDENCY_LIST, DEPENDENCY_SOURCES,
-                "-DincludeScope=test", "-DoutputAbsoluteArtifactFilename=true"
-            ));
-            if (modulePath != null) {
-                cmd.add("-pl"); cmd.add(modulePath); cmd.add("-am");
-            }
-            var output = Files.createTempFile("jls-maven-output", ".txt");
-            var workingDirectory = pomXml.toAbsolutePath().getParent().toFile();
-            LOG.fine("[maven-exec] command=" + String.join(" ", cmd) + " reason=dependency_resolution workingDir=" + workingDirectory);
-            var processStarted = Instant.now();
-            var process = trackProcess(new ProcessBuilder()
-                    .command(cmd).directory(workingDirectory)
-                    .redirectError(ProcessBuilder.Redirect.INHERIT)
-                    .redirectOutput(output.toFile()).start());
-
-            int result;
-            try { result = process.waitFor(); } finally { untrackProcess(process); }
-            LOG.info("[maven-exec] reason=dependency_resolution exit=" + result + " took="
-                    + Duration.between(processStarted, Instant.now()).toMillis() + "ms");
-            if (result != 0) {
-                return new MavenDependencies(Set.of(), Set.of());
-            }
-
-            var classpath = new HashSet<Path>();
-            var sources = new HashSet<Path>();
-            for (var line : Files.exists(output) ? Files.readAllLines(output) : List.<String>of()) {
-                var jar = readDependency(line);
-                if (jar == NOT_FOUND) continue;
-                if (jar.getFileName().toString().contains("-sources")) sources.add(jar);
-                else classpath.add(jar);
-            }
-            LOG.info(String.format(
-                    "[perf] infer_config_maven goal=combined source=fresh classpath=%d sources=%d process=%dms total=%dms",
-                    classpath.size(), sources.size(),
-                    Duration.between(processStarted, Instant.now()).toMillis(),
-                    Duration.between(started, Instant.now()).toMillis()));
-            var immutableClasspath = Set.copyOf(classpath);
-            var immutableSources = Set.copyOf(sources);
-            storeCachedMavenDependencies(pomXml, mavenHome, cacheHome, Map.of(DEPENDENCY_LIST, immutableClasspath), modulePath);
-            storeCachedMavenDependencies(pomXml, mavenHome, cacheHome, Map.of(DEPENDENCY_SOURCES, immutableSources), modulePath);
-            CacheAudit.store("infer_config.maven_dependencies");
-            return new MavenDependencies(immutableClasspath, immutableSources);
-        } catch (InterruptedException | IOException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     static MavenDependencies resolveModuleDependencies(
             Path pomXml, Path mavenHome, Map<String, String> envVars, ModuleGraph graph,
             ModuleGraph.ModuleInfo module, boolean testSources) {
@@ -547,7 +450,8 @@ public final class MavenTooling {
         var scope = testSources ? "test" : "main";
         var classpath = loadCachedMavenDependencies(pomXml, "source-classpath-" + scope, mavenHome, cacheHome, selector);
         var sourceRoots = loadCachedMavenDependencies(pomXml, "source-roots-" + scope, mavenHome, cacheHome, selector);
-        if (classpath == null || sourceRoots == null || classpath.stream().anyMatch(path -> !Files.exists(path))) {
+        var needsResolution = classpath == null || sourceRoots == null || classpath.stream().anyMatch(path -> !Files.exists(path));
+        if (needsResolution) {
             var resolved = resolveSourceDependencies(buildRoot, envVars, module, selector);
             var cache = new LinkedHashMap<String, Set<Path>>();
             for (var selectedScope : List.of("main", "test")) {
@@ -615,7 +519,9 @@ public final class MavenTooling {
     private static Path dependencyExtension;
 
     private static synchronized Path dependencyExtension() throws IOException {
-        if (dependencyExtension != null) return dependencyExtension;
+        if (dependencyExtension != null) {
+            return dependencyExtension;
+        }
         try (var resource = MavenTooling.class.getResourceAsStream("/org/javacs/maven/jls-maven-extension.jar")) {
             if (resource == null) throw new IOException("Missing Maven dependency extension");
             var jar = Files.createTempFile("jls-maven-extension", ".jar");
@@ -639,40 +545,42 @@ public final class MavenTooling {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, modulePath);
         var cache = readCacheFile(cacheFile);
-        if (cache == null || cache.version() != CACHE_VERSION || cache.entries() == null) {
+        if (cache == null || cache.version() != CACHE_VERSION || cache.dependencyGoals() == null) {
             LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_cache_file");
             return null;
         }
-        var entry = cache.entries().get(goal);
-        if (entry == null) {
+        var dependencies = cache.dependencyGoals().get(goal);
+        if (dependencies == null) {
             LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_entry");
             return null;
         }
         var inputs = getCacheInputs(workspaceRoot, mavenHome);
-        if (!Objects.equals(entry.pomInputs(), inputs.pomInputs())
-                || !Objects.equals(entry.settings(), inputs.settings())) {
+        if (!Objects.equals(cache.pomInputs(), inputs.pomInputs())
+                || !Objects.equals(cache.settings(), inputs.settings())) {
             LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=fingerprint_mismatch");
             return null;
         }
-        LOG.fine("[maven-cache] hit goal=" + goal + " module=" + modulePath + " deps=" + entry.dependencies().size());
+        LOG.fine("[maven-cache] hit goal=" + goal + " module=" + modulePath + " deps=" + dependencies.size());
         var result = new LinkedHashSet<Path>();
-        for (var dependency : entry.dependencies()) result.add(Paths.get(dependency));
+        for (var dependency : dependencies) result.add(Paths.get(dependency));
         return Set.copyOf(result);
     }
 
-    private static ResolvedMavenModel loadCachedMavenModel(
+    private static ModuleGraph loadCachedMavenModel(
             Path pomXml, Path mavenHome, Path cacheHome) {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cache = readCacheFile(workspaceCacheFile(workspaceRoot, cacheHome, null));
-        if (cache == null || cache.version() != CACHE_VERSION || cache.compilerLevel() == null || cache.moduleGraph() == null) return null;
+        if (cache == null || cache.version() != CACHE_VERSION || cache.modules() == null) {
+            return null;
+        }
         var inputs = getCacheInputs(workspaceRoot, mavenHome);
-        if (!Objects.equals(cache.moduleGraph().pomInputs(), inputs.pomInputs())
-                || !Objects.equals(cache.moduleGraph().settings(), inputs.settings())
-                || !Objects.equals(cache.compilerLevel().pomInputs(), inputs.pomInputs())
-                || !Objects.equals(cache.compilerLevel().settings(), inputs.settings())) return null;
+        if (!Objects.equals(cache.pomInputs(), inputs.pomInputs())
+                || !Objects.equals(cache.settings(), inputs.settings())) {
+            return null;
+        }
 
         var modules = new LinkedHashMap<String, ModuleGraph.ModuleInfo>();
-        for (var cached : cache.moduleGraph().modules()) {
+        for (var cached : cache.modules()) {
             var sourceDirs = cached.sourceDirs() == null
                     ? List.<Path>of()
                     : cached.sourceDirs().stream().map(Paths::get).toList();
@@ -691,22 +599,16 @@ public final class MavenTooling {
                     cached.artifactId(),
                     cached.coordinates()));
         }
-        var compiler = cache.compilerLevel();
-        return new ResolvedMavenModel(
-                new ModuleGraph(Collections.unmodifiableMap(modules)),
-                new CompilerArgs(
-                        compiler.args() == null ? List.of() : compiler.args(),
-                        compiler.source() == null ? "none" : compiler.source(),
-                        compiler.mixedModules()));
+        return new ModuleGraph(Collections.unmodifiableMap(modules));
     }
 
     private static void storeCachedMavenModel(
-            Path pomXml, Path mavenHome, Path cacheHome, ResolvedMavenModel model) {
+            Path pomXml, Path mavenHome, Path cacheHome, ModuleGraph graph) {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, null);
         var cache = readCacheFile(cacheFile);
         var inputs = getCacheInputs(workspaceRoot, mavenHome);
-        var modules = model.graph().modules().values().stream()
+        var modules = graph.modules().values().stream()
                 .map(module -> new CachedMavenModule(
                         module.projectPath(),
                         module.projectDir().toString(),
@@ -721,19 +623,21 @@ public final class MavenTooling {
                         module.artifactId(),
                         module.coordinates()))
                 .toList();
-        var compilerArgs = model.compilerArgs();
-        var compiler = new MavenCompilerLevelCacheEntry(
-                inputs.pomInputs(), inputs.settings(),
-                compilerArgs.args(), compilerArgs.source(), compilerArgs.mixedModules());
-        var graph = new MavenModuleGraphCacheEntry(inputs.pomInputs(), inputs.settings(), modules);
+        // Preserve any dependency goals already written for this (root) module, but only if
+        // their fingerprint still matches the current generation; otherwise drop them.
+        var goals = cache != null && cache.dependencyGoals() != null
+                && Objects.equals(cache.pomInputs(), inputs.pomInputs())
+                && Objects.equals(cache.settings(), inputs.settings())
+                ? cache.dependencyGoals() : Map.<String, List<String>>of();
         try {
             Files.createDirectories(cacheFile.getParent());
             try (Writer writer = Files.newBufferedWriter(cacheFile)) {
                 GSON.toJson(new MavenInferenceCacheFile(
                         CACHE_VERSION,
-                        cache == null || cache.entries() == null ? Map.of() : cache.entries(),
-                        compiler,
-                        graph), writer);
+                        inputs.settings(),
+                        inputs.pomInputs(),
+                        modules,
+                        goals), writer);
             }
         } catch (IOException e) {
             LOG.fine(String.format("Failed to write Maven model cache %s: %s", cacheFile, e.getMessage()));
@@ -749,24 +653,28 @@ public final class MavenTooling {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, modulePath);
         var cache = readCacheFile(cacheFile);
-        var entries = new LinkedHashMap<String, MavenInferenceCacheEntry>();
-        if (cache != null && cache.entries() != null) entries.putAll(cache.entries());
         var inputs = getCacheInputs(workspaceRoot, mavenHome);
+        // Keep existing modules/goals only if their fingerprint still matches this generation.
+        var sameGeneration = cache != null
+                && Objects.equals(cache.pomInputs(), inputs.pomInputs())
+                && Objects.equals(cache.settings(), inputs.settings());
+        var goals = new LinkedHashMap<String, List<String>>();
+        if (sameGeneration && cache.dependencyGoals() != null) goals.putAll(cache.dependencyGoals());
+        var modules = sameGeneration && cache.modules() != null ? cache.modules() : List.<CachedMavenModule>of();
         for (var dependencySet : dependencies.entrySet()) {
             var dependencyStrings = dependencySet.getValue().stream()
                     .map(path -> path.toAbsolutePath().normalize().toString()).sorted().toList();
-            entries.put(
-                    dependencySet.getKey(),
-                    new MavenInferenceCacheEntry(inputs.pomInputs(), inputs.settings(), dependencyStrings));
+            goals.put(dependencySet.getKey(), dependencyStrings);
         }
         try {
             Files.createDirectories(cacheFile.getParent());
             try (Writer writer = Files.newBufferedWriter(cacheFile)) {
                 GSON.toJson(new MavenInferenceCacheFile(
                         CACHE_VERSION,
-                        entries,
-                        cache == null ? null : cache.compilerLevel(),
-                        cache == null ? null : cache.moduleGraph()), writer);
+                        inputs.settings(),
+                        inputs.pomInputs(),
+                        modules,
+                        goals), writer);
             }
         } catch (IOException e) {
             LOG.fine(String.format("Failed to write Maven cache %s: %s", cacheFile, e.getMessage()));
@@ -774,9 +682,12 @@ public final class MavenTooling {
     }
 
     private static MavenInferenceCacheFile readCacheFile(Path cacheFile) {
-        if (!Files.exists(cacheFile)) return null;
+        if (!Files.exists(cacheFile)) {
+            return null;
+        }
         try (Reader reader = Files.newBufferedReader(cacheFile)) {
-            return GSON.fromJson(reader, MavenInferenceCacheFile.class);
+            var cache = GSON.fromJson(reader, MavenInferenceCacheFile.class);
+            return cache;
         } catch (IOException | JsonParseException e) {
             LOG.fine(String.format("Failed to read Maven cache file %s: %s", cacheFile, e.getMessage()));
             return null;
@@ -787,7 +698,8 @@ public final class MavenTooling {
         var normalizedRoot = normalizePath(workspaceRoot);
         var dir = workspaceCacheDirectory(normalizedRoot, cacheHome);
         var moduleDir = (modulePath == null || modulePath.isBlank()) ? "root" : modulePath.replace(",", "_").replace("/", "_");
-        return dir.resolve(moduleDir).resolve("maven-inference.json");
+        var result = dir.resolve(moduleDir).resolve("maven-inference.json");
+        return result;
     }
 
     private static Path workspaceCacheDirectory(Path workspaceRoot, Path cacheHome) {
@@ -800,10 +712,10 @@ public final class MavenTooling {
     }
 
     private static List<FileFingerprint> workspacePomFingerprints(Path workspaceRoot) {
-        return workspacePomFiles(workspaceRoot).stream()
-                .map(MavenTooling::fingerprintExistingFile)
-                .sorted(Comparator.comparing(FileFingerprint::path))
-                .toList();
+        var poms = workspacePomFiles(workspaceRoot);
+        var fingerprints = poms.stream().map(MavenTooling::fingerprintExistingFile)
+                .sorted(Comparator.comparing(FileFingerprint::path)).toList();
+        return fingerprints;
     }
 
     private static boolean isGeneratedPom(Path pom) {
@@ -827,30 +739,11 @@ public final class MavenTooling {
         return Files.exists(path) ? fingerprintExistingFile(path) : null;
     }
 
-    // =========================================================================
-    // Compiler Args Inference
-    // =========================================================================
-
-    static CompilerArgs inferCompilerArgs(Path pomXml, Path mavenHome, Map<String, String> envVars) {
-        Objects.requireNonNull(pomXml, "pom.xml path is null");
-        Objects.requireNonNull(mavenHome, "mavenHome is null");
-        var started = Instant.now();
-        var inferred = resolveMavenModel(pomXml, mavenHome, envVars).compilerArgs();
-        logCompilerArgsInference("maven_model", inferred, started);
-        return inferred;
-    }
-
-    private static void logCompilerArgsInference(String source, CompilerArgs inferred, Instant started) {
-        LOG.info(String.format("[perf] infer_config_maven_compiler source=%s selected=%s args=%d took=%dms",
-                source, inferred.source(), inferred.args().size(),
-                Duration.between(started, Instant.now()).toMillis()));
-    }
-
-    private static CompilerArgs parseCompilerArgs(Element project) {
+    private static List<String> parseCompilerArgs(Element project) {
         var release = nestedText(project, "properties", "maven.compiler.release");
-        if (isConcrete(release)) return new CompilerArgs(List.of("--release", release), "maven_release", false);
+        if (isConcrete(release)) return List.of("--release", release);
         var pluginRelease = compilerPluginRelease(project);
-        if (isConcrete(pluginRelease)) return new CompilerArgs(List.of("--release", pluginRelease), "maven_release", false);
+        if (isConcrete(pluginRelease)) return List.of("--release", pluginRelease);
         var source = nestedText(project, "properties", "maven.compiler.source");
         var target = nestedText(project, "properties", "maven.compiler.target");
         if (isConcrete(source) && isConcrete(target)) return sourceTargetArgs(source, target);
@@ -862,13 +755,13 @@ public final class MavenTooling {
         return plugin == null ? null : nestedText(plugin, "configuration", "release");
     }
 
-    private static CompilerArgs compilerPluginSourceTarget(Element project) {
+    private static List<String> compilerPluginSourceTarget(Element project) {
         var plugin = compilerPlugin(project);
-        if (plugin == null) return CompilerArgs.none();
+        if (plugin == null) return List.of();
         var source = nestedText(plugin, "configuration", "source");
         var target = nestedText(plugin, "configuration", "target");
         return !isConcrete(source) || !isConcrete(target)
-                ? CompilerArgs.none() : sourceTargetArgs(source, target);
+                ? List.of() : sourceTargetArgs(source, target);
     }
 
     private static Element compilerPlugin(Element project) {
@@ -880,8 +773,8 @@ public final class MavenTooling {
         return null;
     }
 
-    private static CompilerArgs sourceTargetArgs(String source, String target) {
-        return new CompilerArgs(List.of("-source", source, "-target", target), "maven_source_target", false);
+    private static List<String> sourceTargetArgs(String source, String target) {
+        return List.of("-source", source, "-target", target);
     }
 
     private static Path mvnEffectivePom(Path pomXml, Map<String, String> envVars) {
@@ -932,12 +825,6 @@ public final class MavenTooling {
             if (Files.exists(directory.resolve("pom.xml"))) return directory;
         }
         return null;
-    }
-
-    static String modulePath(ModuleGraph graph, Path buildRoot, Path workspaceRoot) {
-        var module = graph.moduleForFile(normalizePath(workspaceRoot));
-        if (module.isEmpty() || module.get().projectDir().equals(normalizePath(buildRoot))) return null;
-        return normalizePath(buildRoot).relativize(module.get().projectDir()).toString();
     }
 
     private static boolean declaresModuleContaining(Path pom, Path projectDir, Path workspace) {
@@ -1011,8 +898,8 @@ public final class MavenTooling {
                         continue;
                     }
                 }
-                if (!validateWrapper(candidate)) {
-                    LOG.warning("[maven] wrapper '" + candidate + "' is broken (missing .mvn/wrapper/ files?)."
+                if (wrapperJarMismatch(dir)) {
+                    LOG.warning("[maven] wrapper '" + candidate + "' has a SHA-256 mismatch on maven-wrapper.jar."
                             + " Falling back to system mvn; run 'mvn -N wrapper:wrapper' to repair it.");
                     break;
                 }
@@ -1023,7 +910,8 @@ public final class MavenTooling {
 
         // 3. System mvn
         LOG.fine("[maven] using system mvn");
-        return getMvnCommand(envVars);
+        var command = getMvnCommand(envVars);
+        return command;
     }
 
     private static String findMvnd(Map<String, String> envVars) {
@@ -1038,18 +926,28 @@ public final class MavenTooling {
         return findExecutableOnPath(name, envVars);
     }
 
-    private static boolean validateWrapper(Path wrapper) {
+    // mvnw self-validates maven-wrapper.jar against wrapperSha256Sum and exits 1 on mismatch (no fallback).
+    // Detect that on disk without spawning a process, so a compromised/stale wrapper falls back to system mvn.
+    private static boolean wrapperJarMismatch(Path dir) {
+        var props = dir.resolve(".mvn").resolve("wrapper").resolve("maven-wrapper.properties");
+        if (!Files.isRegularFile(props)) return false;
         try {
-            var process = new ProcessBuilder()
-                    .command(wrapper.toString(), "--version")
-                    .directory(wrapper.getParent().toFile())
-                    .redirectError(ProcessBuilder.Redirect.DISCARD)
-                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                    .start();
-            var exit = process.waitFor();
-            return exit == 0;
-        } catch (IOException | InterruptedException e) {
-            return false;
+            String declared = null;
+            for (var line : Files.readAllLines(props)) {
+                var trimmed = line.strip();
+                if (trimmed.startsWith("wrapperSha256Sum=")) {
+                    declared = trimmed.substring("wrapperSha256Sum=".length()).strip();
+                    break;
+                }
+            }
+            if (declared == null || declared.isEmpty()) return false; // nothing to validate → wrapper usable
+            var jar = dir.resolve(".mvn").resolve("wrapper").resolve("maven-wrapper.jar");
+            if (!Files.isRegularFile(jar)) return true; // sum declared but jar missing → mvnw will fail
+            var sha = java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(jar));
+            var actual = java.util.HexFormat.of().formatHex(sha);
+            return !actual.equalsIgnoreCase(declared);
+        } catch (IOException | java.security.NoSuchAlgorithmException e) {
+            return false; // on error, let mvnw try rather than suppress it
         }
     }
 
@@ -1060,12 +958,6 @@ public final class MavenTooling {
             if (mvnCommand == null) mvnCommand = findExecutableOnPath("mvn.bat", envVars);
         }
         return mvnCommand == null ? "mvn" : mvnCommand;
-    }
-
-    static Path readDependency(String line) {
-        var match = DEPENDENCY.matcher(line);
-        if (!match.matches() || match.group(1).split(":").length < 5) return NOT_FOUND;
-        return Paths.get(match.group(2));
     }
 
     // =========================================================================
@@ -1091,7 +983,8 @@ public final class MavenTooling {
         try {
             var factory = DocumentBuilderFactory.newInstance();
             factory.setNamespaceAware(true);
-            return factory.newDocumentBuilder().parse(xmlFile.toFile());
+            var result = factory.newDocumentBuilder().parse(xmlFile.toFile());
+            return result;
         } catch (Exception e) {
             LOG.fine(String.format("Failed to parse Maven XML %s: %s", xmlFile, e.getMessage()));
             return null;

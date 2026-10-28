@@ -57,7 +57,9 @@ public class FileStore {
 
     static void setWorkspaceRoots(Set<Path> newRoots) {
         newRoots = normalize(newRoots);
-        if (newRoots.equals(workspaceRoots)) return;
+        if (newRoots.equals(workspaceRoots)) {
+            return;
+        }
         var retained = newRoots;
         javaSources.keySet().removeIf(file -> {
             if (retained.stream().anyMatch(file::startsWith)) return false;
@@ -85,7 +87,8 @@ public class FileStore {
 
     private static void addFiles(Path root) {
         try {
-            if (Files.isDirectory(root)) Files.walkFileTree(root, new FindJavaSources(root));
+            var scanner = new FindJavaSources(root);
+            if (Files.isDirectory(root)) Files.walkFileTree(root, scanner);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }

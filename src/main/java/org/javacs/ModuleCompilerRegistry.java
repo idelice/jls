@@ -73,7 +73,9 @@ final class ModuleCompilerRegistry implements AutoCloseable {
         if (module == null) return server.getOrCreateCompiler();
         var key = moduleCompilerKey(file);
         var existing = moduleCompilers.get(key);
-        if (existing != null) return existing.compiler;
+        if (existing != null) {
+            return existing.compiler;
+        }
         var started = System.nanoTime();
         // A single-module project resolves once at startup; announcing it only adds UI noise.
         var token = multiModule() ? server.progress.begin("Resolving module", module.projectPath()) : null;

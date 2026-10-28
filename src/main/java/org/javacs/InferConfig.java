@@ -36,8 +36,6 @@ class InferConfig {
     private BuildSystem buildSystem;
     /** Cached module graph (lazily initialized) */
     private ModuleGraph cachedModuleGraph;
-    /** Cached maven deps (lazily initialized) */
-    private MavenTooling.MavenDependencies cachedMavenDeps;
 
     InferConfig(
             Path workspaceRoot,
@@ -70,12 +68,16 @@ class InferConfig {
     }
 
     Path buildRoot() {
-        if (buildRoot == null) buildRoot = findBuildRoot();
+        if (buildRoot == null) {
+            buildRoot = findBuildRoot();
+        }
         return buildRoot;
     }
 
     BuildSystem buildSystem() {
-        if (buildSystem == null) buildSystem = detectBuildSystem();
+        if (buildSystem == null) {
+            buildSystem = detectBuildSystem();
+        }
         return buildSystem;
     }
 
@@ -107,7 +109,8 @@ class InferConfig {
         }
 
         return switch (buildSystem()) {
-            case MAVEN -> mavenClasspath();
+            // Maven resolves per-module; only reached if the pom didn't resolve (empty graph).
+            case MAVEN -> Set.of();
             case GRADLE -> gradleClasspath();
             case BAZEL -> bazelClasspath(bazelWorkspaceRoot());
             case UNKNOWN -> standaloneClasspath();
@@ -137,14 +140,6 @@ class InferConfig {
         }
     }
 
-    private Set<Path> mavenClasspath() {
-        var pomXml = buildRoot().resolve("pom.xml");
-        var graph = moduleGraph();
-        var modulePath = MavenTooling.modulePath(graph, buildRoot(), workspaceRoot);
-        cachedMavenDeps = MavenTooling.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath);
-        return graph.externalClasspath(cachedMavenDeps.classpath());
-    }
-
     private Set<Path> gradleClasspath() {
         var graph = moduleGraph();
         var active = graph.moduleForFile(workspaceRoot).orElse(null);
@@ -171,15 +166,15 @@ class InferConfig {
 
     /** Resolve the module graph for this workspace (cached). */
     ModuleGraph moduleGraph() {
-        if (cachedModuleGraph != null) return cachedModuleGraph;
+        if (cachedModuleGraph != null) {
+            return cachedModuleGraph;
+        }
         cachedModuleGraph = switch (buildSystem()) {
             case GRADLE -> GradleTooling.resolveModuleGraph(buildRoot(), cacheHome(this.envVars));
             case MAVEN -> {
                 var workspace = MavenTooling.resolveWorkspace(
                         workspaceRoot, buildRoot(), mavenHome, envVars);
                 buildRoot = workspace.buildRoot();
-                // fingerprint once per compiler generation, not per cache lookup
-                MavenTooling.refreshCacheInputsSnapshot(buildRoot, mavenHome);
                 yield workspace.graph();
             }
             default -> ModuleGraph.EMPTY;
@@ -236,28 +231,16 @@ class InferConfig {
             return resolveExternalDependencies(true);
         }
         return switch (buildSystem()) {
-            case MAVEN -> {
-                // Reuse cached result from classPath() call — no second mvn invocation
-                if (cachedMavenDeps != null) {
-                    yield cachedMavenDeps.sources();
-                }
-                var pomXml = buildRoot().resolve("pom.xml");
-                var modulePath = MavenTooling.modulePath(moduleGraph(), buildRoot(), workspaceRoot);
-                yield MavenTooling.resolveDependencies(pomXml, mavenHome, this.envVars, modulePath).sources();
-            }
+            // Maven resolves doc jars per-module; only reached if the pom didn't resolve (empty graph).
+            case MAVEN -> Collections.emptySet();
             case BAZEL -> bazelSourcepath(bazelWorkspaceRoot());
             default -> Collections.emptySet();
         };
     }
 
     CompilerArgs compilerArgs() {
-        if (buildSystem() == BuildSystem.MAVEN) moduleGraph();
-        var pomXml = buildRoot().resolve("pom.xml");
-        if (!Files.exists(pomXml)) {
-            return CompilerArgs.none();
-        }
-        var result = MavenTooling.inferCompilerArgs(pomXml, mavenHome, envVars);
-        return new CompilerArgs(result.args(), result.source(), result.mixedModules());
+        // Maven args come from per-module ModuleInfo.compilerArgs; only reached if the pom didn't resolve.
+        return CompilerArgs.none();
     }
 
     private Path findAnyJar(Artifact artifact, boolean source) {

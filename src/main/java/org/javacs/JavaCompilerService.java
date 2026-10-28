@@ -37,7 +37,8 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
         this.classPathClasses = ScanClassPath.classPathTopLevelClasses(classPath);
         this.lombokPresentOnClasspath = lombokPresentOnClasspath(classPath);
         this.fileManager = new SourceFileManager(this::ownsSourceType);
-        setSourceRoots(FileStore.sourceRoots());
+        var knownSourceRoots = FileStore.sourceRoots();
+        setSourceRoots(knownSourceRoots);
         this.docsFileManager = new Docs(docPath).createFileManager();
     }
 
