@@ -1,5 +1,7 @@
 package org.javacs;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
@@ -32,7 +34,7 @@ import org.w3c.dom.NodeList;
 public final class MavenTooling {
     private static final Logger LOG = Logger.getLogger("main");
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-    private static final int CACHE_VERSION = 7;
+    private static final int CACHE_VERSION = 8;
 
     static final Path NOT_FOUND = Paths.get("");
 
@@ -41,14 +43,11 @@ public final class MavenTooling {
 
     private MavenTooling() {}
 
-    static final record FileFingerprint(String path, long size, long contentHash) {
-        FileFingerprint() { this(null, 0, 0); }
-    }
+    static final record PomStamp(String path, long size, long contentHash) {}
 
-    static final record MavenInferenceCacheFile(
+    static final record MavenCache(
             int version,
-            FileFingerprint settings,
-            List<FileFingerprint> pomInputs,
+            List<PomStamp> poms,
             List<CachedMavenModule> modules,
             Map<String, List<String>> dependencyGoals) {}
     static final record CachedMavenModule(
@@ -64,41 +63,15 @@ public final class MavenTooling {
             List<String> compilerArgs,
             String artifactId,
             String coordinates) {}
-    private record MavenCacheInputs(List<FileFingerprint> pomInputs, FileFingerprint settings) {}
 
-    // fingerprint-once-per-generation. Computed at compiler creation, reused
-    // for all module cache lookups in that generation. Avoids re-scanning all pom files
-    // on every cache check
-    private static volatile MavenCacheInputs cachedInputsSnapshot;
-    private static volatile Path cachedInputsWorkspaceRoot;
-
-    /**
-     * Compute and cache the reactor fingerprint for this compiler generation.
-     * Call this once at compiler creation time. All subsequent cache lookups
-     * reuse this snapshot until the next generation.
-     */
-    static void refreshCacheInputsSnapshot(Path workspaceRoot, Path mavenHome) {
-        var started = Instant.now();
-        cachedInputsWorkspaceRoot = normalizePath(workspaceRoot);
-        cachedInputsSnapshot = cacheInputs(cachedInputsWorkspaceRoot, mavenHome);
-        LOG.info("[maven-cache] fingerprint snapshot refreshed took="
-                + Duration.between(started, Instant.now()).toMillis() + "ms"
-                + " poms=" + cachedInputsSnapshot.pomInputs().size());
-    }
+    // In-memory session layer: normalized workspace root -> the parsed-and-validated MavenCache
+    // for this server lifetime. Avoids re-reading/re-hashing the on-disk JSON on repeated lookups
+    // within one generation
+    private static final Cache<Path, MavenCache> SESSION_CACHE =
+            Caffeine.newBuilder().maximumSize(16).build();
 
     static void invalidateCacheInputsSnapshot() {
-        cachedInputsSnapshot = null;
-        cachedInputsWorkspaceRoot = null;
-    }
-
-    private static MavenCacheInputs getCacheInputs(Path workspaceRoot, Path mavenHome) {
-        var snapshot = cachedInputsSnapshot;
-        var snapshotRoot = cachedInputsWorkspaceRoot;
-        if (snapshot != null && snapshotRoot != null && snapshotRoot.equals(normalizePath(workspaceRoot))) {
-            return snapshot;
-        }
-        // Fallback: compute on the fly (shouldn't happen if refreshCacheInputsSnapshot was called)
-        return cacheInputs(workspaceRoot, mavenHome);
+        SESSION_CACHE.invalidateAll();
     }
     static final record MavenDependencies(
             Set<Path> classpath, Set<Path> sources, Set<Path> sourceRoots) {
@@ -116,7 +89,6 @@ public final class MavenTooling {
             Path workspaceRoot, Path mavenHome, Map<String, String> envVars) {
         var pom = normalizePath(workspaceRoot).resolve("pom.xml");
         if (!Files.exists(pom)) return ModuleGraph.EMPTY;
-        refreshCacheInputsSnapshot(workspaceRoot, mavenHome);
         return resolveMavenModel(pom, mavenHome, envVars);
     }
 
@@ -544,21 +516,14 @@ public final class MavenTooling {
 
     static Set<Path> loadCachedMavenDependencies(Path pomXml, String goal, Path mavenHome, Path cacheHome, String modulePath) {
         var workspaceRoot = normalizePath(pomXml).getParent();
-        var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, modulePath);
-        var cache = readCacheFile(cacheFile);
-        if (cache == null || cache.version() != CACHE_VERSION || cache.dependencyGoals() == null) {
-            LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_cache_file");
+        var cache = readValidatedCache(workspaceRoot, cacheHome, modulePath);
+        if (cache == null || cache.dependencyGoals() == null) {
+            LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_valid_cache");
             return null;
         }
         var dependencies = cache.dependencyGoals().get(goal);
         if (dependencies == null) {
             LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=no_entry");
-            return null;
-        }
-        var inputs = getCacheInputs(workspaceRoot, mavenHome);
-        if (!Objects.equals(cache.pomInputs(), inputs.pomInputs())
-                || !Objects.equals(cache.settings(), inputs.settings())) {
-            LOG.fine("[maven-cache] miss goal=" + goal + " module=" + modulePath + " reason=fingerprint_mismatch");
             return null;
         }
         LOG.fine("[maven-cache] hit goal=" + goal + " module=" + modulePath + " deps=" + dependencies.size());
@@ -570,13 +535,8 @@ public final class MavenTooling {
     private static ModuleGraph loadCachedMavenModel(
             Path pomXml, Path mavenHome, Path cacheHome) {
         var workspaceRoot = normalizePath(pomXml).getParent();
-        var cache = readCacheFile(workspaceCacheFile(workspaceRoot, cacheHome, null));
-        if (cache == null || cache.version() != CACHE_VERSION || cache.modules() == null) {
-            return null;
-        }
-        var inputs = getCacheInputs(workspaceRoot, mavenHome);
-        if (!Objects.equals(cache.pomInputs(), inputs.pomInputs())
-                || !Objects.equals(cache.settings(), inputs.settings())) {
+        var cache = readValidatedCache(workspaceRoot, cacheHome, null);
+        if (cache == null || cache.modules() == null) {
             return null;
         }
 
@@ -608,7 +568,7 @@ public final class MavenTooling {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, null);
         var cache = readCacheFile(cacheFile);
-        var inputs = getCacheInputs(workspaceRoot, mavenHome);
+        var poms = stampWorkspacePoms(workspaceRoot, mavenHome);
         var modules = graph.modules().values().stream()
                 .map(module -> new CachedMavenModule(
                         module.projectPath(),
@@ -624,25 +584,9 @@ public final class MavenTooling {
                         module.artifactId(),
                         module.coordinates()))
                 .toList();
-        // Preserve any dependency goals already written for this (root) module, but only if
-        // their fingerprint still matches the current generation; otherwise drop them.
-        var goals = cache != null && cache.dependencyGoals() != null
-                && Objects.equals(cache.pomInputs(), inputs.pomInputs())
-                && Objects.equals(cache.settings(), inputs.settings())
+        var goals = cacheValid(cache) && cache.dependencyGoals() != null
                 ? cache.dependencyGoals() : Map.<String, List<String>>of();
-        try {
-            Files.createDirectories(cacheFile.getParent());
-            try (Writer writer = Files.newBufferedWriter(cacheFile)) {
-                GSON.toJson(new MavenInferenceCacheFile(
-                        CACHE_VERSION,
-                        inputs.settings(),
-                        inputs.pomInputs(),
-                        modules,
-                        goals), writer);
-            }
-        } catch (IOException e) {
-            LOG.fine(String.format("Failed to write Maven model cache %s: %s", cacheFile, e.getMessage()));
-        }
+        writeCache(cacheFile, workspaceRoot, true, new MavenCache(CACHE_VERSION, poms, modules, goals));
     }
 
     static void storeCachedMavenDependencies(
@@ -654,41 +598,68 @@ public final class MavenTooling {
         var workspaceRoot = normalizePath(pomXml).getParent();
         var cacheFile = workspaceCacheFile(workspaceRoot, cacheHome, modulePath);
         var cache = readCacheFile(cacheFile);
-        var inputs = getCacheInputs(workspaceRoot, mavenHome);
-        // Keep existing modules/goals only if their fingerprint still matches this generation.
-        var sameGeneration = cache != null
-                && Objects.equals(cache.pomInputs(), inputs.pomInputs())
-                && Objects.equals(cache.settings(), inputs.settings());
+        var valid = cacheValid(cache);
+        var poms = valid ? cache.poms() : stampWorkspacePoms(workspaceRoot, mavenHome);
         var goals = new LinkedHashMap<String, List<String>>();
-        if (sameGeneration && cache.dependencyGoals() != null) goals.putAll(cache.dependencyGoals());
-        var modules = sameGeneration && cache.modules() != null ? cache.modules() : List.<CachedMavenModule>of();
+        if (valid && cache.dependencyGoals() != null) goals.putAll(cache.dependencyGoals());
+        var modules = valid && cache.modules() != null ? cache.modules() : List.<CachedMavenModule>of();
         for (var dependencySet : dependencies.entrySet()) {
             var dependencyStrings = dependencySet.getValue().stream()
                     .map(path -> path.toAbsolutePath().normalize().toString()).sorted().toList();
             goals.put(dependencySet.getKey(), dependencyStrings);
         }
+        writeCache(cacheFile, workspaceRoot, false, new MavenCache(CACHE_VERSION, poms, modules, goals));
+    }
+
+    private static void writeCache(Path cacheFile, Path workspaceRoot, boolean isRoot, MavenCache cache) {
         try {
             Files.createDirectories(cacheFile.getParent());
             try (Writer writer = Files.newBufferedWriter(cacheFile)) {
-                GSON.toJson(new MavenInferenceCacheFile(
-                        CACHE_VERSION,
-                        inputs.settings(),
-                        inputs.pomInputs(),
-                        modules,
-                        goals), writer);
+                GSON.toJson(cache, writer);
             }
+            if (isRoot) SESSION_CACHE.put(normalizePath(workspaceRoot), cache);
         } catch (IOException e) {
             LOG.fine(String.format("Failed to write Maven cache %s: %s", cacheFile, e.getMessage()));
         }
     }
 
-    private static MavenInferenceCacheFile readCacheFile(Path cacheFile) {
+    private static MavenCache readValidatedCache(Path workspaceRoot, Path cacheHome, String modulePath) {
+        var normalizedRoot = normalizePath(workspaceRoot);
+        // Session cache holds the root (modules==null) cache. Module-scoped files share the same pom
+        // stamps, so a session-cache hit on the root proves disk poms are unchanged for this generation.
+        if (modulePath == null) {
+            var session = SESSION_CACHE.getIfPresent(normalizedRoot);
+            if (session != null) {
+                LOG.fine("[maven-cache] hit reason=session module=root");
+                return session;
+            }
+        }
+        var cache = readCacheFile(workspaceCacheFile(normalizedRoot, cacheHome, modulePath));
+        if (!cacheValid(cache)) {
+            LOG.fine("[maven-cache] miss module=" + modulePath + " reason=invalid_or_missing");
+            return null;
+        }
+        if (modulePath == null) SESSION_CACHE.put(normalizedRoot, cache);
+        return cache;
+    }
+
+    private static boolean cacheValid(MavenCache cache) {
+        if (cache == null || cache.version() != CACHE_VERSION || cache.poms() == null) return false;
+        for (var stamp : cache.poms()) {
+            var current = stampIfExists(Paths.get(stamp.path()));
+            if (current == null || current.size() != stamp.size() || current.contentHash() != stamp.contentHash()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static MavenCache readCacheFile(Path cacheFile) {
         if (!Files.exists(cacheFile)) {
             return null;
         }
         try (Reader reader = Files.newBufferedReader(cacheFile)) {
-            var cache = GSON.fromJson(reader, MavenInferenceCacheFile.class);
-            return cache;
+            return GSON.fromJson(reader, MavenCache.class);
         } catch (IOException | JsonParseException e) {
             LOG.fine(String.format("Failed to read Maven cache file %s: %s", cacheFile, e.getMessage()));
             return null;
@@ -708,15 +679,14 @@ public final class MavenTooling {
         return cacheHome.resolve("jls").resolve(name + "-" + shortHash(workspaceRoot.toString()));
     }
 
-    private static MavenCacheInputs cacheInputs(Path workspaceRoot, Path mavenHome) {
-        return new MavenCacheInputs(workspacePomFingerprints(workspaceRoot), fingerprintIfExists(mavenHome.resolve("settings.xml")));
-    }
-
-    private static List<FileFingerprint> workspacePomFingerprints(Path workspaceRoot) {
-        var poms = workspacePomFiles(workspaceRoot);
-        var fingerprints = poms.stream().map(MavenTooling::fingerprintExistingFile)
-                .sorted(Comparator.comparing(FileFingerprint::path)).toList();
-        return fingerprints;
+    private static List<PomStamp> stampWorkspacePoms(Path workspaceRoot, Path mavenHome) {
+        var files = new ArrayList<>(workspacePomFiles(workspaceRoot));
+        var settings = normalizePath(mavenHome.resolve("settings.xml"));
+        var stamps = new ArrayList<PomStamp>();
+        for (var file : files) stamps.add(stampExistingFile(file));
+        if (Files.exists(settings)) stamps.add(stampExistingFile(settings));
+        stamps.sort(Comparator.comparing(PomStamp::path));
+        return List.copyOf(stamps);
     }
 
     private static boolean isGeneratedPom(Path pom) {
@@ -724,20 +694,20 @@ public final class MavenTooling {
         return name.equals("flattened-pom.xml") || name.equals(".flattened-pom.xml");
     }
 
-    private static FileFingerprint fingerprintExistingFile(Path path) {
+    private static PomStamp stampExistingFile(Path path) {
         try {
             var normalized = normalizePath(path);
             var bytes = Files.readAllBytes(normalized);
             var crc = new java.util.zip.CRC32();
             crc.update(bytes);
-            return new FileFingerprint(normalized.toString(), bytes.length, crc.getValue());
+            return new PomStamp(normalized.toString(), bytes.length, crc.getValue());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private static FileFingerprint fingerprintIfExists(Path path) {
-        return Files.exists(path) ? fingerprintExistingFile(path) : null;
+    private static PomStamp stampIfExists(Path path) {
+        return Files.exists(path) ? stampExistingFile(path) : null;
     }
 
     private static List<String> parseCompilerArgs(Element project) {
