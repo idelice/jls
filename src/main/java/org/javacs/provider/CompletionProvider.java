@@ -18,6 +18,7 @@ import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Scope;
 import com.sun.source.tree.SwitchExpressionTree;
 import com.sun.source.tree.SwitchTree;
+import com.sun.source.tree.StatementTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.tree.TypeCastTree;
@@ -765,7 +766,7 @@ public class CompletionProvider {
             if (leaf instanceof SwitchExpressionTree switchExpressionTree) {
                 return switchExpressionTree.getExpression();
             }
-            if (leaf instanceof BlockTree) {
+            if (leaf instanceof BlockTree || leaf instanceof StatementTree) {
                 return null;
             }
         }
