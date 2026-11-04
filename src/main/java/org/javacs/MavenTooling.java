@@ -869,6 +869,11 @@ public final class MavenTooling {
                         continue;
                     }
                 }
+                if (!Files.isRegularFile(dir.resolve(".mvn").resolve("wrapper").resolve("maven-wrapper.properties"))) {
+                    LOG.warning("[maven] wrapper '" + candidate + "' has no .mvn/wrapper/maven-wrapper.properties."
+                            + " Falling back to system mvn.");
+                    break;
+                }
                 if (wrapperJarMismatch(dir)) {
                     LOG.warning("[maven] wrapper '" + candidate + "' has a SHA-256 mismatch on maven-wrapper.jar."
                             + " Falling back to system mvn; run 'mvn -N wrapper:wrapper' to repair it.");
