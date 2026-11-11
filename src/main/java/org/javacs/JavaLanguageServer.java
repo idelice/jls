@@ -340,6 +340,7 @@ class JavaLanguageServer extends LanguageServer {
         var commands = new JsonArray();
         commands.add("java.pickAndGenerate");
         commands.add("java.generateFields");
+        commands.add("java.compileWorkspace");
         executeCommandOptions.add("commands", commands);
         c.add("executeCommandProvider", executeCommandOptions);
         return new InitializeResult(c);
@@ -933,6 +934,27 @@ class JavaLanguageServer extends LanguageServer {
         client.publishDiagnostics(new PublishDiagnosticsParams(file.toUri(), List.of()));
     }
 
+    private Map<String, Object> compileWorkspace() {
+        if (compiler == null) return null;
+        var started = System.currentTimeMillis();
+        var byCompiler = new IdentityHashMap<JavaCompilerService, List<Path>>();
+        for (var f : FileStore.all()) byCompiler.computeIfAbsent(compilerFor(f), k -> new ArrayList<>()).add(f);
+        var files = 0;
+        for (var entry : byCompiler.entrySet()) {
+            try (var task = entry.getKey().compile(entry.getValue().toArray(Path[]::new))) {
+                for (var params : new ErrorProvider(task, settings.richFormatter()).errors(Set.of())) {
+                    client.publishDiagnostics(params);
+                }
+                files += entry.getValue().size();
+            } catch (Exception e) {
+                LOG.warning("[compileWorkspace] compile failed size=" + entry.getValue().size() + " reason=" + e);
+            }
+        }
+        var ms = System.currentTimeMillis() - started;
+        LOG.info("[compileWorkspace] files=" + files + " compiles=" + byCompiler.size() + " ms=" + ms);
+        return Map.of("files", files, "ms", ms);
+    }
+
     /** Reuse the diagnostic compilation for full-file hints on open, or the edited method on change. */
     private void pushHints(Path file, CompileTask existingTask, JavaCompilerService existingCompiler, int editLine) {
         if (!settings.inlayHints()) return;
@@ -1021,6 +1043,7 @@ class JavaLanguageServer extends LanguageServer {
 
     @Override
     public Object executeCommand(ExecuteCommandParams params) {
+        if ("java.compileWorkspace".equals(params.command)) return compileWorkspace();
         if ("java.pickAndGenerate".equals(params.command)) {
             var args = params.arguments;
             if (args == null || args.size() < 3) return null;
