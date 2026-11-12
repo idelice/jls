@@ -13,7 +13,7 @@ Fork of [georgewfraser/java-language-server](https://github.com/georgewfraser/ja
 
 ### Option 1: nvim-jls plugin (Recommended)
 
-[nvim-jls](https://github.com/idelice/nvim-jls) handles installation, configuration, and diagnostics automatically.
+[nvim-jls](https://github.com/idelice/nvim-jls) handles configuration and diagnostics, and installs JLS through Mason.
 
 ### Option 2: Mason + lspconfig
 
@@ -49,6 +49,7 @@ require('lspconfig').jls.setup({
 - **Type/call hierachy** — find type/call hierachy 
 - **Hover** — type information and Javadoc
 - **Diagnostics** — shows errors/warnings from javac
+- **Workspace compile** — `java.compileWorkspace` command checks all sources and publishes their diagnostics (annotation processors don't run; Lombok is supported)
 - **Signature help** — parameter info for methods and constructors
 - **Inlay hints** — parameter name hints at call sites
 - **Code actions** — refactoring, quick fixes, code generation
