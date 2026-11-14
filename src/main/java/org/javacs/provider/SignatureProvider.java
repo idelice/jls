@@ -15,10 +15,10 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Objects;
 import java.util.logging.Logger;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.ElementKind;
@@ -45,6 +45,7 @@ import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.ParameterInformation;
 import org.javacs.lsp.SignatureHelp;
 import org.javacs.lsp.SignatureInformation;
+import org.javacs.resolve.TypeNames;
 
 public class SignatureProvider {
     private static final Logger LOG = Logger.getLogger("main");
@@ -139,37 +140,12 @@ public class SignatureProvider {
 
     private List<SignatureInformation> renderCompiledSignatures(
             CompileTask task, List<ExecutableElement> methods) {
-        String previousOwner = null;
-        byte[] ownerClassBytes = null;
-        ParseTask ownerSource = null;
-        boolean sourceChecked = false, classBytesChecked = false;
+        var classBytesByOwner = new HashMap<String, byte[]>();
+        var sourceByType = new HashMap<String, ParseTask>();
         var signatures = new ArrayList<SignatureInformation>();
         for (var method : methods) {
-            var ownerName = ElementSignatureHelper.ownerQualifiedName(method);
-            if (!Objects.equals(ownerName, previousOwner)) {
-                previousOwner = ownerName;
-                ownerClassBytes = null;
-                ownerSource = null;
-                sourceChecked = false;
-                classBytesChecked = false;
-            }
-            if (ElementSignatureHelper.hasSyntheticNames(method.getParameters()) && !classBytesChecked) {
-                ownerClassBytes = compiler.findClassFile(ownerName).orElse(null);
-                classBytesChecked = true;
-            }
-            var names = ElementSignatureHelper.parameterNames(task, method, ownerClassBytes);
-            if (Arrays.stream(names).anyMatch(name -> name.matches("arg\\d+"))) {
-                if (!sourceChecked) {
-                    var found = compiler.findAnywhere(ownerName);
-                    if (found.isPresent()) {
-                        ownerSource = compiler.parse(found.get());
-                    }
-                    sourceChecked = true;
-                }
-                if (ownerSource != null) {
-                    names = ElementSignatureHelper.parameterNamesFromSource(task, method, ownerSource, names);
-                }
-            }
+            var names = ElementSignatureHelper.parameterNamesWithSourceFallback(
+                    compiler, task, method, classBytesByOwner, sourceByType);
             signatures.add(buildCompiledSignature(method, names));
         }
         return signatures;
@@ -395,7 +371,7 @@ public class SignatureProvider {
     /** Fallback for workspace declarations unavailable to this bounded compilation. */
     private String buildLabelFromIndex(IndexedMember member) {
         var name = member.kind == CompletionItemKind.Constructor
-                ? member.ownerType.substring(member.ownerType.lastIndexOf('.') + 1)
+                ? TypeNames.simpleName(member.ownerType)
                 : member.name;
         var types = indexParameterTypes(member);
         var names = member.parameterNames;

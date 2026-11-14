@@ -256,7 +256,7 @@ public final class ImplementationProvider {
 
     private static void addLocation(Map<String, Location> locations, Location location) {
         if (location == null || location.uri == null || location.range == null) return;
-        locations.putIfAbsent(location.uri + ":" + location.range, location);
+        locations.putIfAbsent(FindHelper.locationKey(location), location);
     }
 
     private static Path sourcePath(URI uri) {

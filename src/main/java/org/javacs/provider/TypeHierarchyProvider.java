@@ -1,6 +1,5 @@
 package org.javacs.provider;
 
-import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -8,17 +7,18 @@ import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.logging.Logger;
-import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.TypeKind;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.JsonHelper;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.SymbolKind;
 import org.javacs.lsp.TypeHierarchyItem;
 import org.javacs.navigation.NavigationHelper;
+import org.javacs.resolve.TypeNames;
 
 /** Builds type hierarchy items, using javac to prepare and the workspace index to relate. */
 public final class TypeHierarchyProvider {
@@ -40,7 +40,7 @@ public final class TypeHierarchyProvider {
     public Optional<List<TypeHierarchyItem>> prepare(Path file, int line, int column) {
         try (var task = compiler.compile(file)) {
             var element = NavigationHelper.findElement(task, file, line, column);
-            var type = enclosingType(element);
+            var type = NavigationHelper.enclosingType(element);
             if (type == null) return Optional.empty();
             var path = task.trees.getPath(type);
             if (path == null) return Optional.empty();
@@ -67,7 +67,7 @@ public final class TypeHierarchyProvider {
     }
 
     private List<TypeHierarchyItem> related(TypeHierarchyItem item, boolean supertypes) {
-        var qualifiedName = dataString(item.data);
+        var qualifiedName = JsonHelper.asString(item.data);
         if (qualifiedName == null) return List.of();
         var file = Path.of(item.uri);
         try {
@@ -120,7 +120,7 @@ public final class TypeHierarchyProvider {
         // External/JDK type — locate via parse.
         var location = parseTypeLocation(contextFile, qualifiedName);
         if (location == null) return null;
-        var simpleName = qualifiedName.substring(qualifiedName.lastIndexOf('.') + 1);
+        var simpleName = TypeNames.simpleName(qualifiedName);
         return typeHierarchyItem(simpleName, SymbolKind.Class, qualifiedName, location);
     }
 
@@ -133,9 +133,8 @@ public final class TypeHierarchyProvider {
         var parse = provider.parse(found.get());
         try {
             var classTree = FindHelper.findType(parse, qualifiedName);
-            var path = TreePath.getPath(parse.root(), classTree);
-            if (path == null) return null;
-            return FindHelper.location(parse, path, classTree.getSimpleName());
+            if (classTree == null) return null;
+            return FindHelper.location(parse, classTree, classTree.getSimpleName());
         } catch (RuntimeException e) {
             return null;
         }
@@ -147,19 +146,12 @@ public final class TypeHierarchyProvider {
         var item = new TypeHierarchyItem();
         item.name = name;
         item.kind = kind;
-        item.detail = packageOf(qualifiedName);
+        item.detail = TypeNames.packageName(qualifiedName);
         item.uri = location.uri;
         item.range = location.range;
         item.selectionRange = location.range;
         item.data = qualifiedName;
         return item;
-    }
-
-    private static TypeElement enclosingType(Element element) {
-        for (var e = element; e != null; e = e.getEnclosingElement()) {
-            if (e instanceof TypeElement type) return type;
-        }
-        return null;
     }
 
     private static int typeSymbolKind(TypeElement type) {
@@ -168,18 +160,5 @@ public final class TypeHierarchyProvider {
             case ENUM -> SymbolKind.Enum;
             default -> SymbolKind.Class;
         };
-    }
-
-    private static String dataString(Object data) {
-        if (data == null) return null;
-        if (data instanceof com.google.gson.JsonElement json) {
-            return json.isJsonPrimitive() ? json.getAsString() : null;
-        }
-        return data.toString();
-    }
-
-    private static String packageOf(String qualifiedName) {
-        var dot = qualifiedName.lastIndexOf('.');
-        return dot < 0 ? "" : qualifiedName.substring(0, dot);
     }
 }

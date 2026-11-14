@@ -380,13 +380,28 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
 
     @Override
     public Path[] findMemberReferences(String className, String memberName, Collection<Path> candidates) {
-        var pkg = packageName(className);
+        return findMemberReferences(Set.of(className), Set.of(memberName), candidates);
+    }
+
+    @Override
+    public Path[] findMemberReferences(
+            Collection<String> classNames, Collection<String> memberNames, Collection<Path> candidates) {
+        if (classNames.isEmpty() || memberNames.isEmpty()) return new Path[0];
+        var packages = classNames.stream().map(this::packageName).toList();
         var result = new ArrayList<Path>();
-        for (var f : candidates != null ? candidates : FileStore.all()) {
-            if (containsWord(f, memberName)
-                    && (pkg.equals(FileStore.packageName(f)) || containsImport(f, className))) {
-                result.add(f);
+        var scanned = candidates != null ? candidates : FileStore.all();
+        for (var f : scanned) {
+            if (memberNames.stream().noneMatch(name -> containsWord(f, name))) continue;
+            var filePackage = FileStore.packageName(f);
+            var visible = false;
+            var i = 0;
+            for (var className : classNames) {
+                if (packages.get(i++).equals(filePackage) || containsImport(f, className)) {
+                    visible = true;
+                    break;
+                }
             }
+            if (visible) result.add(f);
         }
         return result.toArray(Path[]::new);
     }

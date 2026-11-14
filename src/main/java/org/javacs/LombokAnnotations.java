@@ -8,6 +8,8 @@ import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.ImportTree;
 import com.sun.source.tree.AssignmentTree;
 import com.sun.source.util.TreeScanner;
+import com.sun.tools.javac.code.Flags;
+import com.sun.tools.javac.code.Symbol;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -20,7 +22,9 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import javax.lang.model.element.Element;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.element.TypeElement;
 
 /**
  * Centralized Lombok annotation semantics used across compiler, indexing, completion, and
@@ -140,6 +144,23 @@ public final class LombokAnnotations {
     /** Returns whether the supplied type name refers to a Lombok annotation that changes members. */
     public static boolean isStructuralLombokAnnotationType(String annotationType) {
         return isLombokAnnotationType(annotationType) && STRUCTURAL.contains(simpleName(annotationType));
+    }
+
+    /** Returns whether the type carries a structural Lombok annotation. */
+    public static boolean hasStructuralLombokAnnotation(TypeElement type) {
+        for (var mirror : type.getAnnotationMirrors()) {
+            var annotationType = mirror.getAnnotationType().asElement();
+            if (annotationType instanceof TypeElement annotation
+                    && isStructuralLombokAnnotationType(annotation.getQualifiedName().toString())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Returns whether this element was injected with javac's generated-member flag. */
+    public static boolean isGeneratedMember(Element element) {
+        return element instanceof Symbol symbol && (symbol.flags() & Flags.GENERATED_MEMBER) != 0;
     }
 
     /** Reduces a qualified annotation type name such as {@code lombok.Data} to {@code Data}. */

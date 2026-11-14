@@ -1,8 +1,5 @@
 package org.javacs.provider;
 import com.sun.source.tree.ClassTree;
-import com.sun.source.util.TreePath;
-import com.sun.tools.javac.code.Flags;
-import com.sun.tools.javac.code.Symbol;
 import java.lang.classfile.ClassFile;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -117,8 +114,7 @@ public class DefinitionProvider {
                 try {
                     var memberTree = FindHelper.findField(parse, className, memberName);
                     LOG.fine("[def] return=field-in-other-file");
-                    var path = TreePath.getPath(parse.root(), memberTree);
-                    return List.of(FindHelper.location(parse, path, memberName));
+                    return List.of(FindHelper.location(parse, memberTree, memberName));
                 } catch (RuntimeException notInSource) {
                     if (otherFile.get() instanceof SourceFileObject && compiler.lombokPresentOnClasspath()) {
                         LOG.info("[lombok-source-compile] definition=source-field-miss field=" + memberName);
@@ -126,15 +122,13 @@ public class DefinitionProvider {
                         var classFile = compiler.findClassFile(className);
                         if (classFile.isPresent() && classHasMethod(classFile.get(), memberName)) {
                             LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + memberName + ")");
-                            var path = TreePath.getPath(parse.root(), tree);
-                            return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+                            return List.of(FindHelper.location(parse, tree, tree.getSimpleName()));
                         }
                     }
                 }
             }
             LOG.fine("[def] return=class-in-other-file");
-            var path = TreePath.getPath(parse.root(), tree);
-            return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+            return List.of(FindHelper.location(parse, tree, tree.getSimpleName()));
     }
 
     /** present+non-empty = found; present+empty = stop; empty = fall through. */
@@ -147,8 +141,7 @@ public class DefinitionProvider {
             var memberTree = FindHelper.findMethod(parse, className, methodName, erased);
             if (memberTree != null) {
                 LOG.fine("[def] return=method-in-other-file");
-                var path = TreePath.getPath(parse.root(), memberTree);
-                return Optional.of(List.of(FindHelper.location(parse, path, method.getSimpleName())));
+                return Optional.of(List.of(FindHelper.location(parse, memberTree, method.getSimpleName())));
             }
         } catch (RuntimeException notInSource) {
         }
@@ -179,14 +172,12 @@ public class DefinitionProvider {
                     try {
                         var fieldTree = FindHelper.findField(parse, className, fieldName.get());
                         LOG.fine("[def] return=field-in-other-file (via bytecode+accessor)");
-                        var path = TreePath.getPath(parse.root(), fieldTree);
-                        return Optional.of(List.of(FindHelper.location(parse, path, fieldName.get())));
+                        return Optional.of(List.of(FindHelper.location(parse, fieldTree, fieldName.get())));
                     } catch (RuntimeException e) {
                     }
                 }
                 LOG.fine("[def] return=class-in-other-file (via .class bytecode for " + methodName + ")");
-                var path = TreePath.getPath(parse.root(), tree);
-                return Optional.of(List.of(FindHelper.location(parse, path, tree.getSimpleName())));
+                return Optional.of(List.of(FindHelper.location(parse, tree, tree.getSimpleName())));
             }
         }
         return Optional.empty();
@@ -222,11 +213,10 @@ public class DefinitionProvider {
                 var erased = FindHelper.erasedParameterTypes(task, method);
                 var name = method.getSimpleName().toString();
                 var memberTree = FindHelper.findMethod(parse, className, name, erased);
-                var memberPath = TreePath.getPath(parse.root(), memberTree);
                 // A constructor's tree name is "<init>"; highlight the class name instead.
                 var highlight = name.equals("<init>") ? tree.getSimpleName().toString() : name;
                 LOG.fine("[def] return=decompiled-member kind=" + element.getKind() + " name=" + name);
-                return List.of(FindHelper.location(parse, memberPath, highlight));
+                return List.of(FindHelper.location(parse, memberTree, highlight));
             } catch (RuntimeException noMember) {
                 // Fall through to the class declaration.
             }
@@ -234,16 +224,14 @@ public class DefinitionProvider {
             try {
                 var name = element.getSimpleName().toString();
                 var memberTree = FindHelper.findField(parse, className, name);
-                var memberPath = TreePath.getPath(parse.root(), memberTree);
                 LOG.fine("[def] return=decompiled-member kind=" + element.getKind() + " name=" + name);
-                return List.of(FindHelper.location(parse, memberPath, name));
+                return List.of(FindHelper.location(parse, memberTree, name));
             } catch (RuntimeException noMember) {
                 // Fall through to the class declaration.
             }
         }
         LOG.fine("[def] return=decompiled " + decompiled);
-        var path = TreePath.getPath(parse.root(), tree);
-        return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+        return List.of(FindHelper.location(parse, tree, tree.getSimpleName()));
     }
 
     private List<Location> resolveErrorType(String simpleName) {
@@ -256,8 +244,7 @@ public class DefinitionProvider {
         var p = compiler.parse(source.get());
         var tree = FindHelper.findType(p, resolved.get());
         if (tree == null) return List.of();
-        var path = TreePath.getPath(p.root(), tree);
-        return List.of(FindHelper.location(p, path, tree.getSimpleName()));
+        return List.of(FindHelper.location(p, tree, tree.getSimpleName()));
     }
 
     private List<Location> findError(CompileTask task, Element element) {
@@ -296,8 +283,7 @@ public class DefinitionProvider {
             var parse = compiler.parse(otherFile.get());
             var tree = FindHelper.findType(parse, className);
             if (tree == null) return List.of();
-            var path = TreePath.getPath(parse.root(), tree);
-            return List.of(FindHelper.location(parse, path, tree.getSimpleName()));
+            return List.of(FindHelper.location(parse, tree, tree.getSimpleName()));
         }
         var locations = new ArrayList<Location>();
         for (var member : outerTask.elements.getAllMembers(parentClass)) {
@@ -311,14 +297,8 @@ public class DefinitionProvider {
     }
 
     private String className(Element element) {
-        while (element != null) {
-            if (element instanceof TypeElement) {
-                var type = (TypeElement) element;
-                return type.getQualifiedName().toString();
-            }
-            element = element.getEnclosingElement();
-        }
-        return "";
+        var type = NavigationHelper.enclosingType(element);
+        return type == null ? "" : type.getQualifiedName().toString();
     }
 
     private List<Location> resolveLombokField(Element element, String memberName, Elements elements) {
@@ -354,8 +334,7 @@ public class DefinitionProvider {
                 return List.of();
             }
         }
-        var path = TreePath.getPath(parse.root(), fieldTree);
-        return List.of(FindHelper.location(parse, path, fieldName));
+        return List.of(FindHelper.location(parse, fieldTree, fieldName));
     }
 
     /** Resolve a class-level Lombok builder setter to the owner's real source field. */
@@ -367,8 +346,7 @@ public class DefinitionProvider {
                 || memberName.isBlank()) {
             return List.of();
         }
-        if (!(method instanceof Symbol symbol)
-                || (symbol.flags() & Flags.GENERATED_MEMBER) == 0) {
+        if (!LombokAnnotations.isGeneratedMember(method)) {
             return List.of();
         }
         if (!(method.getEnclosingElement() instanceof TypeElement builderType)) {
@@ -392,9 +370,8 @@ public class DefinitionProvider {
         }
         var parse = compiler.parse(sourceFile.get());
         var fieldTree = FindHelper.findField(parse, ownerName, memberName);
-        var path = TreePath.getPath(parse.root(), fieldTree);
         LOG.info("[lombok-source-compile] definition=builder-field method=" + memberName);
-        return List.of(FindHelper.location(parse, path, memberName));
+        return List.of(FindHelper.location(parse, fieldTree, memberName));
     }
 
     private static boolean canOverride(ExecutableElement method) {
@@ -419,8 +396,7 @@ public class DefinitionProvider {
                 var parse = compiler.parse(sourceFile.get());
                 var erased = FindHelper.erasedParameterTypes(task, method);
                 var tree = FindHelper.findMethod(parse, superClass, method.getSimpleName().toString(), erased);
-                var path = TreePath.getPath(parse.root(), tree);
-                return List.of(FindHelper.location(parse, path, method.getSimpleName()));
+                return List.of(FindHelper.location(parse, tree, method.getSimpleName()));
             }
         }
         return List.of();
@@ -459,8 +435,7 @@ public class DefinitionProvider {
         var classTree = FindHelper.findType(parse, recordClass);
         for (var member : classTree.getMembers()) {
             if (member instanceof VariableTree vt && vt.getName().contentEquals(accessorName)) {
-                var path = TreePath.getPath(parse.root(), vt);
-                return List.of(FindHelper.location(parse, path, accessorName));
+                return List.of(FindHelper.location(parse, vt, accessorName));
             }
         }
         return List.of();
@@ -479,19 +454,6 @@ public class DefinitionProvider {
             current = (TypeElement) ((DeclaredType) superMirror).asElement();
         }
         return "";
-    }
-
-    private boolean hasLombokAnnotation(String className, Elements elements) {
-        var type = elements.getTypeElement(className);
-        if (type == null) return false;
-        for (var mirror : type.getAnnotationMirrors()) {
-            var annType = mirror.getAnnotationType().asElement();
-            if (annType instanceof TypeElement te
-                    && LombokAnnotations.isStructuralLombokAnnotationType(te.getQualifiedName().toString())) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private List<Location> tryDeclarationNavigation(CompileTask task, Element element) {
@@ -514,7 +476,8 @@ public class DefinitionProvider {
         if (path == null) {
             if (compiler.lombokPresentOnClasspath()) {
                 var rawClassName = className(element);
-                if (hasLombokAnnotation(rawClassName, task.elements)) {
+                var rawType = task.elements.getTypeElement(rawClassName);
+                if (rawType != null && LombokAnnotations.hasStructuralLombokAnnotation(rawType)) {
                     return resolveLombokField(element, element.getSimpleName().toString(), task.elements);
                 }
                 var memberName = element.getSimpleName().toString();

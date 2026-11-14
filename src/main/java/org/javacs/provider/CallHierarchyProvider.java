@@ -1,6 +1,5 @@
 package org.javacs.provider;
 
-import com.google.gson.JsonElement;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
@@ -21,6 +20,7 @@ import javax.lang.model.element.TypeElement;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FindHelper;
+import org.javacs.JsonHelper;
 import org.javacs.lsp.CallHierarchyIncomingCall;
 import org.javacs.lsp.CallHierarchyItem;
 import org.javacs.lsp.CallHierarchyOutgoingCall;
@@ -28,6 +28,7 @@ import org.javacs.lsp.Range;
 import org.javacs.lsp.SymbolKind;
 import org.javacs.navigation.FindReferences;
 import org.javacs.navigation.NavigationHelper;
+import org.javacs.resolve.TypeNames;
 
 /** Builds call hierarchy items and resolves incoming/outgoing calls, verified by javac. */
 public final class CallHierarchyProvider {
@@ -83,11 +84,11 @@ public final class CallHierarchyProvider {
     }
 
     public List<CallHierarchyIncomingCall> incomingCalls(CallHierarchyItem item) {
-        var data = MethodData.parse(dataString(item.data));
+        var data = MethodData.parse(JsonHelper.asString(item.data));
         if (data == null) return List.of();
         includeReferenceSources.run();
         var file = Path.of(item.uri);
-        var memberName = data.methodName.equals("<init>") ? simpleName(data.className) : data.methodName;
+        var memberName = data.methodName.equals("<init>") ? TypeNames.simpleName(data.className) : data.methodName;
         try {
             var searchNames = incomingSearchNames(file, data.className, memberName);
             var postings = tokenLookup == null ? null : tokenLookup.apply(memberName);
@@ -106,7 +107,7 @@ public final class CallHierarchyProvider {
     }
 
     public List<CallHierarchyOutgoingCall> outgoingCalls(CallHierarchyItem item) {
-        var data = MethodData.parse(dataString(item.data));
+        var data = MethodData.parse(JsonHelper.asString(item.data));
         if (data == null) return List.of();
         var file = Path.of(item.uri);
         try (var task = compilerForFile.apply(file).compile(file)) {
@@ -175,7 +176,7 @@ public final class CallHierarchyProvider {
         var displayName = isCtor ? owner.getSimpleName().toString() : caller.getSimpleName().toString();
         var location = FindHelper.location(task, methodPath, displayName);
         if (location == null || location.uri == null) return;
-        var key = location.uri + ":" + location.range;
+        var key = FindHelper.locationKey(location);
         var call = grouped.get(key);
         if (call == null) {
             var item = new CallHierarchyItem();
@@ -229,7 +230,7 @@ public final class CallHierarchyProvider {
             var displayName = isCtor ? owner.getSimpleName().toString() : method.getSimpleName().toString();
             var location = FindHelper.location(task, declPath, displayName);
             if (location == null || location.uri == null) return;
-            var key = location.uri + ":" + location.range;
+            var key = FindHelper.locationKey(location);
             var call = grouped.get(key);
             if (call == null) {
                 var item = new CallHierarchyItem();
@@ -276,17 +277,5 @@ public final class CallHierarchyProvider {
             var params = paramString.isEmpty() ? new String[0] : paramString.split(",");
             return new MethodData(className, methodName, params);
         }
-    }
-
-    private static String dataString(Object data) {
-        if (data == null) return null;
-        if (data instanceof JsonElement json) {
-            return json.isJsonPrimitive() ? json.getAsString() : null;
-        }
-        return data.toString();
-    }
-
-    private static String simpleName(String qualifiedName) {
-        return qualifiedName.substring(qualifiedName.lastIndexOf('.') + 1);
     }
 }

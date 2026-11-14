@@ -2,8 +2,6 @@ package org.javacs.navigation;
 
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
-import com.sun.tools.javac.code.Flags;
-import com.sun.tools.javac.code.Symbol;
 import java.util.List;
 import java.util.Set;
 import javax.lang.model.element.TypeElement;
@@ -12,6 +10,7 @@ import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
+import org.javacs.LombokAnnotations;
 
 /**
  * Finds references to Lombok-generated accessors (and the underlying field) for a specific class.
@@ -70,8 +69,7 @@ public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> 
             if (!(enclosing instanceof TypeElement te)) return false;
             if (te.getQualifiedName().contentEquals(targetClassName)) return true;
 
-            if (!(element instanceof Symbol symbol)
-                    || (symbol.flags() & Flags.GENERATED_MEMBER) == 0) return false;
+            if (!LombokAnnotations.isGeneratedMember(element)) return false;
 
             // A Lombok @Builder accessor is declared on the generated nested
             // FooBuilder type, not on Foo. Treat that one generated owner as

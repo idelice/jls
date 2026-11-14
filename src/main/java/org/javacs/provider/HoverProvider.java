@@ -10,6 +10,8 @@ import javax.lang.model.type.*;
 import java.util.logging.Logger;
 import org.javacs.*;
 import org.javacs.lsp.*;
+import org.javacs.navigation.NavigationHelper;
+import org.javacs.resolve.TypeNames;
 
 public class HoverProvider {
     private static final Logger LOG = Logger.getLogger("main");
@@ -22,14 +24,7 @@ public class HoverProvider {
     public MarkupContent hover(Path file, int line, int column) {
         var start = System.currentTimeMillis();
         try (var task = compiler.compile(file)) {
-            var root = task.root(file);
-            long cursor;
-            try {
-                cursor = FileStore.offset(root.getSourceFile().getCharContent(true).toString(), line, column);
-            } catch (java.io.IOException e) {
-                throw new RuntimeException(e);
-            }
-            var path = new FindNameAt(task).scan(root, cursor);
+            var path = NavigationHelper.findPath(task, file, line, column);
             if (path == null) return null;
 
             var element = task.trees.getElement(path);
@@ -38,17 +33,14 @@ public class HoverProvider {
 
             var markdown = new StringBuilder();
 
-            var typeElement = enclosingType(element);
+            var typeElement = NavigationHelper.enclosingType(element.getEnclosingElement());
             if (typeElement == null && element instanceof TypeElement self) {
                 typeElement = self;
             }
             if (typeElement != null) {
-                var qualified = typeElement.getQualifiedName().toString();
-                var lastDot = qualified.lastIndexOf('.');
-                if (lastDot >= 0) {
-                    markdown.append("**")
-                            .append(qualified.substring(0, lastDot))
-                            .append("**\n\n");
+                var packageName = TypeNames.packageName(typeElement.getQualifiedName().toString());
+                if (!packageName.isEmpty()) {
+                    markdown.append("**").append(packageName).append("**\n\n");
                 }
             }
 
@@ -71,7 +63,7 @@ public class HoverProvider {
     private String renderSignature(Element element, CompileTask task) {
         return switch (element.getKind()) {
             case METHOD, CONSTRUCTOR -> renderMethodSignature((ExecutableElement) element, task);
-            case FIELD, ENUM_CONSTANT -> renderFieldSignature((VariableElement) element);
+            case FIELD, ENUM_CONSTANT -> renderVariableSignature((VariableElement) element);
             case CLASS, INTERFACE, ENUM, ANNOTATION_TYPE, RECORD -> renderClassSignature((TypeElement) element);
             case LOCAL_VARIABLE, PARAMETER, EXCEPTION_PARAMETER -> renderVariableSignature(
                     (VariableElement) element);
@@ -79,13 +71,17 @@ public class HoverProvider {
         };
     }
 
-    private String renderMethodSignature(ExecutableElement method, CompileTask task) {
-        var sb = new StringBuilder();
-        var modifiers = method.getModifiers().stream()
+    private static String modifierPrefix(Element element) {
+        var modifiers = element.getModifiers().stream()
                 .map(m -> m.toString().toLowerCase())
                 .filter(m -> !m.isEmpty())
                 .collect(Collectors.joining(" "));
-        if (!modifiers.isEmpty()) sb.append(modifiers).append(" ");
+        return modifiers.isEmpty() ? "" : modifiers + " ";
+    }
+
+    private String renderMethodSignature(ExecutableElement method, CompileTask task) {
+        var sb = new StringBuilder();
+        sb.append(modifierPrefix(method));
 
         var typeParams = method.getTypeParameters();
         if (!typeParams.isEmpty()) {
@@ -115,17 +111,9 @@ public class HoverProvider {
         return sb.toString();
     }
 
-    private String renderFieldSignature(VariableElement field) {
-        return ElementSignatureHelper.simpleTypeName(field.asType()) + " " + field.getSimpleName();
-    }
-
     private String renderClassSignature(TypeElement type) {
         var sb = new StringBuilder();
-        var modifiers = type.getModifiers().stream()
-                .map(m -> m.toString().toLowerCase())
-                .filter(m -> !m.isEmpty())
-                .collect(Collectors.joining(" "));
-        if (!modifiers.isEmpty()) sb.append(modifiers).append(" ");
+        sb.append(modifierPrefix(type));
 
         var kind = switch (type.getKind()) {
             case ANNOTATION_TYPE -> "@interface";
@@ -140,15 +128,6 @@ public class HoverProvider {
 
     private String renderVariableSignature(VariableElement variable) {
         return ElementSignatureHelper.simpleTypeName(variable.asType()) + " " + variable.getSimpleName();
-    }
-
-    private TypeElement enclosingType(Element element) {
-        var current = element.getEnclosingElement();
-        while (current != null) {
-            if (current instanceof TypeElement type) return type;
-            current = current.getEnclosingElement();
-        }
-        return null;
     }
 
     private String getDocComment(Element element, CompileTask task) {
@@ -177,9 +156,7 @@ public class HoverProvider {
             var erasedTypes = FindHelper.erasedParameterTypes(task, method);
             var methodTree = FindHelper.findMethod(
                     parse, className, method.getSimpleName().toString(), erasedTypes);
-            var path = Trees.instance(parse.task()).getPath(parse.root(), methodTree);
-            var docTree = DocTrees.instance(parse.task()).getDocCommentTree(path);
-            return docTree != null ? MarkdownHelper.asMarkdown(docTree) : "";
+            return docComment(parse, methodTree);
         } catch (RuntimeException e) {
             return "";
         }
@@ -194,12 +171,16 @@ public class HoverProvider {
             var parse = compiler.parse(sourceFile.get());
             var typeTree = FindHelper.findType(parse, className);
             if (typeTree == null) return "";
-            var path = Trees.instance(parse.task()).getPath(parse.root(), typeTree);
-            if (path == null) return "";
-            var docTree = DocTrees.instance(parse.task()).getDocCommentTree(path);
-            return docTree != null ? MarkdownHelper.asMarkdown(docTree) : "";
+            return docComment(parse, typeTree);
         } catch (RuntimeException e) {
             return "";
         }
+    }
+
+    private String docComment(ParseTask parse, Tree tree) {
+        var path = Trees.instance(parse.task()).getPath(parse.root(), tree);
+        if (path == null) return "";
+        var docTree = DocTrees.instance(parse.task()).getDocCommentTree(path);
+        return docTree != null ? MarkdownHelper.asMarkdown(docTree) : "";
     }
 }

@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -211,6 +212,49 @@ public class WorkspaceTypeIndex {
 
     public Optional<IndexedType> typeInfo(String qualifiedName) {
         return Optional.ofNullable(typesByQualifiedName.get(qualifiedName));
+    }
+
+    /** The defining field and the Lombok accessor/builder names that target it. */
+    public record AccessorNames(String ownerType, Set<String> names) {}
+
+    public Optional<AccessorNames> accessorNames(String ownerType, String memberName) {
+        var type = typesByQualifiedName.get(ownerType);
+        if (type == null) return Optional.empty();
+        String fieldOwner = null;
+        String fieldName = null;
+        for (var member : type.members) {
+            if (!member.name.equals(memberName)) continue;
+            if (member.kind == CompletionItemKind.Field) {
+                fieldOwner = ownerType;
+                fieldName = memberName;
+                break;
+            }
+            if (member.backingFieldName != null) {
+                fieldOwner = member.declarationOwnerType;
+                fieldName = member.backingFieldName;
+                break;
+            }
+        }
+        if (fieldOwner == null || fieldName == null) return Optional.empty();
+        var owner = typesByQualifiedName.get(fieldOwner);
+        if (owner == null) return Optional.empty();
+
+        var names = new LinkedHashSet<String>();
+        names.add(fieldName);
+        for (var member : owner.members) {
+            if (fieldName.equals(member.backingFieldName)) names.add(member.name);
+            if (member.kind == CompletionItemKind.Field && fieldName.equals(member.name)) {
+                names.add(member.name);
+            }
+        }
+        for (var nested : owner.nestedTypes) {
+            var nestedType = typesByQualifiedName.get(nested);
+            if (nestedType == null) continue;
+            for (var member : nestedType.members) {
+                if (fieldName.equals(member.backingFieldName)) names.add(member.name);
+            }
+        }
+        return Optional.of(new AccessorNames(fieldOwner, Set.copyOf(names)));
     }
 
     /** Return true when an update contains the same index-facing declarations for these files. */

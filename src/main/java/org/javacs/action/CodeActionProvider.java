@@ -14,7 +14,6 @@ import java.util.UUID;
 import com.google.gson.JsonPrimitive;
 import javax.lang.model.element.*;
 import javax.lang.model.type.*;
-import javax.lang.model.util.Types;
 import org.javacs.*;
 import org.javacs.FindTypeDeclarationAt;
 import org.javacs.lsp.*;
@@ -268,7 +267,7 @@ public class CodeActionProvider {
             var methodSource = (TypeElement) member.getEnclosingElement();
             if (methodSource.getQualifiedName().contentEquals("java.lang.Object")) continue;
             if (methodSource.equals(classElement)) continue;
-            var ptr = new MethodPtr(task.types, method);
+            var ptr = new MethodPtr(task, method);
             var rewrite =
                     new OverrideInheritedMethod(
                             ptr.className, ptr.methodName, ptr.erasedParameterTypes, file, (int) cursor);
@@ -422,24 +421,18 @@ public class CodeActionProvider {
         var tree = new FindMethodDeclarationAt(task.trees).scan(root, position);
         var path = trees.getPath(root, tree);
         var method = (ExecutableElement) trees.getElement(path);
-        return new MethodPtr(task.types, method);
+        return new MethodPtr(task, method);
     }
 
     class MethodPtr {
         String className, methodName;
         String[] erasedParameterTypes;
 
-        MethodPtr(Types types, ExecutableElement method) {
+        MethodPtr(CompileTask task, ExecutableElement method) {
             var parent = (TypeElement) method.getEnclosingElement();
             className = parent.getQualifiedName().toString();
             methodName = method.getSimpleName().toString();
-            erasedParameterTypes = new String[method.getParameters().size()];
-            for (var i = 0; i < erasedParameterTypes.length; i++) {
-                var param = method.getParameters().get(i);
-                var type = param.asType();
-                var erased = types.erasure(type);
-                erasedParameterTypes[i] = erased.toString();
-            }
+            erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
         }
     }
 

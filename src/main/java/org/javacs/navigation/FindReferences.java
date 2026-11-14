@@ -9,28 +9,25 @@ import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.util.Elements;
-import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
+import org.javacs.FindHelper;
 
 public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
     final Trees trees;
     final Element find;
     final Elements elements;
-    final Types types;
 
     public FindReferences(Trees trees, Element find) {
         this.trees = trees;
         this.find = find;
         this.elements = null;
-        this.types = null;
     }
 
     public FindReferences(CompileTask task, Element find) {
         this.trees = task.trees;
         this.find = find;
         this.elements = task.elements;
-        this.types = task.types;
     }
 
     @Override
@@ -148,18 +145,10 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
      * or both override a common ancestor method).
      */
     private boolean isOverrideEquivalent(Element a, Element b) {
-        if (elements == null || types == null) return false;
-        if (a == null || b == null) return false;
+        if (elements == null) return false;
         if (!(a instanceof ExecutableElement methodA) || !(b instanceof ExecutableElement methodB)) return false;
         if (!a.getSimpleName().contentEquals(b.getSimpleName())) return false;
-        var ownerA = a.getEnclosingElement();
-        var ownerB = b.getEnclosingElement();
-        if (!(ownerA instanceof TypeElement typeA) || !(ownerB instanceof TypeElement typeB)) return false;
-        // Check if B overrides A (e.g. implementation overrides interface method)
-        if (elements.overrides(methodB, methodA, typeB)) return true;
-        // Check if A overrides B (e.g. searching from impl, finding interface declaration)
-        if (elements.overrides(methodA, methodB, typeA)) return true;
-        return false;
+        return FindHelper.overridesEither(elements, methodA, methodB);
     }
 
     /**

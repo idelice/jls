@@ -1,6 +1,7 @@
 package org.javacs;
 
 import java.util.List;
+import java.util.Map;
 import java.util.StringJoiner;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
@@ -44,6 +45,14 @@ public final class ElementSignatureHelper {
         return false;
     }
 
+    public static boolean hasSyntheticNames(String[] names) {
+        if (names == null) return false;
+        for (var name : names) {
+            if (name != null && name.matches("arg\\d+")) return true;
+        }
+        return false;
+    }
+
     public static String[] parameterNames(CompileTask task, ExecutableElement method, byte[] ownerClassBytes) {
         var names = method.getParameters().stream()
                 .map(parameter -> parameter.getSimpleName().toString()).toArray(String[]::new);
@@ -64,6 +73,36 @@ public final class ElementSignatureHelper {
         } catch (RuntimeException missingDeclaration) {
             return fallback;
         }
+    }
+
+    /**
+     * Resolves parameter names from class-file debug info, then falls back to the owner's source.
+     * The maps memoize per-owner lookups for the duration of one completion or signature request.
+     */
+    public static String[] parameterNamesWithSourceFallback(
+            CompilerProvider compiler,
+            CompileTask task,
+            ExecutableElement method,
+            Map<String, byte[]> classBytesByOwner,
+            Map<String, ParseTask> sourceByType) {
+        var owner = ownerQualifiedName(method);
+        byte[] ownerClassBytes = null;
+        if (owner != null && hasSyntheticNames(method.getParameters())) {
+            if (!classBytesByOwner.containsKey(owner)) {
+                classBytesByOwner.put(owner, compiler.findClassFile(owner).orElse(null));
+            }
+            ownerClassBytes = classBytesByOwner.get(owner);
+        }
+        var names = parameterNames(task, method, ownerClassBytes);
+        if (owner == null || !hasSyntheticNames(names)) return names;
+        ParseTask source;
+        if (sourceByType.containsKey(owner)) {
+            source = sourceByType.get(owner);
+        } else {
+            source = compiler.findAnywhere(owner).map(compiler::parse).orElse(null);
+            sourceByType.put(owner, source);
+        }
+        return source == null ? names : parameterNamesFromSource(task, method, source, names);
     }
 
     public static String methodParams(ExecutableElement method, String[] parameterNames) {

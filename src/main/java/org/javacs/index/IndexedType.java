@@ -11,6 +11,7 @@ import javax.lang.model.element.Modifier;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.lsp.Location;
 import org.javacs.lsp.Range;
+import org.javacs.resolve.TypeNames;
 
 /**
  * Shared immutable indexed type snapshot published by both workspace and external indexes.
@@ -85,7 +86,7 @@ public final class IndexedType {
         this.directSupertypes =
                 Collections.unmodifiableList(new ArrayList<>(buildDirectSupertypes(superclass, interfaces)));
         this.nestedTypes = Collections.unmodifiableList(new ArrayList<>(nestedTypes));
-        this.packageName = packageOf(qualifiedName);
+        this.packageName = TypeNames.packageName(qualifiedName);
         this.enclosingTypes = Collections.unmodifiableList(new ArrayList<>(enclosingTypesOf(qualifiedName)));
         this.kind = kind;
         this.annotationType = annotationType;
@@ -117,17 +118,6 @@ public final class IndexedType {
         return direct;
     }
 
-    private static String packageOf(String qualifiedName) {
-        if (qualifiedName == null || qualifiedName.isBlank()) {
-            return "";
-        }
-        var last = qualifiedName.lastIndexOf('.');
-        if (last < 0) {
-            return "";
-        }
-        return qualifiedName.substring(0, last);
-    }
-
     private static List<String> enclosingTypesOf(String qualifiedName) {
         if (qualifiedName == null || qualifiedName.isBlank()) {
             return List.of();
@@ -136,7 +126,7 @@ public final class IndexedType {
         if (parts.length < 3) {
             return List.of();
         }
-        var packageName = packageOf(qualifiedName);
+        var packageName = TypeNames.packageName(qualifiedName);
         var packageSegments = packageName.isBlank() ? 0 : packageName.split("\\.").length;
         if (parts.length - packageSegments <= 1) {
             return List.of();

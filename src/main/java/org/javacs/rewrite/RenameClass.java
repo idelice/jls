@@ -12,6 +12,7 @@ import javax.lang.model.element.TypeElement;
 import org.javacs.CompilerProvider;
 import org.javacs.LspPosition;
 import org.javacs.lsp.TextEdit;
+import org.javacs.resolve.TypeNames;
 
 public class RenameClass implements Rewrite {
     public final String oldQualifiedName;
@@ -24,7 +25,7 @@ public class RenameClass implements Rewrite {
 
     @Override
     public Map<Path, TextEdit[]> rewrite(CompilerProvider compiler) {
-        var oldSimpleName = oldQualifiedName.substring(oldQualifiedName.lastIndexOf('.') + 1);
+        var oldSimpleName = TypeNames.simpleName(oldQualifiedName);
         if (oldSimpleName.equals(newSimpleName)) return CANCELLED;
 
         var sourceFile = compiler.findTypeDeclaration(oldQualifiedName);
@@ -93,7 +94,7 @@ public class RenameClass implements Rewrite {
             CompilationUnitTree root, TypeElement oldType, JavacTask task) {
         var trees = Trees.instance(task);
         var pos = trees.getSourcePositions();
-        var oldSimpleName = oldQualifiedName.substring(oldQualifiedName.lastIndexOf('.') + 1);
+        var oldSimpleName = TypeNames.simpleName(oldQualifiedName);
         var found = new ArrayList<TreePath>();
 
         // Read the source content once so we can verify positions for IdentifierTree nodes.

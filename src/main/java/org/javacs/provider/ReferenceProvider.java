@@ -1,8 +1,5 @@
 package org.javacs.provider;
 
-import com.sun.source.tree.ClassTree;
-import com.sun.source.tree.MethodTree;
-import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -28,13 +25,14 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
-import org.javacs.LombokAnnotations;
 import org.javacs.SourceFileObject;
 import org.javacs.completion.PruneBodiesWithoutToken;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.FindLombokReferences;
 import org.javacs.navigation.FindReferences;
 import org.javacs.navigation.NavigationHelper;
+import org.javacs.resolve.TypeNames;
 
 public class ReferenceProvider {
     private final CompilerProvider compiler;
@@ -43,8 +41,7 @@ public class ReferenceProvider {
     private final Consumer<Path[]> batchResolver;
     private final Path file;
     private final int line, column;
-    /** Token->files lookup from the workspace index. Null = fall back to text-scan. */
-    private final Function<String, List<Path>> tokenLookup;
+    private final WorkspaceTypeIndex typeIndex;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
@@ -58,12 +55,12 @@ public class ReferenceProvider {
             Function<Path, CompilerProvider> compilerForFile,
             BiPredicate<Path, Path> candidateAllowed,
             Consumer<Path[]> batchResolver,
-            Function<String, List<Path>> tokenLookup) {
+            WorkspaceTypeIndex typeIndex) {
         this.compiler = compiler;
         this.compilerForFile = compilerForFile;
         this.candidateAllowed = candidateAllowed;
         this.batchResolver = batchResolver;
-        this.tokenLookup = tokenLookup;
+        this.typeIndex = typeIndex;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -94,10 +91,19 @@ public class ReferenceProvider {
                 }
                 if (compiler.lombokPresentOnClasspath()) {
                     LOG.fine("[ref] lombokOnClasspath=true");
-                    var names = lombokSearchNames(element, memberName, task);
-                    if (!names.isEmpty()) {
-                        task.close();
-                        return findLombokReferences(className, names);
+                    var accessor = typeIndex == null
+                            ? null
+                            : typeIndex.accessorNames(className, memberName).orElse(null);
+                    if (accessor != null) {
+                        var lombokClassName = accessor.ownerType();
+                        var lombokDeclaration = lombokClassName.equals(className)
+                                ? declaration
+                                : compiler.findTypeDeclaration(lombokClassName);
+                        if (!accessor.names().isEmpty()) {
+                            task.close();
+                            return findLombokReferences(
+                                    lombokClassName, accessor.names(), lombokDeclaration);
+                        }
                     }
                     LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
@@ -139,12 +145,12 @@ public class ReferenceProvider {
     }
 
     private List<Path> tokenCandidates(String name) {
-        if (tokenLookup == null) return null;
-        return tokenLookup.apply(name);
+        if (typeIndex == null) return null;
+        return typeIndex.filesContainingToken(name);
     }
 
     private List<Location> findTypeReferences(String className) {
-        var simpleName = className.contains(".") ? className.substring(className.lastIndexOf('.') + 1) : className;
+        var simpleName = TypeNames.simpleName(className);
         var postings = tokenCandidates(simpleName);
         var files = compiler.findTypeReferences(className, postings);
         LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d source=%s",
@@ -155,11 +161,7 @@ public class ReferenceProvider {
 
     private List<Location> findMemberReferences(Set<String> classNames, String memberName, Path declaration, boolean packagePrivate) {
         var postings = tokenCandidates(memberName);
-        var allFiles = new LinkedHashSet<Path>();
-        for (var cn : classNames) {
-            for (var f : compiler.findMemberReferences(cn, memberName, postings)) allFiles.add(f);
-        }
-        var files = allFiles.toArray(Path[]::new);
+        var files = compiler.findMemberReferences(classNames, Set.of(memberName), postings);
         LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d source=%s",
                 classNames, memberName, files.length, postings != null ? "token_index" : "text_scan"));
         if (packagePrivate && declaration != null) {
@@ -215,7 +217,7 @@ public class ReferenceProvider {
             sources.add(new SourceFileObject(file));
             try (var task = candidateCompiler.compile(sources)) {
                 for (var location : findReferences(task)) {
-                    locations.put(location.uri + ":" + location.range, location);
+                    locations.put(FindHelper.locationKey(location), location);
                 }
             }
         }
@@ -251,75 +253,25 @@ public class ReferenceProvider {
         return locations;
     }
 
-    private Set<String> lombokSearchNames(Element element, String memberName, CompileTask task) {
-        var parent = element.getEnclosingElement();
-        LOG.fine(String.format("[ref] lombokSearchNames element.kind=%s memberName=%s", element.getKind(), memberName));
-        if (!(parent instanceof TypeElement parentType)) {
-            return Set.of();
-        }
-        if (element.getKind() == ElementKind.METHOD && task.trees.getTree(element) instanceof MethodTree) {
-            return Set.of();
-        }
-        if (!(task.trees.getTree(parentType) instanceof ClassTree declaration)) {
-            return Set.of();
-        }
-        var fieldName = element.getKind() == ElementKind.FIELD
-                ? memberName
-                : LombokAnnotations.accessorFieldName(memberName).orElse(null);
-        if (fieldName == null) {
-            return Set.of();
-        }
-
-        VariableTree field = null;
-        for (var member : declaration.getMembers()) {
-            if (member instanceof VariableTree variable
-                    && variable.getName().contentEquals(fieldName)) {
-                field = variable;
-                break;
-            }
-        }
-        if (field == null) {
-            return Set.of();
-        }
-        var parentPath = task.trees.getPath(parentType);
-        if (parentPath == null) {
-            return Set.of();
-        }
-        var accessors = LombokAnnotations.accessorInfo(
-                parentPath.getCompilationUnit(), declaration.getModifiers(),
-                field.getModifiers(), fieldName, field.getType().toString());
-        if (accessors.isEmpty()) {
-            return Set.of();
-        }
-
-        var names = new LinkedHashSet<String>();
-        names.add(fieldName);
-        if (accessors.get().hasGetter()) {
-            names.add(accessors.get().getterName());
-        }
-        if (accessors.get().hasSetter()) {
-            names.add(accessors.get().setterName());
-        }
-        return names;
-    }
-
-    private List<Location> findLombokReferences(String className, Set<String> names) {
+    private List<Location> findLombokReferences(String className, Set<String> names, Path declaration) {
         var start = System.currentTimeMillis();
         var files = new LinkedHashSet<Path>();
-        var useIndex = tokenLookup != null;
+        var useIndex = typeIndex != null;
         List<Path> postings = null;
         if (useIndex) {
             postings = new ArrayList<>();
             for (var name : names) {
-                var p = tokenLookup.apply(name);
-                if (p == null) { useIndex = false; postings = null; break; }
+                var p = typeIndex.filesContainingToken(name);
+                if (p == null) {
+                    useIndex = false;
+                    postings = null;
+                    break;
+                }
                 postings.addAll(p);
             }
         }
-        for (var name : names) {
-            for (var f : compiler.findMemberReferences(className, name, postings)) {
-                  files.add(f);
-            }
+        for (var f : compiler.findMemberReferences(Set.of(className), names, postings)) {
+            files.add(f);
         }
         if (files.isEmpty()) {
             LOG.fine(String.format(
@@ -328,7 +280,6 @@ public class ReferenceProvider {
             return List.of();
         }
         var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
-        var declaration = compiler.findTypeDeclaration(className);
         for (var candidate : files) {
             if (!candidateAllowed.test(declaration, candidate)) continue;
             var candidateCompiler = compilerForFile.apply(candidate);
@@ -346,7 +297,7 @@ public class ReferenceProvider {
                 }
                 for (var path : paths) {
                     var location = FindHelper.location(task, path);
-                    locations.put(location.uri + ":" + location.range, location);
+                    locations.put(FindHelper.locationKey(location), location);
                 }
                 roots += task.roots.size();
                 errors += task.diagnostics.stream().filter(d -> d.getKind() == Diagnostic.Kind.ERROR).count();

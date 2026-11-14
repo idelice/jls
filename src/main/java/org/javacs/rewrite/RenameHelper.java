@@ -137,13 +137,7 @@ class RenameHelper {
 
     private boolean overridesTarget(Element candidate, ExecutableElement find) {
         if (!(candidate instanceof ExecutableElement method) || method.equals(find)) return false;
-        var elements = task.elements;
-        if (!(method.getEnclosingElement() instanceof TypeElement methodType)
-                || !(find.getEnclosingElement() instanceof TypeElement findType)) {
-            return false;
-        }
-        return elements.overrides(method, find, methodType)
-                || elements.overrides(find, method, findType);
+        return FindHelper.overridesEither(task.elements, method, find);
     }
 
     private TextEdit[] replaceAll(List<TreePath> found, String newName) {

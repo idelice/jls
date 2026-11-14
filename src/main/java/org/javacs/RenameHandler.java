@@ -1,13 +1,11 @@
 package org.javacs;
 
-import com.sun.tools.javac.code.Flags;
-import com.sun.tools.javac.code.Symbol;
-import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
 import javax.lang.model.element.*;
 import org.javacs.lsp.*;
+import org.javacs.navigation.NavigationHelper;
 import org.javacs.rewrite.*;
 
 /**
@@ -29,17 +27,8 @@ final class RenameHandler {
         var file = Paths.get(params.textDocument.uri);
         var requestCompiler = server.compilerFor(file);
         try (var task = requestCompiler.compile(file)) {
-            long cursor;
-            try {
-                cursor =
-                        FileStore.offset(
-                                task.root(file).getSourceFile().getCharContent(true).toString(),
-                                params.position.line + 1,
-                                params.position.character + 1);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            var path = new FindNameAt(task).scan(task.root(file), cursor);
+            var path = NavigationHelper.findPath(
+                    task, file, params.position.line + 1, params.position.character + 1);
             if (path == null) {
                 LOG.info("...no element under cursor");
                 return Optional.empty();
@@ -123,17 +112,8 @@ final class RenameHandler {
     private Rewrite createRewrite(RenameParams params, CompilerProvider requestCompiler) {
         var file = Paths.get(params.textDocument.uri);
         try (var task = requestCompiler.compile(file)) {
-            long position;
-            try {
-                position =
-                        FileStore.offset(
-                                task.root(file).getSourceFile().getCharContent(true).toString(),
-                                params.position.line + 1,
-                                params.position.character + 1);
-            } catch (java.io.IOException e) {
-                throw new RuntimeException(e);
-            }
-            var path = new FindNameAt(task).scan(task.root(file), position);
+            var path = NavigationHelper.findPath(
+                    task, file, params.position.line + 1, params.position.character + 1);
             if (path == null) return Rewrite.NOT_SUPPORTED;
             var el = task.trees.getElement(path);
             if (isGenerated(el)) {
@@ -156,18 +136,14 @@ final class RenameHandler {
 
     /** Lombok-generated members are injected declarations: they carry no editable source range. */
     private boolean isGenerated(Element element) {
-        return element instanceof Symbol symbol && (symbol.flags() & Flags.GENERATED_MEMBER) != 0;
+        return LombokAnnotations.isGeneratedMember(element);
     }
 
     private RenameMethod renameMethod(CompileTask task, ExecutableElement method, String newName) {
         var parent = (TypeElement) method.getEnclosingElement();
         var className = parent.getQualifiedName().toString();
         var methodName = method.getSimpleName().toString();
-        var erasedParameterTypes = new String[method.getParameters().size()];
-        for (var i = 0; i < erasedParameterTypes.length; i++) {
-            var type = method.getParameters().get(i).asType();
-            erasedParameterTypes[i] = task.types.erasure(type).toString();
-        }
+        var erasedParameterTypes = FindHelper.erasedParameterTypes(task, method);
         return new RenameMethod(className, methodName, erasedParameterTypes, newName);
     }
 

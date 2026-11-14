@@ -29,9 +29,9 @@ import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.util.Elements;
 import org.javacs.CacheAudit;
 import org.javacs.lsp.Location;
-import org.javacs.lsp.Range;
 
 public class FindHelper {
     private static final Map<URI, URI> jarUriCache = new ConcurrentHashMap<>();
@@ -62,6 +62,16 @@ public class FindHelper {
             erasedParameterTypes[i] = types.erasure(p).toString();
         }
         return erasedParameterTypes;
+    }
+
+    /** Returns whether either method overrides the other, from its own declaring type's perspective. */
+    public static boolean overridesEither(Elements elements, ExecutableElement a, ExecutableElement b) {
+        if (a == null || b == null) return false;
+        if (!(a.getEnclosingElement() instanceof TypeElement typeA)
+                || !(b.getEnclosingElement() instanceof TypeElement typeB)) {
+            return false;
+        }
+        return elements.overrides(a, b, typeA) || elements.overrides(b, a, typeB);
     }
 
     public static MethodTree findMethod(
@@ -163,18 +173,24 @@ public class FindHelper {
     }
 
     public static Location location(CompileTask task, TreePath path) {
-        return location(task.trees, path, "", false);
+        return location(task.trees, path, "");
     }
 
     public static Location location(CompileTask task, TreePath path, CharSequence name) {
-        return location(task.trees, path, name, false);
+        return location(task.trees, path, name);
     }
 
-    public static Location location(ParseTask task, TreePath path, CharSequence name) {
-        return location(Trees.instance(task.task()), path, name, false);
+    public static Location location(ParseTask task, Tree tree, CharSequence name) {
+        if (tree == null) return null;
+        var path = TreePath.getPath(task.root(), tree);
+        return path == null ? null : location(Trees.instance(task.task()), path, name);
     }
 
-    public static Location location(Trees trees, TreePath path, CharSequence name, boolean strictNameMatch) {
+    public static String locationKey(Location location) {
+        return location.uri + ":" + location.range;
+    }
+
+    private static Location location(Trees trees, TreePath path, CharSequence name) {
         var pos = trees.getSourcePositions();
         var root = path.getCompilationUnit();
         var start = -1;
@@ -191,19 +207,12 @@ public class FindHelper {
             if (namedStart >= 0) {
                 start = namedStart;
                 end = start + name.length();
-            } else if (strictNameMatch) {
-                return null;
             }
         }
         if (start < 0 || end < start) {
             return null;
         }
-        Range range;
-        try {
-            range = FileStore.range(root.getSourceFile().getCharContent(true).toString(), start, end);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
+        var range = LspPosition.range(root, start, end);
         var uri = normalizeUri(root.getSourceFile().toUri());
         return new Location(uri, range);
     }

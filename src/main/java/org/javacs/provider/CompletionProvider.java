@@ -477,22 +477,8 @@ public class CompletionProvider {
             List<ExecutableElement> overloads, Map<String, byte[]> bytesByOwner,
             Map<String, ParseTask> sourceByType, boolean addParentheses) {
         var first = overloads.getFirst();
-        byte[] ownerClassBytes = null;
-        if (ElementSignatureHelper.hasSyntheticNames(first.getParameters())) {
-            var declaringOwner = ElementSignatureHelper.ownerQualifiedName(first);
-            if (!bytesByOwner.containsKey(declaringOwner)) {
-                bytesByOwner.put(declaringOwner, compiler.findClassFile(declaringOwner).orElse(null));
-            }
-            ownerClassBytes = bytesByOwner.get(declaringOwner);
-        }
-        var names = ElementSignatureHelper.parameterNames(task, first, ownerClassBytes);
-        if (java.util.Arrays.stream(names).anyMatch(name -> name.matches("arg\\d+"))) {
-            var declaringOwner = ElementSignatureHelper.ownerQualifiedName(first);
-            var source = declaringOwner == null ? null : ownerSource(declaringOwner, sourceByType);
-            if (source != null) {
-                names = ElementSignatureHelper.parameterNamesFromSource(task, first, source, names);
-            }
-        }
+        var names = ElementSignatureHelper.parameterNamesWithSourceFallback(
+                compiler, task, first, bytesByOwner, sourceByType);
         var data = new CompletionData();
         data.className = ownerType;
         data.memberName = first.getSimpleName().toString();
@@ -501,14 +487,6 @@ public class CompletionProvider {
         data.compilerId = compilerId;
         var item = CompletionItems.compiledMethod(first, names, data, addParentheses);
         return item;
-    }
-
-    private ParseTask ownerSource(String ownerType, Map<String, ParseTask> memo) {
-        if (memo.containsKey(ownerType)) return memo.get(ownerType);
-        var source = compiler.findAnywhere(ownerType);
-        var parsed = source.map(compiler::parse).orElse(null);
-        memo.put(ownerType, parsed);
-        return parsed;
     }
 
     private CompletionItem indexedMember(IndexedMember member) {

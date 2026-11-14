@@ -7,8 +7,6 @@ import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.TreePath;
-import com.sun.tools.javac.code.Flags;
-import com.sun.tools.javac.code.Symbol;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -21,6 +19,7 @@ import org.javacs.CompileTask;
 import org.javacs.ElementSignatureHelper;
 import org.javacs.CompilerProvider;
 import org.javacs.JsonHelper;
+import org.javacs.LombokAnnotations;
 import org.javacs.LspPosition;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.InlayHint;
@@ -114,8 +113,7 @@ public class InlayHintProvider {
                     var path = getCurrentPath().getParentPath();
                     while (path != null) {
                         var element = task.trees.getElement(path);
-                        if (element instanceof Symbol symbol
-                                && (symbol.flags() & Flags.GENERATED_MEMBER) != 0) {
+                        if (LombokAnnotations.isGeneratedMember(element)) {
                             return true;
                         }
                         path = path.getParentPath();

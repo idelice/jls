@@ -667,7 +667,7 @@ class JavaLanguageServer extends LanguageServer {
                     new ReferenceProvider(
                                     compilerFor(file), file, line, column, this::compilerFor,
                                     this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles,
-                                    completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
+                                    completionSnapshotRef.get().workspaceIndex())
                             .find();
             LOG.fine(String.format("[perf] references file=%s results=%d took=%dms",
                     file.getFileName(), found == ReferenceProvider.NOT_SUPPORTED ? 0 : found.size(),

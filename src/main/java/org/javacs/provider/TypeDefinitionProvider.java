@@ -112,7 +112,7 @@ public final class TypeDefinitionProvider {
             }
         }
 
-        var sourceOwner = outermostTypeName(type);
+        var sourceOwner = NavigationHelper.outermostTypeName(type);
         var source = compiler.findAnywhere(qualifiedName)
                 .or(() -> qualifiedName.equals(sourceOwner)
                         ? java.util.Optional.empty()
@@ -138,17 +138,7 @@ public final class TypeDefinitionProvider {
     private static Location locateInParse(org.javacs.ParseTask parse, String qualifiedName) {
         var tree = FindHelper.findType(parse, qualifiedName);
         if (tree == null) return null;
-        var path = TreePath.getPath(parse.root(), tree);
-        if (path == null) return null;
-        return FindHelper.location(parse, path, tree.getSimpleName());
+        return FindHelper.location(parse, tree, tree.getSimpleName());
     }
 
-    private static String outermostTypeName(TypeElement type) {
-        var outermost = type;
-        for (var owner = type.getEnclosingElement(); owner instanceof TypeElement enclosing;
-                owner = enclosing.getEnclosingElement()) {
-            outermost = enclosing;
-        }
-        return outermost.getQualifiedName().toString();
-    }
 }

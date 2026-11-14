@@ -144,12 +144,6 @@ public class NavigationHelper {
         }
     }
 
-    /** Walks transitive supertypes of {@code owner} to find the highest type declaring {@code methodName}. */
-    public static TypeElement findRootDeclaringType(Types types, TypeElement owner, String methodName) {
-        var all = findDeclaringSupertypes(types, owner, methodName);
-        return all.isEmpty() ? owner : all.getLast();
-    }
-
     /** Returns all transitive supertypes of {@code owner} that declare a method with {@code methodName}, in BFS order. */
     public static ArrayList<TypeElement> findDeclaringSupertypes(Types types, TypeElement owner, String methodName) {
         var result = new ArrayList<TypeElement>();
@@ -170,5 +164,23 @@ public class NavigationHelper {
             queue.addAll(types.directSupertypes(superType.asType()));
         }
         return result;
+    }
+
+    /** Returns the nearest enclosing type, including {@code element} itself. */
+    public static TypeElement enclosingType(Element element) {
+        for (var current = element; current != null; current = current.getEnclosingElement()) {
+            if (current instanceof TypeElement type) return type;
+        }
+        return null;
+    }
+
+    /** Returns the qualified name of the outermost enclosing type. */
+    public static String outermostTypeName(TypeElement type) {
+        var outermost = type;
+        for (var owner = type.getEnclosingElement(); owner instanceof TypeElement enclosing;
+                owner = enclosing.getEnclosingElement()) {
+            outermost = enclosing;
+        }
+        return outermost.getQualifiedName().toString();
     }
 }

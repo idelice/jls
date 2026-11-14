@@ -60,6 +60,13 @@ public final class TypeNames {
         return index >= 0 ? normalized.substring(index + 1) : normalized;
     }
 
+    /** Return the package portion of a qualified type name, or "" for the default package. */
+    public static String packageName(String qualifiedType) {
+        if (qualifiedType == null || qualifiedType.isBlank()) return "";
+        var index = qualifiedType.lastIndexOf('.');
+        return index < 0 ? "" : qualifiedType.substring(0, index);
+    }
+
     public static boolean isPrimitive(String typeName) {
         return PRIMITIVE_TYPE_NAMES.contains(normalize(typeName));
     }
