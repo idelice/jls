@@ -33,7 +33,6 @@ import com.sun.tools.javac.tree.JCTree.JCVariableDecl;
 import org.javacs.LombokAnnotations;
 import org.javacs.LombokStubInjector;
 import org.javacs.ParseTask;
-import org.javacs.FileStore;
 import org.javacs.lsp.CompletionItemKind;
 import org.javacs.resolve.TypeNames;
 
@@ -102,7 +101,6 @@ public class WorkspaceTypeIndex {
     private final Set<String> workspaceOwnedTypeNames;
     private final Map<String, Set<String>> subtypesByType;
     private final Map<Path, SourceFileSnapshot> sourceFiles;
-    private Map<String, List<Path>> filesByToken = Map.of();
 
     private WorkspaceTypeIndex(
             Map<String, IndexedType> typesByQualifiedName,
@@ -159,20 +157,7 @@ public class WorkspaceTypeIndex {
                 files.put(entry.getKey(), entry.getValue());
             }
         }
-        var restricted = new WorkspaceTypeIndex(types, files);
-        restricted.filesByToken = filterTokens(filesByToken, files.keySet());
-        return restricted;
-    }
-
-    private static Map<String, List<Path>> filterTokens(Map<String, List<Path>> source, Set<Path> keep) {
-        if (source.isEmpty()) return Map.of();
-        var out = new Object2ObjectOpenHashMap<String, List<Path>>();
-        for (var e : source.entrySet()) {
-            var kept = new ArrayList<Path>();
-            for (var p : e.getValue()) if (keep.contains(p)) kept.add(p);
-            if (!kept.isEmpty()) out.put(e.getKey(), kept);
-        }
-        return out;
+        return new WorkspaceTypeIndex(types, files);
     }
 
     public boolean containsType(String qualifiedName) {
@@ -181,17 +166,6 @@ public class WorkspaceTypeIndex {
 
     public boolean isAnnotationType(String qualifiedName) {
         return typeInfo(qualifiedName).map(type -> type.annotationType).orElse(false);
-    }
-
-    public List<Path> filesContainingToken(String simpleName) {
-        // A module-scoped snapshot cannot rule out matches in other workspace files.
-        var postings = filesByToken.get(simpleName);
-        var candidates = new ArrayList<Path>();
-        if (postings != null) candidates.addAll(postings);
-        for (var file : FileStore.all()) {
-            if (!sourceFiles.containsKey(file)) candidates.add(file);
-        }
-        return candidates;
     }
 
     public boolean ownsTypeOrEnclosingType(String qualifiedName) {
@@ -334,27 +308,7 @@ public class WorkspaceTypeIndex {
             }
         }
 
-        var result = new WorkspaceTypeIndex(nextTypes, nextSourceFiles);
-        // Carry the inverted token index forward: base postings minus replaced files, plus delta.
-        if (!filesByToken.isEmpty() || (updates != null && !updates.filesByToken.isEmpty())) {
-            var nextTokens = new Object2ObjectOpenHashMap<String, List<Path>>();
-            for (var e : filesByToken.entrySet()) {
-                var kept = new ArrayList<Path>();
-                for (var p : e.getValue()) if (!filesToReplace.contains(p)) kept.add(p);
-                if (!kept.isEmpty()) nextTokens.put(e.getKey(), kept);
-            }
-            if (updates != null) {
-                for (var e : updates.filesByToken.entrySet()) {
-                    nextTokens.merge(e.getKey(), e.getValue(), (a, b) -> {
-                        var merged = new ArrayList<>(a);
-                        merged.addAll(b);
-                        return merged;
-                    });
-                }
-            }
-            result.filesByToken = nextTokens;
-        }
-        return result;
+        return new WorkspaceTypeIndex(nextTypes, nextSourceFiles);
     }
 
     public List<IndexedMember> members(String qualifiedName, boolean staticContext) {
@@ -671,18 +625,21 @@ public class WorkspaceTypeIndex {
 
     public static WorkspaceTypeIndex fromParseTrees(
             Iterable<ParseTask> parseTasks, Predicate<String> knownType) {
-        return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true);
+        return fromParseTrees(parseTasks, (__, name) -> knownType.test(name), (__, ___) -> true, null);
     }
 
     /**
      * @param parseTasks iterated once and never retained: pass a lazy sequence so only one syntax
      *     tree is alive at a time. Materialising every tree first exhausts the heap on a large
      *     module closure.
+     * @param tokenSink receives each file's tokens as it is scanned, or {@code null} to skip token
+     *     collection.
      */
     public static WorkspaceTypeIndex fromParseTrees(
             Iterable<ParseTask> parseTasks,
             BiPredicate<Path, String> knownType,
-            BiPredicate<Path, Path> sourceVisible) {
+            BiPredicate<Path, Path> sourceVisible,
+            TokenIndex tokenSink) {
         // Single-pass: parse each file, extract all metadata + members, discard AST immediately.
         // Supertype resolution is deferred to a post-pass using collected import/package data.
         var allQualifiedNames = new ObjectOpenHashSet<String>();
@@ -700,8 +657,6 @@ public class WorkspaceTypeIndex {
         var typeSourceFile = new Object2ObjectOpenHashMap<String, Path>();
         // Members extracted per type
         var typeDirectMembers = new Object2ObjectOpenHashMap<String, Map<String, IndexedMember>>();
-        // Inverted body-identifier prefilter: token -> files mentioning it (bounded post-pass).
-        var tokenFiles = new Object2ObjectOpenHashMap<String, ObjectOpenHashSet<Path>>();
 
         for (var parseTask : parseTasks) {
             var root = parseTask.root();
@@ -727,7 +682,7 @@ public class WorkspaceTypeIndex {
 
             var declaredTypesInFile = new ArrayList<String>();
             var qualifiedNameStack = new ArrayDeque<String>();
-            var fileTokens = new ObjectOpenHashSet<String>();
+            var fileTokens = tokenSink == null ? null : new ObjectOpenHashSet<String>();
 
             // Extract types, members, raw supertypes — all in one scan
             new TreeScanner<Void, Void>() {
@@ -838,9 +793,7 @@ public class WorkspaceTypeIndex {
                         finalSourcePath, finalSourceUri, packageName,
                         explicitImports, staticImports, declaredTypesInFile,
                         ""));
-                for (var token : fileTokens) {
-                    tokenFiles.computeIfAbsent(token, __ -> new ObjectOpenHashSet<>()).add(finalSourcePath);
-                }
+                if (tokenSink != null) tokenSink.replaceFile(finalSourcePath, fileTokens);
             }
         }
         // Each syntax tree became garbage as soon as its iteration ended; only the collected
@@ -927,28 +880,15 @@ public class WorkspaceTypeIndex {
 
         var finalizedSourceFiles = finalizeSourceFiles(sourceFileSnapshots, typeEntries);
 
-        var index = new WorkspaceTypeIndex(
-                        Collections.unmodifiableMap(typeEntries),
-                        Collections.unmodifiableMap(finalizedSourceFiles));
-        index.filesByToken = buildTokenIndex(tokenFiles);
-        return index;
+        return new WorkspaceTypeIndex(
+                Collections.unmodifiableMap(typeEntries),
+                Collections.unmodifiableMap(finalizedSourceFiles));
     }
 
     private static void addToken(ObjectOpenHashSet<String> fileTokens, CharSequence name) {
-        if (name == null) return;
+        if (fileTokens == null || name == null) return;
         var s = name.toString();
         if (!s.isBlank()) fileTokens.add(s);
-    }
-
-    /** Absent token means no indexed source mentions it. */
-    private static Map<String, List<Path>> buildTokenIndex(
-            Map<String, ObjectOpenHashSet<Path>> tokenFiles) {
-        if (tokenFiles.isEmpty()) return Map.of();
-        var out = new Object2ObjectOpenHashMap<String, List<Path>>();
-        for (var e : tokenFiles.entrySet()) {
-            out.put(e.getKey(), List.copyOf(e.getValue()));
-        }
-        return out;
     }
 
     private static Map<Path, SourceFileSnapshot> finalizeSourceFiles(

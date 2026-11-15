@@ -8,6 +8,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiPredicate;
 import java.util.logging.Logger;
+import org.javacs.index.TokenIndex;
 import org.javacs.index.WorkspaceTypeIndex;
 
 /**
@@ -103,6 +104,7 @@ final class CompletionIndexScheduler {
             scope = "";
             queued.clear();
             epoch++;
+            server.tokenIndex().clear();
         }
         server.publishCompletionSnapshot(WorkspaceTypeIndex.EMPTY, 0);
     }
@@ -172,10 +174,12 @@ final class CompletionIndexScheduler {
             // Parse lazily: a module closure holds thousands of files and materialising every
             // syntax tree at once exhausts the heap.
             Iterable<ParseTask> parsed = () -> files.stream().map(compiler::parse).iterator();
+            var tokens = new TokenIndex();
             var index = WorkspaceTypeIndex.fromParseTrees(
                     parsed,
                     (source, name) -> server.isClasspathTypeForIndexing(source, compiler, name),
-                    (source, declaration) -> server.canReferenceModule(declaration, source));
+                    (source, declaration) -> server.canReferenceModule(declaration, source),
+                    tokens);
             List<Path> drained;
             synchronized (server) {
                 if (!wanted.equals(scope) || epoch != startedEpoch) {
@@ -183,6 +187,7 @@ final class CompletionIndexScheduler {
                     return;
                 }
                 server.publishCompletionSnapshot(index, server.completionIndexVersion.incrementAndGet());
+                server.tokenIndex().replaceWith(tokens);
                 state = State.READY;
                 drained = List.copyOf(queued);
                 queued.clear();
@@ -221,12 +226,18 @@ final class CompletionIndexScheduler {
             if (compiler == null) return;
             var parseTasks = new ArrayList<ParseTask>();
             var indexed = new ArrayList<Path>();
+            var deleted = new ArrayList<Path>();
             for (var file : batch) {
+                if (!FileStore.contains(file)) deleted.add(file);
                 // A half-typed file would delete the declarations it still has; keep the old ones.
                 var parsed = compiler.parse(file);
                 if (parsed.hasSyntaxErrors()) continue;
                 parseTasks.add(parsed);
                 indexed.add(file);
+            }
+            synchronized (server) {
+                if (state != State.READY || epoch != startedEpoch) return;
+                for (var file : deleted) server.tokenIndex().removeFile(file);
             }
             if (parseTasks.isEmpty()) return;
             var base = server.completionSnapshotRef.get();
@@ -238,9 +249,16 @@ final class CompletionIndexScheduler {
                                     .filter(type -> server.canReferenceModule(type.sourcePath, source))
                                     .isPresent()
                             || server.isClasspathTypeForIndexing(source, compiler, name);
+            var tokens = new TokenIndex();
             var delta = WorkspaceTypeIndex.fromParseTrees(
                     parseTasks, knownType,
-                    (source, declaration) -> server.canReferenceModule(declaration, source));
+                    (source, declaration) -> server.canReferenceModule(declaration, source),
+                    tokens);
+            synchronized (server) {
+                if (state != State.READY || epoch != startedEpoch) return;
+                server.tokenIndex().replaceFiles(tokens, indexed);
+            }
+            // Token postings were already replaced above; the early return only skips declarations.
             if (base.workspaceIndex().hasSameDeclarations(delta, indexed)) return;
             var merged = base.workspaceIndex().replaceWorkspaceDeclarations(delta, new LinkedHashSet<>(indexed));
             synchronized (server) {

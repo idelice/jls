@@ -19,6 +19,7 @@ import org.javacs.action.CodeActionProvider;
 import org.javacs.action.FindMethodDeclarationAt;
 import org.javacs.provider.CompletionProvider;
 import org.javacs.provider.SignatureProvider;
+import org.javacs.index.TokenIndex;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.fold.FoldProvider;
 import org.javacs.provider.HoverProvider;
@@ -90,6 +91,11 @@ class JavaLanguageServer extends LanguageServer {
     final AtomicLong completionIndexVersion = new AtomicLong();
     final AtomicReference<CompletionSnapshot> completionSnapshotRef =
             new AtomicReference<>(CompletionSnapshot.EMPTY);
+    private final TokenIndex tokenIndex = new TokenIndex();
+
+    TokenIndex tokenIndex() {
+        return tokenIndex;
+    }
 
 
     private final Set<String> shownWorkspaceWarnings = ConcurrentHashMap.newKeySet();
@@ -667,7 +673,7 @@ class JavaLanguageServer extends LanguageServer {
                     new ReferenceProvider(
                                     compilerFor(file), file, line, column, this::compilerFor,
                                     this::canReferenceModule, moduleRegistry::batchResolveModulesForFiles,
-                                    completionSnapshotRef.get().workspaceIndex())
+                                    completionSnapshotRef.get().workspaceIndex(), tokenIndex())
                             .find();
             LOG.fine(String.format("[perf] references file=%s results=%d took=%dms",
                     file.getFileName(), found == ReferenceProvider.NOT_SUPPORTED ? 0 : found.size(),
@@ -714,7 +720,7 @@ class JavaLanguageServer extends LanguageServer {
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
                         moduleRegistry::includeReferenceSources,
-                        completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
+                        tokenIndex()::filesContainingToken)
                 .prepare(file, position.position.line + 1, position.position.character + 1);
     }
 
@@ -727,7 +733,7 @@ class JavaLanguageServer extends LanguageServer {
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
                         moduleRegistry::includeReferenceSources,
-                        completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
+                        tokenIndex()::filesContainingToken)
                 .incomingCalls(params.item);
     }
 
@@ -740,7 +746,7 @@ class JavaLanguageServer extends LanguageServer {
                         this::compilerFor,
                         moduleRegistry::batchResolveModulesForFiles,
                         moduleRegistry::includeReferenceSources,
-                        completionSnapshotRef.get().workspaceIndex()::filesContainingToken)
+                        tokenIndex()::filesContainingToken)
                 .outgoingCalls(params.item);
     }
 

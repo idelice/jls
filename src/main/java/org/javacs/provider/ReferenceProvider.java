@@ -30,6 +30,7 @@ import org.javacs.FindHelper;
 import org.javacs.LombokAnnotations;
 import org.javacs.SourceFileObject;
 import org.javacs.completion.PruneBodiesWithoutToken;
+import org.javacs.index.TokenIndex;
 import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.lsp.Location;
 import org.javacs.navigation.FindLombokReferences;
@@ -45,6 +46,7 @@ public class ReferenceProvider {
     private final Path file;
     private final int line, column;
     private final WorkspaceTypeIndex typeIndex;
+    private final TokenIndex tokenIndex;
 
     public static final List<Location> NOT_SUPPORTED = List.of();
 
@@ -58,12 +60,14 @@ public class ReferenceProvider {
             Function<Path, CompilerProvider> compilerForFile,
             BiPredicate<Path, Path> candidateAllowed,
             Consumer<Path[]> batchResolver,
-            WorkspaceTypeIndex typeIndex) {
+            WorkspaceTypeIndex typeIndex,
+            TokenIndex tokenIndex) {
         this.compiler = compiler;
         this.compilerForFile = compilerForFile;
         this.candidateAllowed = candidateAllowed;
         this.batchResolver = batchResolver;
         this.typeIndex = typeIndex;
+        this.tokenIndex = tokenIndex;
         this.file = file;
         this.line = line;
         this.column = column;
@@ -157,17 +161,12 @@ public class ReferenceProvider {
         }
     }
 
-    private List<Path> tokenCandidates(String name) {
-        if (typeIndex == null) return null;
-        return typeIndex.filesContainingToken(name);
-    }
-
     private List<Location> findTypeReferences(String className) {
         var simpleName = TypeNames.simpleName(className);
-        var postings = tokenCandidates(simpleName);
+        var postings = tokenIndex.filesContainingToken(simpleName);
         var files = compiler.findTypeReferences(className, postings);
-        LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d source=%s",
-                className, files.length, postings != null ? "token_index" : "text_scan"));
+        LOG.fine(String.format("[ref] type_scan owner=%s candidates=%d",
+                className, files.length));
         if (files.length == 0) return List.of();
         return findReferences(files, compiler.findTypeDeclaration(className), simpleName);
     }
@@ -175,7 +174,7 @@ public class ReferenceProvider {
     private List<Location> findAnnotationElementReferences(String className, Path declaration) {
         // Shorthand @A("x") has no member token; search by the annotation type name instead.
         var simpleName = TypeNames.simpleName(className);
-        var files = compiler.findTypeReferences(className, tokenCandidates(simpleName));
+        var files = compiler.findTypeReferences(className, tokenIndex.filesContainingToken(simpleName));
         var candidates = new LinkedHashSet<Path>();
         candidates.addAll(Arrays.asList(files));
         candidates.add(file);
@@ -187,10 +186,10 @@ public class ReferenceProvider {
 
     private List<Location> findMemberReferences(
             Set<String> classNames, String memberName, Path declaration, boolean packagePrivate, boolean constructor) {
-        var postings = tokenCandidates(memberName);
+        var postings = tokenIndex.filesContainingToken(memberName);
         var files = compiler.findMemberReferences(classNames, Set.of(memberName), postings);
-        LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d source=%s",
-                classNames, memberName, files.length, postings != null ? "token_index" : "text_scan"));
+        LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d",
+                classNames, memberName, files.length));
         if (packagePrivate && declaration != null) {
             var declarationPackage = FileStore.packageName(declaration);
             files = Arrays.stream(files)
@@ -303,19 +302,9 @@ public class ReferenceProvider {
     private List<Location> findLombokReferences(String className, Set<String> names, Path declaration) {
         var start = System.currentTimeMillis();
         var files = new LinkedHashSet<Path>();
-        var useIndex = typeIndex != null;
-        List<Path> postings = null;
-        if (useIndex) {
-            postings = new ArrayList<>();
-            for (var name : names) {
-                var p = typeIndex.filesContainingToken(name);
-                if (p == null) {
-                    useIndex = false;
-                    postings = null;
-                    break;
-                }
-                postings.addAll(p);
-            }
+        var postings = new ArrayList<Path>();
+        for (var name : names) {
+            postings.addAll(tokenIndex.filesContainingToken(name));
         }
         for (var f : compiler.findMemberReferences(Set.of(className), names, postings)) {
             files.add(f);
@@ -351,14 +340,13 @@ public class ReferenceProvider {
             }
         }
         LOG.fine(String.format(
-                "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d source=%s total=%dms",
+                "[ref] lombok_scan owner=%s names=%s candidates=%d roots=%d compiler_errors=%d matches=%d total=%dms",
                 className,
                 names,
                 files.size(),
                 roots,
                 errors,
                 locations.size(),
-                useIndex ? "token_index" : "text_scan",
                 System.currentTimeMillis() - start));
         return new ArrayList<>(locations.values());
     }
