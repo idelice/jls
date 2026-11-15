@@ -1,5 +1,8 @@
 package org.javacs.provider;
 
+import com.sun.source.tree.IdentifierTree;
+import com.sun.source.tree.MemberReferenceTree;
+import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -288,6 +291,15 @@ public class ReferenceProvider {
         return locations;
     }
 
+    private static CharSequence referencedName(TreePath path) {
+        return switch (path.getLeaf()) {
+            case MemberSelectTree select -> select.getIdentifier();
+            case MemberReferenceTree reference -> reference.getName();
+            case IdentifierTree identifier -> identifier.getName();
+            default -> "";
+        };
+    }
+
     private List<Location> findLombokReferences(String className, Set<String> names, Path declaration) {
         var start = System.currentTimeMillis();
         var files = new LinkedHashSet<Path>();
@@ -331,7 +343,7 @@ public class ReferenceProvider {
                     new FindLombokReferences(task, names, className).scan(root, paths);
                 }
                 for (var path : paths) {
-                    var location = FindHelper.location(task, path);
+                    var location = FindHelper.location(task, path, referencedName(path));
                     locations.put(FindHelper.locationKey(location), location);
                 }
                 roots += task.roots.size();

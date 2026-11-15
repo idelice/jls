@@ -51,6 +51,16 @@ public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> 
         return super.visitMemberReference(t, list);
     }
 
+    // Synthetic stubs are positioned on the class declaration; their bodies are not references.
+    private boolean insideGeneratedMember(TreePath path) {
+        for (var current = path; current != null; current = current.getParentPath()) {
+            if (current.getLeaf() instanceof MethodTree) {
+                return LombokAnnotations.isGeneratedMember(trees.getElement(current));
+            }
+        }
+        return false;
+    }
+
     /**
      * Check whether the current tree node belongs to the target class.
      * First tries direct element resolution (works when .class is on classpath).
@@ -59,6 +69,7 @@ public class FindLombokReferences extends TreePathScanner<Void, List<TreePath>> 
      */
     private boolean belongsToTarget() {
         var path = getCurrentPath();
+        if (insideGeneratedMember(path)) return false;
         var pos = trees.getSourcePositions();
         if (pos.getStartPosition(path.getCompilationUnit(), path.getLeaf()) == Diagnostic.NOPOS) return false;
 

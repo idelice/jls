@@ -1502,6 +1502,57 @@ public class ReferencesTest {
                         "InterfaceConstantCrossPackage.java:7"));
     }
 
+    @Test
+    public void lombokFieldReferences() {
+        assertThat(
+                references("/org/javacs/example/LombokFieldReferences.java", 7, 20),
+                containsInAnyOrder(
+                        "LombokFieldReferences.java:10",
+                        "LombokFieldReferences.java:11",
+                        "LombokFieldReferences.java:12",
+                        "LombokFieldReferences.java:13"));
+    }
+
+    @Test
+    public void lombokAccessorReferences() {
+        assertThat(
+                references("/org/javacs/example/LombokFieldReferences.java", 10, 13),
+                containsInAnyOrder(
+                        "LombokFieldReferences.java:10",
+                        "LombokFieldReferences.java:11",
+                        "LombokFieldReferences.java:12",
+                        "LombokFieldReferences.java:13"));
+    }
+
+    @Test
+    public void lombokInheritedAccessorReferences() {
+        assertThat(
+                references("/org/javacs/example/LombokInheritedPojoMembers.java", 14, 34),
+                containsInAnyOrder("LombokInheritedPojoMembers.java:8"));
+        assertThat(
+                references("/org/javacs/example/LombokInheritedAccessorNavigation.java", 15, 13),
+                containsInAnyOrder("LombokInheritedAccessorNavigation.java:15"));
+    }
+
+    @Test
+    public void lombokBuilderReferences() {
+        assertThat(
+                references("/org/javacs/example/LombokBuilderTest.java", 9, 20),
+                containsInAnyOrder("LombokBuilderTest.java:15"));
+    }
+
+    @Test
+    public void lombokCrossFileAccessorReferences() {
+        assertThat(
+                references("/org/javacs/example/LombokCrossTypeModel.java", 7, 20),
+                containsInAnyOrder(
+                        "LombokCrossTypeDiagnostics.java:6",
+                        "LombokCrossTypeDiagnostics.java:7"));
+        assertThat(
+                references("/org/javacs/example/LombokNestedBar.java", 7, 20),
+                containsInAnyOrder("LombokNestedDiagnostics.java:6"));
+    }
+
     private List<String> references(String file, int row, int column) {
         // Existing callers rely on includeDeclaration=true. The server currently ignores the flag:
         // methods include their declaration, fields and types do not.
