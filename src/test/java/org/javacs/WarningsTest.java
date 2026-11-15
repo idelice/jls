@@ -37,7 +37,7 @@ public class WarningsTest {
     @Test
     public void wrongType() {
         var file = FindResource.path("org/javacs/err/WrongType.java");
-        server.lint(List.of(file));
+        server.lint(file, false);
         assertThat(errors, hasItem("compiler.err.prob.found.req(5)"));
     }
 
@@ -46,7 +46,7 @@ public class WarningsTest {
         var server = LanguageServerFixture.getJavaLanguageServer(WarningsTest::onError);
         var file = FindResource.path("org/javacs/err/ClearErrorIncrementally.java");
         open(server, file);
-        server.lint(List.of(file));
+        server.lint(file, false);
         assertTrue(
                 "expected initial open-document diagnostics",
                 errors.contains("unused_local(5)") || errors.contains("compiler.err.prob.found.req(5)"));
@@ -55,14 +55,14 @@ public class WarningsTest {
                 "package org.javacs.err;\n\npublic class ClearErrorIncrementally {\n    void test() {\n        String x = \"1\";\n    }\n}";
         edit(server, file, newContents);
         errors.clear();
-        server.lint(List.of(file));
+        server.lint(file, false);
         assertThat(errors, hasItem("unused_local(5)"));
         // Delete line `String x = "1";`
         newContents =
                 "package org.javacs.err;\n\npublic class ClearErrorIncrementally {\n    void test() {\n        }\n}";
         edit(server, file, newContents);
         errors.clear();
-        server.lint(List.of(file));
+        server.lint(file, false);
         assertThat(errors, not(hasItem("unused_local(5)")));
     }
 
@@ -101,7 +101,7 @@ public class WarningsTest {
 
     @Test
     public void unused() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/Unused.java")));
+        server.lint(FindResource.path("org/javacs/warn/Unused.java"), false);
         var unused = errors.stream().filter(error -> error.startsWith("unused_")).toList();
         assertThat(
                 unused,
@@ -115,14 +115,14 @@ public class WarningsTest {
 
     @Test
     public void interfaceConst() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/InterfaceConst.java")));
+        server.lint(FindResource.path("org/javacs/warn/InterfaceConst.java"), false);
         assertThat(errors, empty());
     }
 
     @Ignore
     @Test
     public void targetedDiagnosticsDoNotExpandPackagePrivateCompanions() {
-        server.lint(List.of(FindResource.path("org/javacs/example/ReferenceGotoPackagePrivate.java")));
+        server.lint(FindResource.path("org/javacs/example/ReferenceGotoPackagePrivate.java"), false);
         assertThat(errors, hasItem("compiler.err.cant.resolve.location(5)"));
     }
 
@@ -130,7 +130,7 @@ public class WarningsTest {
     public void unusedImport() {
         var diags = new ArrayList<Diagnostic>();
         var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
-        srv.lint(List.of(FindResource.path("org/javacs/warn/UnusedImport.java")));
+        srv.lint(FindResource.path("org/javacs/warn/UnusedImport.java"), false);
         var importDiag = diags.stream()
                 .filter(d -> "unused_import".equals(d.code) && d.message.contains("Map"))
                 .findFirst();
@@ -139,7 +139,7 @@ public class WarningsTest {
 
     @Test
     public void recordFieldsDoNotWarnUnused() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedRecordFields.java")));
+        server.lint(FindResource.path("org/javacs/warn/UnusedRecordFields.java"), false);
         var fieldWarnings = errors.stream().filter(e -> e.startsWith("unused_field")).toList();
         // Only the private class field should warn, not the record components
         assertThat(fieldWarnings, containsInAnyOrder("unused_field(8)"));
@@ -147,14 +147,14 @@ public class WarningsTest {
 
     @Test
     public void unusedPrivateTypesWarn() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedPrivateTypes.java")));
+        server.lint(FindResource.path("org/javacs/warn/UnusedPrivateTypes.java"), false);
         var classWarnings = errors.stream().filter(e -> e.startsWith("unused_class")).toList();
         assertThat(classWarnings, containsInAnyOrder("unused_class(5)", "unused_class(8)"));
     }
 
     @Test
     public void usedPrivateTypesDoNotWarn() {
-        server.lint(List.of(FindResource.path("org/javacs/warn/UnusedPrivateTypes.java")));
+        server.lint(FindResource.path("org/javacs/warn/UnusedPrivateTypes.java"), false);
         var classWarnings = errors.stream().filter(e -> e.startsWith("unused_class")).toList();
         // UsedRecord and UsedInner should NOT appear
         assertThat(classWarnings, not(hasItem(containsString("11"))));
@@ -165,7 +165,7 @@ public class WarningsTest {
     public void diagnosticMessageStripsPackageNames() {
         var diags = new ArrayList<Diagnostic>();
         var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
-        srv.lint(List.of(FindResource.path("org/javacs/err/MissingOverride.java")));
+        srv.lint(FindResource.path("org/javacs/err/MissingOverride.java"), false);
         var diag = diags.stream()
                 .filter(d -> d.code != null && d.code.contains("does.not.override.abstract"))
                 .findFirst();
@@ -177,7 +177,7 @@ public class WarningsTest {
     public void diagnosticMessageSimplifiesCantResolve() {
         var diags = new ArrayList<Diagnostic>();
         var srv = LanguageServerFixture.getJavaLanguageServer(diags::add);
-        srv.lint(List.of(FindResource.path("org/javacs/err/CantResolve.java")));
+        srv.lint(FindResource.path("org/javacs/err/CantResolve.java"), false);
         var diag = diags.stream()
                 .filter(d -> d.code != null && d.code.contains("cant.resolve"))
                 .findFirst();

@@ -43,6 +43,12 @@ public class LSP {
 
     static class EndOfStream extends RuntimeException {}
 
+    static class ClientDisconnected extends RuntimeException {
+        ClientDisconnected(IOException cause) {
+            super(cause);
+        }
+    }
+
     /** Grace period for the dispatch thread to notice the closed stream and return normally. */
     private static final long EXIT_GRACE_MS = 2000;
 
@@ -130,7 +136,7 @@ public class LSP {
                 client.write(messageBytes);
             }
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new ClientDisconnected(e);
         }
     }
 
@@ -293,7 +299,12 @@ public class LSP {
                 break processMessages;
             }
             if (r == null) {
-                server.doAsyncWork();
+                try {
+                    server.doAsyncWork();
+                } catch (ClientDisconnected disconnected) {
+                    LOG.fine("Client disconnected during async work, exiting...");
+                    break processMessages;
+                }
                 continue;
             }
             if (r.method == null) {
@@ -574,10 +585,18 @@ public class LSP {
                     default:
                         LOG.warning(String.format("Don't know what to do with method `%s`", r.method));
                 }
+            } catch (ClientDisconnected disconnected) {
+                LOG.fine("Client disconnected, exiting...");
+                break processMessages;
             } catch (Exception e) {
                 LOG.log(Level.SEVERE, e.getMessage(), e);
                 if (r.id != null) {
-                    error(send, r.id, new ResponseError(ErrorCodes.InternalError, e.getMessage(), null));
+                    try {
+                        error(send, r.id, new ResponseError(ErrorCodes.InternalError, e.getMessage(), null));
+                    } catch (ClientDisconnected disconnected) {
+                        LOG.fine("Client disconnected while reporting an error, exiting...");
+                        break processMessages;
+                    }
                 }
             }
         }

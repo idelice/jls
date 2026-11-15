@@ -895,8 +895,7 @@ class JavaLanguageServer extends LanguageServer {
     private long lastPropagatedIndexVersion;
     private boolean serverReadyAnnounced;
 
-    private void lint(Path file, boolean propagate) {
-        if (compiler == null) return;
+    void lint(Path file, boolean propagate) {
         try {
             var requestCompiler = compilerFor(file);
             try (var task = requestCompiler.compile(List.<JavaFileObject>of(new SourceFileObject(file)))) {

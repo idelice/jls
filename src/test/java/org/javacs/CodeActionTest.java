@@ -113,14 +113,12 @@ public class CodeActionTest {
 
     private List<String> quickFix(String testFile) {
         var file = FindResource.path(testFile);
-        var diagParams = new DocumentDiagnosticParams();
-        diagParams.textDocument = new TextDocumentIdentifier(file.toUri());
-        var report = server.textDocumentDiagnostic(diagParams);
+        server.lint(file, false);
 
         var actionParams = new CodeActionParams();
         actionParams.textDocument = new TextDocumentIdentifier(file.toUri());
         actionParams.range = new Range(new Position(0, 0), new Position(0, 0));
-        actionParams.context.diagnostics = report.items;
+        actionParams.context.diagnostics = new ArrayList<>(errors);
         return extractTitles(server.codeAction(actionParams));
     }
 
@@ -132,12 +130,10 @@ public class CodeActionTest {
     private List<String> quickFixViaJsonRoundTrip(String testFile) {
         var gson = new Gson();
         var file = FindResource.path(testFile);
-        var diagParams = new DocumentDiagnosticParams();
-        diagParams.textDocument = new TextDocumentIdentifier(file.toUri());
-        var report = server.textDocumentDiagnostic(diagParams);
+        server.lint(file, false);
 
         // Serialize diagnostics to JSON and back (mimics the LSP wire protocol)
-        var json = gson.toJson(report.items);
+        var json = gson.toJson(new ArrayList<>(errors));
         List<Diagnostic> roundTripped = gson.fromJson(json, new TypeToken<List<Diagnostic>>() {}.getType());
         var actionParams = new CodeActionParams();
         actionParams.textDocument = new TextDocumentIdentifier(file.toUri());
@@ -149,7 +145,7 @@ public class CodeActionTest {
     private List<String> forCursor(String testFile, int line, int column) {
         var file = FindResource.path(testFile);
         var cursor = new Position(line - 1, column - 1);
-        server.lint(List.of(file));
+        server.lint(file, false);
         var params = new CodeActionParams();
         params.textDocument = new TextDocumentIdentifier(file.toUri());
         params.range = new Range(cursor, cursor);

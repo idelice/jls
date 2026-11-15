@@ -373,9 +373,11 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
 
     private boolean referencesType(Path file, String className) {
         var pkg = packageName(className);
-        return (containsImport(file, className) || containsWord(file, className))
-                && (pkg.isEmpty() || containsWord(file, pkg))
-                && containsWord(file, simpleName(className));
+        if (!containsWord(file, simpleName(className))) return false;
+        // containsImport also covers java.lang and same-package types, whose uses never spell out
+        // the package name.
+        if (containsImport(file, className)) return true;
+        return pkg.isEmpty() || containsWord(file, className);
     }
 
     @Override

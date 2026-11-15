@@ -24,7 +24,7 @@ public class ReleasePlatformReuseTest {
                         "class Usage { int value() { return " + i + "; } }", Instant.now());
                 var diagnostics = new javax.tools.DiagnosticCollector<javax.tools.JavaFileObject>();
                 try (var borrow = compiler.borrow(files, diagnostics,
-                        List.of("-proc:none", "--release", "8"), List.of(source), false)) {
+                        List.of("-proc:none", "--release", "8"), List.of(source))) {
                     borrow.task.analyze();
                     assertFalse(diagnostics.getDiagnostics().stream()
                             .anyMatch(d -> d.getKind() == Diagnostic.Kind.ERROR));

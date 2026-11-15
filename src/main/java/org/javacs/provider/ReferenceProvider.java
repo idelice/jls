@@ -14,7 +14,6 @@ import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.logging.Logger;
-import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
@@ -25,6 +24,7 @@ import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
 import org.javacs.FileStore;
 import org.javacs.FindHelper;
+import org.javacs.LombokAnnotations;
 import org.javacs.SourceFileObject;
 import org.javacs.completion.PruneBodiesWithoutToken;
 import org.javacs.index.WorkspaceTypeIndex;
@@ -74,6 +74,12 @@ public class ReferenceProvider {
                 LOG.fine("[ref] target_unresolved");
                 return NOT_SUPPORTED;
             }
+            // javac attributes this/super keywords to synthetic fields; they are not declarations.
+            if (element.getKind() == ElementKind.FIELD
+                    && (element.getSimpleName().contentEquals("this")
+                            || element.getSimpleName().contentEquals("super"))) {
+                return NOT_SUPPORTED;
+            }
             if (NavigationHelper.isMember(element)) {
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
@@ -86,14 +92,15 @@ public class ReferenceProvider {
                         ? compiler.findTypeDeclaration(className)
                         : Path.of(declarationPath.getCompilationUnit().getSourceFile().toUri());
                 LOG.fine(String.format("[ref] isMember kind=%s name=%s in=%s", element.getKind(), memberName, className));
-                if (memberName.equals("<init>")) {
+                var isConstructor = memberName.equals("<init>");
+                if (isConstructor) {
                     memberName = parentClass.getSimpleName().toString();
                 }
-                if (compiler.lombokPresentOnClasspath()) {
-                    LOG.fine("[ref] lombokOnClasspath=true");
-                    var accessor = typeIndex == null
-                            ? null
-                            : typeIndex.accessorNames(className, memberName).orElse(null);
+                var root = task.root(file);
+                if (compiler.lombokPresentOnClasspath()
+                        && root != null
+                        && LombokAnnotations.hasStructuralLombokAnnotation(root)) {
+                    var accessor = typeIndex.accessorNames(className, memberName).orElse(null);
                     if (accessor != null) {
                         var lombokClassName = accessor.ownerType();
                         var lombokDeclaration = lombokClassName.equals(className)
@@ -105,7 +112,6 @@ public class ReferenceProvider {
                                     lombokClassName, accessor.names(), lombokDeclaration);
                         }
                     }
-                    LOG.fine("[ref] names empty, falling back to findMemberReferences");
                 }
                 // Private non-Lombok: file-only scan (record components are private but have public accessors)
                 if (element.getModifiers().contains(Modifier.PRIVATE)
@@ -122,7 +128,11 @@ public class ReferenceProvider {
                     }
                 }
                 task.close();
-                return findMemberReferences(searchClassNames, memberName, declaration, isPackagePrivate);
+                if (parentClass.getKind() == ElementKind.ANNOTATION_TYPE) {
+                    return findAnnotationElementReferences(className, declaration);
+                }
+                return findMemberReferences(
+                        searchClassNames, memberName, declaration, isPackagePrivate, isConstructor);
             }
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(task);
@@ -159,7 +169,21 @@ public class ReferenceProvider {
         return findReferences(files, compiler.findTypeDeclaration(className), simpleName);
     }
 
-    private List<Location> findMemberReferences(Set<String> classNames, String memberName, Path declaration, boolean packagePrivate) {
+    private List<Location> findAnnotationElementReferences(String className, Path declaration) {
+        // Shorthand @A("x") has no member token; search by the annotation type name instead.
+        var simpleName = TypeNames.simpleName(className);
+        var files = compiler.findTypeReferences(className, tokenCandidates(simpleName));
+        var candidates = new LinkedHashSet<Path>();
+        candidates.addAll(Arrays.asList(files));
+        candidates.add(file);
+        if (declaration != null && !declaration.equals(CompilerProvider.NOT_FOUND)) {
+            candidates.add(declaration);
+        }
+        return findReferences(candidates.toArray(Path[]::new), declaration, null);
+    }
+
+    private List<Location> findMemberReferences(
+            Set<String> classNames, String memberName, Path declaration, boolean packagePrivate, boolean constructor) {
         var postings = tokenCandidates(memberName);
         var files = compiler.findMemberReferences(classNames, Set.of(memberName), postings);
         LOG.fine(String.format("[ref] member_scan owner=%s name=%s candidates=%d source=%s",
@@ -171,8 +195,19 @@ public class ReferenceProvider {
                     .toArray(Path[]::new);
             LOG.fine(String.format("[ref] package_private_filter owner=%s name=%s candidates=%d", classNames, memberName, files.length));
         }
+        // The cursor file and the declaration file must always be scanned. Token postings can be
+        // empty when the file never mentions the type name (e.g. a constructor used only by this(...)).
+        var candidates = new LinkedHashSet<Path>();
+        candidates.addAll(Arrays.asList(files));
+        candidates.add(file);
+        if (declaration != null && !declaration.equals(CompilerProvider.NOT_FOUND)) {
+            candidates.add(declaration);
+        }
+        files = candidates.toArray(Path[]::new);
         if (files.length == 0) return List.of();
-        return findReferences(files, declaration, memberName);
+        // Constructor bodies contain the only trace of this(...)/super(...), which the token never
+        // mentions, so they must not be pruned.
+        return findReferences(files, declaration, constructor ? null : memberName);
     }
 
     private List<Location> findReferences(Path[] files, Path declaration, String token) {

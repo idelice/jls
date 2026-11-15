@@ -1,5 +1,6 @@
 package org.javacs.navigation;
 
+import com.sun.source.tree.ImportTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.util.TreePath;
@@ -11,6 +12,7 @@ import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
+import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
@@ -40,12 +42,33 @@ public class NavigationHelper {
     public static Element findElement(CompileTask task, TreePath path) {
         if (path == null) return null;
         var element = task.trees.getElement(path);
+        if (element == null && path.getParentPath() != null
+                && path.getParentPath().getLeaf() instanceof ImportTree imported && imported.isStatic()) {
+            element = resolveStaticImport(task.elements, path.getLeaf().toString());
+        }
         if (element != null && element.asType().getKind() == TypeKind.ERROR
                 && path.getLeaf() instanceof MemberSelectTree select) {
             var resolved = resolveChain(task, path, select);
             if (resolved != null) element = resolved;
         }
         return element;
+    }
+
+    // javac attaches no element to a static-import member select.
+    static Element resolveStaticImport(Elements elements, String qualifiedName) {
+        if (qualifiedName.endsWith(".*")) return null;
+        var separator = qualifiedName.lastIndexOf('.');
+        while (separator > 0) {
+            var type = elements.getTypeElement(qualifiedName.substring(0, separator));
+            if (type != null) {
+                var memberName = qualifiedName.substring(separator + 1);
+                for (var member : elements.getAllMembers(type)) {
+                    if (member.getSimpleName().contentEquals(memberName)) return member;
+                }
+            }
+            separator = qualifiedName.lastIndexOf('.', separator - 1);
+        }
+        return null;
     }
 
     /**

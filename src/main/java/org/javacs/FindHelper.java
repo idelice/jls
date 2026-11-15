@@ -48,10 +48,20 @@ public class FindHelper {
                     || leaf instanceof BlockTree block && block.isStatic()) staticContext = true;
             if (leaf instanceof ClassTree type) {
                 scopes.put(path, staticContext);
-                if (type.getModifiers().getFlags().contains(Modifier.STATIC)) staticContext = true;
+                if (type.getModifiers().getFlags().contains(Modifier.STATIC) || implicitlyStatic(type)) {
+                    staticContext = true;
+                }
             }
         }
         return scopes;
+    }
+
+    // Nested records, enums, interfaces and annotations are implicitly static.
+    private static boolean implicitlyStatic(ClassTree type) {
+        return switch (type.getKind()) {
+            case RECORD, ENUM, INTERFACE, ANNOTATION_TYPE -> true;
+            default -> false;
+        };
     }
 
     public static String[] erasedParameterTypes(CompileTask task, ExecutableElement method) {
@@ -201,6 +211,17 @@ public class FindHelper {
             if (start >= 0 && end >= start) {
                 break;
             }
+        }
+        if (name.isEmpty() && path.getLeaf() instanceof MethodTree method) {
+            name = method.getName();
+            if ("<init>".contentEquals(name) && path.getParentPath() != null
+                    && path.getParentPath().getLeaf() instanceof ClassTree type) {
+                name = type.getSimpleName();
+            }
+            // Start after annotations/return type so the range cannot land on @Override.
+            var anchor = method.getReturnType() != null ? method.getReturnType() : method.getModifiers();
+            var anchorEnd = (int) pos.getEndPosition(root, anchor);
+            if (anchorEnd > start) start = anchorEnd;
         }
         if (!name.isEmpty() && start >= 0 && end >= start) {
             var namedStart = FindHelper.findNameIn(path.getCompilationUnit(), name, start, end);

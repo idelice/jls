@@ -34,7 +34,7 @@ import org.w3c.dom.NodeList;
 public final class MavenTooling {
     private static final Logger LOG = Logger.getLogger("main");
     private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-    private static final int CACHE_VERSION = 8;
+    private static final int CACHE_VERSION = 9;
 
     static final Path NOT_FOUND = Paths.get("");
 
@@ -646,6 +646,11 @@ public final class MavenTooling {
     private static boolean cacheValid(MavenCache cache) {
         if (cache == null || cache.version() != CACHE_VERSION || cache.poms() == null) return false;
         for (var stamp : cache.poms()) {
+            if (stamp.size() == -1) {
+                // Marker for a settings file that did not exist when the cache was written.
+                if (Files.exists(Paths.get(stamp.path()))) return false;
+                continue;
+            }
             var current = stampIfExists(Paths.get(stamp.path()));
             if (current == null || current.size() != stamp.size() || current.contentHash() != stamp.contentHash()) {
                 return false;
@@ -685,6 +690,7 @@ public final class MavenTooling {
         var stamps = new ArrayList<PomStamp>();
         for (var file : files) stamps.add(stampExistingFile(file));
         if (Files.exists(settings)) stamps.add(stampExistingFile(settings));
+        else stamps.add(new PomStamp(settings.toString(), -1, 0));
         stamps.sort(Comparator.comparing(PomStamp::path));
         return List.copyOf(stamps);
     }

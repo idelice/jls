@@ -49,7 +49,7 @@ public class IncrementalCompileTest implements TaskListener, DiagnosticListener<
             var files = fileManager.getJavaFileObjects(foo);
             LOG.info(String.format("Compile %d...", i));
             try (var borrow = pool.borrow(
-                    fileManager, this, options, List.of(files.iterator().next()), false)) {
+                    fileManager, this, options, List.of(files.iterator().next()))) {
                 checkInvokeType(borrow.task);
             }
         }

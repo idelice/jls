@@ -7,8 +7,11 @@ import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.DeclaredType;
+import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.util.Elements;
+import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
 import org.javacs.FindHelper;
@@ -17,17 +20,20 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
     final Trees trees;
     final Element find;
     final Elements elements;
+    final Types types;
 
     public FindReferences(Trees trees, Element find) {
         this.trees = trees;
         this.find = find;
         this.elements = null;
+        this.types = null;
     }
 
     public FindReferences(CompileTask task, Element find) {
         this.trees = task.trees;
         this.find = find;
         this.elements = task.elements;
+        this.types = task.types;
     }
 
     @Override
@@ -63,6 +69,45 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
     }
 
     @Override
+    public Void visitAnnotation(AnnotationTree annotation, List<TreePath> list) {
+        // javac normalizes shorthand @A("x") to @A(value = "x") with a synthetic `value`
+        // identifier that has no end position. The identifier visitor skips it; report the
+        // argument instead.
+        if (isShorthandAnnotationValue(annotation)) {
+            list.add(new TreePath(getCurrentPath(), annotation.getArguments().get(0)));
+        }
+        return super.visitAnnotation(annotation, list);
+    }
+
+    private boolean isShorthandAnnotationValue(AnnotationTree annotation) {
+        if (find.getKind() != ElementKind.METHOD || !find.getSimpleName().contentEquals("value")) {
+            return false;
+        }
+        if (!(find.getEnclosingElement() instanceof TypeElement declaring)
+                || declaring.getKind() != ElementKind.ANNOTATION_TYPE) {
+            return false;
+        }
+        var arguments = annotation.getArguments();
+        if (arguments.size() != 1 || !(arguments.get(0) instanceof AssignmentTree assignment)) return false;
+        var annotationType = trees.getElement(new TreePath(getCurrentPath(), annotation.getAnnotationType()));
+        if (!declaring.equals(annotationType)) return false;
+        return trees.getSourcePositions()
+                        .getEndPosition(getCurrentPath().getCompilationUnit(), assignment.getVariable())
+                == Diagnostic.NOPOS;
+    }
+
+    @Override
+    public Void visitImport(ImportTree importTree, List<TreePath> list) {
+        if (elements != null
+                && importTree.isStatic()
+                && importTree.getQualifiedIdentifier() instanceof MemberSelectTree select
+                && find.equals(NavigationHelper.resolveStaticImport(elements, select.toString()))) {
+            list.add(new TreePath(getCurrentPath(), importTree.getQualifiedIdentifier()));
+        }
+        return super.visitImport(importTree, list);
+    }
+
+    @Override
     public Void visitMethod(MethodTree t, List<TreePath> list) {
         if (check()) {
             list.add(getCurrentPath());
@@ -76,7 +121,9 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
         if (candidate != null && candidate.asType().getKind() != TypeKind.ERROR) {
             if (!find.equals(candidate)
                     && !isRecordComponentEquivalent(find, candidate)
-                    && !isOverrideEquivalent(find, candidate)) {
+                    // Overrides are shared only at declarations; call sites keep their own target.
+                    && !(path.getLeaf() instanceof MethodTree && isOverrideEquivalent(find, candidate))
+                    && !isAnonymousConstructorEquivalent(find, candidate)) {
                 return false;
             }
         } else {
@@ -149,6 +196,46 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
         if (!(a instanceof ExecutableElement methodA) || !(b instanceof ExecutableElement methodB)) return false;
         if (!a.getSimpleName().contentEquals(b.getSimpleName())) return false;
         return FindHelper.overridesEither(elements, methodA, methodB);
+    }
+
+    // new C() { ... } is attributed to a synthetic anonymous-subclass constructor.
+    private boolean isAnonymousConstructorEquivalent(Element target, Element candidate) {
+        if (types == null) return false;
+        if (target.getKind() != ElementKind.CONSTRUCTOR || candidate.getKind() != ElementKind.CONSTRUCTOR) {
+            return false;
+        }
+        if (!(target instanceof ExecutableElement targetConstructor)
+                || !(candidate instanceof ExecutableElement anonymousConstructor)) {
+            return false;
+        }
+        if (!(candidate.getEnclosingElement() instanceof TypeElement anonymous)
+                || !anonymous.getSimpleName().isEmpty()) {
+            return false;
+        }
+        if (!(target.getEnclosingElement() instanceof TypeElement declaring)) return false;
+        // Only a class superclass can be invoked by `new C() {}`; interface anonymous classes
+        // invoke Object(), which is not a source-level reference to a constructor.
+        if (!declaring.getKind().isClass() || declaring.getQualifiedName().contentEquals("java.lang.Object")) {
+            return false;
+        }
+        if (!(anonymous.getSuperclass() instanceof DeclaredType superDeclared)) return false;
+        if (!(superDeclared.asElement() instanceof TypeElement superType) || !superType.equals(declaring)) {
+            return false;
+        }
+        // Substitute the superclass type arguments, so `new Box<String>("x") {}` matches `Box(T)`.
+        if (!(types.asMemberOf(superDeclared, targetConstructor) instanceof ExecutableType targetSignature)) {
+            return false;
+        }
+        var targetParameters = targetSignature.getParameterTypes();
+        var anonymousParameters = anonymousConstructor.getParameters();
+        var captured = anonymousParameters.size() - targetParameters.size();
+        if (captured < 0) return false;
+        for (var i = 0; i < targetParameters.size(); i++) {
+            var actual = types.erasure(anonymousParameters.get(captured + i).asType());
+            var expected = types.erasure(targetParameters.get(i));
+            if (!types.isSameType(actual, expected)) return false;
+        }
+        return true;
     }
 
     /**

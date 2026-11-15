@@ -18,8 +18,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.tools.JavaFileObject;
+import org.javacs.index.WorkspaceTypeIndex;
 import org.javacs.provider.CompletionProvider;
-import org.javacs.index.TypeIndexRouter;
 import org.javacs.lsp.*;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -100,8 +100,8 @@ public class CompletionsTest extends CompletionsBase {
     public void expressionInMiddleOfLambdaChain() {
         // Cursor between two dots in "item..isVip()" where item is a lambda parameter
         var file = "/org/javacs/example/CompleteInMiddleOfLambdaChain.java";
-        // line 19: "                .filter(item -> item..isVip())", second dot at col 38 (1-indexed)
-        var suggestions = filterText(file, 19, 38);
+        // line 20: "                .filter(item -> item..isVip())", second dot at col 38 (1-indexed)
+        var suggestions = filterText(file, 20, 38);
         assertThat(suggestions, hasItems("isVip", "instanceMethod", "equals"));
     }
 
@@ -265,6 +265,11 @@ public class CompletionsTest extends CompletionsBase {
                             }
 
                             @Override
+                            public boolean isTopLevelTypeOnClasspath(String name) {
+                                return delegate.isTopLevelTypeOnClasspath(name);
+                            }
+
+                            @Override
                             public Iterable<Path> search(String query) {
                                 return delegate.search(query);
                             }
@@ -283,13 +288,21 @@ public class CompletionsTest extends CompletionsBase {
                             }
 
                             @Override
-                            public Path[] findTypeReferences(String className, java.util.Collection<Path> candidates) {
+                            public Path[] findTypeReferences(String className, Collection<Path> candidates) {
                                 return delegate.findTypeReferences(className, candidates);
                             }
 
                             @Override
-                            public Path[] findMemberReferences(String className, String memberName, java.util.Collection<Path> candidates) {
+                            public Path[] findMemberReferences(String className, String memberName, Collection<Path> candidates) {
                                 return delegate.findMemberReferences(className, memberName, candidates);
+                            }
+
+                            @Override
+                            public Path[] findMemberReferences(
+                                    Collection<String> classNames,
+                                    Collection<String> memberNames,
+                                    Collection<Path> candidates) {
+                                return delegate.findMemberReferences(classNames, memberNames, candidates);
                             }
 
                             @Override
@@ -312,8 +325,9 @@ public class CompletionsTest extends CompletionsBase {
                                 return delegate.compile(sources);
                             }
                         },
-                        TypeIndexRouter.EMPTY,
-                        0L);
+                        WorkspaceTypeIndex.EMPTY,
+                        0L,
+                        "test");
         provider.resolveCompletionItem(item);
         assertThat(item.label, equalTo("Goto"));
     }
@@ -989,7 +1003,7 @@ public class CompletionsTest extends CompletionsBase {
     public void completeInLineComment() {
         var file = "/org/javacs/example/AutocompleteComment.java";
         var uri = FindResource.uri(file);
-        server.lint(List.of(Paths.get(uri)));
+        server.lint(Paths.get(uri), false);
         var position =
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(3, 11));
         var result = server.completion(position);
@@ -1000,7 +1014,7 @@ public class CompletionsTest extends CompletionsBase {
     public void completeInBlockComment() {
         var file = "/org/javacs/example/AutocompleteComment.java";
         var uri = FindResource.uri(file);
-        server.lint(List.of(Paths.get(uri)));
+        server.lint(Paths.get(uri), false);
         var position =
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(4, 11));
         var result = server.completion(position);
@@ -1011,7 +1025,7 @@ public class CompletionsTest extends CompletionsBase {
     public void completeInJavadocComment() {
         var file = "/org/javacs/example/AutocompleteComment.java";
         var uri = FindResource.uri(file);
-        server.lint(List.of(Paths.get(uri)));
+        server.lint(Paths.get(uri), false);
         var position =
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(5, 12));
         var result = server.completion(position);
@@ -1022,7 +1036,7 @@ public class CompletionsTest extends CompletionsBase {
     public void completeOutsideComment() {
         var file = "/org/javacs/example/AutocompleteComment.java";
         var uri = FindResource.uri(file);
-        server.lint(List.of(Paths.get(uri)));
+        server.lint(Paths.get(uri), false);
         var position =
                 new TextDocumentPositionParams(new TextDocumentIdentifier(uri), new Position(9, 8));
         var result = server.completion(position);

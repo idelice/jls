@@ -5,10 +5,6 @@ import com.google.gson.JsonObject;
 import java.util.UUID;
 import org.javacs.lsp.LanguageClient;
 
-/**
- * Encapsulates LSP work-done-progress reporting (begin/report/end) so that callers
- * only need a token and message string.
- */
 class ProgressReporter {
     private final LanguageClient client;
     private final boolean supported;

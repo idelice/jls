@@ -366,6 +366,14 @@ public class CompletionProvider {
         return list;
     }
 
+    // receiver..call() -> receiver.call(); the cursor prefix is unchanged.
+    private static String collapseDoubleDot(String contents, long cursor) {
+        var at = (int) cursor;
+        if (at <= 0 || at >= contents.length()) return contents;
+        if (contents.charAt(at) != '.' || contents.charAt(at - 1) != '.') return contents;
+        return contents.substring(0, at) + contents.substring(at + 1);
+    }
+
     private int endOfLine(CharSequence contents, int cursor) {
         while (cursor < contents.length()) {
             var c = contents.charAt(cursor);
@@ -382,6 +390,7 @@ public class CompletionProvider {
     private CompletionList completeMember(
             ParseTask parseTask, String contents, long cursor,
             MemberAccessContext memberAccess, boolean endsWithParen, boolean inAnnotation) {
+        contents = collapseDoubleDot(contents, cursor);
         // A statement terminator after an annotation detaches it from its declaration.
         if (!inAnnotation) contents = terminateCompletionLine(contents, cursor);
         try {
@@ -420,12 +429,31 @@ public class CompletionProvider {
                 if (!(type instanceof DeclaredType declared)) {
                     return EMPTY;
                 }
-                return memberItems(task, declared, scope, isStatic, memberAccess, endsWithParen, inAnnotation);
+                var qualifiedThis = allowsQualifiedThis(trees, path, receiver);
+                return memberItems(
+                        task, declared, scope, isStatic, memberAccess, endsWithParen, inAnnotation, qualifiedThis);
             }
         } catch (Exception e) {
             LOG.warning("[completion] compile_member_failed: " + e);
             return EMPTY;
         }
+    }
+
+    // True when Type.this / Type.super is valid: Type encloses the cursor with a live instance.
+    private static boolean allowsQualifiedThis(Trees trees, TreePath path, Element receiver) {
+        if (!(receiver instanceof TypeElement receiverType) || !receiverType.getKind().isClass()) {
+            return false;
+        }
+        for (var entry : FindHelper.findEnclosingTypeScopes(path).entrySet()) {
+            if (entry.getValue()) continue;
+            var enclosing = trees.getElement(entry.getKey());
+            if (enclosing instanceof TypeElement type
+                    && type.getKind().isClass()
+                    && type.getQualifiedName().contentEquals(receiverType.getQualifiedName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private CompletionList memberItems(
@@ -434,7 +462,7 @@ public class CompletionProvider {
             Scope scope,
             boolean isStatic,
             MemberAccessContext memberAccess,
-            boolean endsWithParen, boolean inAnnotation) {
+            boolean endsWithParen, boolean inAnnotation, boolean qualifiedThis) {
         var trees = task.trees;
         var typeElement = (TypeElement) declared.asElement();
         var methodReference = memberAccess.methodReference();
@@ -448,6 +476,7 @@ public class CompletionProvider {
             if (!trees.isAccessible(scope, member, declared)) continue;
             if (methodReference) {
                 if (member.getKind() != ElementKind.METHOD) continue;
+                if (!isStatic && member.getModifiers().contains(Modifier.STATIC)) continue;
             } else if (isStatic != member.getModifiers().contains(Modifier.STATIC)) {
                 continue;
             }
@@ -469,6 +498,10 @@ public class CompletionProvider {
             list.add(keyword("new"));
         } else if (isStatic) {
             list.add(keyword("class"));
+        }
+        if (qualifiedThis && !methodReference && !inAnnotation) {
+            if (matchesCompletionPrefix("this", memberAccess.partial())) list.add(keyword("this"));
+            if (matchesCompletionPrefix("super", memberAccess.partial())) list.add(keyword("super"));
         }
         return new CompletionList(false, list);
     }
@@ -522,6 +555,11 @@ public class CompletionProvider {
         var scope = FindHelper.findEnclosingTypeScopes(path);
         if (!constructor) {
             addKeywords(path, partial, list);
+            if (path.getLeaf() instanceof ClassTree classTree && inClassHeader(parseTask, classTree, contents, cursor)) {
+                for (var keyword : new String[] {"extends", "implements"}) {
+                    if (StringSearch.matchesPartialName(keyword, partial)) list.items.add(keyword(keyword));
+                }
+            }
             for (int i = 0; i < list.items.size(); i++) positions.put(list.items.get(i).label, i);
             addSyntacticLocalVariables(parseTask, cursor, partial, positions, list);
         }
@@ -1115,6 +1153,13 @@ public class CompletionProvider {
         "extends",
         "implements",
     };
+
+    private static boolean inClassHeader(ParseTask task, ClassTree tree, String contents, long cursor) {
+        var start = Trees.instance(task.task()).getSourcePositions().getStartPosition(task.root(), tree);
+        if (start < 0 || cursor <= start) return false;
+        var brace = contents.indexOf('{', (int) start);
+        return brace < 0 || brace >= cursor;
+    }
 
     private static boolean matchesCompletionPrefix(CharSequence candidate, String partial) {
         if (partial == null) return true;

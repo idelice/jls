@@ -112,7 +112,7 @@ public class CompletionsBase {
     protected List<? extends CompletionItem> items(String file, int row, int column) {
         var uri = FindResource.uri(file);
         var path = java.nio.file.Paths.get(uri);
-        server.lint(List.of(path));
+        server.lint(path, false);
         server.completionIndexScheduler.ensureIndexed(path);
         server.completionIndexScheduler.awaitReady(10_000);
         var position =
