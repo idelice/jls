@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -49,7 +50,8 @@ public class NavigationHelper {
         var element = task.trees.getElement(path);
         if (element == null && path.getParentPath() != null
                 && path.getParentPath().getLeaf() instanceof ImportTree imported && imported.isStatic()) {
-            element = resolveStaticImport(task.elements, path.getLeaf().toString());
+            var importedMembers = resolveStaticImport(task.elements, path.getLeaf().toString());
+            if (!importedMembers.isEmpty()) element = importedMembers.get(0);
         }
         if (element != null && element.asType().getKind() == TypeKind.ERROR
                 && path.getLeaf() instanceof MemberSelectTree select) {
@@ -78,21 +80,23 @@ public class NavigationHelper {
         return assignment.getExpression();
     }
 
-    // javac attaches no element to a static-import member select.
-    static Element resolveStaticImport(Elements elements, String qualifiedName) {
-        if (qualifiedName.endsWith(".*")) return null;
+    /** A static import of an overloaded member names every overload, not just the first. */
+    static List<Element> resolveStaticImport(Elements elements, String qualifiedName) {
+        if (qualifiedName.endsWith(".*")) return List.of();
         var separator = qualifiedName.lastIndexOf('.');
         while (separator > 0) {
             var type = elements.getTypeElement(qualifiedName.substring(0, separator));
             if (type != null) {
                 var memberName = qualifiedName.substring(separator + 1);
+                var matches = new ArrayList<Element>();
                 for (var member : elements.getAllMembers(type)) {
-                    if (member.getSimpleName().contentEquals(memberName)) return member;
+                    if (member.getSimpleName().contentEquals(memberName)) matches.add(member);
                 }
+                if (!matches.isEmpty()) return matches;
             }
             separator = qualifiedName.lastIndexOf('.', separator - 1);
         }
-        return null;
+        return List.of();
     }
 
     /**

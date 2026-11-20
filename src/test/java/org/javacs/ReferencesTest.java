@@ -1226,6 +1226,23 @@ public class ReferencesTest {
     }
 
     @Test
+    public void overloadedStaticImportMethod() {
+        // The import line imports both overloads, so it is a reference to each declaration.
+        assertThat(
+                references("/org/javacs/example/RefStaticOverload.java", 4, 19),
+                containsInAnyOrder(
+                        "RefStaticOverload.java:4",
+                        "RefStaticOverloadUse.java:3",
+                        "RefStaticOverloadUse.java:7"));
+        assertThat(
+                references("/org/javacs/example/RefStaticOverload.java", 6, 19),
+                containsInAnyOrder(
+                        "RefStaticOverload.java:6",
+                        "RefStaticOverloadUse.java:3",
+                        "RefStaticOverloadUse.java:8"));
+    }
+
+    @Test
     public void singleStaticImportField() {
         // A field has no declaration location: only the import line and the use are returned.
         assertThat(

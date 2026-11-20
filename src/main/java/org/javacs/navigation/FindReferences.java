@@ -84,7 +84,7 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
         if (elements != null
                 && importTree.isStatic()
                 && importTree.getQualifiedIdentifier() instanceof MemberSelectTree select
-                && find.equals(NavigationHelper.resolveStaticImport(elements, select.toString()))) {
+                && NavigationHelper.resolveStaticImport(elements, select.toString()).contains(find)) {
             list.add(new TreePath(getCurrentPath(), importTree.getQualifiedIdentifier()));
         }
         return super.visitImport(importTree, list);
