@@ -73,27 +73,10 @@ public class FindReferences extends TreePathScanner<Void, List<TreePath>> {
         // javac normalizes shorthand @A("x") to @A(value = "x") with a synthetic `value`
         // identifier that has no end position. The identifier visitor skips it; report the
         // argument instead.
-        if (isShorthandAnnotationValue(annotation)) {
+        if (NavigationHelper.shorthandAnnotationValue(getCurrentPath(), trees, find) != null) {
             list.add(new TreePath(getCurrentPath(), annotation.getArguments().get(0)));
         }
         return super.visitAnnotation(annotation, list);
-    }
-
-    private boolean isShorthandAnnotationValue(AnnotationTree annotation) {
-        if (find.getKind() != ElementKind.METHOD || !find.getSimpleName().contentEquals("value")) {
-            return false;
-        }
-        if (!(find.getEnclosingElement() instanceof TypeElement declaring)
-                || declaring.getKind() != ElementKind.ANNOTATION_TYPE) {
-            return false;
-        }
-        var arguments = annotation.getArguments();
-        if (arguments.size() != 1 || !(arguments.get(0) instanceof AssignmentTree assignment)) return false;
-        var annotationType = trees.getElement(new TreePath(getCurrentPath(), annotation.getAnnotationType()));
-        if (!declaring.equals(annotationType)) return false;
-        return trees.getSourcePositions()
-                        .getEndPosition(getCurrentPath().getCompilationUnit(), assignment.getVariable())
-                == Diagnostic.NOPOS;
     }
 
     @Override

@@ -1,6 +1,7 @@
 package org.javacs.rewrite;
 
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -32,12 +33,18 @@ public class RenameMethod implements Rewrite {
             Function<Path, CompilerProvider> compilerForFile,
             BiPredicate<Path, Path> candidateAllowed) {
         LOG.info("Rewrite " + className + "#" + methodName + " to " + newName + "...");
-        var paths = compiler.findMemberReferences(className, methodName, null);
-        if (paths.length == 0) {
+        var paths = new LinkedHashSet<Path>();
+        Collections.addAll(paths, compiler.findMemberReferences(className, methodName, null));
+        if (methodName.equals("value")) {
+            // Over-approximates: shorthand @A("x") has no `value` token, so add files referencing the
+            // annotation type; RenameHelper filters them down to real annotation elements.
+            Collections.addAll(paths, compiler.findTypeReferences(className, null));
+        }
+        if (paths.isEmpty()) {
             LOG.warning("...no references to " + className + "#" + methodName);
             return Map.of();
         }
-        LOG.info("...check " + paths.length + " files for references");
+        LOG.info("...check " + paths.size() + " files for references");
         var declaration = compiler.findTypeDeclaration(className);
         var groups = new LinkedHashMap<CompilerProvider, LinkedHashSet<Path>>();
         for (var path : paths) {

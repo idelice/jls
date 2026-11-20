@@ -1,9 +1,13 @@
 package org.javacs.navigation;
 
+import com.sun.source.tree.AnnotationTree;
+import com.sun.source.tree.AssignmentTree;
+import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.ImportTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.util.TreePath;
+import com.sun.source.util.Trees;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -19,6 +23,7 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.ExecutableType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
+import javax.tools.Diagnostic;
 import org.javacs.CompileTask;
 import org.javacs.FindNameAt;
 import org.javacs.LspPosition;
@@ -52,6 +57,25 @@ public class NavigationHelper {
             if (resolved != null) element = resolved;
         }
         return element;
+    }
+
+    /**
+     * javac normalizes shorthand {@code @A("x")} into {@code @A(value = "x")} with a synthetic,
+     * position-less {@code value}. Returns the argument expression of such a shorthand for {@code find},
+     * or null when the annotation argument is not shorthand for {@code find}.
+     */
+    public static ExpressionTree shorthandAnnotationValue(TreePath path, Trees trees, Element find) {
+        if (find.getKind() != ElementKind.METHOD || !find.getSimpleName().contentEquals("value")) return null;
+        if (!(find.getEnclosingElement() instanceof TypeElement declaring)
+                || declaring.getKind() != ElementKind.ANNOTATION_TYPE) return null;
+        var annotation = (AnnotationTree) path.getLeaf();
+        var arguments = annotation.getArguments();
+        if (arguments.size() != 1 || !(arguments.get(0) instanceof AssignmentTree assignment)) return null;
+        var annotationType = trees.getElement(new TreePath(path, annotation.getAnnotationType()));
+        if (!declaring.equals(annotationType)) return null;
+        var end = trees.getSourcePositions().getEndPosition(path.getCompilationUnit(), assignment.getVariable());
+        if (end != Diagnostic.NOPOS) return null;
+        return assignment.getExpression();
     }
 
     // javac attaches no element to a static-import member select.

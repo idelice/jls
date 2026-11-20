@@ -1,15 +1,19 @@
 package org.javacs.rewrite;
 
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.MemberReferenceTree;
 import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
+import com.sun.source.util.TreePathScanner;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +29,7 @@ import org.javacs.FindHelper;
 import org.javacs.LspPosition;
 import org.javacs.lsp.TextEdit;
 import org.javacs.navigation.FindLombokReferences;
+import org.javacs.navigation.NavigationHelper;
 
 class RenameHelper {
     final CompileTask task;
@@ -51,9 +56,17 @@ class RenameHelper {
         for (var root : roots) {
             var file = Paths.get(root.getSourceFile().toUri());
             var references = findMethodReferences(root, method);
-            if (references.isEmpty()) continue;
-            var fileEdits = replaceAll(references, newName);
-            allEdits.put(file, fileEdits);
+            var shorthand = findShorthandValues(root, method);
+            if (references.isEmpty() && shorthand.isEmpty()) continue;
+            var fileEdits = new ArrayList<TextEdit>();
+            Collections.addAll(fileEdits, replaceAll(references, newName));
+            var pos = task.trees.getSourcePositions();
+            for (var expression : shorthand) {
+                var start = pos.getStartPosition(root, expression);
+                if (start < 0) continue;
+                fileEdits.add(new TextEdit(LspPosition.range(root, start, start), newName + " = "));
+            }
+            allEdits.put(file, fileEdits.toArray(TextEdit[]::new));
         }
         return allEdits;
     }
@@ -138,6 +151,19 @@ class RenameHelper {
     private boolean overridesTarget(Element candidate, ExecutableElement find) {
         if (!(candidate instanceof ExecutableElement method) || method.equals(find)) return false;
         return FindHelper.overridesEither(task.elements, method, find);
+    }
+
+    private List<ExpressionTree> findShorthandValues(CompilationUnitTree root, ExecutableElement find) {
+        var found = new ArrayList<ExpressionTree>();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitAnnotation(AnnotationTree annotation, Void unused) {
+                var value = NavigationHelper.shorthandAnnotationValue(getCurrentPath(), task.trees, find);
+                if (value != null) found.add(value);
+                return super.visitAnnotation(annotation, unused);
+            }
+        }.scan(root, null);
+        return found;
     }
 
     private TextEdit[] replaceAll(List<TreePath> found, String newName) {
