@@ -1,6 +1,5 @@
 package org.javacs;
 
-import org.hamcrest.Matchers;
 import static org.hamcrest.Matchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 
