@@ -12,7 +12,7 @@ runtime_needs_refresh() {
     if [ ! -e "$release_file" ]; then
         return 0
     fi
-    ! grep -q 'jdk.jdeps' "$release_file" || ! grep -q "JAVA_VERSION=\"$JDK_VERSION\"" "$release_file"
+    ! grep -q 'jdk.jdeps' "$release_file" || ! grep -q 'java.desktop' "$release_file" || ! grep -q "JAVA_VERSION=\"$JDK_VERSION\"" "$release_file"
 }
 
 build_java_home() {

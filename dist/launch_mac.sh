@@ -45,7 +45,7 @@ elif [ -f "$AOT_CONF_FILE" ]; then
     # Build it now before starting, then use it.
     "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} \
         -XX:AOTMode=create -XX:AOTConfiguration="$AOT_CONF_FILE" \
-        -XX:AOTCache="$AOT_CACHE_FILE" -classpath "$DIR/classpath/*" 2>/dev/null
+        -XX:AOTCache="$AOT_CACHE_FILE" -classpath "$DIR/classpath/*" >/dev/null 2>&1
     if [ -f "$AOT_CACHE_FILE" ]; then
         AOT_OPTS="-XX:AOTCache=$AOT_CACHE_FILE"
         rm -f "$AOT_CONF_FILE"
@@ -59,7 +59,7 @@ else
         if [ -f "$AOT_CONF_FILE" ] && [ ! -f "$AOT_CACHE_FILE" ]; then
             "$JAVA_BIN" $JLINK_VM_OPTIONS ${JLS_JVM_OPTS:-$JLS_JVM_DEFAULT_MEM} \
                 -XX:AOTMode=create -XX:AOTConfiguration="$AOT_CONF_FILE" \
-                -XX:AOTCache="$AOT_CACHE_FILE" -classpath "$DIR/classpath/*" 2>/dev/null
+                -XX:AOTCache="$AOT_CACHE_FILE" -classpath "$DIR/classpath/*" >/dev/null 2>&1
             [ -f "$AOT_CACHE_FILE" ] && rm -f "$AOT_CONF_FILE"
         fi
     ' EXIT
