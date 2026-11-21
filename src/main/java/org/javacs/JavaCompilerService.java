@@ -1,14 +1,23 @@
 package org.javacs;
 
 import java.io.IOException;
-import java.nio.file.*;
-import java.util.*;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import javax.tools.*;
+import javax.tools.JavaFileObject;
+import javax.tools.StandardLocation;
 import org.javacs.completion.ExternalBinaryDecompiler;
 
 class JavaCompilerService implements CompilerProvider, AutoCloseable {
@@ -50,7 +59,7 @@ class JavaCompilerService implements CompilerProvider, AutoCloseable {
     void addDocPathEntries(Set<Path> entries) {
         if (entries.isEmpty()) return;
         try {
-            var merged = new java.util.LinkedHashSet<>(docPath);
+            var merged = new LinkedHashSet<>(docPath);
             if (merged.addAll(entries)) {
                 docsFileManager.setLocationFromPaths(StandardLocation.SOURCE_PATH, merged);
             }
