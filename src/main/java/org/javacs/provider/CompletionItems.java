@@ -214,10 +214,10 @@ final class CompletionItems {
             return Character.isUpperCase(name.charAt(3));
         }
         if (name.startsWith("set") && name.length() > 3) {
-            return Character.isUpperCase(name.charAt(3));
+            return !Character.isLowerCase(name.charAt(3));
         }
         if (name.startsWith("is") && name.length() > 2) {
-            return Character.isUpperCase(name.charAt(2));
+            return !Character.isLowerCase(name.charAt(2));
         }
         return false;
     }

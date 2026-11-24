@@ -394,7 +394,7 @@ public final class LombokAnnotations {
                 && booleanField
                 && baseName.length() > 2
                 && baseName.startsWith("is")
-                && Character.isUpperCase(baseName.charAt(2));
+                && !Character.isLowerCase(baseName.charAt(2));
         var suffix = booleanPrefix
                 ? baseName.substring(2)
                 : capitalize(baseName, config.capitalizeBeanFirst());
@@ -617,9 +617,11 @@ public final class LombokAnnotations {
             return Optional.of(decapitalize(methodName.substring(3)));
         }
         if (methodName.startsWith("is") && methodName.length() > 2) {
+            if (!Character.isJavaIdentifierStart(methodName.charAt(2))) return Optional.of(methodName);
             return Optional.of(decapitalize(methodName.substring(2)));
         }
         if (methodName.startsWith("set") && methodName.length() > 3) {
+            if (!Character.isJavaIdentifierStart(methodName.charAt(3))) return Optional.of("is" + methodName.substring(3));
             return Optional.of(decapitalize(methodName.substring(3)));
         }
         return Optional.empty();
